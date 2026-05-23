@@ -23,10 +23,7 @@ import { useTranslation } from 'react-i18next';
 import { Dialog, ConfirmDialog } from '../components/Modal';
 import { CopyButton } from '../components/CopyButton';
 import { parseServerDate } from '../utils/date';
-
-function cn(...classes: (string | undefined | null | false)[]) {
-  return classes.filter(Boolean).join(' ');
-}
+import { cn } from '../lib/utils'
 
 export default function Models() {
   const { t, i18n } = useTranslation();
@@ -240,7 +237,7 @@ export default function Models() {
   };
 
   return (
-    <div className="space-y-8 animate-in fade-in duration-500">
+    <div className="space-y-8 animate-fadeIn">
       {/* Header */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div className="flex items-center gap-3">
@@ -248,7 +245,7 @@ export default function Models() {
             <Box size={24} />
           </div>
           <div>
-            <h1 className="text-2xl font-bold tracking-tight">{t('common.models')}</h1>
+            <h1 className="text-2xl font-semibold tracking-tight">{t('common.models')}</h1>
             <p className="text-sm text-muted-foreground">{t('models.subtitle')}</p>
           </div>
         </div>
@@ -256,7 +253,7 @@ export default function Models() {
            <button 
              onClick={handleTestAll}
              disabled={queueStatus.isRunning || filteredModels.length === 0}
-             className="flex items-center gap-2 px-3 py-2 bg-amber-500/10 text-amber-600 rounded-lg text-sm font-medium hover:bg-amber-500/20 transition-all shadow-sm disabled:opacity-50"
+             className="flex items-center gap-2 px-3 py-2 bg-warning/10 text-warning rounded-lg text-sm font-medium hover:bg-warning/20 transition-all shadow-sm disabled:opacity-50"
              title={t('models.testAllDesc')}
            >
              <Zap size={16} className={cn(queueStatus.isRunning && "animate-pulse")} />
@@ -289,7 +286,7 @@ export default function Models() {
       {/* Aliases Section (Condensed) */}
       {aliases.length > 0 && (
         <div className="space-y-4">
-           <h2 className="text-xs font-bold text-muted-foreground uppercase tracking-[0.2em] px-1 flex items-center gap-2">
+           <h2 className="text-xs font-semibold text-muted-foreground uppercase tracking-[0.2em] px-1 flex items-center gap-2">
               <Zap size={14} className="text-primary" />
               {t('models.aliasSection')}
            </h2>
@@ -317,22 +314,22 @@ export default function Models() {
                   >
                     <div className="flex items-center gap-2 min-w-0">
                         <div className="flex items-center gap-1 group/alias">
-                           <span className="px-2 py-0.5 bg-primary/10 text-primary rounded text-[11px] font-black uppercase truncate shadow-sm border border-primary/5">
+                           <span className="px-2 py-0.5 bg-primary/10 text-primary rounded text-xs font-bold uppercase truncate shadow-sm border border-primary/5">
                              {a.alias}
                            </span>
                            <CopyButton value={a.alias} size={10} className="p-1 opacity-0 group-hover/alias:opacity-100 transition-opacity" />
                         </div>
                         <ArrowRight size={10} className="text-muted-foreground opacity-30 shrink-0" />
                         <div className="flex items-center gap-2 min-w-0">
-                          <div className="text-[11px] font-bold truncate text-muted-foreground">{a.target_model}</div>
+                          <div className="text-xs font-bold truncate text-muted-foreground">{a.target_model}</div>
                           {result && (
                             <div className="flex items-center gap-1.5 shrink-0">
                               <div className={cn(
                                 "w-1.5 h-1.5 rounded-full",
-                                result.success ? "bg-green-500" : "bg-red-500"
+                                result.success ? "bg-success" : "bg-destructive"
                               )} />
                               {result.latency != null && (
-                                <span className="text-[9px] font-bold text-muted-foreground/50">{(result.latency / 1000).toFixed(1)}s</span>
+                                <span className="text-xs font-bold text-muted-foreground/50">{(result.latency / 1000).toFixed(1)}s</span>
                               )}
                             </div>
                           )}
@@ -340,7 +337,7 @@ export default function Models() {
                     </div>
                     <button
                       onClick={(e) => { e.stopPropagation(); setAliasToDelete({ id: a.id, name: a.alias }); }}
-                      className="p-1 text-muted-foreground hover:text-red-500 opacity-0 group-hover:opacity-100 transition-all"
+                      className="p-1 text-muted-foreground hover:text-destructive opacity-0 group-hover:opacity-100 transition-all"
                     >
                       <Trash2 size={12} />
                     </button>
@@ -391,21 +388,21 @@ export default function Models() {
           <div key={model.id} className="p-4 rounded-xl border border-border bg-card hover:border-primary/40 transition-all group flex flex-col justify-between min-h-[160px]">
             <div className="space-y-1">
               <div className="flex items-center justify-between">
-                <span className="text-[9px] font-black text-primary uppercase tracking-widest">{model.owned_by}</span>
+                <span className="text-xs font-bold text-primary uppercase tracking-widest">{model.owned_by}</span>
                 <div className="flex items-center gap-1.5">
                    {testResults[model.id]?.loading ? (
                      <RefreshCcw size={10} className="animate-spin text-muted-foreground" />
                    ) : testResults[model.id] ? (
                      <div className={cn(
                        "w-1.5 h-1.5 rounded-full",
-                       testResults[model.id]?.success ? "bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.6)]" : "bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.6)]"
+                       testResults[model.id]?.success ? "bg-success shadow-[0_0_8px_rgba(34,197,94,0.6)]" : "bg-destructive shadow-[0_0_8px_rgba(239,68,68,0.6)]"
                      )} title={testResults[model.id]?.error} />
                    ) : null}
                    <LayoutGrid size={12} className="text-muted-foreground/30" />
                 </div>
               </div>
               <div className="flex items-start justify-between gap-2">
-                <h3 className="font-bold text-sm tracking-tight line-clamp-2 leading-snug">{model.id}</h3>
+                <h3 className="font-semibold text-sm tracking-tight line-clamp-2 leading-snug">{model.id}</h3>
                 <CopyButton 
                   value={model.id} 
                   size={12} 
@@ -415,10 +412,10 @@ export default function Models() {
               </div>
               <div className="flex items-center gap-2">
                 {testResults[model.id]?.latency != null && (
-                  <span className="text-[10px] text-green-600 font-bold">{(testResults[model.id]!.latency! / 1000).toFixed(1)}s</span>
+                  <span className="text-xs text-success font-bold">{(testResults[model.id]!.latency! / 1000).toFixed(1)}s</span>
                 )}
                 {testResults[model.id]?.lastChecked && (
-                  <span className="text-[9px] text-muted-foreground/60 font-medium">
+                  <span className="text-xs text-muted-foreground/60 font-medium">
                     {parseServerDate(testResults[model.id]!.lastChecked!).toLocaleString(i18n.language, { 
                       month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' 
                     })}
@@ -426,7 +423,7 @@ export default function Models() {
                 )}
               </div>
               {testResults[model.id]?.error && (
-                <p className="text-[9px] text-red-500 font-medium line-clamp-1 opacity-80" title={testResults[model.id]?.error}>{testResults[model.id]?.error}</p>
+                <p className="text-xs text-destructive font-medium line-clamp-1 opacity-80" title={testResults[model.id]?.error}>{testResults[model.id]?.error}</p>
               )}
               {/* 限额进度条：只有厂商返回了 ratelimit 数据才显示 */}
               {(() => {
@@ -437,10 +434,10 @@ export default function Models() {
                 const total = parseInt(limits['x-ratelimit-limit-tokens'] ?? limits['x-quota-total'] ?? -1);
                 if (remaining < 0 || total <= 0) return null;
                 const pct = Math.max(0, Math.min(100, (remaining / total) * 100));
-                const color = pct > 50 ? 'bg-green-500' : pct > 15 ? 'bg-amber-500' : 'bg-red-500';
+                const color = pct > 50 ? 'bg-success' : pct > 15 ? 'bg-warning' : 'bg-destructive';
                 return (
                   <div className="mt-1.5 space-y-0.5">
-                    <div className="flex justify-between text-[9px] text-muted-foreground">
+                    <div className="flex justify-between text-xs text-muted-foreground">
                       <span>Tokens</span>
                       <span>{remaining.toLocaleString()} / {total.toLocaleString()}</span>
                     </div>
@@ -451,7 +448,7 @@ export default function Models() {
                       />
                     </div>
                     {limitsUpdatedAt && (
-                      <div className="text-[8px] text-muted-foreground/40 text-right">
+                      <div className="text-xs text-muted-foreground/40 text-right">
                         更新于 {parseServerDate(limitsUpdatedAt).toLocaleString(i18n.language, {
                           month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'
                         })}
@@ -462,13 +459,13 @@ export default function Models() {
               })()}
             </div>
             
-            <div className="pt-3 mt-3 border-t border-border/40 flex items-center justify-between text-[10px] font-bold text-muted-foreground uppercase tracking-tighter">
+            <div className="pt-3 mt-3 border-t border-border/40 flex items-center justify-between text-xs font-bold text-muted-foreground uppercase tracking-tighter">
                <button 
                  onClick={() => handleTest(model.id, model.owned_by)}
                  disabled={testResults[model.id]?.loading || queueStatus.isRunning}
                  className="flex items-center gap-1 hover:text-foreground transition-colors disabled:opacity-50"
                >
-                 <Zap size={12} className={cn(testResults[model.id]?.success && "text-amber-500")} />
+                 <Zap size={12} className={cn(testResults[model.id]?.success && "text-warning")} />
                  {testResults[model.id]?.loading ? t('models.testing') : t('models.testBtn')}
                </button>
                <button 
@@ -551,24 +548,24 @@ export default function Models() {
                     <span className="ml-1 text-primary font-normal">({matchingAccounts.length})</span>
                   )}
                 </label>
-                <p className="text-[10px] text-muted-foreground">{t('models.bindAccountsHint')}</p>
+                <p className="text-xs text-muted-foreground">{t('models.bindAccountsHint')}</p>
                 {aliasForm.target && matchingAccounts.length === 0 && (
-                  <p className="text-[10px] text-amber-500">{t('models.noAccountsForModel')}</p>
+                  <p className="text-xs text-warning">{t('models.noAccountsForModel')}</p>
                 )}
                 {aliasForm.target && otherAccounts.length > 0 && (
-                  <p className="text-[10px] text-muted-foreground/60">{t('models.otherAccountsHidden', { count: otherAccounts.length })}</p>
+                  <p className="text-xs text-muted-foreground/60">{t('models.otherAccountsHidden', { count: otherAccounts.length })}</p>
                 )}
                 {matchingAccounts.length > 0 && (
                   <div className="flex items-center gap-2">
                     <button
                       type="button"
                       onClick={() => setAliasForm({...aliasForm, selectedAccountIds: matchingAccounts.map(a => a.id)})}
-                      className="text-[10px] font-bold text-primary hover:underline"
+                      className="text-xs font-bold text-primary hover:underline"
                     >{t('models.selectAll')}</button>
                     <button
                       type="button"
                       onClick={() => setAliasForm({...aliasForm, selectedAccountIds: []})}
-                      className="text-[10px] font-bold text-muted-foreground hover:underline"
+                      className="text-xs font-bold text-muted-foreground hover:underline"
                     >{t('models.deselectAll')}</button>
                   </div>
                 )}
@@ -591,7 +588,7 @@ export default function Models() {
                 </label>
               ))}
                   {matchingAccounts.length === 0 && (
-                    <p className="text-[10px] text-muted-foreground p-2">{t('accounts.noAccounts')}</p>
+                    <p className="text-xs text-muted-foreground p-2">{t('accounts.noAccounts')}</p>
                   )}
                 </div>
               </div>
@@ -665,7 +662,7 @@ export default function Models() {
               type="button"
               onClick={handleVerify}
               disabled={isVerifying || !customForm.target || !customForm.accountId}
-              className="flex items-center gap-2 px-4 py-2 bg-amber-500/10 text-amber-600 rounded-lg text-sm font-medium hover:bg-amber-500/20 transition-all disabled:opacity-50"
+              className="flex items-center gap-2 px-4 py-2 bg-warning/10 text-warning rounded-lg text-sm font-medium hover:bg-warning/20 transition-all disabled:opacity-50"
             >
               {isVerifying ? <Loader2 size={16} className="animate-spin" /> : <Zap size={16} />}
               {isVerifying ? t('models.verifying') : t('models.verify')}
@@ -673,7 +670,7 @@ export default function Models() {
             {verifyResult && (
               <div className={cn(
                 "flex items-center gap-2 p-3 rounded-lg text-sm font-medium",
-                verifyResult.success ? "bg-green-500/10 text-green-600" : "bg-red-500/10 text-red-600"
+                verifyResult.success ? "bg-success/10 text-success" : "bg-destructive/10 text-destructive"
               )}>
                 {verifyResult.success ? <CheckCircle2 size={16} /> : <XCircle size={16} />}
                 {verifyResult.success
