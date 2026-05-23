@@ -19,11 +19,8 @@ import {
 } from 'lucide-react';
 import { Dialog, ConfirmDialog } from '../components/Modal';
 import { CopyButton } from '../components/CopyButton';
+import { cn } from '../lib/utils';
 import { parseServerDate } from '../utils/date';
-
-function cn(...classes: (string | undefined | null | false)[]) {
-  return classes.filter(Boolean).join(' ');
-}
 
 function parseAllowedModels(raw: string): string[] {
   if (!raw || raw === '*') return [];
@@ -101,14 +98,14 @@ export default function KeysPage() {
   );
 
   return (
-    <div className="space-y-8 animate-in fade-in duration-500">
+    <div className="space-y-8 animate-fadeIn duration-500">
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-3">
           <div className="p-2 bg-primary/10 text-primary rounded-lg">
             <Key size={24} />
           </div>
           <div>
-            <h1 className="text-2xl font-bold tracking-tight">{t('keys.title')}</h1>
+            <h1 className="text-2xl font-semibold tracking-tight">{t('keys.title')}</h1>
             <p className="text-sm text-muted-foreground">{t('keys.subtitle')}</p>
           </div>
         </div>
@@ -126,10 +123,10 @@ export default function KeysPage() {
         </button>
       </div>
 
-      <div className="p-5 bg-card border border-border rounded-2xl flex flex-col md:flex-row md:items-center justify-between gap-4 relative overflow-hidden">
+      <div className="p-5 bg-card border border-border rounded-xl flex flex-col md:flex-row md:items-center justify-between gap-4 relative overflow-hidden">
         <div className="absolute inset-0 bg-gradient-to-r from-primary/5 to-transparent pointer-events-none" />
         <div className="space-y-1.5 relative">
-          <div className="font-bold flex items-center gap-2 text-sm">
+          <div className="font-semibold flex items-center gap-2 text-sm">
             <Terminal size={16} className="text-primary" />
             {t('keys.apiUsage')}
           </div>
@@ -138,20 +135,20 @@ export default function KeysPage() {
           </div>
         </div>
         <div className="flex items-center gap-2 bg-muted/50 p-2 rounded-xl border border-border/50 relative">
-          <span className="text-[10px] font-black uppercase text-muted-foreground/60 border-r border-border/50 pr-2 mr-1 ml-1">{t('keys.endpoint')}</span>
-          <code className="text-sm font-mono font-bold select-all text-primary">{baseUrl}</code>
+          <span className="text-xs font-semibold uppercase text-muted-foreground/60 border-r border-border/50 pr-2 mr-1 ml-1">{t('keys.endpoint')}</span>
+          <code className="text-sm font-mono font-semibold select-all text-primary">{baseUrl}</code>
           <CopyButton value={baseUrl} size={14} title={t('keys.copyBase')} />
         </div>
       </div>
 
       <div className="grid gap-4">
         {keys.map((k) => (
-          <div key={k.id} className="p-5 rounded-2xl border border-border bg-card hover:border-primary/30 transition-all group relative overflow-hidden">
+          <div key={k.id} className="p-5 rounded-xl border border-border bg-card hover:border-primary/30 transition-all group relative overflow-hidden">
             <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
               <div className="space-y-1 flex-1">
                 <div className="flex items-center gap-2">
-                  <h3 className="font-bold text-base">{k.name}</h3>
-                  <span className="text-[10px] bg-muted px-2 py-0.5 rounded-full font-bold text-muted-foreground uppercase tracking-tight flex items-center gap-1">
+                  <h3 className="font-semibold text-base">{k.name}</h3>
+                  <span className="text-xs bg-muted px-2 py-0.5 rounded-full font-semibold text-muted-foreground uppercase tracking-tight flex items-center gap-1">
                     <Calendar size={10} />
                     {parseServerDate(k.created_at).toLocaleString(undefined, {
                       year: 'numeric', month: 'short', day: 'numeric'
@@ -175,7 +172,7 @@ export default function KeysPage() {
                 {k.allowed_models !== '*' && (
                    <div className="flex flex-wrap gap-1.5 mt-2">
                       {parseAllowedModels(k.allowed_models).map((m: string) => (
-                         <div key={m} className="flex items-center gap-1.5 pl-2.5 pr-1 py-0.5 bg-primary/5 text-primary/80 text-[11px] font-black rounded border border-primary/10 group/tag hover:bg-primary/10 transition-colors shadow-sm">
+                         <div key={m} className="flex items-center gap-1.5 pl-2.5 pr-1 py-0.5 bg-primary/5 text-primary/80 text-xs font-semibold rounded border border-primary/10 group/tag hover:bg-primary/10 transition-colors shadow-sm">
                             {m}
                             <CopyButton value={m} size={9} className="p-0.5 opacity-0 group-hover/tag:opacity-100 transition-opacity" />
                          </div>
@@ -186,10 +183,10 @@ export default function KeysPage() {
 
               <div className="flex items-center gap-3">
                 <div className="text-right mr-3 hidden sm:block">
-                  <div className="text-[10px] font-bold text-muted-foreground uppercase tracking-widest mb-1">{t('keys.permissions')}</div>
+                  <div className="text-xs font-semibold text-muted-foreground uppercase tracking-widest mb-1">{t('keys.permissions')}</div>
                   <div className="flex items-center gap-1.5 justify-end">
-                    <ShieldCheck size={14} className={k.allowed_models === '*' ? 'text-green-500' : 'text-blue-500'} />
-                    <span className="text-xs font-bold capitalize">
+                    <ShieldCheck size={14} className={k.allowed_models === '*' ? 'text-success' : 'text-primary'} />
+                    <span className="text-xs font-semibold capitalize">
                       {k.allowed_models === '*' ? t('keys.allModels') : t('keys.specificModels', { count: parseAllowedModels(k.allowed_models).length })}
                     </span>
                   </div>
@@ -212,7 +209,7 @@ export default function KeysPage() {
                   </button>
                   <button
                     onClick={() => setKeyToDelete(k)}
-                    className="p-2.5 hover:bg-red-500/10 hover:text-red-500 rounded-xl text-muted-foreground transition-all"
+                    className="p-2.5 hover:bg-destructive/10 hover:text-destructive rounded-xl text-muted-foreground transition-all"
                     title={t('common.delete')}
                   >
                     <Trash2 size={18} />
@@ -240,10 +237,10 @@ export default function KeysPage() {
       >
         {generatedKey ? (
           <div className="space-y-6 animate-in zoom-in-95 duration-300">
-            <div className="p-4 bg-primary/5 border border-primary/10 rounded-2xl space-y-3">
+            <div className="p-4 bg-primary/5 border border-primary/10 rounded-xl space-y-3">
               <div className="flex items-center justify-between">
-                <span className="text-xs font-bold text-primary uppercase tracking-widest">{t('keys.secretKey')}</span>
-                <span className="text-[10px] text-amber-600 font-bold bg-amber-500/10 px-2 py-0.5 rounded">{t('keys.saveThisNow')}</span>
+                <span className="text-xs font-semibold text-primary uppercase tracking-widest">{t('keys.secretKey')}</span>
+                <span className="text-xs text-warning font-semibold bg-warning/10 px-2 py-0.5 rounded">{t('keys.saveThisNow')}</span>
               </div>
               <div className="flex items-center gap-3 bg-card p-3 rounded-xl border border-border shadow-sm">
                 <code className="text-sm font-mono flex-1 truncate">{generatedKey}</code>
@@ -256,7 +253,7 @@ export default function KeysPage() {
             </div>
             <button
               onClick={() => setIsModalOpen(false)}
-              className="w-full py-3 bg-muted hover:bg-muted/80 rounded-xl font-bold transition-all"
+              className="w-full py-3 bg-muted hover:bg-muted/80 rounded-xl font-semibold transition-all"
             >
               {t('common.done')}
             </button>
@@ -264,7 +261,7 @@ export default function KeysPage() {
         ) : (
           <form onSubmit={handleCreateOrUpdate} className="space-y-6">
             <div className="space-y-2">
-              <label className="text-xs font-bold text-muted-foreground uppercase px-1">{t('keys.keyName')}</label>
+              <label className="text-xs font-semibold text-muted-foreground uppercase px-1">{t('keys.keyName')}</label>
               <input 
                 type="text" 
                 required
@@ -276,13 +273,13 @@ export default function KeysPage() {
             </div>
 
             <div className="space-y-3">
-              <label className="text-xs font-bold text-muted-foreground uppercase px-1">{t('keys.permissions')}</label>
+              <label className="text-xs font-semibold text-muted-foreground uppercase px-1">{t('keys.permissions')}</label>
               <div className="grid grid-cols-2 gap-2">
                 <button
                   type="button"
                   onClick={() => setNewKeyData({...newKeyData, allowedModels: '*'})}
                   className={cn(
-                    "p-3 rounded-xl border text-sm font-bold transition-all flex items-center justify-center gap-2",
+                    "p-3 rounded-xl border text-sm font-semibold transition-all flex items-center justify-center gap-2",
                     newKeyData.allowedModels === '*' 
                       ? "bg-primary/10 border-primary text-primary" 
                       : "bg-card border-border text-muted-foreground hover:border-primary/30"
@@ -295,7 +292,7 @@ export default function KeysPage() {
                   type="button"
                   onClick={() => setNewKeyData({...newKeyData, allowedModels: Array.isArray(newKeyData.allowedModels) ? newKeyData.allowedModels : []})}
                   className={cn(
-                    "p-3 rounded-xl border text-sm font-bold transition-all flex items-center justify-center gap-2",
+                    "p-3 rounded-xl border text-sm font-semibold transition-all flex items-center justify-center gap-2",
                     newKeyData.allowedModels !== '*' 
                       ? "bg-primary/10 border-primary text-primary" 
                       : "bg-card border-border text-muted-foreground hover:border-primary/30"
@@ -327,7 +324,7 @@ export default function KeysPage() {
                       />
                       <div className="flex flex-1 items-center justify-between min-w-0">
                         <span className="text-xs font-medium truncate">{item.id}</span>
-                        <span className="shrink-0 text-[10px] font-black bg-primary/10 text-primary px-2 py-0.5 rounded uppercase tracking-tight shadow-sm border border-primary/5">{t('common.alias')}</span>
+                        <span className="shrink-0 text-xs font-semibold bg-primary/10 text-primary px-2 py-0.5 rounded uppercase tracking-tight shadow-sm border border-primary/5">{t('common.alias')}</span>
                       </div>
                     </label>
                   ))
@@ -352,14 +349,14 @@ export default function KeysPage() {
               <button 
                 type="button" 
                 onClick={() => setIsModalOpen(false)}
-                className="flex-1 py-3 border border-border rounded-xl font-bold hover:bg-muted transition-all"
+                className="flex-1 py-3 border border-border rounded-xl font-semibold hover:bg-muted transition-all"
               >
                 {t('common.cancel')}
               </button>
               <button
                 type="submit"
                 disabled={!canSubmit}
-                className="flex-1 py-3 bg-primary text-primary-foreground rounded-xl font-bold hover:opacity-90 transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+                className="flex-1 py-3 bg-primary text-primary-foreground rounded-xl font-semibold hover:opacity-90 transition-all disabled:opacity-40 disabled:cursor-not-allowed"
               >
                 {t('common.save')}
               </button>
@@ -390,13 +387,13 @@ export default function KeysPage() {
         title={t('keys.emptyAuthWarning')}
       >
         <div className="space-y-4">
-          <div className="p-4 bg-amber-500/10 border border-amber-500/20 rounded-2xl flex gap-3 text-amber-700">
+          <div className="p-4 bg-warning/10 border border-warning/20 rounded-xl flex gap-3 text-warning">
              <ShieldCheck size={20} className="shrink-0" />
              <div className="space-y-2">
-                <p className="text-sm font-bold">{t('keys.emptyAuthDesc')}</p>
+                <p className="text-sm font-semibold">{t('keys.emptyAuthDesc')}</p>
                 <div className="flex flex-wrap gap-2">
                    {warningKeyNames.map(name => (
-                     <span key={name} className="px-2 py-1 bg-amber-500/20 rounded text-[10px] font-black uppercase tracking-tight">
+                     <span key={name} className="px-2 py-1 bg-warning/20 rounded text-xs font-semibold uppercase tracking-tight">
                         {name}
                      </span>
                    ))}
@@ -405,7 +402,7 @@ export default function KeysPage() {
           </div>
           <button 
             onClick={() => setShowWarningModal(false)}
-            className="w-full py-3 bg-primary text-primary-foreground rounded-xl font-bold shadow-lg shadow-primary/20 transition-all hover:opacity-90"
+            className="w-full py-3 bg-primary text-primary-foreground rounded-xl font-semibold shadow-lg shadow-primary/20 transition-all hover:opacity-90"
           >
             {t('common.done')}
           </button>

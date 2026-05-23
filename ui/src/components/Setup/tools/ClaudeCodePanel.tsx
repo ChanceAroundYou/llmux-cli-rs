@@ -283,22 +283,22 @@ export function ClaudeCodePanel({
         {/* 左列 */}
         <div className="space-y-4">
           <div className="space-y-2">
-            <div className="text-xs font-bold text-muted-foreground uppercase tracking-widest">{t('setup.step1')}</div>
+            <div className="text-xs font-semibold text-muted-foreground uppercase tracking-widest">{t('setup.step1')}</div>
             <KeySelector keys={keys} selectedKeyId={selectedKeyId} onSelect={setSelectedKeyId} />
           </div>
 
           {allowedModelsList.length > 0 && (
             <div className="space-y-3 p-4 rounded-xl border border-border bg-card">
-              <div className="text-xs font-bold text-muted-foreground uppercase tracking-widest">{t('setup.modelRoles')}</div>
+              <div className="text-xs font-semibold text-muted-foreground uppercase tracking-widest">{t('setup.modelRoles')}</div>
               <ModelRoleSelect label="Opus"   envKey="ANTHROPIC_DEFAULT_OPUS_MODEL"   models={allowedModelsList} value={opusModel}   longContext={opus1m}   onChange={setOpusModel}   onLongContextChange={setOpus1m} />
               <ModelRoleSelect label="Sonnet" envKey="ANTHROPIC_DEFAULT_SONNET_MODEL" models={allowedModelsList} value={sonnetModel} longContext={sonnet1m} onChange={setSonnetModel} onLongContextChange={setSonnet1m} />
               <ModelRoleSelect label="Haiku"  envKey="ANTHROPIC_DEFAULT_HAIKU_MODEL"  models={allowedModelsList} value={haikuModel}  longContext={haiku1m}  onChange={setHaikuModel}  onLongContextChange={setHaiku1m} />
-              <p className="text-[10px] text-muted-foreground leading-relaxed">{t('setup.modelRolesHint')}</p>
+              <p className="text-xs text-muted-foreground leading-relaxed">{t('setup.modelRolesHint')}</p>
             </div>
           )}
 
-          <div className="p-3 bg-blue-500/5 border border-blue-500/10 rounded-lg">
-            <p className="text-[10px] text-blue-600/80 leading-relaxed">{t('setup.endpointHint')}</p>
+          <div className="p-3 bg-primary/5 border border-primary/10 rounded-lg">
+            <p className="text-xs text-primary/80 leading-relaxed">{t('setup.endpointHint')}</p>
           </div>
           <ApplyButton
             selectedKey={!!selectedKey}

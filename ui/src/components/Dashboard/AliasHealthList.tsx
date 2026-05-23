@@ -1,5 +1,6 @@
 import { Zap, ArrowRight } from 'lucide-react';
 import { TFunction } from 'i18next';
+import { cn } from '../../lib/utils';
 
 export interface AliasHealth {
   alias: string;
@@ -9,8 +10,6 @@ export interface AliasHealth {
   error: string | null;
   lastChecked: number | null;
 }
-
-const cn = (...classes: (string | boolean | undefined | null)[]) => classes.filter(Boolean).join(' ');
 
 interface AliasHealthListProps {
   aliases: AliasHealth[];
@@ -22,7 +21,7 @@ export const AliasHealthList = ({ aliases, t }: AliasHealthListProps) => {
 
   return (
     <div className="premium-card bg-gradient-to-br from-card to-primary/[0.02] flex flex-col">
-      <div className="flex items-center gap-2 text-xs font-bold text-muted-foreground uppercase tracking-widest mb-6">
+      <div className="flex items-center gap-2 text-xs font-semibold text-muted-foreground uppercase tracking-widest mb-6">
         <Zap size={14} className="text-primary" />
         {t('dashboard.aliasHealth')}
         {aliases.length > 0 && (
@@ -33,7 +32,7 @@ export const AliasHealthList = ({ aliases, t }: AliasHealthListProps) => {
       </div>
       <div className="space-y-3 overflow-y-auto max-h-[320px] no-scrollbar">
         {aliases.length === 0 ? (
-          <div className="py-16 text-center text-muted-foreground/30 text-[10px] font-bold uppercase border border-dashed border-border/60 rounded-2xl">
+          <div className="py-16 text-center text-muted-foreground/30 text-xs font-semibold uppercase border border-dashed border-border/60 rounded-xl">
             {t('dashboard.noAliases')}
           </div>
         ) : (
@@ -47,14 +46,14 @@ export const AliasHealthList = ({ aliases, t }: AliasHealthListProps) => {
                   className={cn(
                     "w-2 h-2 rounded-full shrink-0",
                     a.success
-                      ? "bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.4)]"
+                      ? "bg-success shadow-[0_0_8px_rgba(34,197,94,0.4)]"
                       : a.lastChecked
-                        ? "bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.4)]"
+                        ? "bg-destructive shadow-[0_0_8px_rgba(239,68,68,0.4)]"
                         : "bg-muted-foreground/30"
                   )}
                 />
                 <div className="min-w-0">
-                  <div className="text-sm font-bold truncate">{a.alias}</div>
+                  <div className="text-sm font-semibold truncate">{a.alias}</div>
                   <div className="flex items-center gap-1 text-[9px] text-muted-foreground/60 mt-0.5">
                     <span className="truncate">{a.target_model}</span>
                   </div>
@@ -62,13 +61,13 @@ export const AliasHealthList = ({ aliases, t }: AliasHealthListProps) => {
               </div>
               <div className="text-right shrink-0 ml-2">
                 {a.latency !== null ? (
-                  <div className={cn("text-sm font-bold tabular-nums", a.success ? "text-green-600" : "text-red-500")}>
+                  <div className={cn("text-sm font-semibold tabular-nums", a.success ? "text-success" : "text-destructive")}>
                     {a.success ? `${(a.latency / 1000).toFixed(1)}s` : 'ERR'}
                   </div>
                 ) : a.lastChecked ? (
-                  <div className="text-sm font-bold text-red-500">ERR</div>
+                  <div className="text-sm font-semibold text-destructive">ERR</div>
                 ) : (
-                  <div className="text-[10px] text-muted-foreground/40">{t('dashboard.untested')}</div>
+                  <div className="text-xs text-muted-foreground/40">{t('dashboard.untested')}</div>
                 )}
               </div>
             </div>

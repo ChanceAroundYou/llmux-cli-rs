@@ -16,7 +16,7 @@ export function KeySelector({ keys, selectedKeyId, onSelect }: Props) {
   if (keys.length === 0) {
     return (
       <div className="flex items-start gap-3 p-4 rounded-xl border border-dashed border-border bg-muted/30 text-sm text-muted-foreground">
-        <AlertCircle size={15} className="mt-0.5 shrink-0 text-amber-500" />
+        <AlertCircle size={15} className="mt-0.5 shrink-0 text-warning" />
         <span>
           {t('setup.noKeys')}{' '}
           <Link to="/keys" className="text-primary underline underline-offset-2 font-medium">
@@ -40,7 +40,7 @@ export function KeySelector({ keys, selectedKeyId, onSelect }: Props) {
           <Key size={13} className={selectedKeyId === k.id ? 'text-primary' : 'text-muted-foreground'} />
           <div className="flex-1 min-w-0">
             <div className="text-xs font-semibold truncate">{k.name}</div>
-            <div className="text-[10px] text-muted-foreground font-mono truncate">
+            <div className="text-xs text-muted-foreground font-mono truncate">
               {k.key.slice(0, 12)}••••••••
             </div>
           </div>

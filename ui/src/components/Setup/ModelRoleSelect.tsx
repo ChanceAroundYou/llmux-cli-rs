@@ -18,8 +18,8 @@ export function ModelRoleSelect({ label, envKey, models, value, longContext, onC
   return (
     <div className="space-y-1.5">
       <div className="flex items-center justify-between">
-        <span className="text-[11px] font-bold text-muted-foreground uppercase tracking-wide">{label}</span>
-        <span className="text-[10px] text-muted-foreground/60 font-mono">{envKey}</span>
+        <span className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">{label}</span>
+        <span className="text-xs text-muted-foreground/60 font-mono">{envKey}</span>
       </div>
       <div className="flex gap-2">
         <div className="relative flex-1">
@@ -42,7 +42,7 @@ export function ModelRoleSelect({ label, envKey, models, value, longContext, onC
           onClick={() => onLongContextChange(!longContext)}
           title="启用百万上下文 [1m]"
           className={cn(
-            'shrink-0 px-2 rounded-lg border text-[10px] font-bold transition-all',
+            'shrink-0 px-2 rounded-lg border text-xs font-semibold transition-all',
             !value && 'opacity-30 cursor-not-allowed',
             value && longContext
               ? 'bg-primary/15 border-primary/40 text-primary'
@@ -54,7 +54,7 @@ export function ModelRoleSelect({ label, envKey, models, value, longContext, onC
       </div>
       {/* 实际写入值预览 */}
       {effectiveValue && (
-        <div className="text-[10px] font-mono text-muted-foreground/70 pl-1">
+        <div className="text-xs font-mono text-muted-foreground/70 pl-1">
           → <span className="text-foreground/80">{effectiveValue}</span>
         </div>
       )}

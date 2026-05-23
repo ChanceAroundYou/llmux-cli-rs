@@ -13,14 +13,11 @@ import {
   Upload
 } from 'lucide-react';
 import { ConfirmDialog } from '../components/Modal';
-
-function cn(...classes: (string | undefined | null | false)[]) {
-  return classes.filter(Boolean).join(' ');
-}
+import { cn } from '../lib/utils';
 
 const SettingGroup = ({ title, icon: Icon, children }: { title: string, icon: any, children: React.ReactNode }) => (
   <div className="space-y-4">
-    <div className="flex items-center gap-2 text-xs font-bold text-muted-foreground uppercase tracking-widest px-1">
+    <div className="flex items-center gap-2 text-xs font-semibold text-muted-foreground uppercase tracking-widest px-1">
       <Icon size={14} />
       <span>{title}</span>
     </div>
@@ -35,8 +32,8 @@ const SettingGroup = ({ title, icon: Icon, children }: { title: string, icon: an
 const SettingItem = ({ label, description, children }: { label: string, description?: string, children: React.ReactNode }) => (
   <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 p-4">
     <div className="space-y-0.5">
-      <div className="text-sm font-bold">{label}</div>
-      {description && <div className="text-[11px] text-muted-foreground font-medium">{description}</div>}
+      <div className="text-sm font-semibold">{label}</div>
+      {description && <div className="text-xs text-muted-foreground font-medium">{description}</div>}
     </div>
     <div className="flex items-center">
       {children}
@@ -152,20 +149,20 @@ export default function Settings() {
   };
 
   return (
-    <div className="max-w-3xl mx-auto space-y-10 animate-in fade-in duration-500">
+    <div className="max-w-3xl mx-auto space-y-10 animate-fadeIn duration-500">
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-3">
           <div className="p-2 bg-primary/10 text-primary rounded-lg">
             <SettingsIcon size={24} />
           </div>
           <div>
-            <h1 className="text-2xl font-bold tracking-tight">{t('common.settings')}</h1>
+            <h1 className="text-2xl font-semibold tracking-tight">{t('common.settings')}</h1>
             <p className="text-sm text-muted-foreground">{t('settings.subtitle')}</p>
           </div>
         </div>
         <div className="flex items-center gap-2">
            {showSaved && (
-             <div className="flex items-center gap-1.5 text-[10px] font-bold text-green-500 bg-green-500/10 px-3 py-1.5 rounded-full animate-in zoom-in duration-300">
+             <div className="flex items-center gap-1.5 text-xs font-semibold text-success bg-success/10 px-3 py-1.5 rounded-full animate-in zoom-in duration-300">
                 <CheckCircle2 size={12} />
                 <span>{t('common.saved')}</span>
              </div>
@@ -182,7 +179,7 @@ export default function Settings() {
                   value={localConfig.port || '25975'}
                   onChange={e => setLocalConfig({...localConfig, port: e.target.value})}
                   onKeyDown={e => e.key === 'Enter' && handleAutoSave(localConfig, true)}
-                  className="bg-muted/50 border border-border rounded-lg px-3 py-1.5 text-xs font-bold w-24 text-center outline-none focus:ring-1 focus:ring-primary/20 transition-all"
+                  className="bg-muted/50 border border-border rounded-lg px-3 py-1.5 text-xs font-semibold w-24 text-center outline-none focus:ring-1 focus:ring-primary/20 transition-all"
                 />
                 <button
                   onClick={() => handleAutoSave(localConfig, true)}
@@ -197,7 +194,7 @@ export default function Settings() {
 
         <SettingGroup title={t('settings.ui')} icon={Monitor}>
            <SettingItem label={t('settings.theme')} description={t('settings.themeDesc')}>
-             <div className="flex border border-border rounded-lg overflow-hidden text-[10px] font-bold">
+             <div className="flex border border-border rounded-lg overflow-hidden text-xs font-semibold">
                 <button 
                   onClick={() => handleAutoSave({...localConfig, theme: 'dark'})}
                   className={cn("px-4 py-1.5 transition-colors", localConfig.theme !== 'light' ? 'bg-primary text-primary-foreground' : 'hover:bg-muted')}
@@ -219,7 +216,7 @@ export default function Settings() {
              <button 
                 onClick={() => setIsConfirmOpen(true)}
                 disabled={isPurging}
-                className="px-3 py-1.5 text-[10px] font-bold text-red-500 border border-red-500/20 rounded-lg hover:bg-red-500 hover:text-white transition-all disabled:opacity-50"
+                className="px-3 py-1.5 text-xs font-semibold text-destructive border border-destructive/20 rounded-lg hover:bg-destructive hover:text-white transition-all disabled:opacity-50"
               >
                 {isPurging ? <Loader2 size={12} className="animate-spin inline mr-1" /> : null}
                 {t('settings.purgeBtn')}
@@ -230,11 +227,11 @@ export default function Settings() {
         <SettingGroup title={t('settings.sync')} icon={RefreshCw}>
           <SettingItem label={t('settings.export')} description={t('settings.exportDesc')}>
             <div className="flex items-center gap-2">
-              <span className="text-[9px] text-amber-500 font-medium whitespace-nowrap">{t('settings.exportWarning')}</span>
+              <span className="text-[9px] text-warning font-medium whitespace-nowrap">{t('settings.exportWarning')}</span>
               <button
                 onClick={handleExport}
                 disabled={isExporting}
-                className="flex items-center gap-1.5 px-3 py-1.5 text-[10px] font-bold border border-border rounded-lg hover:bg-muted transition-all disabled:opacity-50 shrink-0"
+                className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold border border-border rounded-lg hover:bg-muted transition-all disabled:opacity-50 shrink-0"
               >
                 {isExporting ? <Loader2 size={12} className="animate-spin" /> : <Download size={12} />}
                 {t('settings.export')}
@@ -247,13 +244,13 @@ export default function Settings() {
               <button
                 onClick={() => fileInputRef.current?.click()}
                 disabled={isImporting}
-                className="flex items-center gap-1.5 px-3 py-1.5 text-[10px] font-bold border border-border rounded-lg hover:bg-muted transition-all disabled:opacity-50"
+                className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold border border-border rounded-lg hover:bg-muted transition-all disabled:opacity-50"
               >
                 {isImporting ? <Loader2 size={12} className="animate-spin" /> : <Upload size={12} />}
                 {t('settings.import')}
               </button>
               {importResult && (
-                <span className="text-[9px] text-green-500 font-medium max-w-[200px] text-right">{importResult}</span>
+                <span className="text-[9px] text-success font-medium max-w-[200px] text-right">{importResult}</span>
               )}
             </div>
           </SettingItem>
@@ -267,14 +264,14 @@ export default function Settings() {
         title={t('settings.purge')}
         description={
           <div className="space-y-4">
-             <div className="p-3 bg-red-500/10 border border-red-500/20 rounded-xl flex gap-3">
-                <Shield size={20} className="text-red-500 shrink-0" />
-                <p className="text-xs font-bold text-red-600 leading-relaxed">
+             <div className="p-3 bg-destructive/10 border border-destructive/20 rounded-xl flex gap-3">
+                <Shield size={20} className="text-destructive shrink-0" />
+                <p className="text-xs font-semibold text-destructive leading-relaxed">
                   {t('settings.purgeConfirmTitle', '【危险操作】确定要彻底重置系统并清空数据库吗？')}
                 </p>
              </div>
              <div>
-                <p className="text-[11px] font-black text-muted-foreground uppercase tracking-widest mb-2 px-1">
+                <p className="text-xs font-semibold text-muted-foreground uppercase tracking-widest mb-2 px-1">
                    {t('settings.purgeWillWipe', '这将永久抹除：')}
                  </p>
                 <div className="grid grid-cols-1 gap-1">
@@ -284,14 +281,14 @@ export default function Settings() {
                      t('settings.wipeKeys', '3. 所有客户端访问密钥 (API Keys)'),
                      t('settings.wipeLogs', '4. 所有历史用量统计和日志')
                    ].map((item, idx) => (
-                     <div key={idx} className="flex items-center gap-2 px-3 py-1.5 bg-muted/40 rounded-lg text-[11px] font-medium text-muted-foreground border border-transparent hover:border-border/50">
-                        <div className="w-1 h-1 rounded-full bg-red-400" />
+                     <div key={idx} className="flex items-center gap-2 px-3 py-1.5 bg-muted/40 rounded-lg text-xs font-medium text-muted-foreground border border-transparent hover:border-border/50">
+                        <div className="w-1 h-1 rounded-full bg-destructive" />
                         {item}
                      </div>
                    ))}
                 </div>
              </div>
-             <p className="text-[10px] text-red-500/70 italic px-1">
+             <p className="text-xs text-destructive/70 italic px-1">
                 {t('settings.purgeIrreversible', '此操作不可撤销，系统将回到初始状态。')}
              </p>
           </div>

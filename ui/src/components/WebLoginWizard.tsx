@@ -104,13 +104,13 @@ export default function WebLoginWizard({ isOpen, onClose, provider }: Props) {
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4">
-      <div className="bg-card border rounded-2xl shadow-2xl max-w-2xl w-full overflow-hidden animate-in zoom-in-95 duration-200">
+      <div className="bg-card border rounded-xl shadow-2xl max-w-2xl w-full overflow-hidden animate-in zoom-in-95 duration-200">
         <div className="flex justify-between items-center px-6 py-4 border-b bg-muted/30">
           <div className="flex items-center gap-2">
             <div className="p-1.5 bg-primary/10 text-primary rounded-lg">
               <Code2 size={18} />
             </div>
-            <h2 className="text-xl font-bold">{t('auth.webLogin')}</h2>
+            <h2 className="text-xl font-semibold">{t('auth.webLogin')}</h2>
           </div>
           <button onClick={onClose} className="p-1 hover:bg-muted rounded-full transition-colors text-muted-foreground hover:text-foreground">
             <X size={20} />
@@ -124,7 +124,7 @@ export default function WebLoginWizard({ isOpen, onClose, provider }: Props) {
 
           <div className="space-y-6">
             <div className="flex items-start gap-4">
-              <div className="flex-shrink-0 bg-primary/10 text-primary w-7 h-7 flex items-center justify-center rounded-full font-bold text-sm">1</div>
+              <div className="flex-shrink-0 bg-primary/10 text-primary w-7 h-7 flex items-center justify-center rounded-full font-semibold text-sm">1</div>
               <div className="flex-1">
                 <p className="font-medium mb-2">{t('auth.step1')}</p>
                 <a 
@@ -140,24 +140,24 @@ export default function WebLoginWizard({ isOpen, onClose, provider }: Props) {
             </div>
 
             <div className="flex items-start gap-4">
-              <div className="flex-shrink-0 bg-primary/10 text-primary w-7 h-7 flex items-center justify-center rounded-full font-bold text-sm">2</div>
+              <div className="flex-shrink-0 bg-primary/10 text-primary w-7 h-7 flex items-center justify-center rounded-full font-semibold text-sm">2</div>
               <div className="flex-1 pt-1">
                 <p className="font-medium">{t('auth.step2')}</p>
               </div>
             </div>
 
             <div className="flex items-start gap-4">
-              <div className="flex-shrink-0 bg-primary/10 text-primary w-7 h-7 flex items-center justify-center rounded-full font-bold text-sm">3</div>
+              <div className="flex-shrink-0 bg-primary/10 text-primary w-7 h-7 flex items-center justify-center rounded-full font-semibold text-sm">3</div>
               <div className="flex-1">
                 <p className="font-medium mb-3">{t('auth.step3')}</p>
                 
                 <div className="relative group bg-slate-950 rounded-xl border border-white/10 overflow-hidden">
-                  <div className="flex items-center justify-between px-4 py-2 bg-white/5 border-b border-white/5 text-[10px] uppercase tracking-widest text-white/40 font-bold">
+                  <div className="flex items-center justify-between px-4 py-2 bg-white/5 border-b border-white/5 text-xs uppercase tracking-widest text-white/40 font-semibold">
                     <span>Javascript</span>
                     <span>Session Capturer</span>
                   </div>
                   
-                  <pre className="p-5 text-[11px] font-mono text-blue-100/80 overflow-auto whitespace-pre h-64 scrollbar-thin scrollbar-thumb-white/20">
+                  <pre className="p-5 text-xs font-mono text-blue-100/80 overflow-auto whitespace-pre h-64 scrollbar-thin scrollbar-thumb-white/20">
                     {script}
                   </pre>
 

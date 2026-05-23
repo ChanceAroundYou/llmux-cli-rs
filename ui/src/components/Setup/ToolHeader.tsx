@@ -21,15 +21,15 @@ export function ToolHeader({ tool, isInstalled, detectLoaded }: Props) {
         </div>
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2">
-            <h2 className="text-base font-bold">{tool.label}</h2>
+            <h2 className="text-base font-semibold">{tool.label}</h2>
             {detectLoaded && (
               <span className={cn(
-                'inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-bold',
+                'inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-xs font-semibold',
                 isInstalled
-                  ? 'bg-green-500/10 text-green-600 dark:text-green-400'
+                  ? 'bg-success/10 text-success dark:text-success'
                   : 'bg-muted text-muted-foreground'
               )}>
-                <span className={cn('w-1 h-1 rounded-full', isInstalled ? 'bg-green-500' : 'bg-muted-foreground/40')} />
+                <span className={cn('w-1 h-1 rounded-full', isInstalled ? 'bg-success' : 'bg-muted-foreground/40')} />
                 {isInstalled ? t('setup.installed') : t('setup.notInstalled')}
               </span>
             )}
@@ -39,8 +39,8 @@ export function ToolHeader({ tool, isInstalled, detectLoaded }: Props) {
       </div>
 
       {detectLoaded && !isInstalled && (
-        <div className="flex items-center gap-3 p-4 rounded-xl border border-amber-500/20 bg-amber-500/5 text-sm">
-          <AlertCircle size={16} className="shrink-0 text-amber-500" />
+        <div className="flex items-center gap-3 p-4 rounded-xl border border-warning/20 bg-warning/5 text-sm">
+          <AlertCircle size={16} className="shrink-0 text-warning" />
           <span className="flex-1 text-foreground">{t('setup.notInstalledHint', { tool: tool.label })}</span>
           <a
             href={tool.installUrl}

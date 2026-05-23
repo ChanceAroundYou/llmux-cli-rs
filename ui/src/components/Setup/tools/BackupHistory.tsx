@@ -54,9 +54,9 @@ export function BackupHistory({
       <div className="border border-border rounded-xl overflow-hidden">
         <div className="flex items-center gap-2 px-4 py-3 border-b border-border bg-muted/20">
           <History size={14} className="text-muted-foreground shrink-0" />
-          <span className="text-xs font-bold flex-1">{t('setup.backupHistory')}</span>
+          <span className="text-xs font-semibold flex-1">{t('setup.backupHistory')}</span>
           {backupsLoading && <RotateCcw size={11} className="animate-spin text-muted-foreground" />}
-          <span className="text-[10px] text-muted-foreground">{t('setup.backupMax')}</span>
+          <span className="text-xs text-muted-foreground">{t('setup.backupMax')}</span>
         </div>
 
         <div className="max-h-[480px] overflow-y-auto divide-y divide-border">
@@ -79,7 +79,7 @@ export function BackupHistory({
                       }
                       <div className="min-w-0">
                         <div className="text-xs font-mono text-foreground/80">{b.timestamp}</div>
-                        <div className="text-[10px] text-muted-foreground">{(b.size / 1024).toFixed(1)} KB</div>
+                        <div className="text-xs text-muted-foreground">{(b.size / 1024).toFixed(1)} KB</div>
                       </div>
                     </button>
 
@@ -87,7 +87,7 @@ export function BackupHistory({
                       onClick={() => onRestoreClick(b.name)}
                       disabled={isRestoring}
                       className={cn(
-                        'flex items-center gap-1 px-2 py-1 rounded-lg border border-border text-[11px] font-semibold transition-colors shrink-0',
+                        'flex items-center gap-1 px-2 py-1 rounded-lg border border-border text-xs font-semibold transition-colors shrink-0',
                         isRestoring ? 'opacity-40 cursor-not-allowed' : 'hover:bg-muted/50',
                       )}
                     >
@@ -100,7 +100,7 @@ export function BackupHistory({
 
                     <button
                       onClick={() => onDeleteClick(b.name)}
-                      className="p-1.5 rounded-lg text-muted-foreground hover:text-red-500 hover:bg-red-500/10 transition-colors shrink-0"
+                      className="p-1.5 rounded-lg text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors shrink-0"
                       title={t('setup.deleteBackup')}
                     >
                       <Trash2 size={13} />
@@ -116,7 +116,7 @@ export function BackupHistory({
                           <div className="absolute top-2 right-2 z-10">
                             <CopyButton value={JSON.stringify(content, null, 2)} size={12} />
                           </div>
-                          <pre className="px-4 py-3 text-[11px] font-mono text-foreground/80 whitespace-pre overflow-x-auto">
+                          <pre className="px-4 py-3 text-xs font-mono text-foreground/80 whitespace-pre overflow-x-auto">
                             {JSON.stringify(content, null, 2)}
                           </pre>
                         </div>

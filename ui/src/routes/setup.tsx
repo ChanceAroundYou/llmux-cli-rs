@@ -51,7 +51,7 @@ export default function Setup() {
   const gatewayUrl = window.location.origin;
 
   return (
-    <div className="flex gap-0 h-full min-h-[calc(100vh-8rem)] animate-in fade-in duration-500">
+    <div className="flex gap-0 h-full min-h-[calc(100vh-8rem)] animate-fadeIn duration-500">
       <ToolSidebar
         selectedTool={selectedTool}
         installed={installed}

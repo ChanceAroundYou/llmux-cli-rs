@@ -14,8 +14,8 @@ const StatCard = ({ icon: Icon, label, value, color }: StatCardProps) => (
         <Icon size={20} />
       </div>
       <div>
-        <div className="text-[10px] font-bold text-muted-foreground uppercase tracking-widest">{label}</div>
-        <div className="text-xl font-bold mt-0.5 tracking-tight">{value}</div>
+        <div className="text-xs font-semibold text-muted-foreground uppercase tracking-widest">{label}</div>
+        <div className="text-xl font-semibold mt-0.5 tracking-tight">{value}</div>
       </div>
     </div>
   </div>
@@ -35,25 +35,25 @@ export const StatGrid = ({ accountCount, aliasCount, keyCount, healthyCount, t }
       icon={Users}
       label={t('dashboard.stats.accounts')}
       value={String(accountCount)}
-      color="text-blue-500"
+      color="text-primary"
     />
     <StatCard
       icon={Zap}
       label={t('dashboard.stats.aliases')}
       value={String(aliasCount)}
-      color="text-amber-500"
+      color="text-warning"
     />
     <StatCard
       icon={Key}
       label={t('dashboard.stats.apiKeys')}
       value={String(keyCount)}
-      color="text-purple-500"
+      color="text-info"
     />
     <StatCard
       icon={Shield}
       label={t('dashboard.stats.healthy')}
       value={String(healthyCount)}
-      color="text-green-500"
+      color="text-success"
     />
   </div>
 );

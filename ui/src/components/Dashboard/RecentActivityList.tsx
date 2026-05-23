@@ -2,8 +2,7 @@ import React, { useState } from 'react';
 import { History, AlertTriangle } from 'lucide-react';
 import { parseServerDate } from '../../utils/date';
 import { TFunction } from 'i18next';
-
-const cn = (...classes: (string | boolean | undefined | null)[]) => classes.filter(Boolean).join(' ');
+import { cn } from '../../lib/utils';
 
 interface ActivityEntry {
   id: number;
@@ -30,27 +29,27 @@ const ActivityItem = ({ model, time, status, latency, accountName, errorMessage 
     <div className="flex items-center gap-3 min-w-0">
       <div className={cn(
         "w-1.5 h-1.5 rounded-full shrink-0",
-        status === 'success' ? "bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.4)]" : "bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.4)]"
+        status === 'success' ? "bg-success shadow-[0_0_8px_rgba(34,197,94,0.4)]" : "bg-destructive shadow-[0_0_8px_rgba(239,68,68,0.4)]"
       )} />
       <div className="min-w-0">
-        <div className="text-[11px] font-bold truncate leading-tight">{model}</div>
+        <div className="text-xs font-semibold truncate leading-tight">{model}</div>
         <div className="flex items-center gap-1.5 mt-0.5">
           <span className="text-[9px] text-muted-foreground/60 font-medium">{time}</span>
           {accountName && (
             <>
               <span className="text-[8px] opacity-20">|</span>
-              <span className="text-[9px] text-primary/50 font-bold">{accountName}</span>
+              <span className="text-[9px] text-primary/50 font-semibold">{accountName}</span>
             </>
           )}
         </div>
         {status === 'error' && errorMessage && (
-          <div className="text-[9px] text-red-500/80 truncate mt-0.5 max-w-[200px]" title={errorMessage}>
+          <div className="text-[9px] text-destructive/80 truncate mt-0.5 max-w-[200px]" title={errorMessage}>
             {errorMessage}
           </div>
         )}
       </div>
     </div>
-    <div className="text-[10px] font-mono font-bold text-muted-foreground/40 group-hover:text-muted-foreground transition-colors shrink-0">{latency}</div>
+    <div className="text-xs font-mono font-semibold text-muted-foreground/40 group-hover:text-muted-foreground transition-colors shrink-0">{latency}</div>
   </div>
 );
 
@@ -75,20 +74,20 @@ export const RecentActivityList = ({ recentLogs, t }: RecentActivityListProps) =
     <div className="premium-card flex flex-col h-full bg-card border-border/60">
       <div className="flex items-center justify-between mb-6">
         <div className="flex items-center gap-2">
-          <History size={16} className="text-blue-500" />
-          <span className="text-sm font-bold text-foreground/80">{t('dashboard.recentLogs')}</span>
+          <History size={16} className="text-primary" />
+          <span className="text-sm font-semibold text-foreground/80">{t('dashboard.recentLogs')}</span>
         </div>
         <div className="flex items-center gap-3">
-          <div className="flex items-center gap-3 text-[10px] text-muted-foreground">
+          <div className="flex items-center gap-3 text-xs text-muted-foreground">
             <span>{successRate}% {t('dashboard.monitor.successRate')}</span>
             <span>{(avgLatency / 1000).toFixed(1)}s {t('dashboard.monitor.avgLag')}</span>
           </div>
           <button
             onClick={() => setShowErrorsOnly(!showErrorsOnly)}
             className={cn(
-              "flex items-center gap-1 px-2 py-1 rounded text-[10px] font-bold transition-all",
+              "flex items-center gap-1 px-2 py-1 rounded text-xs font-semibold transition-all",
               showErrorsOnly
-                ? "bg-red-500/10 text-red-500"
+                ? "bg-destructive/10 text-destructive"
                 : "bg-muted/50 text-muted-foreground hover:text-foreground"
             )}
           >
@@ -111,7 +110,7 @@ export const RecentActivityList = ({ recentLogs, t }: RecentActivityListProps) =
               errorMessage={log.error_message}
             />
           )) : (
-            <div className="py-20 text-center text-muted-foreground/20 text-[10px] font-bold uppercase border border-dashed border-border/60 rounded-2xl">
+            <div className="py-20 text-center text-muted-foreground/20 text-xs font-semibold uppercase border border-dashed border-border/60 rounded-xl">
               {showErrorsOnly ? t('dashboard.noErrors') : t('dashboard.noActivity')}
             </div>
           )}

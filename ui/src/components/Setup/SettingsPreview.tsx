@@ -55,7 +55,7 @@ function DiffView({ current, preview }: { current: Record<string, any> | null; p
   const hasChanges = lines.some(l => l.type !== 'unchanged');
 
   return (
-    <div className="text-[11px] font-mono leading-relaxed space-y-px overflow-x-auto">
+    <div className="text-xs font-mono leading-relaxed space-y-px overflow-x-auto">
       {!hasChanges && (
         <div className="text-muted-foreground/50 italic mb-1">无变更</div>
       )}
@@ -67,15 +67,15 @@ function DiffView({ current, preview }: { current: Record<string, any> | null; p
             key={i}
             className={cn(
               'px-2 rounded flex items-start gap-2 whitespace-nowrap',
-              l.type === 'removed' && 'bg-red-500/10 text-red-400',
-              l.type === 'added' && 'bg-green-500/10 text-green-400',
+              l.type === 'removed' && 'bg-destructive/10 text-destructive',
+              l.type === 'added' && 'bg-success/10 text-success',
               l.type === 'unchanged' && (highlighted ? 'text-foreground/70' : 'text-muted-foreground/80'),
             )}
           >
             <span className="shrink-0 w-3 select-none">
               {l.type === 'removed' ? '−' : l.type === 'added' ? '+' : ' '}
             </span>
-            <span className={cn(highlighted && l.type !== 'unchanged' && 'font-bold')}>{l.line}</span>
+            <span className={cn(highlighted && l.type !== 'unchanged' && 'font-semibold')}>{l.line}</span>
           </div>
         );
       })}
@@ -108,7 +108,7 @@ export function SettingsPreview({ settings, preview, exists, loading, onRefresh 
             <button
               onClick={() => setTab('diff')}
               className={cn(
-                'px-2.5 py-1 rounded-md text-[11px] font-bold transition-all',
+                'px-2.5 py-1 rounded-md text-xs font-semibold transition-all',
                 tab === 'diff' ? 'bg-card text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'
               )}
             >
@@ -119,7 +119,7 @@ export function SettingsPreview({ settings, preview, exists, loading, onRefresh 
           <button
             onClick={() => setTab('current')}
             className={cn(
-              'px-2.5 py-1 rounded-md text-[11px] font-bold transition-all',
+              'px-2.5 py-1 rounded-md text-xs font-semibold transition-all',
               tab === 'current' ? 'bg-card text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'
             )}
           >
@@ -128,7 +128,7 @@ export function SettingsPreview({ settings, preview, exists, loading, onRefresh 
         </div>
 
         <div className="flex items-center gap-2">
-          {exists && <span className="text-[10px] text-muted-foreground font-mono">~/.claude/settings.json</span>}
+          {exists && <span className="text-xs text-muted-foreground font-mono">~/.claude/settings.json</span>}
           <button onClick={onRefresh} className="p-1 hover:bg-muted rounded-lg transition-colors" title={t('setup.refresh')}>
             <RotateCcw size={11} className="text-muted-foreground" />
           </button>
@@ -138,13 +138,13 @@ export function SettingsPreview({ settings, preview, exists, loading, onRefresh 
       <div className="rounded-xl border border-border bg-muted/20 overflow-hidden">
         <div className="flex items-center justify-between px-4 py-2 border-b border-border/40 bg-muted/10">
           <div className="flex gap-1.5">
-            <div className="w-2 h-2 rounded-full bg-red-500/60" />
-            <div className="w-2 h-2 rounded-full bg-yellow-500/60" />
-            <div className="w-2 h-2 rounded-full bg-green-500/60" />
+            <div className="w-2 h-2 rounded-full bg-destructive/60" />
+            <div className="w-2 h-2 rounded-full bg-warning/60" />
+            <div className="w-2 h-2 rounded-full bg-success/60" />
           </div>
           <div className="flex items-center gap-1.5">
             {tab === 'diff' && preview && (
-              <span className="text-[10px] text-muted-foreground">变更预览</span>
+              <span className="text-xs text-muted-foreground">变更预览</span>
             )}
             {tab === 'current' && (preview ?? settings) && (
               <CopyButton value={JSON.stringify(preview ?? settings, null, 2)} size={12} />
@@ -154,15 +154,15 @@ export function SettingsPreview({ settings, preview, exists, loading, onRefresh 
 
         <div className="p-4 max-h-[400px] overflow-y-auto">
           {loading ? (
-            <div className="text-[11px] text-muted-foreground font-mono">{t('setup.loading')}</div>
+            <div className="text-xs text-muted-foreground font-mono">{t('setup.loading')}</div>
           ) : tab === 'diff' && preview ? (
             <DiffView current={settings} preview={preview} />
           ) : (settings ?? preview) ? (
-            <pre className="text-[11px] leading-relaxed font-mono text-foreground/80 whitespace-pre overflow-x-auto">
+            <pre className="text-xs leading-relaxed font-mono text-foreground/80 whitespace-pre overflow-x-auto">
               {JSON.stringify(settings ?? preview, null, 2)}
             </pre>
           ) : (
-            <div className="text-[11px] text-muted-foreground font-mono space-y-1">
+            <div className="text-xs text-muted-foreground font-mono space-y-1">
               <div>{t('setup.noSettingsFile')}</div>
               <div className="text-muted-foreground/50"># {t('setup.noSettingsHint')}</div>
             </div>

@@ -19,7 +19,7 @@ export function ApplyButton({ selectedKey, applying, settingsExists, applyResult
         onClick={onApply}
         disabled={!selectedKey || applying}
         className={cn(
-          'w-full flex items-center justify-center gap-2 py-2.5 rounded-xl text-sm font-bold transition-all',
+          'w-full flex items-center justify-center gap-2 py-2.5 rounded-xl text-sm font-semibold transition-all',
           selectedKey && !applying
             ? 'bg-primary text-primary-foreground hover:opacity-90'
             : 'bg-muted text-muted-foreground cursor-not-allowed',
@@ -36,14 +36,14 @@ export function ApplyButton({ selectedKey, applying, settingsExists, applyResult
         <div className={cn(
           'p-3 rounded-xl text-xs space-y-1',
           applyResult.success
-            ? 'bg-green-500/10 border border-green-500/20 text-green-600 dark:text-green-400'
-            : 'bg-red-500/10 border border-red-500/20 text-red-500',
+            ? 'bg-success/10 border border-success/20 text-success dark:text-success'
+            : 'bg-destructive/10 border border-destructive/20 text-destructive',
         )}>
           {applyResult.success ? (
             <>
-              <div className="flex items-center gap-1.5 font-bold"><Check size={12} />{t('setup.applySuccess')}</div>
+              <div className="flex items-center gap-1.5 font-semibold"><Check size={12} />{t('setup.applySuccess')}</div>
               {applyResult.backupPath && (
-                <div className="text-muted-foreground font-mono break-all text-[10px]">
+                <div className="text-muted-foreground font-mono break-all text-xs">
                   {t('setup.backupAt')}{applyResult.backupPath}
                 </div>
               )}
