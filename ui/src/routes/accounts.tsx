@@ -22,10 +22,7 @@ import {
 import { useTranslation } from 'react-i18next';
 import { Dialog, ConfirmDialog } from '../components/Modal';
 import { CopyButton } from '../components/CopyButton';
-
-function cn(...classes: (string | undefined | null | false)[]) {
-  return classes.filter(Boolean).join(' ');
-}
+import { cn } from '../lib/utils';
 
 export default function Accounts() {
   const { t } = useTranslation();
@@ -112,14 +109,14 @@ export default function Accounts() {
   };
 
   return (
-    <div className="space-y-10 animate-in fade-in duration-500">
+    <div className="space-y-10 animate-fadeIn">
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-3">
           <div className="p-2 bg-primary/10 text-primary rounded-lg">
             <Users size={24} />
           </div>
           <div>
-            <h1 className="text-2xl font-bold tracking-tight">{t('common.accounts')}</h1>
+            <h1 className="text-2xl font-semibold tracking-tight">{t('common.accounts')}</h1>
             <p className="text-sm text-muted-foreground">{t('accounts.subtitle')}</p>
           </div>
         </div>
@@ -147,15 +144,15 @@ export default function Accounts() {
               </div>
               <div>
                 <div className="flex items-center gap-2">
-                   <h3 className="font-bold text-sm">{acc.alias}</h3>
+                   <h3 className="font-semibold text-sm">{acc.alias}</h3>
                    <span className={cn(
-                     "text-[10px] font-bold px-2 py-0.5 rounded-full",
-                     acc.is_active === 1 ? "bg-green-500/10 text-green-600" : "bg-muted text-muted-foreground"
+                     "text-xs font-bold px-2 py-0.5 rounded-full",
+                     acc.is_active === 1 ? "bg-success/10 text-success" : "bg-muted text-muted-foreground"
                    )}>
                      {acc.is_active === 1 ? t('common.online') : t('accounts.offline')}
                    </span>
                 </div>
-                <div className="text-[10px] text-muted-foreground mt-0.5 flex items-center gap-2 uppercase tracking-tight">
+                <div className="text-xs text-muted-foreground mt-0.5 flex items-center gap-2 uppercase tracking-tight">
                   <Globe size={10} /> {acc.provider_id}
                   <span className="opacity-20">|</span>
                   <Key size={10} /> {t('accounts.apiKey')}: ****
@@ -166,14 +163,14 @@ export default function Accounts() {
               <div className="flex items-center gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
                   <button 
                     onClick={() => handleExport(acc.id, acc.alias)}
-                    className="p-2 hover:bg-blue-500/10 text-blue-500 rounded-lg transition-all"
+                    className="p-2 hover:bg-primary/10 text-primary rounded-lg transition-all"
                     title={t('accounts.exportData')}
                   >
                     <Download size={16} />
                   </button>
                   <button 
                     onClick={() => openEdit(acc)}
-                    className="p-2 hover:bg-amber-500/10 text-amber-500 rounded-lg transition-all"
+                    className="p-2 hover:bg-warning/10 text-warning rounded-lg transition-all"
                     title="Edit account"
                   >
                     <Pencil size={16} />
@@ -183,7 +180,7 @@ export default function Accounts() {
                     className={cn(
                       "p-2 rounded-lg transition-all",
                       acc.is_active === 1 
-                        ? "hover:bg-green-500/10 text-green-500 shadow-[0_0_10px_rgba(34,197,94,0.1)]" 
+                        ? "hover:bg-success/10 text-success shadow-[0_0_10px_rgba(34,197,94,0.1)]" 
                         : "hover:bg-muted text-muted-foreground/40"
                     )}
                     title={acc.is_active === 1 ? t('common.online') : t('accounts.offline')}
@@ -192,7 +189,7 @@ export default function Accounts() {
                   </button>
                   <button
                     onClick={() => setAccountToDelete({ id: acc.id, name: acc.alias })}
-                    className="p-2 hover:bg-red-500/10 text-red-500 rounded-lg transition-all"
+                    className="p-2 hover:bg-destructive/10 text-destructive rounded-lg transition-all"
                   >
                     <Trash2 size={16} />
                   </button>              </div>
@@ -200,7 +197,7 @@ export default function Accounts() {
         ))}
 
         {!isLoading && accounts.length === 0 && (
-          <div className="py-20 text-center border-2 border-dashed border-border rounded-2xl">
+          <div className="py-20 text-center border-2 border-dashed border-border rounded-xl">
              <AlertCircle className="mx-auto mb-2 text-muted-foreground/30" />
              <p className="text-sm text-muted-foreground">{t('accounts.noAccounts')}</p>
           </div>
@@ -214,7 +211,7 @@ export default function Accounts() {
       >
         <div className="space-y-6">
           {validationError && (
-            <div className="p-3 bg-red-500/10 border border-red-500/20 rounded-lg flex items-start gap-2 text-red-600 text-xs animate-in slide-in-from-top-2">
+            <div className="p-3 bg-destructive/10 border border-destructive/20 rounded-lg flex items-start gap-2 text-destructive text-xs animate-in slide-in-from-top-2">
               <AlertCircle size={14} className="shrink-0 mt-0.5" />
               <p className="font-medium">{t(validationError)}</p>
             </div>
@@ -252,7 +249,7 @@ export default function Accounts() {
                 <option value="anthropic">{t('accounts.anthropic')}</option>
                 <option value="gemini">{t('accounts.gemini')}</option>
               </select>
-              <p className="text-[10px] text-muted-foreground mt-1">{t('accounts.providerHint')}</p>
+              <p className="text-xs text-muted-foreground mt-1">{t('accounts.providerHint')}</p>
             </div>
             <div className="space-y-1.5">
               <label className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.apiKey')}</label>
@@ -273,7 +270,7 @@ export default function Accounts() {
                 placeholder={formData.provider_id === 'anthropic' ? 'https://api.anthropic.com/v1' : formData.provider_id === 'gemini' ? 'https://generativelanguage.googleapis.com/v1beta' : 'https://api.openai.com/v1'}
                 className="w-full px-4 py-2 bg-muted/50 border border-border rounded-lg text-sm outline-none focus:ring-2 focus:ring-primary/20 transition-all font-mono disabled:opacity-50"
               />
-              <p className="text-[10px] text-muted-foreground">{t('accounts.baseUrlHint')}</p>
+              <p className="text-xs text-muted-foreground">{t('accounts.baseUrlHint')}</p>
             </div>
             <div className="space-y-1.5 border-t border-border pt-3">
               <label className="flex items-center gap-2 cursor-pointer select-none">
@@ -289,7 +286,7 @@ export default function Accounts() {
                 />
                 <span className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.supportsAnthropic')}</span>
               </label>
-              <p className="text-[10px] text-muted-foreground ml-6">{t('accounts.supportsAnthropicHint')}</p>
+              <p className="text-xs text-muted-foreground ml-6">{t('accounts.supportsAnthropicHint')}</p>
             </div>
             {formSupportsAnthropic && (
               <div className="space-y-1.5 animate-in slide-in-from-top-1">
@@ -303,8 +300,8 @@ export default function Accounts() {
                 />
               </div>
             )}
-            <div className="p-3 bg-blue-500/5 border border-blue-500/10 rounded-lg">
-              <p className="text-[10px] text-blue-600/80 leading-relaxed">{t('accounts.passthroughNote')}</p>
+            <div className="p-3 bg-primary/5 border border-primary/10 rounded-lg">
+              <p className="text-xs text-primary/80 leading-relaxed">{t('accounts.passthroughNote')}</p>
             </div>
             <div className="pt-4 flex gap-3">
                <button 
@@ -345,7 +342,7 @@ export default function Accounts() {
       >
         <div className="space-y-6">
           {validationError && (
-            <div className="p-3 bg-red-500/10 border border-red-500/20 rounded-lg flex items-start gap-2 text-red-600 text-xs animate-in slide-in-from-top-2">
+            <div className="p-3 bg-destructive/10 border border-destructive/20 rounded-lg flex items-start gap-2 text-destructive text-xs animate-in slide-in-from-top-2">
               <AlertCircle size={14} className="shrink-0 mt-0.5" />
               <p className="font-medium">{t(validationError)}</p>
             </div>
@@ -375,12 +372,12 @@ export default function Accounts() {
                 <option value="anthropic">{t('accounts.anthropic')}</option>
                 <option value="gemini">{t('accounts.gemini')}</option>
               </select>
-              <p className="text-[10px] text-muted-foreground mt-1">{t('accounts.providerHint')}</p>
+              <p className="text-xs text-muted-foreground mt-1">{t('accounts.providerHint')}</p>
             </div>
             <div className="space-y-1.5">
               <div className="flex items-center justify-between">
                 <label className="text-xs font-bold text-muted-foreground uppercase">API Key</label>
-                <span className="text-[10px] text-muted-foreground italic">{t('accounts.leaveBlank')}</span>
+                <span className="text-xs text-muted-foreground italic">{t('accounts.leaveBlank')}</span>
               </div>
               <input
                 type="password" value={editData.api_key}
@@ -399,7 +396,7 @@ export default function Accounts() {
                 placeholder={editData.provider_id === 'anthropic' ? 'https://api.anthropic.com/v1' : editData.provider_id === 'gemini' ? 'https://generativelanguage.googleapis.com/v1beta' : 'https://api.openai.com/v1'}
                 className="w-full px-4 py-2 bg-muted/50 border border-border rounded-lg text-sm outline-none focus:ring-2 focus:ring-primary/20 transition-all font-mono disabled:opacity-50"
               />
-              <p className="text-[10px] text-muted-foreground">{t('accounts.baseUrlHint')}</p>
+              <p className="text-xs text-muted-foreground">{t('accounts.baseUrlHint')}</p>
             </div>
             <div className="space-y-1.5 border-t border-border pt-3">
               <label className="flex items-center gap-2 cursor-pointer select-none">
@@ -415,7 +412,7 @@ export default function Accounts() {
                 />
                 <span className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.supportsAnthropic')}</span>
               </label>
-              <p className="text-[10px] text-muted-foreground ml-6">{t('accounts.supportsAnthropicHint')}</p>
+              <p className="text-xs text-muted-foreground ml-6">{t('accounts.supportsAnthropicHint')}</p>
             </div>
             {editSupportsAnthropic && (
               <div className="space-y-1.5 animate-in slide-in-from-top-1">
@@ -429,8 +426,8 @@ export default function Accounts() {
                 />
               </div>
             )}
-            <div className="p-3 bg-blue-500/5 border border-blue-500/10 rounded-lg">
-              <p className="text-[10px] text-blue-600/80 leading-relaxed">{t('accounts.passthroughNote')}</p>
+            <div className="p-3 bg-primary/5 border border-primary/10 rounded-lg">
+              <p className="text-xs text-primary/80 leading-relaxed">{t('accounts.passthroughNote')}</p>
             </div>
             <div className="pt-4 flex gap-3">
                <button
@@ -490,7 +487,7 @@ export default function Accounts() {
                     setAccountToDelete(null);
                   }
                 }}
-                className="px-4 py-2 text-sm font-bold bg-red-500 text-white rounded-lg hover:bg-red-600 transition-all flex items-center gap-2"
+                className="px-4 py-2 text-sm font-bold bg-destructive text-destructive-foreground rounded-lg hover:bg-destructive/90 transition-colors duration-150 flex items-center gap-2"
               >
                 <Trash2 size={16} />
                 {t('common.delete')}
@@ -500,16 +497,16 @@ export default function Accounts() {
         }
       >
         <div className="space-y-4">
-           <div className="p-4 bg-red-500/5 border border-red-500/10 rounded-2xl flex gap-4">
-              <ShieldAlert size={24} className="text-red-500 shrink-0" />
+           <div className="p-4 bg-destructive/5 border border-destructive/10 rounded-xl flex gap-4">
+              <ShieldAlert size={24} className="text-destructive shrink-0" />
               <div className="space-y-1">
-                 <p className="text-sm font-bold text-red-600">{t('accounts.deleteWarning')}</p>
-                 <p className="text-xs text-red-500/80 leading-relaxed">
+                 <p className="text-sm font-semibold text-destructive">{t('accounts.deleteWarning')}</p>
+                 <p className="text-xs text-destructive/80 leading-relaxed">
                    {t('accounts.deleteConfirm', { name: accountToDelete?.name })}
                  </p>
               </div>
            </div>
-           <p className="text-[11px] text-muted-foreground px-1 italic">
+           <p className="text-xs text-muted-foreground px-1 italic">
              {t('accounts.deleteWarningDetail')}
            </p>
         </div>
