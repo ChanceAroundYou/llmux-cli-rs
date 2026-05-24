@@ -19,7 +19,7 @@
 
 ---
 
-> **Note:** This is the Rust rewrite of the [original TypeScript version](https://github.com/zhMoody/llmux-cli). The original served us well as a prototype, but we wanted better startup performance, lower memory footprint, and native cross-platform binaries — so we rebuilt it in Rust.
+> **Note:** This is the Rust rewrite of the [original TypeScript version](https://github.com/zhMoody/llmux-cli-rs). The original served us well as a prototype, but we wanted better startup performance, lower memory footprint, and native cross-platform binaries — so we rebuilt it in Rust.
 
 ## Why LLMux?
 
@@ -52,7 +52,7 @@ LLMux solves all of this. It's a local gateway that runs on your machine and exp
 **From source:**
 
 ```bash
-git clone https://github.com/zhMoody/llmux-cli.git
+git clone https://github.com/zhMoody/llmux-cli-rs.git
 cd llmux-cli
 cd ui && bun install && bun run build && cd ..
 cargo build --release

@@ -59,7 +59,7 @@ export default function About() {
            variant="outline"
          >
            <a
-             href="https://github.com/zhMoody/llmux-cli"
+             href="https://github.com/zhMoody/llmux-cli-rs"
              target="_blank"
              rel="noopener noreferrer"
            >
