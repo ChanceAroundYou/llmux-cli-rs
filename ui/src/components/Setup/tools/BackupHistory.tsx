@@ -146,7 +146,7 @@ export function BackupHistory({
         onConfirm={onDeleteConfirm}
         title={t('setup.deleteBackupTitle')}
         description={t('setup.deleteBackupConfirm', {
-          name: deleteModalName?.replace('settings.json.', '') ?? '',
+          name: deleteModalName?.replace(/^(?:settings\.json|codex)\./, '') ?? '',
         })}
         confirmText={t('setup.delete')}
         variant="danger"

@@ -9,9 +9,11 @@ interface Props {
   settingsExists: boolean;
   applyResult: { success: boolean; backupPath?: string; error?: string } | null;
   onApply: () => void;
+  applyLabel?: string;
+  initLabel?: string;
 }
 
-export function ApplyButton({ selectedKey, applying, settingsExists, applyResult, onApply }: Props) {
+export function ApplyButton({ selectedKey, applying, settingsExists, applyResult, onApply, applyLabel, initLabel }: Props) {
   const { t } = useTranslation();
   return (
     <div className="space-y-2">
@@ -28,7 +30,7 @@ export function ApplyButton({ selectedKey, applying, settingsExists, applyResult
         {applying ? (
           <><RotateCcw size={14} className="animate-spin" />{t('setup.applying')}</>
         ) : (
-          <><Zap size={14} />{settingsExists ? t('setup.applyBtn') : t('setup.initBtn')}</>
+          <><Zap size={14} />{settingsExists ? (applyLabel ?? t('setup.applyBtn')) : (initLabel ?? t('setup.initBtn'))}</>
         )}
       </button>
 

@@ -193,6 +193,16 @@ pub fn app(state: AppState) -> AppRouter {
                 .delete(system::delete_claude_backup),
         )
         .route(
+            "/api/system/codex-settings",
+            get(system::get_codex_settings).post(system::apply_codex_settings),
+        )
+        .route(
+            "/api/system/codex-backups",
+            get(system::list_codex_backups)
+                .post(system::restore_codex_backup)
+                .delete(system::delete_codex_backup),
+        )
+        .route(
             "/api/settings",
             get(settings::get_settings).put(settings::update_settings),
         )

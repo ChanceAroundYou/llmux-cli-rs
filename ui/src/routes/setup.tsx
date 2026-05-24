@@ -8,6 +8,7 @@ import { TOOLS } from '../components/Setup/types';
 import { ToolSidebar } from '../components/Setup/ToolSidebar';
 import { ToolHeader } from '../components/Setup/ToolHeader';
 import { ClaudeCodePanel } from '../components/Setup/tools/ClaudeCodePanel';
+import { CodexPanel } from '../components/Setup/tools/CodexPanel';
 
 export default function Setup() {
   const { t } = useTranslation();
@@ -18,7 +19,8 @@ export default function Setup() {
   const [installed, setInstalled] = useState<Record<string, boolean>>({});
   const [detectLoaded, setDetectLoaded] = useState(false);
 
-  const [currentSettings, setCurrentSettings] = useState<Record<string, any> | null>(null);
+  const [claudeSettings, setClaudeSettings] = useState<Record<string, any> | null>(null);
+  const [codexSettings, setCodexSettings] = useState<Record<string, any> | null>(null);
   const [settingsExists, setSettingsExists] = useState(false);
   const [settingsLoading, setSettingsLoading] = useState(false);
   const [settingsFetched, setSettingsFetched] = useState(false);
@@ -26,16 +28,40 @@ export default function Setup() {
 
   const fetchClaudeSettings = useCallback(async () => {
     setSettingsLoading(true);
+    setSettingsFetched(false);
     try {
       const res = await fetch('/api/system/claude-settings');
       const data = await res.json();
       setSettingsExists(data.exists);
-      setCurrentSettings(data.settings);
+      setClaudeSettings(data.settings);
     } finally {
       setSettingsLoading(false);
       setSettingsFetched(true);
     }
   }, []);
+
+  const fetchCodexSettings = useCallback(async () => {
+    setSettingsLoading(true);
+    setSettingsFetched(false);
+    try {
+      const res = await fetch('/api/system/codex-settings');
+      const data = await res.json();
+      setSettingsExists(data.exists);
+      setCodexSettings(data.auth || data.configToml ? { auth: data.auth, configToml: data.configToml } : null);
+    } finally {
+      setSettingsLoading(false);
+      setSettingsFetched(true);
+    }
+  }, []);
+
+  const currentSettings = selectedTool === 'codex' ? codexSettings : claudeSettings;
+  const onRefreshSettings = selectedTool === 'codex' ? fetchCodexSettings : fetchClaudeSettings;
+
+  // 当切换工具时重新加载对应的 settings
+  useEffect(() => {
+    if (selectedTool === 'codex') fetchCodexSettings();
+    else { setSettingsFetched(true); }
+  }, [selectedTool]);
 
   useEffect(() => {
     fetchKeys().then(() => setKeysFetched(true));
@@ -76,26 +102,36 @@ export default function Setup() {
           </div>
         )}
 
-        {selectedTool === 'claude-code' && (
-          !settingsFetched || !keysFetched ? (
-            <div className="flex items-center gap-2 py-8 text-sm text-muted-foreground">
-              <RotateCcw size={14} className="animate-spin shrink-0" />
-              <span>{t('setup.loading')}</span>
-            </div>
-          ) : (
-            <ClaudeCodePanel
-              keys={keys}
-              aliases={aliases}
-              gatewayUrl={gatewayUrl}
-              currentSettings={currentSettings}
-              settingsExists={settingsExists}
-              settingsLoading={settingsLoading}
-              settingsFetched={settingsFetched}
-              onRefreshSettings={fetchClaudeSettings}
-              onSettingsApplied={(s) => { setCurrentSettings(s); setSettingsExists(true); }}
-            />
-          )
-        )}
+        {!settingsFetched || !keysFetched ? (
+          <div className="flex items-center gap-2 py-8 text-sm text-muted-foreground">
+            <RotateCcw size={14} className="animate-spin shrink-0" />
+            <span>{t('setup.loading')}</span>
+          </div>
+        ) : selectedTool === 'claude-code' ? (
+          <ClaudeCodePanel
+            keys={keys}
+            aliases={aliases}
+            gatewayUrl={gatewayUrl}
+            currentSettings={currentSettings}
+            settingsExists={settingsExists}
+            settingsLoading={settingsLoading}
+            settingsFetched={settingsFetched}
+            onRefreshSettings={onRefreshSettings}
+            onSettingsApplied={(s) => { setClaudeSettings(s); setSettingsExists(true); }}
+          />
+        ) : selectedTool === 'codex' ? (
+          <CodexPanel
+            keys={keys}
+            aliases={aliases}
+            gatewayUrl={gatewayUrl}
+            currentSettings={currentSettings}
+            settingsExists={settingsExists}
+            settingsLoading={settingsLoading}
+            settingsFetched={settingsFetched}
+            onRefreshSettings={onRefreshSettings}
+            onSettingsApplied={(s) => { setCodexSettings(s); setSettingsExists(true); }}
+          />
+        ) : null}
       </div>
     </div>
     </div>

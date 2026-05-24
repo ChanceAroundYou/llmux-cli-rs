@@ -7,12 +7,12 @@ interface Props {
   envKey: string;
   models: string[];
   value: string;
-  longContext: boolean;
+  longContext?: boolean;
   onChange: (v: string) => void;
-  onLongContextChange: (v: boolean) => void;
+  onLongContextChange?: (v: boolean) => void;
 }
 
-export function ModelRoleSelect({ label, envKey, models, value, longContext, onChange, onLongContextChange }: Props) {
+export function ModelRoleSelect({ label, envKey, models, value, longContext = false, onChange, onLongContextChange }: Props) {
   const effectiveValue = value ? (longContext ? `${value}[1m]` : value) : '';
 
   return (
@@ -35,22 +35,24 @@ export function ModelRoleSelect({ label, envKey, models, value, longContext, onC
           </select>
           <ChevronDown size={12} className="absolute right-2.5 top-1/2 -translate-y-1/2 text-muted-foreground pointer-events-none" />
         </div>
-        {/* 1m 开关 */}
-        <button
-          type="button"
-          disabled={!value}
-          onClick={() => onLongContextChange(!longContext)}
-          title="启用百万上下文 [1m]"
-          className={cn(
-            'shrink-0 px-2 rounded-lg border text-xs font-semibold transition-all',
-            !value && 'opacity-30 cursor-not-allowed',
-            value && longContext
-              ? 'bg-primary/15 border-primary/40 text-primary'
-              : 'bg-card border-border text-muted-foreground hover:border-muted-foreground/50'
-          )}
-        >
-          1m
-        </button>
+        {/* 1m 开关 - 仅在传了 onLongContextChange 时显示 */}
+        {onLongContextChange && (
+          <button
+            type="button"
+            disabled={!value}
+            onClick={() => onLongContextChange(!longContext)}
+            title="启用百万上下文 [1m]"
+            className={cn(
+              'shrink-0 px-2 rounded-lg border text-xs font-semibold transition-all',
+              !value && 'opacity-30 cursor-not-allowed',
+              value && longContext
+                ? 'bg-primary/15 border-primary/40 text-primary'
+                : 'bg-card border-border text-muted-foreground hover:border-muted-foreground/50'
+            )}
+          >
+            1m
+          </button>
+        )}
       </div>
       {/* 实际写入值预览 */}
       {effectiveValue && (

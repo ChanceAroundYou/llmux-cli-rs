@@ -2,7 +2,7 @@ import { Terminal, Code2, Wrench } from "lucide-react";
 
 export interface ToolDef {
   id: string;
-  detectKey: "claude" | "vscode" | "gemini" | "opencode";
+  detectKey: "claude" | "vscode" | "gemini" | "opencode" | "codex";
   label: string;
   description: string;
   icon: React.ElementType;
@@ -45,5 +45,13 @@ export const TOOLS: ToolDef[] = [
     icon: Wrench,
     installUrl: "https://github.com/opencode-ai/opencode",
     comingSoon: true,
+  },
+  {
+    id: "codex",
+    detectKey: "codex",
+    label: "Codex",
+    description: "OpenAI Codex CLI",
+    icon: Terminal,
+    installUrl: "https://github.com/openai/codex",
   },
 ];
