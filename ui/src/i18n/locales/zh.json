@@ -304,6 +304,7 @@
     "testingQueue": "测试中 ({{current}}/{{total}})...",
     "testAllDesc": "在后台顺序拨测当前筛选出的所有模型",
     "noAccountsConnected": "未连接任何账户",
+    "apiUnavailable": "API 不可用，可通过上方「笔」按钮手动添加别名",
     "noModelsFound": "该厂商下未找到任何模型"
   },
   "keys": {
@@ -366,6 +367,10 @@
     "initBtn": "初始化 settings.json",
     "codexApplyBtn": "一键写入 auth.json + config.toml",
     "codexInitBtn": "初始化 auth.json + config.toml",
+    "geminiModelHint": "选择 Gemini CLI 使用的默认模型。",
+    "geminiEndpointHint": "Gemini CLI 通过 /v1beta (Gemini 协议) 与网关通信，由网关鉴权后路由到对应模型。",
+    "geminiApplyBtn": "一键写入 .env + settings.json",
+    "geminiInitBtn": "初始化 .env + settings.json",
     "applying": "写入中…",
     "applySuccess": "写入成功！",
     "backupAt": "备份位置：",

@@ -2,9 +2,11 @@ import { create } from 'zustand';
 
 export interface AvailableModel {
   id: string;
+  name?: string;
   object: string;
   created: number;
   owned_by: string;
+  error?: string;
 }
 
 export interface ModelAlias {

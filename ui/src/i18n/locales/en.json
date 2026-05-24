@@ -302,6 +302,7 @@
     "testingQueue": "Testing ({{current}}/{{total}})...",
     "testAllDesc": "Test all filtered models sequentially in backend",
     "noAccountsConnected": "No accounts connected",
+    "apiUnavailable": "API unavailable, use the pencil button above to manually add aliases",
     "noModelsFound": "No models found in this provider"
   },
   "setup": {
@@ -338,6 +339,10 @@
     "initBtn": "Init settings.json",
     "codexApplyBtn": "Apply to auth.json + config.toml",
     "codexInitBtn": "Init auth.json + config.toml",
+    "geminiModelHint": "Select the default model for Gemini CLI.",
+    "geminiEndpointHint": "Gemini CLI communicates via /v1beta (Gemini protocol); the gateway authenticates and routes to the target model.",
+    "geminiApplyBtn": "Apply to .env + settings.json",
+    "geminiInitBtn": "Init .env + settings.json",
     "applying": "Applying…",
     "applySuccess": "Applied successfully!",
     "backupAt": "Backup saved at: ",

@@ -23,6 +23,41 @@ pub struct TestQueueState {
     pub progress: usize,
 }
 
+/// Normalize a model object to a unified format.
+///
+/// Ensures every model has: `id`, `name`, `object`, `created`.
+/// - `id`: extracted from `id` or Gemini's `name` (strips "models/" prefix)
+/// - `name`: display name from `displayName` or `name`, fallback to `id`
+/// - `object`: "model" if missing
+/// - `created`: 0 if missing
+fn normalize_model(m: &mut Value) {
+    let Value::Object(obj) = m else { return };
+
+    // Resolve id: use "id" if present, otherwise extract from Gemini's "name"
+    let id = match (obj.get("id").and_then(Value::as_str), obj.get("name").and_then(Value::as_str)) {
+        (Some(existing_id), _) if !existing_id.is_empty() => existing_id.to_string(),
+        (_, Some(name)) => name.strip_prefix("models/").unwrap_or(name).to_string(),
+        _ => String::new(),
+    };
+
+    // Resolve display name
+    let display_name = obj
+        .get("displayName")
+        .and_then(Value::as_str)
+        .map(|s| s.to_string())
+        .or_else(|| {
+            obj.get("name")
+                .and_then(Value::as_str)
+                .map(|n| n.strip_prefix("models/").unwrap_or(n).to_string())
+        })
+        .unwrap_or_else(|| id.clone());
+
+    obj.insert("id".to_string(), json!(id));
+    obj.insert("name".to_string(), json!(display_name));
+    obj.entry("object".to_string()).or_insert(json!("model"));
+    obj.entry("created".to_string()).or_insert(json!(0));
+}
+
 pub async fn get_available_models(Extension(state): Extension<AppState>) -> Response {
     const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
@@ -76,18 +111,36 @@ pub async fn get_available_models(Extension(state): Extension<AppState>) -> Resp
                     .flatten();
                     resolve_provider_type(pt.as_deref(), &account.provider_id)
                 };
-                let models = fetch_provider_models(&account, &provider_type).await;
-                (account.alias, models)
+                let (models, fetch_error) = fetch_provider_models(&account, &provider_type).await;
+                (account.alias, models, fetch_error)
             }
         })
         .collect();
 
-    let results: Vec<(String, Vec<Value>)> = futures_util::future::join_all(futures).await;
+    let results: Vec<(String, Vec<Value>, Option<String>)> = futures_util::future::join_all(futures).await;
 
     let mut all_models: Vec<Value> = Vec::new();
     let mut seen_keys = std::collections::HashSet::new();
 
-    for (alias, models) in results {
+    for (alias, models, fetch_error) in results {
+        if models.is_empty() {
+            // Provider API failed (e.g., geo-blocked), show the account with error
+            let key = format!("{}:__unavailable__", alias);
+            if seen_keys.insert(key) {
+                let mut placeholder = json!({
+                    "id": format!("{}-models-unavailable", alias),
+                    "name": alias,
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": alias,
+                });
+                if let Some(err) = &fetch_error {
+                    placeholder["error"] = json!(err);
+                }
+                all_models.push(placeholder);
+            }
+            continue;
+        }
         for mut m in models {
             let id = m.get("id").and_then(Value::as_str).unwrap_or("").to_string();
             let key = format!("{}:{}", alias, id);
@@ -155,13 +208,13 @@ pub async fn get_available_models(Extension(state): Extension<AppState>) -> Resp
 pub async fn fetch_provider_models(
     account: &llmux_core::adapters::Account,
     provider_type: &str,
-) -> Vec<Value> {
+) -> (Vec<Value>, Option<String>) {
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
     {
         Ok(c) => c,
-        Err(_) => return vec![],
+        Err(e) => return (vec![], Some(format!("Failed to create HTTP client: {e}"))),
     };
 
     let (url, headers): (String, std::collections::BTreeMap<String, String>) = match provider_type
@@ -222,27 +275,43 @@ pub async fn fetch_provider_models(
         Ok(r) => r,
         Err(e) => {
             tracing::error!("🤖 [{}] listModels error for {}: {e}", provider_type, account.alias);
-            return vec![];
+            return (vec![], Some(format!("Network error: {e}")));
         }
     };
 
     if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let body = response.text().await.unwrap_or_default();
+        let err_msg = serde_json::from_str::<Value>(&body)
+            .ok()
+            .and_then(|v| v.get("error").and_then(|e| e.get("message").and_then(Value::as_str).map(|s| s.to_string())))
+            .unwrap_or_else(|| format!("HTTP {}", status));
         tracing::warn!(
-            "🤖 [{}] External API Error: {url} returned {}",
+            "🤖 [{}] listModels HTTP {} for {}: {}",
             provider_type,
-            response.status().as_u16()
+            status,
+            account.alias,
+            err_msg
         );
-        return vec![];
+        return (vec![], Some(err_msg));
     }
 
     let body_text = response.text().await.unwrap_or_default();
     let data: Value = match serde_json::from_str(&body_text) {
         Ok(v) => v,
-        Err(_) => return vec![],
+        Err(e) => {
+            tracing::warn!(
+                "🤖 [{}] listModels JSON parse error for {}: {}",
+                provider_type,
+                account.alias,
+                e
+            );
+            return (vec![], Some(format!("JSON parse error: {e}")));
+        }
     };
 
     // Platform-specific model array extraction
-    let models = if provider_type == "gemini" {
+    let mut models = if provider_type == "gemini" {
         // Gemini returns { models: [...] }
         data.get("models")
             .and_then(Value::as_array)
@@ -256,6 +325,11 @@ pub async fn fetch_provider_models(
             .unwrap_or_default()
     };
 
+    // Normalize all model objects to a unified format
+    for m in &mut models {
+        normalize_model(m);
+    }
+
     tracing::debug!(
         "🤖 [{}] Successfully listed {} models from {}",
         provider_type,
@@ -263,7 +337,7 @@ pub async fn fetch_provider_models(
         account.alias
     );
 
-    models
+    (models, None)
 }
 
 pub async fn get_model_aliases(Extension(state): Extension<AppState>) -> Response {

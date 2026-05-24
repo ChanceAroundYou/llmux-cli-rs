@@ -25,15 +25,15 @@
 
 > LLMux 是一个**个人本地优先**的工具，运行在你自己的机器上，面向独立开发者或小团队使用，而非作为共享的生产级 API 网关。
 
-作为开发者，你大概同时持有 OpenAI、Anthropic、Google 等多家平台的账号。每个平台有自己的 SDK、限速策略和接口格式。某个账号触发限速，你就得手动切换、重新配置工具。你想用 Claude Code，但需要 Gemini 的吞吐量。你想把 API 访问权限分享给团队，又不想暴露真实密钥。
+作为开发者，你大概同时持有 OpenAI、Anthropic、Google 等多家平台的账号。每个平台有自己的 SDK、限速策略和接口格式。某个账号触发限速，你就得手动切换、重新配置工具。你想把 API 访问权限分享给团队，又不想暴露真实密钥。
 
-LLMux 解决的就是这些问题。它是一个运行在本地机器上的网关，对外暴露统一的单一入口。你的工具只和 LLMux 对话，路由、协议转换、负载均衡、密钥隔离全部交给 LLMux 处理。
+LLMux 解决的就是这些问题。它是一个运行在本地机器上的网关，对外暴露统一的单一入口。你的工具只和 LLMux 对话，路由、协议透传、负载均衡、密钥隔离全部交给 LLMux 处理。
 
 ## 它能做什么
 
 **统一入口。** 将任何兼容 OpenAI 格式的客户端指向 `http://localhost:25975/v1`，即可访问所有已配置的 provider 和模型。
 
-**Anthropic Ingress（协议跨越）。** 原生支持 Anthropic 协议。Claude Code 等工具可以通过 LLMux 的协议转换层直接调用 Gemini 或 OpenAI 模型，客户端无需任何修改。
+**多协议透传。** 原生支持 OpenAI、Anthropic、Gemini 三种协议。Claude Code、Codex、Gemini CLI 等工具通过 LLMux 直接连接，客户端无需任何修改。
 
 **自愈负载均衡器。** 当某个账号触发限速或出现故障，LLMux 在毫秒级内自动切换至下一个可用账号。无需人工干预，请求不中断。
 
@@ -43,7 +43,7 @@ LLMux 解决的就是这些问题。它是一个运行在本地机器上的网�
 
 **API Key 权限隔离。** 生成网关密钥，并为每个密钥配置允许访问的模型白名单。可安全地将访问权限分发给团队成员或测试环境，不会暴露实际的 provider 凭证。
 
-**一键工具配置。** 内置 Claude Code 和 Codex 的快速配置向导。选择密钥和模型，点击应用——LLMux 直接写入配置文件，提供 diff 预览和备份历史。无需手动编辑 JSON 或 TOML。
+**一键工具配置。** 内置 Claude Code、Codex 和 Gemini CLI 的快速配置向导。选择密钥和模型，点击应用——LLMux 直接写入配置文件，提供 diff 预览和备份历史。无需手动编辑 JSON 或 TOML。
 
 **自定义 Provider。** 在内置 provider 之外，可接入任何兼容 OpenAI 格式的端点（Ollama、DeepSeek、本地推理服务器等）。
 
@@ -74,7 +74,7 @@ cargo build --release
 1. **Accounts** — 添加你的 API Key（支持 OpenAI、Anthropic、Gemini 及自定义端点）
 2. **Models** — 创建模型别名，并运行连接测试
 3. **Keys** — 生成网关 API Key，按需配置模型白名单
-4. **Setup** — 一键配置 Claude Code 或 Codex，或手动将工具的 Base URL 设为 `http://localhost:25975/v1`
+4. **Setup** — 一键配置 Claude Code、Codex 或 Gemini CLI，或手动将工具的 Base URL 设为 `http://localhost:25975/v1`
 5. 完成 — 路由、故障切换、负载均衡全部由 LLMux 自动处理
 
 ## 环境变量
@@ -94,7 +94,7 @@ cargo build --release
 - **Accounts** — 启用/禁用账号，设置路由权重
 - **Models** — 管理模型别名，将短名称映射到 provider 的模型 ID，运行连接测试
 - **Keys** — 创建和管理网关 API Key，配置模型白名单
-- **Setup** — Claude Code 和 Codex 一键配置，含 diff 预览和备份历史
+- **Setup** — Claude Code、Codex 和 Gemini CLI 一键配置，含 diff 预览和备份历史
 
 ## 技术说明
 

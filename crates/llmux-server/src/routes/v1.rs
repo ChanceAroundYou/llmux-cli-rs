@@ -648,11 +648,13 @@ pub async fn gemini(
     let mut last_error: Option<String> = None;
 
     for account in &ordered_accounts {
+        let is_custom_base = account.base_url.as_deref().is_some_and(|u| !u.is_empty());
+        let default_base = "https://generativelanguage.googleapis.com/v1beta";
         let base_url = normalize_base_url(
             account
                 .base_url
                 .as_deref()
-                .unwrap_or("https://generativelanguage.googleapis.com/v1beta"),
+                .unwrap_or(default_base),
         );
 
         // Rebuild URL with resolved model and API key
@@ -663,20 +665,33 @@ pub async fn gemini(
         };
         let new_path = format!("{target_model}:{_action}");
 
-        // Preserve query params from the original URI, add API key
-        let query: String = uri
-            .query()
-            .map(|q| format!("{q}&key={}", account.api_key))
-            .unwrap_or_else(|| format!("key={}", account.api_key));
-        let url = format!("{base_url}/{new_path}?{query}");
+        // Auth: for default Google API, use ?key= query param.
+        // For custom proxies, use Bearer header (common proxy convention).
+        let (url, headers) = if is_custom_base {
+            let url = format!("{base_url}/{new_path}");
+            let mut h = BTreeMap::from([(
+                "content-type".to_string(),
+                "application/json".to_string(),
+            )]);
+            h.insert("authorization".to_string(), format!("Bearer {}", account.api_key));
+            (url, h)
+        } else {
+            let query: String = uri
+                .query()
+                .map(|q| format!("{q}&key={}", account.api_key))
+                .unwrap_or_else(|| format!("key={}", account.api_key));
+            let url = format!("{base_url}/{new_path}?{query}");
+            let h = BTreeMap::from([(
+                "content-type".to_string(),
+                "application/json".to_string(),
+            )]);
+            (url, h)
+        };
 
         let provider_request = ProviderRequest {
             method: "POST".to_string(),
             url,
-            headers: BTreeMap::from([(
-                "content-type".to_string(),
-                "application/json".to_string(),
-            )]),
+            headers,
             body: body.clone(),
         };
 

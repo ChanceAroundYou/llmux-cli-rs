@@ -9,6 +9,7 @@ import { ToolSidebar } from '../components/Setup/ToolSidebar';
 import { ToolHeader } from '../components/Setup/ToolHeader';
 import { ClaudeCodePanel } from '../components/Setup/tools/ClaudeCodePanel';
 import { CodexPanel } from '../components/Setup/tools/CodexPanel';
+import { GeminiPanel } from '../components/Setup/tools/GeminiPanel';
 
 export default function Setup() {
   const { t } = useTranslation();
@@ -21,6 +22,7 @@ export default function Setup() {
 
   const [claudeSettings, setClaudeSettings] = useState<Record<string, any> | null>(null);
   const [codexSettings, setCodexSettings] = useState<Record<string, any> | null>(null);
+  const [geminiSettings, setGeminiSettings] = useState<Record<string, any> | null>(null);
   const [settingsExists, setSettingsExists] = useState(false);
   const [settingsLoading, setSettingsLoading] = useState(false);
   const [settingsFetched, setSettingsFetched] = useState(false);
@@ -54,12 +56,27 @@ export default function Setup() {
     }
   }, []);
 
-  const currentSettings = selectedTool === 'codex' ? codexSettings : claudeSettings;
-  const onRefreshSettings = selectedTool === 'codex' ? fetchCodexSettings : fetchClaudeSettings;
+  const fetchGeminiSettings = useCallback(async () => {
+    setSettingsLoading(true);
+    setSettingsFetched(false);
+    try {
+      const res = await fetch('/api/system/gemini-settings');
+      const data = await res.json();
+      setSettingsExists(data.exists);
+      setGeminiSettings({ env: data.env, settings: data.settings });
+    } finally {
+      setSettingsLoading(false);
+      setSettingsFetched(true);
+    }
+  }, []);
+
+  const currentSettings = selectedTool === 'codex' ? codexSettings : selectedTool === 'gemini' ? geminiSettings : claudeSettings;
+  const onRefreshSettings = selectedTool === 'codex' ? fetchCodexSettings : selectedTool === 'gemini' ? fetchGeminiSettings : fetchClaudeSettings;
 
   // 当切换工具时重新加载对应的 settings
   useEffect(() => {
     if (selectedTool === 'codex') fetchCodexSettings();
+    else if (selectedTool === 'gemini') fetchGeminiSettings();
     else { setSettingsFetched(true); }
   }, [selectedTool]);
 
@@ -130,6 +147,18 @@ export default function Setup() {
             settingsFetched={settingsFetched}
             onRefreshSettings={onRefreshSettings}
             onSettingsApplied={(s) => { setCodexSettings(s); setSettingsExists(true); }}
+          />
+        ) : selectedTool === 'gemini' ? (
+          <GeminiPanel
+            keys={keys}
+            aliases={aliases}
+            gatewayUrl={gatewayUrl}
+            currentSettings={currentSettings}
+            settingsExists={settingsExists}
+            settingsLoading={settingsLoading}
+            settingsFetched={settingsFetched}
+            onRefreshSettings={onRefreshSettings}
+            onSettingsApplied={(s) => { setGeminiSettings(s); setSettingsExists(true); }}
           />
         ) : null}
       </div>

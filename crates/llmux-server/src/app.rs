@@ -203,6 +203,16 @@ pub fn app(state: AppState) -> AppRouter {
                 .delete(system::delete_codex_backup),
         )
         .route(
+            "/api/system/gemini-settings",
+            get(system::get_gemini_settings).post(system::apply_gemini_settings),
+        )
+        .route(
+            "/api/system/gemini-backups",
+            get(system::list_gemini_backups)
+                .post(system::restore_gemini_backup)
+                .delete(system::delete_gemini_backup),
+        )
+        .route(
             "/api/settings",
             get(settings::get_settings).put(settings::update_settings),
         )

@@ -146,8 +146,8 @@ export default function Models() {
 
   const filteredModels = useMemo(() => {
     return (safeModels).filter(m => {
-      const matchSearch = m.id.toLowerCase().includes(search.toLowerCase()) || 
-                          m.owned_by.toLowerCase().includes(search.toLowerCase());
+      const matchSearch = (m.id ?? '').toLowerCase().includes(search.toLowerCase()) ||
+                          (m.owned_by ?? '').toLowerCase().includes(search.toLowerCase());
       const matchProvider = m.owned_by === activeProvider;
       return matchSearch && matchProvider;
     });
@@ -387,15 +387,17 @@ export default function Models() {
 
       {/* Models Grid */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5 gap-4">
-        {filteredModels.map((model) => (
-          <div key={model.id} className="p-4 rounded-xl border border-border bg-card hover:border-primary/40 transition-all group flex flex-col justify-between min-h-[160px]">
+        {filteredModels.map((model) => {
+          const isPlaceholder = model.id?.endsWith('-models-unavailable');
+          return (
+          <div key={model.id} className={cn("p-4 rounded-xl border bg-card hover:border-primary/40 transition-all group flex flex-col justify-between min-h-[160px]", isPlaceholder ? "border-dashed border-warning/30 bg-warning/5" : "border-border")}>
             <div className="space-y-1">
               <div className="flex items-center justify-between">
                 <span className="text-xs font-bold text-primary uppercase tracking-widest">{model.owned_by}</span>
                 <div className="flex items-center gap-1.5">
-                   {testResults[model.id]?.loading ? (
+                   {!isPlaceholder && testResults[model.id]?.loading ? (
                      <RefreshCcw size={10} className="animate-spin text-muted-foreground" />
-                   ) : testResults[model.id] ? (
+                   ) : !isPlaceholder && testResults[model.id] ? (
                      <div className={cn(
                        "w-1.5 h-1.5 rounded-full",
                        testResults[model.id]?.success ? "bg-success shadow-[0_0_8px_rgba(34,197,94,0.6)]" : "bg-destructive shadow-[0_0_8px_rgba(239,68,68,0.6)]"
@@ -405,7 +407,7 @@ export default function Models() {
                 </div>
               </div>
               <div className="flex items-start justify-between gap-2">
-                <h3 className="font-semibold text-sm tracking-tight line-clamp-2 leading-snug">{model.id}</h3>
+                <h3 className="font-semibold text-sm tracking-tight line-clamp-2 leading-snug">{model.name || model.id}</h3>
                 <CopyButton 
                   value={model.id} 
                   size={12} 
@@ -463,30 +465,36 @@ export default function Models() {
             </div>
             
             <div className="pt-3 mt-3 border-t border-border/40 flex items-center justify-between text-xs font-bold text-muted-foreground uppercase tracking-tighter">
-               <button 
-                 onClick={() => handleTest(model.id, model.owned_by)}
-                 disabled={testResults[model.id]?.loading || queueStatus.isRunning}
-                 className="flex items-center gap-1 hover:text-foreground transition-colors disabled:opacity-50"
-               >
-                 <Zap size={12} className={cn(testResults[model.id]?.success && "text-warning")} />
-                 {testResults[model.id]?.loading ? t('models.testing') : t('models.testBtn')}
-               </button>
-               <button 
-                 onClick={() => {
-                    setEditingAliasId(null);
-                    const matchingOwners = [...new Set(safeModels.filter(x => x.id === model.id).map(x => x.owned_by))];
-                    const matchingIds = safeAccounts.filter(a => matchingOwners.includes(a.alias) && a.is_active === 1).map(a => a.id);
-                    setAliasForm({ alias: '', target: model.id, provider: model.owned_by, selectedAccountIds: matchingIds });
-                    setIsModalOpen(true);
-                 }}
-                 className="flex items-center gap-1 text-primary hover:opacity-80 transition-opacity"
-               >
-                 {t('models.actions.assign')}
-                 <ChevronRight size={12} />
-               </button>
+               {isPlaceholder ? (
+                 <p className="text-xs text-warning font-normal normal-case truncate" title={(model as any).error}>{(model as any).error || t('models.apiUnavailable')}</p>
+               ) : (
+                 <button
+                   onClick={() => handleTest(model.id, model.owned_by)}
+                   disabled={testResults[model.id]?.loading || queueStatus.isRunning}
+                   className="flex items-center gap-1 hover:text-foreground transition-colors disabled:opacity-50"
+                 >
+                   <Zap size={12} className={cn(testResults[model.id]?.success && "text-warning")} />
+                   {testResults[model.id]?.loading ? t('models.testing') : t('models.testBtn')}
+                 </button>
+               )}
+               {!isPlaceholder && (
+                 <button
+                   onClick={() => {
+                      setEditingAliasId(null);
+                      const matchingOwners = [...new Set(safeModels.filter(x => x.id === model.id).map(x => x.owned_by))];
+                      const matchingIds = safeAccounts.filter(a => matchingOwners.includes(a.alias) && a.is_active === 1).map(a => a.id);
+                      setAliasForm({ alias: '', target: model.id, provider: model.owned_by, selectedAccountIds: matchingIds });
+                      setIsModalOpen(true);
+                   }}
+                   className="flex items-center gap-1 text-primary hover:opacity-80 transition-opacity"
+                 >
+                   {t('models.actions.assign')}
+                   <ChevronRight size={12} />
+                 </button>
+               )}
             </div>
           </div>
-        ))}
+        )})}
       </div>
 
       {/* Empty State */}

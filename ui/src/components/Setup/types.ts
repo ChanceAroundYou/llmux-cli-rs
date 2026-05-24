@@ -1,4 +1,4 @@
-import { Terminal, Code2, Wrench } from "lucide-react";
+import { Terminal, Code2, Wrench, Sparkles } from "lucide-react";
 
 export interface ToolDef {
   id: string;
@@ -28,15 +28,14 @@ export const TOOLS: ToolDef[] = [
     installUrl: "https://code.visualstudio.com/",
     comingSoon: true,
   },
-  // {
-  //   id: "gemini",
-  //   detectKey: "gemini",
-  //   label: "Gemini CLI",
-  //   description: "即将支持",
-  //   icon: Sparkles,
-  //   installUrl: "https://github.com/google-gemini/gemini-cli",
-  //   comingSoon: true,
-  // },
+  {
+    id: "gemini",
+    detectKey: "gemini",
+    label: "Gemini CLI",
+    description: "Google Gemini CLI",
+    icon: Sparkles,
+    installUrl: "https://github.com/google-gemini/gemini-cli",
+  },
   {
     id: "opencode",
     detectKey: "opencode",
