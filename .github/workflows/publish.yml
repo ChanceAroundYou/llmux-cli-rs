@@ -11,6 +11,7 @@ permissions:
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
@@ -36,7 +37,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Setup Bun
-        uses: oven-sh/setup-bun@v1
+        uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
 
@@ -50,7 +51,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libssl-dev libsqlite3-dev pkg-config
+          sudo apt-get install -y libssl-dev pkg-config
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -58,8 +59,6 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Build Rust binary
-        env:
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: cc
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Package artifact
@@ -70,34 +69,10 @@ jobs:
           cp target/${{ matrix.target }}/release/llmux$EXT ./llmux-${{ matrix.name }}$EXT
 
       - name: Upload to Release
+        shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           EXT=""
           if [[ "${{ matrix.name }}" == windows* ]]; then EXT=".exe"; fi
           gh release upload ${{ github.event.release.tag_name }} llmux-${{ matrix.name }}$EXT --clobber
-
-  # publish-npm:
-  #   runs-on: ubuntu-latest
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #
-  #     - name: Setup Node.js
-  #       uses: actions/setup-node@v4
-  #       with:
-  #         node-version: '20'
-  #
-  #     - name: Setup Bun runtime
-  #       uses: oven-sh/setup-bun@v1
-  #       with:
-  #         bun-version: latest
-  #
-  #     - name: Install dependencies
-  #       run: |
-  #         npm install -g npm@latest
-  #         bun install
-  #
-  #     - name: Publish to npm
-  #       run: |
-  #         npm config set //registry.npmjs.org/:_authToken ""
-  #         npm publish --access public --provenance
