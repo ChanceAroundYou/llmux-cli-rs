@@ -20,7 +20,7 @@ pub async fn get_health_status(Extension(state): Extension<AppState>) -> Respons
         }
     };
 
-    tracing::info!("[Health] Starting health check for {} accounts...", accounts.len());
+    tracing::info!("💚 Starting health check for {} accounts...", accounts.len());
 
     let mut health_data: Vec<Value> = Vec::new();
 
@@ -64,7 +64,7 @@ pub async fn get_health_status(Extension(state): Extension<AppState>) -> Respons
         };
 
         tracing::info!(
-            "[Health] Account {} ({}): {}",
+            "💚 Account {} ({}): {}",
             acc_id,
             alias,
             status.to_uppercase()

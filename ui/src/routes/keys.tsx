@@ -20,6 +20,9 @@ import {
 import { Dialog, ConfirmDialog } from '../components/Modal';
 import { CopyButton } from '../components/CopyButton';
 import { cn } from '../lib/utils';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Badge } from '@/components/ui/badge';
 import { parseServerDate } from '../utils/date';
 
 function parseAllowedModels(raw: string): string[] {
@@ -100,8 +103,8 @@ export default function KeysPage() {
   return (
     <div className="space-y-8 animate-fadeIn duration-500">
       <div className="flex items-center justify-between">
-        <div className="flex items-center gap-3">
-          <div className="p-2 bg-primary/10 text-primary rounded-lg">
+        <div className="flex items-start gap-3">
+          <div className="p-2 bg-primary/10 text-primary rounded-lg mt-1.5">
             <Key size={24} />
           </div>
           <div>
@@ -109,18 +112,18 @@ export default function KeysPage() {
             <p className="text-sm text-muted-foreground">{t('keys.subtitle')}</p>
           </div>
         </div>
-        <button
+        <Button
+          size="sm"
           onClick={() => {
             setGeneratedKey(null);
             setEditingKey(null);
             setNewKeyData({ name: '', allowedModels: '*' });
             setIsModalOpen(true);
           }}
-          className="flex items-center gap-2 px-4 py-2 bg-primary text-primary-foreground rounded-lg text-sm font-medium hover:opacity-90 transition-all shadow-sm"
         >
           <Plus size={16} />
           {t('keys.createKey')}
-        </button>
+        </Button>
       </div>
 
       <div className="p-5 bg-card border border-border rounded-xl flex flex-col md:flex-row md:items-center justify-between gap-4 relative overflow-hidden">
@@ -172,10 +175,10 @@ export default function KeysPage() {
                 {k.allowed_models !== '*' && (
                    <div className="flex flex-wrap gap-1.5 mt-2">
                       {parseAllowedModels(k.allowed_models).map((m: string) => (
-                         <div key={m} className="flex items-center gap-1.5 pl-2.5 pr-1 py-0.5 bg-primary/5 text-primary/80 text-xs font-semibold rounded border border-primary/10 group/tag hover:bg-primary/10 transition-colors shadow-sm">
+                         <Badge key={m} variant="secondary" className="gap-1.5 pl-2.5 pr-1 py-0.5 bg-primary/5 text-primary/80 border-primary/10 hover:bg-primary/10 group/tag shadow-sm">
                             {m}
                             <CopyButton value={m} size={9} className="p-0.5 opacity-0 group-hover/tag:opacity-100 transition-opacity" />
-                         </div>
+                         </Badge>
                       ))}
                    </div>
                 )}
@@ -192,28 +195,32 @@ export default function KeysPage() {
                   </div>
                 </div>
                 <div className="flex items-center gap-1">
-                  <button
+                  <Button
+                    variant="ghost"
+                    size="icon"
                     onClick={() => {
                       setEditingKey(k);
                       setGeneratedKey(null);
-                      setNewKeyData({ 
-                        name: k.name, 
-                        allowedModels: k.allowed_models === '*' ? '*' : parseAllowedModels(k.allowed_models) 
+                      setNewKeyData({
+                        name: k.name,
+                        allowedModels: k.allowed_models === '*' ? '*' : parseAllowedModels(k.allowed_models)
                       });
                       setIsModalOpen(true);
                     }}
-                    className="p-2.5 hover:bg-primary/10 hover:text-primary rounded-xl text-muted-foreground transition-all"
+                    className="text-muted-foreground hover:text-primary hover:bg-primary/10"
                     title={t('common.edit')}
                   >
                     <Edit2 size={18} />
-                  </button>
-                  <button
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="icon"
                     onClick={() => setKeyToDelete(k)}
-                    className="p-2.5 hover:bg-destructive/10 hover:text-destructive rounded-xl text-muted-foreground transition-all"
+                    className="text-muted-foreground hover:text-destructive hover:bg-destructive/10"
                     title={t('common.delete')}
                   >
                     <Trash2 size={18} />
-                  </button>
+                  </Button>
                 </div>
               </div>
             </div>
@@ -251,56 +258,46 @@ export default function KeysPage() {
                 />
               </div>
             </div>
-            <button
+            <Button
+              variant="secondary"
               onClick={() => setIsModalOpen(false)}
-              className="w-full py-3 bg-muted hover:bg-muted/80 rounded-xl font-semibold transition-all"
+              className="w-full"
             >
               {t('common.done')}
-            </button>
+            </Button>
           </div>
         ) : (
           <form onSubmit={handleCreateOrUpdate} className="space-y-6">
             <div className="space-y-2">
               <label className="text-xs font-semibold text-muted-foreground uppercase px-1">{t('keys.keyName')}</label>
-              <input 
-                type="text" 
+              <Input
+                type="text"
                 required
                 value={newKeyData.name}
                 onChange={e => setNewKeyData({...newKeyData, name: e.target.value})}
                 placeholder={t('keys.keyPlaceholder')}
-                className="w-full px-4 py-3 bg-muted/50 border border-border rounded-xl outline-none focus:ring-2 focus:ring-primary/20 transition-all"
               />
             </div>
 
             <div className="space-y-3">
               <label className="text-xs font-semibold text-muted-foreground uppercase px-1">{t('keys.permissions')}</label>
               <div className="grid grid-cols-2 gap-2">
-                <button
+                <Button
                   type="button"
+                  variant={newKeyData.allowedModels === '*' ? "default" : "outline"}
                   onClick={() => setNewKeyData({...newKeyData, allowedModels: '*'})}
-                  className={cn(
-                    "p-3 rounded-xl border text-sm font-semibold transition-all flex items-center justify-center gap-2",
-                    newKeyData.allowedModels === '*' 
-                      ? "bg-primary/10 border-primary text-primary" 
-                      : "bg-card border-border text-muted-foreground hover:border-primary/30"
-                  )}
                 >
                   <ShieldCheck size={16} />
                   {t('keys.allModels')}
-                </button>
-                <button
+                </Button>
+                <Button
                   type="button"
+                  variant={newKeyData.allowedModels !== '*' ? "default" : "outline"}
                   onClick={() => setNewKeyData({...newKeyData, allowedModels: Array.isArray(newKeyData.allowedModels) ? newKeyData.allowedModels : []})}
-                  className={cn(
-                    "p-3 rounded-xl border text-sm font-semibold transition-all flex items-center justify-center gap-2",
-                    newKeyData.allowedModels !== '*' 
-                      ? "bg-primary/10 border-primary text-primary" 
-                      : "bg-card border-border text-muted-foreground hover:border-primary/30"
-                  )}
                 >
                   <Plus size={16} />
                   {t('keys.selectedModels')}
-                </button>
+                </Button>
               </div>
             </div>
 
@@ -346,20 +343,21 @@ export default function KeysPage() {
               </p>
             )}
             <div className="flex gap-3 pt-2">
-              <button 
-                type="button" 
+              <Button
+                type="button"
+                variant="outline"
                 onClick={() => setIsModalOpen(false)}
-                className="flex-1 py-3 border border-border rounded-xl font-semibold hover:bg-muted transition-all"
+                className="flex-1"
               >
                 {t('common.cancel')}
-              </button>
-              <button
+              </Button>
+              <Button
                 type="submit"
                 disabled={!canSubmit}
-                className="flex-1 py-3 bg-primary text-primary-foreground rounded-xl font-semibold hover:opacity-90 transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+                className="flex-1"
               >
                 {t('common.save')}
-              </button>
+              </Button>
             </div>
           </form>
         )}
@@ -400,12 +398,12 @@ export default function KeysPage() {
                 </div>
              </div>
           </div>
-          <button 
+          <Button
             onClick={() => setShowWarningModal(false)}
-            className="w-full py-3 bg-primary text-primary-foreground rounded-xl font-semibold shadow-lg shadow-primary/20 transition-all hover:opacity-90"
+            className="w-full"
           >
             {t('common.done')}
-          </button>
+          </Button>
         </div>
       </Dialog>
     </div>

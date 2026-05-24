@@ -24,6 +24,9 @@ import { Dialog, ConfirmDialog } from '../components/Modal';
 import { CopyButton } from '../components/CopyButton';
 import { parseServerDate } from '../utils/date';
 import { cn } from '../lib/utils'
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 
 export default function Models() {
   const { t, i18n } = useTranslation();
@@ -240,8 +243,8 @@ export default function Models() {
     <div className="space-y-8 animate-fadeIn">
       {/* Header */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-        <div className="flex items-center gap-3">
-          <div className="p-2 bg-primary/10 text-primary rounded-lg">
+        <div className="flex items-start gap-3">
+          <div className="p-2 bg-primary/10 text-primary rounded-lg mt-1.5">
             <Box size={24} />
           </div>
           <div>
@@ -250,36 +253,41 @@ export default function Models() {
           </div>
         </div>
         <div className="flex items-center gap-2">
-           <button 
+           <Button
+             variant="outline"
+             size="sm"
              onClick={handleTestAll}
              disabled={queueStatus.isRunning || filteredModels.length === 0}
-             className="flex items-center gap-2 px-3 py-2 bg-warning/10 text-warning rounded-lg text-sm font-medium hover:bg-warning/20 transition-all shadow-sm disabled:opacity-50"
+             className="bg-warning/10 text-warning hover:bg-warning/20 border-0"
              title={t('models.testAllDesc')}
            >
              <Zap size={16} className={cn(queueStatus.isRunning && "animate-pulse")} />
              {queueStatus.isRunning ? t('models.testingQueue', { current: queueStatus.current, total: queueStatus.total }) : t('models.testAll')}
-           </button>
-           <button 
+           </Button>
+           <Button
+             variant="ghost"
+             size="icon"
              onClick={() => { fetchModels(); fetchHealth(); }}
-             className="p-2 hover:bg-muted rounded-lg transition-colors text-muted-foreground"
+             className="text-muted-foreground"
              title={t('models.actions.refresh')}
            >
              <RefreshCcw size={18} className={cn(isLoading && "animate-spin")} />
-           </button>
-           <button
+           </Button>
+           <Button
+             size="sm"
              onClick={() => { setEditingAliasId(null); setAliasForm({ alias: '', target: '', provider: '', selectedAccountIds: [] }); setIsModalOpen(true); }}
-             className="flex items-center gap-2 px-4 py-2 bg-primary text-primary-foreground rounded-lg text-sm font-medium hover:opacity-90 transition-all shadow-sm"
            >
              <Plus size={16} />
              {t('models.createAlias')}
-           </button>
-           <button
+           </Button>
+           <Button
+             variant="outline"
+             size="sm"
              onClick={() => setIsCustomModalOpen(true)}
-             className="flex items-center gap-2 px-4 py-2 bg-card border border-border text-foreground rounded-lg text-sm font-medium hover:bg-muted transition-all shadow-sm"
            >
              <PenLine size={16} />
              {t('models.customAlias')}
-           </button>
+           </Button>
         </div>
       </div>
 
@@ -335,12 +343,14 @@ export default function Models() {
                           )}
                         </div>
                     </div>
-                    <button
+                    <Button
+                      variant="ghost"
+                      size="icon"
                       onClick={(e) => { e.stopPropagation(); setAliasToDelete({ id: a.id, name: a.alias }); }}
-                      className="p-1 text-muted-foreground hover:text-destructive opacity-0 group-hover:opacity-100 transition-all"
+                      className="h-6 w-6 text-muted-foreground hover:text-destructive opacity-0 group-hover:opacity-100 transition-all"
                     >
                       <Trash2 size={12} />
-                    </button>
+                    </Button>
                   </div>
                 );
               })}
@@ -351,32 +361,25 @@ export default function Models() {
       {/* Filters & Tabs */}
       <div className="space-y-4">
         <div className="flex items-center justify-between gap-4">
-           <div className="flex items-center bg-muted/50 p-1 rounded-xl border border-border/50 overflow-x-auto no-scrollbar">
-              {providers.map(p => (
-                <button
-                  key={p}
-                  onClick={() => setActiveProvider(p)}
-                  className={cn(
-                    "px-4 py-1.5 text-xs font-bold rounded-lg transition-all whitespace-nowrap capitalize",
-                    activeProvider === p 
-                      ? "bg-card text-primary shadow-sm border border-border/50" 
-                      : "text-muted-foreground hover:text-foreground"
-                  )}
-                >
-                  {p}
-                </button>
-              ))}
-              {providers.length === 0 && <span className="px-4 py-1.5 text-xs text-muted-foreground italic">No providers</span>}
-           </div>
-           
+           <Tabs value={activeProvider} onValueChange={setActiveProvider} className="overflow-x-auto">
+              <TabsList className="bg-muted/50 border border-border/50">
+                {providers.map(p => (
+                  <TabsTrigger key={p} value={p} className="text-xs font-bold capitalize">
+                    {p}
+                  </TabsTrigger>
+                ))}
+                {providers.length === 0 && <span className="px-4 py-1.5 text-xs text-muted-foreground italic">No providers</span>}
+              </TabsList>
+           </Tabs>
+
            <div className="relative flex-1 max-w-xs">
-              <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground" size={14} />
-              <input 
-                type="text" 
+              <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground z-10" size={14} />
+              <Input
+                type="text"
                 placeholder={t('models.filter.searchPlaceholder')}
                 value={search}
                 onChange={e => setSearch(e.target.value)}
-                className="w-full pl-9 pr-4 py-2 bg-muted/30 border border-border rounded-xl text-xs outline-none focus:ring-2 focus:ring-primary/20 transition-all"
+                className="pl-9"
               />
            </div>
         </div>
@@ -500,11 +503,10 @@ export default function Models() {
         <form onSubmit={handleAddAlias} className="space-y-4">
           <div className="space-y-1.5">
             <label className="text-xs font-bold text-muted-foreground uppercase">{t('models.aliasName')}</label>
-            <input
+            <Input
               type="text" required value={aliasForm.alias}
               onChange={e => setAliasForm({...aliasForm, alias: e.target.value})}
               placeholder={t('models.aliasPlaceholder')}
-              className="w-full px-4 py-2 bg-muted/50 border border-border rounded-lg text-sm outline-none focus:ring-2 focus:ring-primary/20 transition-all"
             />
           </div>
           <div className="space-y-1.5">
@@ -515,7 +517,6 @@ export default function Models() {
                 const modelId = e.target.value;
                 const models = safeModels;
                 const accts = safeAccounts;
-                // Find accounts that have this model
                 const matchingAliases = [...new Set(models.filter(x => x.id === modelId).map(x => x.owned_by))];
                 const matchingAccounts = accts.filter(a => matchingAliases.includes(a.alias) && a.is_active === 1);
                 setAliasForm({
@@ -525,7 +526,7 @@ export default function Models() {
                   selectedAccountIds: matchingAccounts.map(a => a.id),
                 });
               }}
-              className="w-full px-4 py-2 bg-muted/50 border border-border rounded-lg text-sm outline-none focus:ring-2 focus:ring-primary/20 transition-all font-semibold"
+              className="w-full h-10 px-3 py-2 rounded-md border border-input bg-background text-sm ring-offset-background focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2"
             >
               <option value="">{t('common.default')}</option>
               {safeModels.map(mod => (
@@ -595,10 +596,10 @@ export default function Models() {
             );
           })()}
           <div className="pt-4 flex gap-3">
-             <button type="button" onClick={closeAliasModal} className="flex-1 px-4 py-2 text-sm font-bold border border-border rounded-lg hover:bg-muted transition-all">{t('common.cancel')}</button>
-             <button type="submit" className="flex-1 px-4 py-2 text-sm font-bold bg-primary text-primary-foreground rounded-lg hover:opacity-90 transition-all flex items-center justify-center gap-2">
+             <Button type="button" variant="outline" onClick={closeAliasModal} className="flex-1">{t('common.cancel')}</Button>
+             <Button type="submit" className="flex-1">
                <Save size={16} /> {editingAliasId !== null ? t('common.update') : t('common.save')}
-             </button>
+             </Button>
           </div>
         </form>
       </Dialog>
@@ -614,7 +615,7 @@ export default function Models() {
                 setCustomForm({ ...customForm, accountId: e.target.value, target: '' });
                 setVerifyResult(null);
               }}
-              className="w-full px-4 py-2 bg-muted/50 border border-border rounded-lg text-sm outline-none focus:ring-2 focus:ring-primary/20 transition-all font-semibold"
+              className="w-full h-10 px-3 py-2 rounded-md border border-input bg-background text-sm ring-offset-background focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2"
             >
               <option value="">{t('models.selectAccountPlaceholder')}</option>
               {safeAccounts.filter(a => a.is_active === 1).map(a => (
@@ -624,16 +625,15 @@ export default function Models() {
           </div>
           <div className="space-y-1.5">
             <label className="text-xs font-bold text-muted-foreground uppercase">{t('models.aliasName')}</label>
-            <input
+            <Input
               type="text" required value={customForm.alias}
               onChange={e => setCustomForm({ ...customForm, alias: e.target.value })}
               placeholder={t('models.aliasPlaceholder')}
-              className="w-full px-4 py-2 bg-muted/50 border border-border rounded-lg text-sm outline-none focus:ring-2 focus:ring-primary/20 transition-all"
             />
           </div>
           <div className="space-y-1.5">
             <label className="text-xs font-bold text-muted-foreground uppercase">{t('models.manualModel')}</label>
-            <input
+            <Input
               type="text" required value={customForm.target}
               onChange={e => {
                 setCustomForm({ ...customForm, target: e.target.value });
@@ -641,7 +641,6 @@ export default function Models() {
               }}
               placeholder={t('models.manualModelPlaceholder')}
               list="custom-model-options"
-              className="w-full px-4 py-2 bg-muted/50 border border-border rounded-lg text-sm outline-none focus:ring-2 focus:ring-primary/20 transition-all"
             />
             <datalist id="custom-model-options">
               {safeModels
@@ -658,15 +657,16 @@ export default function Models() {
 
           {/* Verify */}
           <div className="space-y-2">
-            <button
+            <Button
               type="button"
+              variant="outline"
               onClick={handleVerify}
               disabled={isVerifying || !customForm.target || !customForm.accountId}
-              className="flex items-center gap-2 px-4 py-2 bg-warning/10 text-warning rounded-lg text-sm font-medium hover:bg-warning/20 transition-all disabled:opacity-50"
+              className="bg-warning/10 text-warning hover:bg-warning/20 border-0"
             >
               {isVerifying ? <Loader2 size={16} className="animate-spin" /> : <Zap size={16} />}
               {isVerifying ? t('models.verifying') : t('models.verify')}
-            </button>
+            </Button>
             {verifyResult && (
               <div className={cn(
                 "flex items-center gap-2 p-3 rounded-lg text-sm font-medium",
@@ -681,14 +681,14 @@ export default function Models() {
           </div>
 
           <div className="pt-2 flex gap-3">
-            <button type="button" onClick={() => { setIsCustomModalOpen(false); setVerifyResult(null); }} className="flex-1 px-4 py-2 text-sm font-bold border border-border rounded-lg hover:bg-muted transition-all">{t('common.cancel')}</button>
-            <button
+            <Button type="button" variant="outline" onClick={() => { setIsCustomModalOpen(false); setVerifyResult(null); }} className="flex-1">{t('common.cancel')}</Button>
+            <Button
               type="submit"
               disabled={!verifyResult?.success}
-              className="flex-1 px-4 py-2 text-sm font-bold bg-primary text-primary-foreground rounded-lg hover:opacity-90 transition-all flex items-center justify-center gap-2 disabled:opacity-50"
+              className="flex-1"
             >
               <Save size={16} /> {t('common.save')}
-            </button>
+            </Button>
           </div>
         </form>
       </Dialog>

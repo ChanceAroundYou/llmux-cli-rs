@@ -32,7 +32,7 @@ pub async fn get_available_models(Extension(state): Extension<AppState>) -> Resp
         if let Some(ref entry) = *cache {
             if entry.created.elapsed() < CACHE_TTL {
                 tracing::debug!(
-                    "[Models] Returning {} cached models (age: {}s)",
+                    "🤖 Returning {} cached models (age: {}s)",
                     entry.data.len(),
                     entry.created.elapsed().as_secs()
                 );
@@ -53,7 +53,7 @@ pub async fn get_available_models(Extension(state): Extension<AppState>) -> Resp
     };
 
     if accounts.is_empty() {
-        tracing::warn!("[Dispatcher] No active accounts found for model listing");
+        tracing::warn!("🔀 No active accounts found for model listing");
         return Json(Value::Array(vec![])).into_response();
     }
 
@@ -142,7 +142,7 @@ pub async fn get_available_models(Extension(state): Extension<AppState>) -> Resp
             created: std::time::Instant::now(),
         });
         tracing::info!(
-            "[Models] Cached {} models ({} from APIs, {} from aliases)",
+            "🤖 Cached {} models ({} from APIs, {} from aliases)",
             all_models.len(),
             all_models.len().saturating_sub(alias_model_count),
             alias_model_count,
@@ -221,14 +221,14 @@ pub async fn fetch_provider_models(
     let response = match req.send().await {
         Ok(r) => r,
         Err(e) => {
-            tracing::error!("[{} Adapter] listModels error for {}: {e}", provider_type, account.alias);
+            tracing::error!("🤖 [{}] listModels error for {}: {e}", provider_type, account.alias);
             return vec![];
         }
     };
 
     if !response.status().is_success() {
         tracing::warn!(
-            "[{} Adapter] External API Error: {url} returned {}",
+            "🤖 [{}] External API Error: {url} returned {}",
             provider_type,
             response.status().as_u16()
         );
@@ -257,7 +257,7 @@ pub async fn fetch_provider_models(
     };
 
     tracing::debug!(
-        "[{} Adapter] Successfully listed {} models from {}",
+        "🤖 [{}] Successfully listed {} models from {}",
         provider_type,
         models.len(),
         account.alias
@@ -324,7 +324,7 @@ pub async fn set_model_alias(
             if let Ok(mut cache) = state.models_cache.lock() {
                 *cache = None;
             }
-            tracing::info!("[Alias] Set alias {} -> {} (provider: {:?}), cache invalidated", alias, target_model, provider_id);
+            tracing::info!("🏷️ Set alias {} -> {} (provider: {:?}), cache invalidated", alias, target_model, provider_id);
             Json(json!({ "success": true, "message": "Alias set successfully" })).into_response()
         },
         Err(e) => crate::error::simple_error(
@@ -402,7 +402,7 @@ pub async fn delete_model_alias(
                     .bind(key_id)
                     .execute(&state.pool)
                     .await;
-                tracing::info!("[Sync] Removed alias {} from API Key ID: {}", alias_row.alias, key_id);
+                tracing::info!("🔄 Removed alias {} from API Key ID: {}", alias_row.alias, key_id);
             }
         }
     }
@@ -503,7 +503,7 @@ pub async fn start_test_queue(
         queue.progress = 0;
     }
 
-    tracing::info!("[Test Queue] Starting test for {} models", models.len());
+    tracing::info!("🧪 Starting test for {} models", models.len());
     let pool = state.pool.clone();
     let master_key = state.master_key.clone();
     let queue_state = state.test_queue.clone();
@@ -915,7 +915,7 @@ pub async fn test_model(
 
     if success {
         tracing::info!(
-            "[Test] {} | {} | {} | {}ms | OK",
+            "🧪 {} | {} | {} | {}ms | OK",
             model_name,
             account.alias,
             effective_provider,
@@ -923,7 +923,7 @@ pub async fn test_model(
         );
     } else {
         tracing::warn!(
-            "[Test] {} | {} | {} | {}ms | FAILED: {}",
+            "🧪 {} | {} | {} | {}ms | FAILED: {}",
             model_name,
             account.alias,
             effective_provider,

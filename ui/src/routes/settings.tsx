@@ -14,6 +14,8 @@ import {
 } from 'lucide-react';
 import { ConfirmDialog } from '../components/Modal';
 import { cn } from '../lib/utils';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
 
 const SettingGroup = ({ title, icon: Icon, children }: { title: string, icon: any, children: React.ReactNode }) => (
   <div className="space-y-4">
@@ -151,8 +153,8 @@ export default function Settings() {
   return (
     <div className="max-w-3xl mx-auto space-y-10 animate-fadeIn duration-500">
       <div className="flex items-center justify-between">
-        <div className="flex items-center gap-3">
-          <div className="p-2 bg-primary/10 text-primary rounded-lg">
+        <div className="flex items-start gap-3">
+          <div className="p-2 bg-primary/10 text-primary rounded-lg mt-1.5">
             <SettingsIcon size={24} />
           </div>
           <div>
@@ -174,53 +176,60 @@ export default function Settings() {
         <SettingGroup title={t('settings.infra')} icon={Terminal}>
            <SettingItem label={t('settings.port')} description={t('settings.portDesc')}>
              <div className="relative flex items-center gap-2">
-                <input
+                <Input
                   type="text"
                   value={localConfig.port || '25975'}
                   onChange={e => setLocalConfig({...localConfig, port: e.target.value})}
                   onKeyDown={e => e.key === 'Enter' && handleAutoSave(localConfig, true)}
-                  className="bg-muted/50 border border-border rounded-lg px-3 py-1.5 text-xs font-semibold w-24 text-center outline-none focus:ring-1 focus:ring-primary/20 transition-all"
+                  className="h-auto py-1.5 text-xs font-semibold w-24 text-center"
                 />
-                <button
+                <Button
+                  variant="ghost"
+                  size="icon"
                   onClick={() => handleAutoSave(localConfig, true)}
-                  className="p-1.5 bg-primary/10 text-primary rounded-md hover:bg-primary hover:text-primary-foreground transition-all duration-200"
+                  className="h-8 w-8 text-primary hover:text-primary-foreground"
                   title={t('common.save')}
                 >
                   <CheckCircle2 size={14} />
-                </button>
+                </Button>
              </div>
            </SettingItem>
         </SettingGroup>
 
         <SettingGroup title={t('settings.ui')} icon={Monitor}>
            <SettingItem label={t('settings.theme')} description={t('settings.themeDesc')}>
-             <div className="flex border border-border rounded-lg overflow-hidden text-xs font-semibold">
-                <button 
+             <div className="flex border border-border rounded-lg overflow-hidden">
+                <Button
+                  variant={localConfig.theme !== 'light' ? "default" : "ghost"}
+                  size="sm"
                   onClick={() => handleAutoSave({...localConfig, theme: 'dark'})}
-                  className={cn("px-4 py-1.5 transition-colors", localConfig.theme !== 'light' ? 'bg-primary text-primary-foreground' : 'hover:bg-muted')}
+                  className="rounded-none h-auto py-1.5 text-xs font-semibold"
                 >
                   {t('settings.themeDark')}
-                </button>
-                <button 
+                </Button>
+                <Button
+                  variant={localConfig.theme === 'light' ? "default" : "ghost"}
+                  size="sm"
                   onClick={() => handleAutoSave({...localConfig, theme: 'light'})}
-                  className={cn("px-4 py-1.5 transition-colors", localConfig.theme === 'light' ? 'bg-primary text-primary-foreground' : 'hover:bg-muted')}
+                  className="rounded-none h-auto py-1.5 text-xs font-semibold"
                 >
                   {t('settings.themeLight')}
-                </button>
+                </Button>
              </div>
            </SettingItem>
         </SettingGroup>
 
         <SettingGroup title={t('settings.security')} icon={Shield}>
            <SettingItem label={t('settings.purge')} description={t('settings.purgeDesc')}>
-             <button 
+             <Button
+                variant="destructive"
+                size="sm"
                 onClick={() => setIsConfirmOpen(true)}
                 disabled={isPurging}
-                className="px-3 py-1.5 text-xs font-semibold text-destructive border border-destructive/20 rounded-lg hover:bg-destructive hover:text-white transition-all disabled:opacity-50"
               >
-                {isPurging ? <Loader2 size={12} className="animate-spin inline mr-1" /> : null}
+                {isPurging ? <Loader2 size={12} className="animate-spin mr-1" /> : null}
                 {t('settings.purgeBtn')}
-             </button>
+             </Button>
            </SettingItem>
         </SettingGroup>
 
@@ -228,27 +237,29 @@ export default function Settings() {
           <SettingItem label={t('settings.export')} description={t('settings.exportDesc')}>
             <div className="flex items-center gap-2">
               <span className="text-[9px] text-warning font-medium whitespace-nowrap">{t('settings.exportWarning')}</span>
-              <button
+              <Button
+                variant="outline"
+                size="sm"
                 onClick={handleExport}
                 disabled={isExporting}
-                className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold border border-border rounded-lg hover:bg-muted transition-all disabled:opacity-50 shrink-0"
               >
                 {isExporting ? <Loader2 size={12} className="animate-spin" /> : <Download size={12} />}
                 {t('settings.export')}
-              </button>
+              </Button>
             </div>
           </SettingItem>
           <SettingItem label={t('settings.import')} description={t('settings.importDesc')}>
             <div className="flex flex-col items-end gap-1.5">
               <input ref={fileInputRef} type="file" accept=".json" className="hidden" onChange={handleImport} />
-              <button
+              <Button
+                variant="outline"
+                size="sm"
                 onClick={() => fileInputRef.current?.click()}
                 disabled={isImporting}
-                className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold border border-border rounded-lg hover:bg-muted transition-all disabled:opacity-50"
               >
                 {isImporting ? <Loader2 size={12} className="animate-spin" /> : <Upload size={12} />}
                 {t('settings.import')}
-              </button>
+              </Button>
               {importResult && (
                 <span className="text-[9px] text-success font-medium max-w-[200px] text-right">{importResult}</span>
               )}
@@ -279,7 +290,6 @@ export default function Settings() {
                      t('settings.wipeAccounts', '1. 所有服务商账户信息'),
                      t('settings.wipeAliases', '2. 所有自定义模型别名'),
                      t('settings.wipeKeys', '3. 所有客户端访问密钥 (API Keys)'),
-                     t('settings.wipeLogs', '4. 所有历史用量统计和日志')
                    ].map((item, idx) => (
                      <div key={idx} className="flex items-center gap-2 px-3 py-1.5 bg-muted/40 rounded-lg text-xs font-medium text-muted-foreground border border-transparent hover:border-border/50">
                         <div className="w-1 h-1 rounded-full bg-destructive" />

@@ -15,6 +15,7 @@ axum.workspace = true
 clap.workspace = true
 llmux-core = { path = "../llmux-core" }
 llmux-server = { path = "../llmux-server" }
+time.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

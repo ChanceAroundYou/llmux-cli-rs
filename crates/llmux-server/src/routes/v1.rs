@@ -169,19 +169,19 @@ async fn openai_dispatch(
             body: patched_body.clone(),
         };
 
-        tracing::debug!(
-            account = %account.alias,
-            provider = %account.provider_id,
-            model = %model_resolution.target_model,
-            url = %provider_request.url,
-            "[Gateway] Dispatching request to {endpoint}"
+        tracing::info!(
+            "⚡ {} → {} → {}/{}",
+            account.alias,
+            model_resolution.target_model,
+            base_url,
+            endpoint,
         );
 
         let response = match execute_provider_request(&provider_request).await {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!(
-                    "[Dispatcher] Account {} (id={}) request failed: {e}",
+                    "🔀 Account {} (id={}) request failed: {e}",
                     account.alias,
                     account.id
                 );
@@ -198,7 +198,7 @@ async fn openai_dispatch(
 
             if is_retryable_status(status.as_u16()) {
                 tracing::warn!(
-                    "[Dispatcher] Account {} (id={}) failed with status {}. Trying next...",
+                    "🔀 Account {} (id={}) failed ({}) — trying next...",
                     account.alias,
                     account.id,
                     status.as_u16()
@@ -323,7 +323,7 @@ pub async fn messages(
             true,
         );
     }
-    tracing::info!("[v1/messages] model={model_name} key={}", auth.key_name);
+    tracing::info!("📨 model={model_name} key={}", auth.key_name);
     let anthropic_beta = headers
         .get("anthropic-beta")
         .and_then(|v| v.to_str().ok())
@@ -403,17 +403,15 @@ pub async fn messages(
         ) {
             Ok(r) => {
                 tracing::info!(
-                    url = %r.url,
-                    model = %model_resolution.target_model,
-                    account = %account.alias,
-                    "[Proxy] passthrough -> {} (model=\"{}\")",
-                    r.url,
-                    model_resolution.target_model
+                    "⚡ {} → {} → {}",
+                    account.alias,
+                    model_resolution.target_model,
+                    base_url,
                 );
                 r
             }
             Err(e) => {
-                tracing::error!("[Proxy] Failed to build passthrough request: {e}");
+                tracing::error!("📡 Failed to build passthrough request: {e}");
                 last_error = Some(format!("Failed to build passthrough request: {e}"));
                 continue;
             }
@@ -422,7 +420,7 @@ pub async fn messages(
         let response = match execute_provider_request(&provider_request).await {
             Ok(r) => r,
             Err(e) => {
-                tracing::error!("[Proxy] passthrough failed: {e}");
+                tracing::error!("📡 passthrough failed: {e}");
                 last_error = Some(format!("Passthrough request failed: {e}"));
                 continue;
             }
@@ -435,7 +433,7 @@ pub async fn messages(
 
             if is_retryable_status(status.as_u16()) {
                 tracing::warn!(
-                    "[Dispatcher] Account {} (id={}) failed with status {}. Trying next...",
+                    "🔀 Account {} (id={}) failed ({}) — trying next...",
                     account.alias,
                     account.id,
                     status.as_u16()
@@ -502,7 +500,7 @@ pub async fn messages(
             output = usage.output_tokens,
             cache_read = usage.cache_read_input_tokens,
             cache_create = usage.cache_creation_input_tokens,
-            "[Proxy][Usage][JSON] account={} model={} input={} cacheRead={} cacheCreate={} output={}",
+            "📊 account={} model={} input={} cacheRead={} cacheCreate={} output={}",
             account.id,
             model_resolution.target_model,
             usage.input_tokens,
@@ -682,19 +680,18 @@ pub async fn gemini(
             body: body.clone(),
         };
 
-        tracing::debug!(
-            account = %account.alias,
-            provider = "gemini",
-            model = %model_resolution.target_model,
-            url = %provider_request.url,
-            "[Gateway] Gemini passthrough dispatching"
+        tracing::info!(
+            "⚡ {} → {} → {}",
+            account.alias,
+            model_resolution.target_model,
+            base_url,
         );
 
         let response = match execute_provider_request(&provider_request).await {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!(
-                    "[Dispatcher] Account {} (id={}) request failed: {e}",
+                    "🔀 Account {} (id={}) request failed: {e}",
                     account.alias,
                     account.id
                 );
@@ -710,7 +707,7 @@ pub async fn gemini(
 
             if is_retryable_status(status.as_u16()) {
                 tracing::warn!(
-                    "[Dispatcher] Account {} (id={}) failed with status {}. Trying next...",
+                    "🔀 Account {} (id={}) failed ({}) — trying next...",
                     account.alias,
                     account.id,
                     status.as_u16()
@@ -850,10 +847,9 @@ async fn gemini_streaming_passthrough(
     let provider_id = provider_id.to_string();
 
     tracing::info!(
-        account_id = account.id,
-        model = %model,
-        provider = %provider_id,
-        "Gemini streaming: per-request token usage is not captured (requires stream parsing)",
+        "⚡ streaming {} → {}",
+        provider_id,
+        model,
     );
 
     let stream = response.bytes_stream().map(move |chunk| {
@@ -896,7 +892,7 @@ async fn gemini_streaming_passthrough(
 // ---------------------------------------------------------------------------
 
 pub async fn models(Extension(state): Extension<AppState>, headers: HeaderMap) -> Response {
-    tracing::info!("[v1/models] Request received");
+    tracing::info!("🤖 Request received");
     let is_anthropic =
         headers.contains_key("x-api-key") || headers.contains_key("anthropic-version");
 
@@ -1040,10 +1036,9 @@ async fn anthropic_streaming_passthrough(
     let provider_id = provider_id.to_string();
 
     tracing::info!(
-        account_id = account.id,
-        model = %model,
-        provider = %provider_id,
-        "Passthrough streaming: per-request token usage is not captured (requires SSE parsing)",
+        "⚡ streaming {} → {}",
+        account.alias,
+        model,
     );
 
     let stream = response.bytes_stream().map(move |chunk| {
@@ -1170,7 +1165,7 @@ async fn log_usage(
 
     match &result {
         Err(e) => {
-            tracing::error!("[UsageService] Failed to insert usage log: {e}");
+            tracing::error!("📊 Failed to insert usage log: {e}");
             Err(anyhow::anyhow!("{e}"))
         }
         Ok(_) => Ok(()),

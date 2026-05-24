@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Wrench, RotateCcw } from 'lucide-react';
+import { Wrench, RotateCcw, MonitorSmartphone } from 'lucide-react';
+import { PageHeader } from '../components/shared/PageHeader';
 import { useKeysStore } from '../stores/keys';
 import { useModelsStore } from '../stores/models';
 import { TOOLS } from '../components/Setup/types';
@@ -51,7 +52,13 @@ export default function Setup() {
   const gatewayUrl = window.location.origin;
 
   return (
-    <div className="flex gap-0 h-full min-h-[calc(100vh-8rem)] animate-fadeIn duration-500">
+    <div className="space-y-8 animate-fadeIn duration-500">
+      <PageHeader
+        icon={<MonitorSmartphone size={24} />}
+        title={t('common.setup')}
+        subtitle={t('setup.subtitle')}
+      />
+      <div className="flex gap-0 h-full min-h-[calc(100vh-16rem)]">
       <ToolSidebar
         selectedTool={selectedTool}
         installed={installed}
@@ -90,6 +97,7 @@ export default function Setup() {
           )
         )}
       </div>
+    </div>
     </div>
   );
 }

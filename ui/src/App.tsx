@@ -24,6 +24,7 @@ import SetupPage from './routes/setup';
 import { useSettingsStore } from './stores/settings';
 import { cn } from './lib/utils'
 import { StatusDot } from './components/shared/StatusDot'
+import { Button } from '@/components/ui/button'
 
 const LanguageSwitcher = () => {
   const { i18n } = useTranslation();
@@ -32,16 +33,18 @@ const LanguageSwitcher = () => {
   return (
     <div className="flex border border-border rounded-lg overflow-hidden">
       {['zh', 'en'].map(lang => (
-        <button
+        <Button
           key={lang}
+          variant={currentLang === lang ? "default" : "ghost"}
+          size="sm"
           onClick={() => i18n.changeLanguage(lang)}
           className={cn(
-            "px-2 py-1 text-[10px] font-semibold transition-colors",
-            currentLang === lang ? "bg-primary text-primary-foreground" : "bg-background text-muted-foreground hover:bg-muted"
+            "h-auto px-2 py-1 text-[10px] font-semibold rounded-none",
+            currentLang === lang ? "" : "text-muted-foreground hover:bg-muted"
           )}
         >
           {lang.toUpperCase()}
-        </button>
+        </Button>
       ))}
     </div>
   );
@@ -118,12 +121,14 @@ function App() {
               </div>
               <h1 className="text-xl font-bold tracking-tight">LLMux</h1>
            </div>
-           <button 
+           <Button
+             variant="ghost"
+             size="icon"
              onClick={() => setIsSidebarOpen(false)}
-             className="p-2 hover:bg-muted rounded-lg lg:hidden"
+             className="lg:hidden"
            >
              <X size={20} />
-           </button>
+           </Button>
         </div>
 
         <nav className="flex-1 px-3 space-y-1 overflow-y-auto">
@@ -150,12 +155,14 @@ function App() {
       {/* Main Content */}
       <main className="flex-1 flex flex-col overflow-hidden w-full">
         <header className="h-14 border-b border-border/50 flex items-center px-4 lg:px-10 bg-card/50 backdrop-blur-md sticky top-0 z-30">
-          <button 
+          <Button
+            variant="ghost"
+            size="icon"
             onClick={() => setIsSidebarOpen(true)}
-            className="p-2 -ml-2 mr-2 hover:bg-muted rounded-lg lg:hidden"
+            className="lg:hidden -ml-2 mr-2"
           >
             <Menu size={20} />
-          </button>
+          </Button>
           <div className="flex-1">
             <h2 className="text-sm font-bold lg:hidden">LLMux</h2>
           </div>

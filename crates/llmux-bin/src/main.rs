@@ -34,6 +34,12 @@ async fn main() -> anyhow::Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "llmux=info,tower_http=info".into()),
         )
+        .with_target(false)
+        .with_timer(
+            tracing_subscriber::fmt::time::LocalTime::new(
+                time::macros::format_description!("[month]-[day] [hour]:[minute]:[second]"),
+            ),
+        )
         .init();
 
     let cli = Cli::parse();
@@ -52,12 +58,12 @@ async fn start(port_override: Option<u16>) -> anyhow::Result<()> {
     std::fs::create_dir_all(&config.data_dir)?;
     let database_url = sqlite_url_from_path(&config.database_path);
     let pool = connect_sqlite(&database_url).await?;
-    tracing::info!(path = %config.database_path.display(), "[DB] Connecting to database");
+    tracing::info!(path = %config.database_path.display(), "🗄️  Connecting to database");
     init_db(&pool).await?;
-    tracing::info!("[DB] Database initialized");
+    tracing::info!("🗄️  Database initialized");
 
     let master_key = get_or_create_master_key(&config.data_dir, config.master_key.as_deref())?;
-    tracing::info!("[Crypto] Master key loaded");
+    tracing::info!("🔐 Master key loaded");
 
     let dispatcher_state = Arc::new(Mutex::new(llmux_core::dispatcher::DispatcherState::default()));
     let test_queue = Arc::new(Mutex::new(TestQueueState::default()));
@@ -68,7 +74,7 @@ async fn start(port_override: Option<u16>) -> anyhow::Result<()> {
     let listener = TcpListener::bind(addr).await?;
     tracing::info!(
         port = effective_port,
-        "[Gateway] Server running at http://0.0.0.0:{}",
+        "🚀 Server running at http://0.0.0.0:{}",
         effective_port
     );
 
@@ -102,5 +108,5 @@ async fn shutdown_signal() {
         _ = terminate => {},
     }
 
-    tracing::info!("[Gateway] Shutting down...");
+    tracing::info!("🛑 Shutting down...");
 }

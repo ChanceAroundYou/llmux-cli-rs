@@ -73,34 +73,56 @@ where
     fn call(&mut self, req: http::Request<B>) -> Self::Future {
         let method = req.method().clone();
         let uri = req.uri().clone();
-        let has_api_key = req.headers().contains_key("x-api-key");
-        let has_auth = req.headers().contains_key("authorization");
-        let content_type = req
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("-")
-            .to_string();
+        let path = uri.path().to_string();
 
-        eprintln!(
-            "[RequestLog] {} {} | content-type={} x-api-key={} authorization={}",
-            method,
-            uri,
-            content_type,
-            has_api_key,
-            has_auth,
-        );
+        // Skip logging for dev static files
+        let is_static = path.ends_with(".svg") || path.ends_with(".ico") || path.ends_with(".png");
 
         let fut = self.inner.call(req);
         Box::pin(async move {
             let res = fut.await?;
             let status = res.status();
-            eprintln!(
-                "[RequestLog] {} {} -> {}",
-                method,
-                uri,
-                status.as_u16(),
-            );
+            let code = status.as_u16();
+
+            if !is_static {
+                let kind_icon = if path.starts_with("/v1/chat/completions") {
+                    "💬"
+                } else if path.starts_with("/v1/messages") {
+                    "📨"
+                } else if path.starts_with("/v1") {
+                    "🚀"
+                } else if path.starts_with("/api/health") {
+                    "💚"
+                } else if path.starts_with("/api/models") {
+                    "🤖"
+                } else if path.starts_with("/api/accounts") {
+                    "👤"
+                } else if path.starts_with("/api/keys") {
+                    "🔑"
+                } else if path.starts_with("/api/activity") {
+                    "📊"
+                } else if path.starts_with("/api/auth") {
+                    "🔐"
+                } else if path.starts_with("/api/settings") {
+                    "⚙️"
+                } else if path.starts_with("/api/export") || path.starts_with("/api/import") {
+                    "📦"
+                } else if path.starts_with("/api/system") {
+                    "🖥️"
+                } else {
+                    "🌐"
+                };
+                let status_icon = if code < 300 {
+                    "✅"
+                } else if code < 500 {
+                    "⚠️"
+                } else {
+                    "❌"
+                };
+                tracing::info!(
+                    "{kind_icon} {method} {path} → {status_icon} {code}",
+                );
+            }
             Ok(res)
         })
     }

@@ -64,7 +64,7 @@ pub async fn handle_web_session(
             .await
         {
             Ok(_) => {
-                tracing::info!("[Auth] Successfully updated Web Session for {provider}");
+                tracing::info!("🔐 Successfully updated Web Session for {provider}");
                 return Json(json!({
                     "success": true,
                     "message": format!("Web Session for {provider} updated successfully as {alias}")
@@ -92,7 +92,7 @@ pub async fn handle_web_session(
     .await
     {
         Ok(_) => {
-            tracing::info!("[Auth] Successfully imported Web Session for {provider}");
+            tracing::info!("🔐 Successfully imported Web Session for {provider}");
             Json(json!({
                 "success": true,
                 "message": format!("Web Session for {provider} imported successfully as {alias}")

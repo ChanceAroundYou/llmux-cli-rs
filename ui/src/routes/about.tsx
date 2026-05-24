@@ -1,9 +1,9 @@
 import React from 'react';
 import { useTranslation } from 'react-i18next';
-import { 
-  Heart, 
-  Github, 
-  Globe, 
+import {
+  Heart,
+  Github,
+  Globe,
   Zap,
   ShieldCheck,
   Cpu,
@@ -11,6 +11,8 @@ import {
   Terminal,
   Box
 } from 'lucide-react';
+import { Button } from '@/components/ui/button';
+import pkg from '../../package.json';
 
 const FeatureItem = ({ icon: Icon, title, desc }: { icon: any, title: string, desc: string }) => (
   <div className="flex gap-4 p-5 rounded-xl border border-border bg-card">
@@ -39,24 +41,32 @@ export default function About() {
 
       {/* Buttons */}
       <div className="flex flex-col sm:flex-row items-center justify-center gap-3">
-         <a 
-           href="https://ifdian.net/a/llmux" 
-           target="_blank" 
-           rel="noopener noreferrer"
-           className="flex items-center gap-2 px-6 py-2.5 bg-[#946ce6] text-white rounded-lg text-sm font-semibold shadow-sm hover:opacity-90 transition-all"
+         <Button
+           asChild
+           className="bg-[#946ce6] text-white hover:bg-[#946ce6]/90"
          >
-            <Heart size={16} fill="currentColor" />
-            {t('about.sponsor')}
-         </a>
-         <a 
-           href="https://github.com/zhMoody/llmux-cli" 
-           target="_blank" 
-           rel="noopener noreferrer"
-           className="flex items-center gap-2 px-6 py-2.5 bg-card border border-border rounded-lg text-sm font-semibold hover:bg-muted transition-all"
+           <a
+             href="https://ifdian.net/a/llmux"
+             target="_blank"
+             rel="noopener noreferrer"
+           >
+             <Heart size={16} fill="currentColor" />
+             {t('about.sponsor')}
+           </a>
+         </Button>
+         <Button
+           asChild
+           variant="outline"
          >
-           <Github size={16} />
-           Star on GitHub
-         </a>
+           <a
+             href="https://github.com/zhMoody/llmux-cli"
+             target="_blank"
+             rel="noopener noreferrer"
+           >
+             <Github size={16} />
+             Star on GitHub
+           </a>
+         </Button>
       </div>
 
       {/* Feature Grid */}
@@ -103,7 +113,7 @@ export default function About() {
 
       {/* Footer */}
       <div className="pt-8 text-xs text-muted-foreground font-medium opacity-50 flex justify-between items-center border-t border-border/40">
-         <span>LLMux Engine v0.1.0-alpha · Open Source · AGPL-3.0</span>
+         <span>LLMux Engine v{pkg.version} · Open Source · {pkg.license}</span>
          <span>© 2026</span>
       </div>
     </div>

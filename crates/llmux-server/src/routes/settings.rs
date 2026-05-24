@@ -58,7 +58,7 @@ pub async fn purge_database(Extension(state): Extension<AppState>) -> Response {
         }
     };
 
-    tracing::info!("[Settings] Purging database...");
+    tracing::info!("⚙️ Purging database...");
 
     // Delete in dependency order: usage_logs references accounts, so it goes first.
     for table in &["usage_logs", "api_keys", "model_aliases", "accounts"] {
@@ -66,13 +66,13 @@ pub async fn purge_database(Extension(state): Extension<AppState>) -> Response {
             .execute(&mut *tx)
             .await
         {
-            tracing::error!("[Settings] Failed to purge table {table}: {e}");
+            tracing::error!("⚙️ Failed to purge table {table}: {e}");
             return crate::error::simple_error(
                 format!("Failed to purge {table}: {e}"),
                 StatusCode::INTERNAL_SERVER_ERROR,
             );
         }
-        tracing::info!("[Settings] Purged table: {table}");
+        tracing::info!("⚙️ Purged table: {table}");
     }
 
     if let Err(e) = tx.commit().await {
@@ -90,7 +90,7 @@ pub async fn purge_database(Extension(state): Extension<AppState>) -> Response {
         );
     }
 
-    tracing::info!("[Settings] Database purged and vacuumed successfully");
+    tracing::info!("⚙️ Database purged and vacuumed successfully");
     Json(json!({ "success": true, "message": "Database purged successfully" })).into_response()
 }
 

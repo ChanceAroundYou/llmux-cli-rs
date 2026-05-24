@@ -1,12 +1,28 @@
 import React, { useEffect, useState, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router-dom';
-import { RefreshCw, Plus, Search, AlertTriangle, Database, Users, Zap, Key, Shield, Activity } from 'lucide-react';
+import { RefreshCw, Plus, Search, AlertTriangle, Database, Users, Zap, Key, Shield, Activity, LayoutDashboard } from 'lucide-react';
 import { parseServerDate } from '../utils/date';
 import { cn } from '../lib/utils'
 import { StatusDot } from '../components/shared/StatusDot'
 import { PageHeader } from '../components/shared/PageHeader'
 import { EmptyState } from '../components/shared/EmptyState'
+import { StatCard } from '../components/shared/StatCard'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Badge } from '@/components/ui/badge'
+import {
+  Chart as ChartJS,
+  CategoryScale,
+  LinearScale,
+  BarElement,
+  Tooltip,
+  type ChartData,
+  type ChartOptions,
+} from 'chart.js'
+import { Bar } from 'react-chartjs-2'
+
+ChartJS.register(CategoryScale, LinearScale, BarElement, Tooltip)
 
 interface ProviderHealth { id: string; name?: string; status: string; totalChecks: number; }
 interface ActivityEntry { id: number; timestamp: number; model: string; success: number; latency_ms: number; error_message: string | null; account_name: string; }
@@ -33,7 +49,7 @@ export default function Dashboard() {
     try {
       const [accRes, aliasRes, keyRes, healthRes, mhRes, actRes] = await Promise.all([
         fetch('/api/accounts'), fetch('/api/models/aliases'), fetch('/api/keys'),
-        fetch('/api/health'), fetch('/api/models/health'), fetch('/api/activity?limit=30'),
+        fetch('/api/health'), fetch('/api/models/health'), fetch('/api/activity?limit=200'),
       ]);
       const accounts = accRes.ok ? await accRes.json() : [];
       const aliasData: ModelAlias[] = aliasRes.ok ? await aliasRes.json() : [];
@@ -79,16 +95,59 @@ export default function Dashboard() {
 
   const filteredLogs = useMemo(() => {
     const src = onlyShowErrors ? activityLogs.filter(l => l.success !== 1) : activityLogs;
-    return src.slice(0, 20);
+    return src.slice(0, 100);
   }, [activityLogs, onlyShowErrors]);
 
   const logMetrics = useMemo(() => {
-    const recent = activityLogs.slice(0, 20);
+    const recent = activityLogs.slice(0, 100);
     const ok = recent.filter(l => l.success === 1).length;
     const rate = recent.length ? Math.round((ok / recent.length) * 100) : 0;
     const avg = recent.length ? Math.round(recent.reduce((a, l) => a + (l.latency_ms || 0), 0) / recent.length) : 0;
     return { rate, avg, len: recent.length };
   }, [activityLogs]);
+
+  const pulseChartData: ChartData<'bar'> = useMemo(() => {
+    const displayLogs = [...activityLogs.slice(0, 100)].reverse();
+    return {
+      labels: displayLogs.map(() => ''),
+      datasets: [{
+        data: displayLogs.map(l => l.latency_ms || 0),
+        backgroundColor: displayLogs.map(l => {
+          if (l.success !== 1) return '#ef4444';
+          return (l.latency_ms || 0) > 2000 ? 'rgba(59, 130, 246, 0.4)' : '#3b82f6';
+        }),
+        borderRadius: 0,
+        barThickness: 3,
+      }]
+    };
+  }, [activityLogs]);
+
+  const pulseChartOptions: ChartOptions<'bar'> = useMemo(() => ({
+    responsive: true,
+    maintainAspectRatio: false,
+    animation: false,
+    plugins: {
+      legend: { display: false },
+      tooltip: {
+        enabled: true,
+        backgroundColor: '#1e293b',
+        titleFont: { size: 10 },
+        bodyFont: { size: 10 },
+        displayColors: false,
+        callbacks: {
+          label: (context) => ` ${context.parsed.y}ms`
+        }
+      }
+    },
+    scales: {
+      x: { display: false },
+      y: {
+        display: false,
+        beginAtZero: true,
+        max: activityLogs.length > 0 ? Math.max(...activityLogs.slice(0, 100).map(l => l.latency_ms || 0)) * 1.1 : 1000
+      }
+    }
+  }), [activityLogs]);
 
   const providerList = useMemo(() => {
     const set = new Set(aliasHealthList.map(a => a.provider).filter(Boolean));
@@ -102,42 +161,44 @@ export default function Dashboard() {
   }, [filteredAliases, selectedProvider]);
 
   return (
-    <div className="space-y-8 animate-fadeIn">
+    <div className="flex flex-col gap-6 animate-fadeIn" style={{ height: 'calc(100vh - 126px)', paddingBottom: '20px' }}>
 
       {/* Header */}
       <PageHeader
+        icon={<LayoutDashboard size={24} />}
         title={t('common.dashboard')}
         subtitle={t('dashboard.subtitle')}
         action={
           <>
-            <button
+            <Button
+              variant="outline"
+              size="sm"
               onClick={loadAll}
-              className="flex items-center justify-center gap-2 px-4 py-2 border border-border bg-card hover:bg-muted text-foreground/80 text-sm font-medium rounded-lg transition-colors duration-150"
             >
               <RefreshCw size={14} className={isLoading ? 'animate-spin text-primary' : 'text-muted-foreground'} />
               <span>{isLoading ? t('dashboard.refreshing') : t('models.actions.refresh')}</span>
-            </button>
-            <button
+            </Button>
+            <Button
+              size="sm"
               onClick={() => navigate('/accounts')}
-              className="flex items-center justify-center gap-2 px-4 py-2 bg-primary hover:bg-primary/90 text-primary-foreground text-sm font-medium rounded-lg transition-colors duration-150"
             >
               <Plus size={14} />
               <span>{t('dashboard.connectNew')}</span>
-            </button>
+            </Button>
           </>
         }
       />
 
       {/* 4 Stat Cards */}
       <section className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6">
-        <StatCard label={t('dashboard.stats.accounts')} value={accountCount} subtitle={`${t('dashboard.healthy')}: ${healthyCount}`} Icon={Users} color="blue" />
-        <StatCard label={t('dashboard.stats.aliases')} value={aliasCount} subtitle={`${t('dashboard.stats.aliasesHint')}: ${aliasCount}`} Icon={Zap} color="amber" />
-        <StatCard label={t('dashboard.stats.apiKeys')} value={keyCount} subtitle={t('dashboard.stats.keysHint')} Icon={Key} color="purple" />
-        <StatCard label={t('dashboard.stats.healthy')} value={healthyCount} subtitle={`${accountCount > 0 ? Math.round((healthyCount / accountCount) * 100) : 0}% ${t('dashboard.online')}`} Icon={Shield} color="emerald" />
+        <StatCard label={t('dashboard.stats.accounts')} value={accountCount} subtitle={`${t('dashboard.healthy')}: ${healthyCount}`} icon={Users} trend={{ value: healthyCount, label: t('dashboard.healthy'), type: 'primary' }} />
+        <StatCard label={t('dashboard.stats.aliases')} value={aliasCount} subtitle={`${t('dashboard.stats.aliasesHint')}: ${aliasCount}`} icon={Zap} trend={{ value: aliasCount, type: 'warning' }} />
+        <StatCard label={t('dashboard.stats.apiKeys')} value={keyCount} subtitle={t('dashboard.stats.keysHint')} icon={Key} trend={{ value: keyCount, type: 'primary' }} />
+        <StatCard label={t('dashboard.stats.healthy')} value={healthyCount} subtitle={`${accountCount > 0 ? Math.round((healthyCount / accountCount) * 100) : 0}% ${t('dashboard.online')}`} icon={Shield} trend={{ value: `${accountCount > 0 ? Math.round((healthyCount / accountCount) * 100) : 0}%`, type: 'success' }} />
       </section>
 
       {/* Two-Column Panel */}
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-stretch flex-1 min-h-0">
 
         {/* Left: Alias Health — 7 cols */}
         <section className="lg:col-span-7 bg-card border border-border rounded-xl shadow-sm overflow-hidden flex flex-col">
@@ -147,35 +208,37 @@ export default function Dashboard() {
                 <Database size={16} className="text-muted-foreground" />
                 <h2 className="text-lg font-bold text-foreground">{t('dashboard.aliasHealth')}</h2>
               </div>
-              <span className="text-xs bg-success/10 text-success px-2.5 py-1 rounded-full font-semibold border border-success/20">
+              <Badge variant="secondary" className="bg-success/10 text-success border-success/20 hover:bg-success/20">
                 {aliasHealthList.filter(a => a.success).length}/{aliasHealthList.length} OK
-              </span>
+              </Badge>
             </div>
 
             <div className="mt-4 space-y-3">
               <div className="relative">
-                <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground" size={14} />
-                <input
+                <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground z-10" size={14} />
+                <Input
                   type="text" placeholder={t('dashboard.filterAliases')} value={searchQuery}
                   onChange={e => setSearchQuery(e.target.value)}
-                  className="block w-full pl-9 pr-4 py-2 border border-border rounded-lg text-sm bg-muted focus:bg-card focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-all duration-200"
+                  className="pl-9"
                 />
               </div>
               {providerList.length > 2 && (
                 <div className="flex items-center gap-1.5 overflow-x-auto py-1 text-xs">
                   <span className="text-muted-foreground shrink-0 font-medium mr-1">{t('dashboard.providerFilter')}:</span>
                   {providerList.map(prov => (
-                    <button key={prov}
+                    <Button key={prov}
+                      variant={selectedProvider === prov ? "default" : "ghost"}
+                      size="sm"
                       onClick={() => setSelectedProvider(prov)}
-                      className={`px-2.5 py-1 rounded-md font-medium transition-colors duration-150 shrink-0 ${selectedProvider === prov ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground hover:bg-accent'}`}
-                    >{prov === 'All' ? t('dashboard.all') : prov}</button>
+                      className="h-auto px-2.5 py-1 text-xs font-medium shrink-0"
+                    >{prov === 'All' ? t('dashboard.all') : prov}</Button>
                   ))}
                 </div>
               )}
             </div>
           </div>
 
-          <div className="divide-y divide-border/50 max-h-[500px] overflow-y-auto">
+          <div className="divide-y divide-border/50 flex-1 overflow-y-auto">
             {displayAliases.length === 0 ? (
               <EmptyState icon={Database} title={t('dashboard.noAliases')} />
             ) : displayAliases.map((a, i) => (
@@ -194,13 +257,18 @@ export default function Dashboard() {
                 </div>
                 <div className="text-right shrink-0">
                   {a.latency !== null ? (
-                    <span className={`text-sm font-bold font-mono px-2 py-1 rounded ${a.success
-                      ? a.latency < 500 ? 'text-success bg-success/10' : a.latency < 1200 ? 'text-warning bg-warning/10' : 'text-primary bg-primary/10'
-                      : 'text-destructive bg-destructive/10'}`}>
+                    <Badge variant={a.success ? (a.latency < 500 ? "secondary" : a.latency < 1200 ? "secondary" : "secondary") : "destructive"}
+                      className={cn(
+                        "font-mono",
+                        a.success
+                          ? a.latency < 500 ? 'bg-success/10 text-success border-success/20' : a.latency < 1200 ? 'bg-warning/10 text-warning border-warning/20' : 'bg-primary/10 text-primary border-primary/20'
+                          : 'bg-destructive/10 text-destructive border-destructive/20'
+                      )}
+                    >
                       {a.success ? `${(a.latency / 1000).toFixed(1)}s` : 'ERR'}
-                    </span>
+                    </Badge>
                   ) : a.lastChecked ? (
-                    <span className="text-sm font-bold text-destructive bg-destructive/10 px-2 py-1 rounded">ERR</span>
+                    <Badge variant="destructive" className="bg-destructive/10 text-destructive border-destructive/20 font-mono">ERR</Badge>
                   ) : (
                     <span className="text-xs text-muted-foreground/60">{t('dashboard.untested')}</span>
                   )}
@@ -223,15 +291,14 @@ export default function Dashboard() {
                 <Activity size={16} className="text-muted-foreground" />
                 <h2 className="text-lg font-bold text-foreground">{t('dashboard.recentLogs')}</h2>
               </div>
-              <button
+              <Button
+                variant={onlyShowErrors ? "destructive" : "outline"}
+                size="sm"
                 onClick={() => setOnlyShowErrors(!onlyShowErrors)}
-                className={`flex items-center gap-1.5 px-3 py-1 rounded-md text-xs font-medium transition-colors border ${onlyShowErrors
-                  ? 'bg-destructive/10 border-destructive/20 text-destructive hover:bg-destructive/20'
-                  : 'bg-muted border-border text-muted-foreground hover:bg-accent'}`}
               >
                 <AlertTriangle size={12} />
                 <span>{onlyShowErrors ? t('dashboard.showAll') : t('dashboard.errorsOnly')}</span>
-              </button>
+              </Button>
             </div>
 
             <div className="grid grid-cols-2 gap-4 mt-6 p-4 bg-muted rounded-xl border border-border/50">
@@ -248,9 +315,24 @@ export default function Dashboard() {
                 </div>
               </div>
             </div>
+
+            {/* Latency Pulse */}
+            <div className="mt-4 space-y-2">
+              <div className="flex items-center justify-between">
+                <span className="text-[10px] font-bold text-muted-foreground uppercase tracking-widest">{t('dashboard.monitor.latencyPulse')}</span>
+                <span className="text-[10px] font-mono text-muted-foreground/60">{activityLogs.length} {t('dashboard.monitor.reqs')}</span>
+              </div>
+              <div className="h-16 w-full bg-muted/20 rounded-lg p-2 border border-border/40 relative">
+                {activityLogs.length > 0 ? (
+                  <Bar data={pulseChartData} options={pulseChartOptions} />
+                ) : (
+                  <div className="h-full flex items-center justify-center text-[10px] text-muted-foreground/30 italic">{t('dashboard.noActivity')}</div>
+                )}
+              </div>
+            </div>
           </div>
 
-          <div className="flex-1 p-6 max-h-[420px] overflow-y-auto min-h-[280px] space-y-3">
+          <div className="flex-1 p-6 overflow-y-auto space-y-3">
             {filteredLogs.length === 0 ? (
               <EmptyState icon={AlertTriangle} title={onlyShowErrors ? t('dashboard.noErrors') : t('dashboard.noActivity')} />
             ) : filteredLogs.map(log => (
@@ -268,9 +350,9 @@ export default function Dashboard() {
                   </div>
                   <div className="flex items-center gap-2 shrink-0">
                     <span className="text-muted-foreground text-xs">{log.latency_ms ? `${(log.latency_ms / 1000).toFixed(1)}s` : '--'}</span>
-                    <span className={`px-1.5 py-0.5 rounded text-xs font-bold ${log.success === 1 ? 'bg-success/20 text-success' : 'bg-destructive/20 text-destructive'}`}>
+                    <Badge variant={log.success === 1 ? "secondary" : "destructive"} className={log.success === 1 ? 'bg-success/20 text-success border-success/20' : 'bg-destructive/20 text-destructive border-destructive/20'}>
                       {log.success === 1 ? '200' : 'ERR'}
-                    </span>
+                    </Badge>
                   </div>
                 </div>
                 {log.account_name && (
@@ -289,34 +371,6 @@ export default function Dashboard() {
             <span className="text-muted-foreground/70">{t('dashboard.logCount', { count: activityLogs.length })}</span>
           </div>
         </section>
-      </div>
-    </div>
-  );
-}
-
-function StatCard({ label, value, subtitle, Icon, color }: {
-  label: string; value: number; subtitle: string; Icon: React.ComponentType<any>; color: string;
-}) {
-  const colors: Record<string, { bg: string; iconBg: string; iconColor: string; text: string }> = {
-    blue:    { bg: 'bg-primary/10',    iconBg: 'bg-primary/20',    iconColor: 'text-primary',    text: 'text-primary' },
-    amber:   { bg: 'bg-warning/10',    iconBg: 'bg-warning/20',    iconColor: 'text-warning',    text: 'text-warning' },
-    purple:  { bg: 'bg-info/10',       iconBg: 'bg-info/20',       iconColor: 'text-info',       text: 'text-info' },
-    emerald: { bg: 'bg-success/10',    iconBg: 'bg-success/20',    iconColor: 'text-success',    text: 'text-success' },
-  };
-  const c = colors[color] || colors.blue;
-  return (
-    <div className="bg-card border border-border p-6 rounded-xl shadow-sm hover:shadow-sm hover:border-border transition-colors duration-150">
-      <div className="flex justify-between items-start">
-        <div>
-          <p className="text-sm font-medium text-muted-foreground">{label}</p>
-          <h3 className="text-3xl font-bold text-foreground mt-2 tracking-tight">{value}</h3>
-        </div>
-        <div className={cn('p-3 rounded-xl', c.iconBg)}>
-          <Icon size={20} className={c.iconColor} />
-        </div>
-      </div>
-      <div className={cn('mt-4 flex items-center text-xs font-medium gap-1', c.text)}>
-        <span>{subtitle}</span>
       </div>
     </div>
   );

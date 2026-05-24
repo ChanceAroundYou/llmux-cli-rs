@@ -16,8 +16,8 @@ interface AccountsState {
   isLoading: boolean;
   error: string | null;
   fetchAccounts: () => Promise<void>;
-  addAccount: (account: { alias: string; provider_id: string; api_key: string; base_url?: string }) => Promise<void>;
-  updateAccount: (id: number, account: { alias?: string; provider_id?: string; api_key?: string; base_url?: string; notes?: string }) => Promise<void>;
+  addAccount: (account: { alias: string; provider_id: string; api_key: string; base_url?: string; anthropic_base_url?: string; skip_validation?: boolean }) => Promise<void>;
+  updateAccount: (id: number, account: { alias?: string; provider_id?: string; api_key?: string; base_url?: string; anthropic_base_url?: string; notes?: string; skip_validation?: boolean }) => Promise<void>;
   deleteAccount: (id: number) => Promise<void>;
   toggleActive: (id: number, currentStatus: number) => Promise<void>;
 }

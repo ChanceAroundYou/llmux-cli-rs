@@ -49,6 +49,7 @@ pub async fn create_account(
     let is_active = body["is_active"].as_i64().unwrap_or(1);
     let weight = body["weight"].as_i64().unwrap_or(1);
     let notes = body["notes"].as_str().map(|s| s.to_string());
+    let skip_validation = body["skip_validation"].as_bool().unwrap_or(false);
 
     if alias.is_empty() || provider_id.is_empty() || api_key_plain.is_empty() {
         return crate::error::simple_error(
@@ -57,7 +58,7 @@ pub async fn create_account(
         );
     }
 
-    // Validate by calling adapter.listModels() like Bun does.
+    // Always try to validate — but only reject on failure if skip_validation is false.
     let test_account = Account {
         id: 0,
         alias: alias.clone(),
@@ -69,7 +70,6 @@ pub async fn create_account(
         weight,
     };
 
-    // Determine provider type to call the correct models endpoint
     let provider_type = {
         let pt = sqlx::query_scalar::<_, Option<String>>(
             "SELECT type FROM providers WHERE id = ?",
@@ -84,12 +84,13 @@ pub async fn create_account(
     };
 
     let models = fetch_provider_models(&test_account, &provider_type).await;
-    if models.is_empty() {
+    if models.is_empty() && !skip_validation {
         return crate::error::simple_error(
             "accounts.validationFailed",
             StatusCode::BAD_REQUEST,
         );
     }
+    let models_fetched = models.len();
 
     let encrypted_key = match encrypt_api_key(&api_key_plain, &state.master_key) {
         Ok(key) => key,
@@ -121,8 +122,9 @@ pub async fn create_account(
             Json(json!({
                 "success": true,
                 "id": id,
-                "message": "Account verified and created successfully",
-                "modelCount": models.len(),
+                "message": if skip_validation { "Account created (skipped validation)" } else { "Account verified and created successfully" },
+                "modelCount": models_fetched,
+                "skippedValidation": skip_validation,
             }))
             .into_response()
         }
@@ -204,6 +206,7 @@ pub async fn update_account(
         .and_then(|v| v.as_str())
         .is_some_and(|s| !s.is_empty() && s != "********");
     let base_url_changed = body.get("base_url").is_some();
+    let skip_validation = body["skip_validation"].as_bool().unwrap_or(false);
 
     let api_key_ciphertext = if api_key_changed {
         let new_key = body["api_key"].as_str().unwrap_or_default();
@@ -234,7 +237,7 @@ pub async fn update_account(
             };
 
             let models = fetch_provider_models(&test_account, &provider_type).await;
-            if models.is_empty() {
+            if models.is_empty() && !skip_validation {
                 return crate::error::simple_error(
                     "accounts.validationFailed",
                     StatusCode::BAD_REQUEST,

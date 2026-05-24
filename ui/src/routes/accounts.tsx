@@ -23,6 +23,9 @@ import { useTranslation } from 'react-i18next';
 import { Dialog, ConfirmDialog } from '../components/Modal';
 import { CopyButton } from '../components/CopyButton';
 import { cn } from '../lib/utils';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { StatusBadge } from '@/components/shared/StatusBadge';
 
 export default function Accounts() {
   const { t } = useTranslation();
@@ -33,8 +36,10 @@ export default function Accounts() {
   const [editingAccount, setEditingAccount] = useState<any>(null);
   const [formData, setFormData] = useState({ alias: '', provider_id: 'custom', api_key: '', base_url: '', anthropic_base_url: '' });
   const [formSupportsAnthropic, setFormSupportsAnthropic] = useState(false);
+  const [formSkipValidation, setFormSkipValidation] = useState(false);
   const [editData, setEditData] = useState({ alias: '', provider_id: '', api_key: '', base_url: '', anthropic_base_url: '', notes: '' });
   const [editSupportsAnthropic, setEditSupportsAnthropic] = useState(false);
+  const [editSkipValidation, setEditSkipValidation] = useState(false);
   const [accountToDelete, setAccountToDelete] = useState<{id: number, name: string} | null>(null);
   const [isValidating, setIsValidating] = useState(false);
   const [validationError, setValidationError] = useState<string | null>(null);
@@ -48,10 +53,11 @@ export default function Accounts() {
     setIsValidating(true);
     setValidationError(null);
     try {
-      await addAccount(formData);
+      await addAccount({ ...formData, skip_validation: formSkipValidation });
       setIsModalOpen(false);
       setFormData({ alias: '', provider_id: 'custom', api_key: '', base_url: '', anthropic_base_url: '' });
       setFormSupportsAnthropic(false);
+      setFormSkipValidation(false);
     } catch (err: any) {
       setValidationError(err.message || "Validation failed");
     } finally {
@@ -73,7 +79,7 @@ export default function Accounts() {
     setIsValidating(true);
     setValidationError(null);
     try {
-      await updateAccount(editingAccount.id, editData);
+      await updateAccount(editingAccount.id, { ...editData, skip_validation: editSkipValidation });
       setIsEditOpen(false);
       setEditingAccount(null);
     } catch (err: any) {
@@ -111,8 +117,8 @@ export default function Accounts() {
   return (
     <div className="space-y-10 animate-fadeIn">
       <div className="flex items-center justify-between">
-        <div className="flex items-center gap-3">
-          <div className="p-2 bg-primary/10 text-primary rounded-lg">
+        <div className="flex items-start gap-3">
+          <div className="p-2 bg-primary/10 text-primary rounded-lg mt-1.5">
             <Users size={24} />
           </div>
           <div>
@@ -120,13 +126,13 @@ export default function Accounts() {
             <p className="text-sm text-muted-foreground">{t('accounts.subtitle')}</p>
           </div>
         </div>
-        <button 
+        <Button
           onClick={() => setIsModalOpen(true)}
-          className="flex items-center gap-2 px-4 py-2 bg-primary text-primary-foreground rounded-lg text-sm font-medium hover:opacity-90 transition-all shadow-sm"
+          size="sm"
         >
           <Plus size={16} />
           {t('accounts.addAccount')}
-        </button>
+        </Button>
       </div>
 
       {isLoading && (
@@ -145,12 +151,7 @@ export default function Accounts() {
               <div>
                 <div className="flex items-center gap-2">
                    <h3 className="font-semibold text-sm">{acc.alias}</h3>
-                   <span className={cn(
-                     "text-xs font-bold px-2 py-0.5 rounded-full",
-                     acc.is_active === 1 ? "bg-success/10 text-success" : "bg-muted text-muted-foreground"
-                   )}>
-                     {acc.is_active === 1 ? t('common.online') : t('accounts.offline')}
-                   </span>
+                   <StatusBadge status={acc.is_active === 1 ? 'online' : 'offline'} label={acc.is_active === 1 ? t('common.online') : t('accounts.offline')} />
                 </div>
                 <div className="text-xs text-muted-foreground mt-0.5 flex items-center gap-2 uppercase tracking-tight">
                   <Globe size={10} /> {acc.provider_id}
@@ -161,38 +162,42 @@ export default function Accounts() {
             </div>
 
               <div className="flex items-center gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
-                  <button 
+                  <Button
+                    variant="ghost"
+                    size="icon"
                     onClick={() => handleExport(acc.id, acc.alias)}
-                    className="p-2 hover:bg-primary/10 text-primary rounded-lg transition-all"
+                    className="text-primary hover:text-primary hover:bg-primary/10"
                     title={t('accounts.exportData')}
                   >
                     <Download size={16} />
-                  </button>
-                  <button 
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="icon"
                     onClick={() => openEdit(acc)}
-                    className="p-2 hover:bg-warning/10 text-warning rounded-lg transition-all"
+                    className="text-warning hover:text-warning hover:bg-warning/10"
                     title="Edit account"
                   >
                     <Pencil size={16} />
-                  </button>
-                  <button 
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="icon"
                     onClick={() => toggleActive(acc.id, acc.is_active)}
-                    className={cn(
-                      "p-2 rounded-lg transition-all",
-                      acc.is_active === 1 
-                        ? "hover:bg-success/10 text-success shadow-[0_0_10px_rgba(34,197,94,0.1)]" 
-                        : "hover:bg-muted text-muted-foreground/40"
-                    )}
+                    className={acc.is_active === 1 ? "text-success hover:text-success hover:bg-success/10" : "text-muted-foreground/40 hover:text-muted-foreground hover:bg-muted"}
                     title={acc.is_active === 1 ? t('common.online') : t('accounts.offline')}
                   >
                     <Power size={16} />
-                  </button>
-                  <button
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="icon"
                     onClick={() => setAccountToDelete({ id: acc.id, name: acc.alias })}
-                    className="p-2 hover:bg-destructive/10 text-destructive rounded-lg transition-all"
+                    className="text-destructive hover:text-destructive hover:bg-destructive/10"
                   >
                     <Trash2 size={16} />
-                  </button>              </div>
+                  </Button>
+                </div>
           </div>
         ))}
 
@@ -220,12 +225,11 @@ export default function Accounts() {
           <form onSubmit={handleSubmit} className="space-y-4">
             <div className="space-y-1.5">
               <label className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.alias')}</label>
-              <input
+              <Input
                 type="text" required value={formData.alias}
                 disabled={isValidating}
                 onChange={e => setFormData({...formData, alias: e.target.value})}
                 placeholder={t('accounts.aliasPlaceholder')}
-                className="w-full px-4 py-2 bg-muted/50 border border-border rounded-lg text-sm outline-none focus:ring-2 focus:ring-primary/20 transition-all disabled:opacity-50"
               />
             </div>
             <div className="space-y-1.5">
@@ -241,7 +245,7 @@ export default function Accounts() {
                   else if (pid === 'gemini') burl = '';
                   setFormData({...formData, provider_id: pid, base_url: burl});
                 }}
-                className="w-full px-4 py-2 bg-muted/50 border border-border rounded-lg text-sm outline-none focus:ring-2 focus:ring-primary/20 transition-all font-semibold disabled:opacity-50"
+                className="w-full h-10 px-3 py-2 rounded-md border border-input bg-background text-sm ring-offset-background focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:opacity-50"
               >
                 <option value="custom">{t('accounts.custom')}</option>
                 <option value="custom-anthropic" hidden>{t('accounts.customAnthropic')}</option>
@@ -253,69 +257,87 @@ export default function Accounts() {
             </div>
             <div className="space-y-1.5">
               <label className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.apiKey')}</label>
-              <input
+              <Input
                 type="password" required value={formData.api_key}
                 disabled={isValidating}
                 onChange={e => setFormData({...formData, api_key: e.target.value})}
                 placeholder="sk-..."
-                className="w-full px-4 py-2 bg-muted/50 border border-border rounded-lg text-sm outline-none focus:ring-2 focus:ring-primary/20 transition-all font-mono disabled:opacity-50"
+                className="font-mono"
               />
             </div>
             <div className="space-y-1.5">
               <label className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.baseUrl')}</label>
-              <input
+              <Input
                 type="text" value={formData.base_url}
                 disabled={isValidating}
                 onChange={e => setFormData({...formData, base_url: e.target.value})}
                 placeholder={formData.provider_id === 'anthropic' ? 'https://api.anthropic.com/v1' : formData.provider_id === 'gemini' ? 'https://generativelanguage.googleapis.com/v1beta' : 'https://api.openai.com/v1'}
-                className="w-full px-4 py-2 bg-muted/50 border border-border rounded-lg text-sm outline-none focus:ring-2 focus:ring-primary/20 transition-all font-mono disabled:opacity-50"
+                className="font-mono"
               />
               <p className="text-xs text-muted-foreground">{t('accounts.baseUrlHint')}</p>
             </div>
+            {formData.provider_id === 'custom' && (
+              <>
+                <div className="space-y-1.5 border-t border-border pt-3">
+                  <label className="flex items-center gap-2 cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={formSupportsAnthropic}
+                      disabled={isValidating}
+                      onChange={e => {
+                        setFormSupportsAnthropic(e.target.checked);
+                        if (!e.target.checked) setFormData({...formData, anthropic_base_url: ''});
+                      }}
+                      className="w-4 h-4 rounded accent-primary"
+                    />
+                    <span className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.supportsAnthropic')}</span>
+                  </label>
+                  <p className="text-xs text-muted-foreground ml-6">{t('accounts.supportsAnthropicHint')}</p>
+                </div>
+                {formSupportsAnthropic && (
+                  <div className="space-y-1.5 animate-in slide-in-from-top-1">
+                    <label className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.anthropicBaseUrl')}</label>
+                    <Input
+                      type="text" value={formData.anthropic_base_url}
+                      disabled={isValidating}
+                      onChange={e => setFormData({...formData, anthropic_base_url: e.target.value})}
+                      placeholder={t('accounts.anthropicBaseUrlPlaceholder')}
+                      className="font-mono"
+                    />
+                  </div>
+                )}
+              </>
+            )}
             <div className="space-y-1.5 border-t border-border pt-3">
               <label className="flex items-center gap-2 cursor-pointer select-none">
                 <input
                   type="checkbox"
-                  checked={formSupportsAnthropic}
+                  checked={formSkipValidation}
                   disabled={isValidating}
-                  onChange={e => {
-                    setFormSupportsAnthropic(e.target.checked);
-                    if (!e.target.checked) setFormData({...formData, anthropic_base_url: ''});
-                  }}
+                  onChange={e => setFormSkipValidation(e.target.checked)}
                   className="w-4 h-4 rounded accent-primary"
                 />
-                <span className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.supportsAnthropic')}</span>
+                <span className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.skipValidation')}</span>
               </label>
-              <p className="text-xs text-muted-foreground ml-6">{t('accounts.supportsAnthropicHint')}</p>
+              <p className="text-xs text-muted-foreground ml-6">{t('accounts.skipValidationHint')}</p>
             </div>
-            {formSupportsAnthropic && (
-              <div className="space-y-1.5 animate-in slide-in-from-top-1">
-                <label className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.anthropicBaseUrl')}</label>
-                <input
-                  type="text" value={formData.anthropic_base_url}
-                  disabled={isValidating}
-                  onChange={e => setFormData({...formData, anthropic_base_url: e.target.value})}
-                  placeholder={t('accounts.anthropicBaseUrlPlaceholder')}
-                  className="w-full px-4 py-2 bg-muted/50 border border-border rounded-lg text-sm outline-none focus:ring-2 focus:ring-primary/20 transition-all font-mono disabled:opacity-50"
-                />
-              </div>
-            )}
             <div className="p-3 bg-primary/5 border border-primary/10 rounded-lg">
               <p className="text-xs text-primary/80 leading-relaxed">{t('accounts.passthroughNote')}</p>
             </div>
             <div className="pt-4 flex gap-3">
-               <button 
-                 type="button" 
+               <Button
+                 type="button"
+                 variant="outline"
                  disabled={isValidating}
-                 onClick={() => setIsModalOpen(false)} 
-                 className="flex-1 px-4 py-2 text-sm font-bold border border-border rounded-lg hover:bg-muted transition-all disabled:opacity-50"
+                 onClick={() => setIsModalOpen(false)}
+                 className="flex-1"
                >
                  {t('common.cancel')}
-               </button>
-               <button 
-                 type="submit" 
+               </Button>
+               <Button
+                 type="submit"
                  disabled={isValidating}
-                 className="flex-1 px-4 py-2 text-sm font-bold bg-primary text-primary-foreground rounded-lg hover:opacity-90 transition-all flex items-center justify-center gap-2 disabled:opacity-80"
+                 className="flex-1"
                >
                  {isValidating ? (
                    <>
@@ -328,7 +350,7 @@ export default function Accounts() {
                      {t('common.save')}
                    </>
                  )}
-               </button>
+               </Button>
             </div>
           </form>
         </div>
@@ -351,11 +373,10 @@ export default function Accounts() {
           <form onSubmit={handleEditSubmit} className="space-y-4">
             <div className="space-y-1.5">
               <label className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.alias')}</label>
-              <input
+              <Input
                 type="text" required value={editData.alias}
                 disabled={isValidating}
                 onChange={e => setEditData({...editData, alias: e.target.value})}
-                className="w-full px-4 py-2 bg-muted/50 border border-border rounded-lg text-sm outline-none focus:ring-2 focus:ring-primary/20 transition-all disabled:opacity-50"
               />
             </div>
             <div className="space-y-1.5">
@@ -364,7 +385,7 @@ export default function Accounts() {
                 value={editData.provider_id}
                 disabled={isValidating}
                 onChange={e => setEditData({...editData, provider_id: e.target.value})}
-                className="w-full px-4 py-2 bg-muted/50 border border-border rounded-lg text-sm outline-none focus:ring-2 focus:ring-primary/20 transition-all font-semibold disabled:opacity-50"
+                className="w-full h-10 px-3 py-2 rounded-md border border-input bg-background text-sm ring-offset-background focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:opacity-50"
               >
                 <option value="custom">{t('accounts.custom')}</option>
                 <option value="custom-anthropic" hidden>{t('accounts.customAnthropic')}</option>
@@ -379,69 +400,87 @@ export default function Accounts() {
                 <label className="text-xs font-bold text-muted-foreground uppercase">API Key</label>
                 <span className="text-xs text-muted-foreground italic">{t('accounts.leaveBlank')}</span>
               </div>
-              <input
+              <Input
                 type="password" value={editData.api_key}
                 disabled={isValidating}
                 onChange={e => setEditData({...editData, api_key: e.target.value})}
                 placeholder={t('accounts.leaveBlank')}
-                className="w-full px-4 py-2 bg-muted/50 border border-border rounded-lg text-sm outline-none focus:ring-2 focus:ring-primary/20 transition-all font-mono disabled:opacity-50"
+                className="font-mono"
               />
             </div>
             <div className="space-y-1.5">
               <label className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.baseUrl')}</label>
-              <input
+              <Input
                 type="text" value={editData.base_url}
                 disabled={isValidating}
                 onChange={e => setEditData({...editData, base_url: e.target.value})}
                 placeholder={editData.provider_id === 'anthropic' ? 'https://api.anthropic.com/v1' : editData.provider_id === 'gemini' ? 'https://generativelanguage.googleapis.com/v1beta' : 'https://api.openai.com/v1'}
-                className="w-full px-4 py-2 bg-muted/50 border border-border rounded-lg text-sm outline-none focus:ring-2 focus:ring-primary/20 transition-all font-mono disabled:opacity-50"
+                className="font-mono"
               />
               <p className="text-xs text-muted-foreground">{t('accounts.baseUrlHint')}</p>
             </div>
+            {editData.provider_id === 'custom' && (
+              <>
+                <div className="space-y-1.5 border-t border-border pt-3">
+                  <label className="flex items-center gap-2 cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={editSupportsAnthropic}
+                      disabled={isValidating}
+                      onChange={e => {
+                        setEditSupportsAnthropic(e.target.checked);
+                        if (!e.target.checked) setEditData({...editData, anthropic_base_url: ''});
+                      }}
+                      className="w-4 h-4 rounded accent-primary"
+                    />
+                    <span className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.supportsAnthropic')}</span>
+                  </label>
+                  <p className="text-xs text-muted-foreground ml-6">{t('accounts.supportsAnthropicHint')}</p>
+                </div>
+                {editSupportsAnthropic && (
+                  <div className="space-y-1.5 animate-in slide-in-from-top-1">
+                    <label className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.anthropicBaseUrl')}</label>
+                    <Input
+                      type="text" value={editData.anthropic_base_url}
+                      disabled={isValidating}
+                      onChange={e => setEditData({...editData, anthropic_base_url: e.target.value})}
+                      placeholder={t('accounts.anthropicBaseUrlPlaceholder')}
+                      className="font-mono"
+                    />
+                  </div>
+                )}
+              </>
+            )}
             <div className="space-y-1.5 border-t border-border pt-3">
               <label className="flex items-center gap-2 cursor-pointer select-none">
                 <input
                   type="checkbox"
-                  checked={editSupportsAnthropic}
+                  checked={editSkipValidation}
                   disabled={isValidating}
-                  onChange={e => {
-                    setEditSupportsAnthropic(e.target.checked);
-                    if (!e.target.checked) setEditData({...editData, anthropic_base_url: ''});
-                  }}
+                  onChange={e => setEditSkipValidation(e.target.checked)}
                   className="w-4 h-4 rounded accent-primary"
                 />
-                <span className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.supportsAnthropic')}</span>
+                <span className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.skipValidation')}</span>
               </label>
-              <p className="text-xs text-muted-foreground ml-6">{t('accounts.supportsAnthropicHint')}</p>
+              <p className="text-xs text-muted-foreground ml-6">{t('accounts.skipValidationHint')}</p>
             </div>
-            {editSupportsAnthropic && (
-              <div className="space-y-1.5 animate-in slide-in-from-top-1">
-                <label className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.anthropicBaseUrl')}</label>
-                <input
-                  type="text" value={editData.anthropic_base_url}
-                  disabled={isValidating}
-                  onChange={e => setEditData({...editData, anthropic_base_url: e.target.value})}
-                  placeholder={t('accounts.anthropicBaseUrlPlaceholder')}
-                  className="w-full px-4 py-2 bg-muted/50 border border-border rounded-lg text-sm outline-none focus:ring-2 focus:ring-primary/20 transition-all font-mono disabled:opacity-50"
-                />
-              </div>
-            )}
             <div className="p-3 bg-primary/5 border border-primary/10 rounded-lg">
               <p className="text-xs text-primary/80 leading-relaxed">{t('accounts.passthroughNote')}</p>
             </div>
             <div className="pt-4 flex gap-3">
-               <button
+               <Button
                  type="button"
+                 variant="outline"
                  disabled={isValidating}
-                 onClick={() => { setIsEditOpen(false); setEditingAccount(null); }} 
-                 className="flex-1 px-4 py-2 text-sm font-bold border border-border rounded-lg hover:bg-muted transition-all disabled:opacity-50"
+                 onClick={() => { setIsEditOpen(false); setEditingAccount(null); }}
+                 className="flex-1"
                >
                  {t('common.cancel')}
-               </button>
-               <button 
-                 type="submit" 
+               </Button>
+               <Button
+                 type="submit"
                  disabled={isValidating}
-                 className="flex-1 px-4 py-2 text-sm font-bold bg-primary text-primary-foreground rounded-lg hover:opacity-90 transition-all flex items-center justify-center gap-2 disabled:opacity-80"
+                 className="flex-1"
                >
                  {isValidating ? (
                    <>
@@ -454,7 +493,7 @@ export default function Accounts() {
                      {t('common.save')}
                    </>
                  )}
-               </button>
+               </Button>
             </div>
           </form>
         </div>
@@ -469,29 +508,31 @@ export default function Accounts() {
         size="md"
         footer={
           <div className="flex items-center justify-between w-full">
-            <button
+            <Button
+               variant="ghost"
+               size="sm"
                onClick={() => handleExport()}
-               className="flex items-center gap-2 px-3 py-2 text-xs font-bold text-primary hover:bg-primary/5 rounded-lg transition-all"
             >
                <Download size={14} />
                {t('accounts.exportData')}
-            </button>
+            </Button>
             <div className="flex items-center gap-3">
-              <button onClick={() => setAccountToDelete(null)} className="px-4 py-2 text-sm font-bold border border-border rounded-lg hover:bg-muted transition-all">
+              <Button variant="outline" size="sm" onClick={() => setAccountToDelete(null)}>
                 {t('common.cancel')}
-              </button>
-              <button 
+              </Button>
+              <Button
+                variant="destructive"
+                size="sm"
                 onClick={async () => {
                   if (accountToDelete) {
                     await deleteAccount(accountToDelete.id);
                     setAccountToDelete(null);
                   }
                 }}
-                className="px-4 py-2 text-sm font-bold bg-destructive text-destructive-foreground rounded-lg hover:bg-destructive/90 transition-colors duration-150 flex items-center gap-2"
               >
                 <Trash2 size={16} />
                 {t('common.delete')}
-              </button>
+              </Button>
             </div>
           </div>
         }

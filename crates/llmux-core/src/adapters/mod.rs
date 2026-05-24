@@ -21,7 +21,7 @@ pub async fn execute_provider_request(
     }
     builder.json(&request.body).send().await.map_err(|e| {
         tracing::error!(
-            "[Gateway] Upstream request failed: {} {} - {e}",
+            "🚀❌ Upstream request failed: {} {} - {e}",
             request.method,
             request.url
         );
