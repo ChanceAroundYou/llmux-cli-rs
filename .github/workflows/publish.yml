@@ -46,6 +46,12 @@ jobs:
           bun install
           bun run build
 
+      - name: Install system deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev libsqlite3-dev pkg-config
+
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
