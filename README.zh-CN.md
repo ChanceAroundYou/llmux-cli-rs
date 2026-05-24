@@ -19,7 +19,7 @@
 
 ---
 
-> **说明：** 这是[原 TypeScript 版本](https://github.com/zhMoody/llmux-cli)的 Rust 重构版。原版作为原型验证了方向，但我们追求更快的启动速度、更低的内存占用和原生跨平台二进制产物，于是用 Rust 重写了整个后台。
+> **说明：** 这是[原 TypeScript 版本](https://github.com/zhMoody/llmux-cli)的 Rust 重构版。原版作为原型验证了方向，但追求更快的启动速度、更低的内存占用和原生跨平台二进制产物，于是用 Rust 重写了整个后台。
 
 ## 为什么需要 LLMux？
 
