@@ -51,10 +51,9 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Remove local cargo config (CI uses system linker)
-        run: rm -f .cargo/config.toml
-
       - name: Build Rust binary
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: cc
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Package artifact
