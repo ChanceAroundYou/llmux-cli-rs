@@ -85,28 +85,18 @@ where
             let code = status.as_u16();
 
             if !is_static {
-                let kind_icon = if path.starts_with("/v1/chat/completions") {
+                let kind_icon = if path.starts_with("/v1/chat/completions") || path.starts_with("/v1/messages") {
                     "💬"
-                } else if path.starts_with("/v1/messages") {
-                    "📨"
                 } else if path.starts_with("/v1") {
                     "🚀"
-                } else if path.starts_with("/api/health") {
-                    "💚"
-                } else if path.starts_with("/api/models") {
+                } else if path.starts_with("/api/models") || path.starts_with("/api/health") || path.starts_with("/api/activity") {
                     "🤖"
-                } else if path.starts_with("/api/accounts") {
+                } else if path.starts_with("/api/accounts") || path.starts_with("/api/auth") {
                     "👤"
                 } else if path.starts_with("/api/keys") {
                     "🔑"
-                } else if path.starts_with("/api/activity") {
-                    "📊"
-                } else if path.starts_with("/api/auth") {
-                    "🔐"
-                } else if path.starts_with("/api/settings") {
+                } else if path.starts_with("/api/settings") || path.starts_with("/api/export") || path.starts_with("/api/import") {
                     "⚙️"
-                } else if path.starts_with("/api/export") || path.starts_with("/api/import") {
-                    "📦"
                 } else if path.starts_with("/api/system") {
                     "🖥️"
                 } else {
@@ -120,7 +110,7 @@ where
                     "❌"
                 };
                 tracing::info!(
-                    "{status_icon} {code} → {kind_icon} {method} | {path}",
+                    "{status_icon} {code} → {kind_icon} {method} {path}",
                 );
             }
             Ok(res)
