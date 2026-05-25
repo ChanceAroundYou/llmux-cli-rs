@@ -569,7 +569,7 @@ pub async fn gemini(
     Extension(state): Extension<AppState>,
     Extension(auth): Extension<AuthContext>,
     OriginalUri(uri): OriginalUri,
-    _headers: HeaderMap,
+    headers: HeaderMap,
     axum::extract::Path(path): axum::extract::Path<String>,
     Json(body): Json<Value>,
 ) -> Response {
@@ -654,6 +654,7 @@ pub async fn gemini(
             account
                 .base_url
                 .as_deref()
+                .filter(|u| !u.is_empty())
                 .unwrap_or(default_base),
         );
 
@@ -665,6 +666,11 @@ pub async fn gemini(
         };
         let new_path = format!("{target_model}:{_action}");
 
+        // Preserve x-goog-api-client from the incoming request (gemini-cli sets this).
+        let goog_api_client = headers
+            .get("x-goog-api-client")
+            .and_then(|v| v.to_str().ok());
+
         // Auth: for default Google API, use ?key= query param.
         // For custom proxies, use Bearer header (common proxy convention).
         let (url, headers) = if is_custom_base {
@@ -674,6 +680,9 @@ pub async fn gemini(
                 "application/json".to_string(),
             )]);
             h.insert("authorization".to_string(), format!("Bearer {}", account.api_key));
+            if let Some(v) = goog_api_client {
+                h.insert("x-goog-api-client".to_string(), v.to_string());
+            }
             (url, h)
         } else {
             let query: String = uri
@@ -681,10 +690,13 @@ pub async fn gemini(
                 .map(|q| format!("{q}&key={}", account.api_key))
                 .unwrap_or_else(|| format!("key={}", account.api_key));
             let url = format!("{base_url}/{new_path}?{query}");
-            let h = BTreeMap::from([(
+            let mut h = BTreeMap::from([(
                 "content-type".to_string(),
                 "application/json".to_string(),
             )]);
+            if let Some(v) = goog_api_client {
+                h.insert("x-goog-api-client".to_string(), v.to_string());
+            }
             (url, h)
         };
 

@@ -54,6 +54,10 @@ fn extract_api_key(headers: &HeaderMap) -> Option<String> {
     if let Some(value) = headers.get("x-api-key") {
         return value.to_str().ok().map(str::to_string);
     }
+    // x-goog-api-key for Gemini clients
+    if let Some(value) = headers.get("x-goog-api-key") {
+        return value.to_str().ok().map(str::to_string);
+    }
     if let Some(auth) = headers.get("authorization") {
         return auth
             .to_str()

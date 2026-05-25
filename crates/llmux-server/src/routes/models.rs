@@ -658,7 +658,7 @@ pub async fn start_test_queue(
                                 (url, headers, body)
                             }
                             "gemini" => {
-                                let base = account.base_url.as_deref().unwrap_or(
+                                let base = account.base_url.as_deref().filter(|u| !u.is_empty()).unwrap_or(
                                     "https://generativelanguage.googleapis.com/v1beta",
                                 );
                                 let model_id = if model_name.starts_with("models/") {
@@ -896,7 +896,7 @@ pub async fn test_model(
             (url, headers, body)
         }
         "gemini" => {
-            let base = account.base_url.as_deref().unwrap_or(
+            let base = account.base_url.as_deref().filter(|u| !u.is_empty()).unwrap_or(
                 "https://generativelanguage.googleapis.com/v1beta",
             );
             let model_id = if model_name.starts_with("models/") {

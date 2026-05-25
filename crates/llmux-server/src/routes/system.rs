@@ -458,8 +458,7 @@ pub async fn delete_claude_backup(
 
 /// Generate a local-time timestamp string for backup filenames.
 fn local_now_str() -> String {
-    let now = time::OffsetDateTime::now_local()
-        .unwrap_or_else(|_| time::OffsetDateTime::now_utc());
+    let now = time::OffsetDateTime::now_utc();
     now.format(
         &time::format_description::parse("[year]-[month]-[day]-[hour]-[minute]-[second]")
             .unwrap(),
@@ -474,11 +473,7 @@ fn format_local_time(t: std::time::SystemTime) -> String {
         .unwrap_or_default();
     let utc = time::OffsetDateTime::from_unix_timestamp(dur.as_secs() as i64)
         .unwrap_or_else(|_| time::OffsetDateTime::now_utc());
-    let local = utc
-        .to_offset(
-            time::UtcOffset::local_offset_at(utc).unwrap_or(time::UtcOffset::UTC),
-        );
-    local
+    utc
         .format(
             &time::format_description::parse("[year]-[month]-[day] [hour]:[minute]:[second]")
                 .unwrap(),
