@@ -180,13 +180,12 @@ async fn system_tools_returns_expected_structure() {
     let (status, body) = request_json(Method::GET, "/api/system/tools", None).await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.is_object(), "expected object, got {:?}", body);
-    for key in &["vscode", "claude", "gemini", "opencode"] {
+    for key in &["vscode", "claude", "gemini", "opencode", "codex"] {
         let val = body.get(key);
         assert!(val.is_some(), "missing key {}", key);
         assert!(val.unwrap().is_boolean(), "key {} should be boolean", key);
     }
-    // only these 4 keys
-    assert_eq!(body.as_object().unwrap().len(), 4);
+    assert_eq!(body.as_object().unwrap().len(), 5);
 }
 
 #[tokio::test]
