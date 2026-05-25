@@ -27,11 +27,12 @@ export interface Account {
 
 interface ModelsState {
   availableModels: AvailableModel[];
+  cachedAt: number | null;
   aliases: ModelAlias[];
   accounts: Account[];
   isLoading: boolean;
   error: string | null;
-  fetchModels: () => Promise<void>;
+  fetchModels: (force?: boolean) => Promise<void>;
   fetchAliases: () => Promise<void>;
   fetchAccounts: () => Promise<void>;
   addAlias: (alias: string, targetModel: string, providerId?: string, accountIds?: number[]) => Promise<void>;
@@ -43,18 +44,23 @@ interface ModelsState {
 
 export const useModelsStore = create<ModelsState>((set, get) => ({
   availableModels: [],
+  cachedAt: null,
   aliases: [],
   accounts: [],
   isLoading: false,
   error: null,
 
-  fetchModels: async () => {
+  fetchModels: async (force = false) => {
     set({ isLoading: true, error: null });
     try {
-      const res = await fetch('/api/models/available');
+      const url = force ? '/api/models/available?force=true' : '/api/models/available';
+      const res = await fetch(url);
       if (!res.ok) throw new Error('Failed to fetch available models');
-      const data = await res.json();
-      set({ availableModels: data, isLoading: false });
+      const json = await res.json();
+      // New format: { data: [...], stale: boolean }; fallback: plain array
+      const models = Array.isArray(json) ? json : (json.data || []);
+      const cachedAt = json.cached_at ?? null;
+      set({ availableModels: models, cachedAt, isLoading: false });
     } catch (err: any) {
       set({ error: err.message, isLoading: false });
     }

@@ -1,5 +1,4 @@
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
 
 use axum::{
     extract::OriginalUri,
@@ -25,7 +24,8 @@ use crate::routes::models::TestQueueState;
 #[derive(Clone)]
 pub struct ModelsCache {
     pub data: Vec<Value>,
-    pub created: Instant,
+    pub created_at: i64,
+    pub refreshing: bool,
 }
 
 #[derive(Clone)]
@@ -120,7 +120,7 @@ where
                     "❌"
                 };
                 tracing::info!(
-                    "{kind_icon} {method} {path} → {status_icon} {code}",
+                    "{status_icon} {code} → {kind_icon} {method} | {path}",
                 );
             }
             Ok(res)

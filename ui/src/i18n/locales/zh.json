@@ -247,6 +247,7 @@
   "models": {
     "title": "模型管理",
     "subtitle": "查看可用模型并管理自定义别名。",
+    "cachedAt": " · 缓存于 {{time}}",
     "aliasSection": "模型别名",
     "aliasSubtitle": "为冗长的模型 ID 创建简短易记的别名。",
     "availableSection": "可用模型库",

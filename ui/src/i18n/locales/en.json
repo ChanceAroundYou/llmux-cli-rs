@@ -245,6 +245,7 @@
   "models": {
     "title": "Model Management",
     "subtitle": "Explore available models and manage custom aliases.",
+    "cachedAt": " · Cached at {{time}}",
     "aliasSection": "Model Aliases",
     "aliasSubtitle": "Create short, memorable aliases for long model IDs.",
     "availableSection": "Available Models",

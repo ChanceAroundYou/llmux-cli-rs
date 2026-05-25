@@ -30,7 +30,7 @@ import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 
 export default function Models() {
   const { t, i18n } = useTranslation();
-  const { availableModels, aliases, accounts, isLoading, fetchModels, fetchAliases, fetchAccounts, addAlias, deleteAlias, testModel } = useModelsStore();
+  const { availableModels, cachedAt, aliases, accounts, isLoading, fetchModels, fetchAliases, fetchAccounts, addAlias, deleteAlias, testModel } = useModelsStore();
   const safeModels = availableModels || [];
   const safeAccounts = accounts || [];
   const [search, setSearch] = useState('');
@@ -249,7 +249,7 @@ export default function Models() {
           </div>
           <div>
             <h1 className="text-2xl font-semibold tracking-tight">{t('common.models')}</h1>
-            <p className="text-sm text-muted-foreground">{t('models.subtitle')}</p>
+            <p className="text-sm text-muted-foreground">{t('models.subtitle')}{cachedAt ? t('models.cachedAt', { time: new Date(cachedAt * 1000).toLocaleString() }) : ''}</p>
           </div>
         </div>
         <div className="flex items-center gap-2">
@@ -267,7 +267,7 @@ export default function Models() {
            <Button
              variant="ghost"
              size="icon"
-             onClick={() => { fetchModels(); fetchHealth(); }}
+             onClick={() => { fetchModels(true); fetchHealth(); }}
              className="text-muted-foreground"
              title={t('models.actions.refresh')}
            >

@@ -1,5 +1,4 @@
 use axum::{
-    http::StatusCode,
     response::{IntoResponse, Response},
     Extension, Json,
 };
@@ -45,73 +44,121 @@ fn normalize_model(m: &mut Value) {
     obj.entry("created".to_string()).or_insert(json!(0));
 }
 
-pub async fn get_available_models(Extension(state): Extension<AppState>) -> Response {
-    const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+pub async fn get_available_models(
+    Extension(state): Extension<AppState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    const CACHE_TTL: i64 = 24 * 60 * 60;
+    let force = params.get("force").map(|v| v == "true").unwrap_or(false);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
 
-    // Check cache first
-    {
-        let cache = state.models_cache.lock().unwrap();
-        if let Some(ref entry) = *cache {
-            if entry.created.elapsed() < CACHE_TTL {
-                tracing::debug!(
-                    "🤖 Returning {} cached models (age: {}s)",
-                    entry.data.len(),
-                    entry.created.elapsed().as_secs()
-                );
-                return Json(Value::Array(entry.data.clone())).into_response();
-            }
+    if force {
+        tracing::info!("🤖 Force refresh requested, bypassing cache");
+        let data = do_fetch_models(&state).await;
+        {
+            let mut cache = state.models_cache.lock().unwrap();
+            *cache = Some(ModelsCache {
+                data: data.clone(),
+                created_at: now,
+                refreshing: false,
+            });
         }
+        return Json(json!({ "data": data, "stale": false, "cached_at": now })).into_response();
     }
 
-    // Fetch active accounts (matching Bun's dispatcher.listAllModels behavior)
+    // stale-while-revalidate: return cached data, background refresh only when cache expired
+    let (cached_data, need_refresh) = {
+        let mut c = state.models_cache.lock().unwrap();
+        match c.as_mut() {
+            None => (None, false),
+            Some(entry) => {
+                let age = now - entry.created_at;
+                let stale = age >= CACHE_TTL;
+                let do_refresh = stale && !entry.refreshing;
+                if do_refresh {
+                    entry.refreshing = true;
+                }
+                (Some((entry.data.clone(), age, stale, entry.created_at)), do_refresh)
+            }
+        }
+    };
+    if let Some((data, age, stale, cached_at)) = cached_data {
+        if need_refresh {
+            let state_bg = state.clone();
+            let cache_bg = state.models_cache.clone();
+            tokio::spawn(async move {
+                let new_data = do_fetch_models(&state_bg).await;
+                let now_bg = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64;
+                let mut c = cache_bg.lock().unwrap();
+                if let Some(e) = c.as_mut() {
+                    e.data = new_data;
+                    e.created_at = now_bg;
+                    e.refreshing = false;
+                }
+            });
+        }
+        tracing::debug!(
+            "🤖 Returning {} cached models (age: {}s{})",
+            data.len(),
+            age,
+            if stale { ", refreshing in background" } else { "" }
+        );
+        return Json(json!({ "data": data, "stale": stale, "cached_at": cached_at })).into_response();
+    }
+
+    let data = do_fetch_models(&state).await;
+    {
+        let mut cache = state.models_cache.lock().unwrap();
+        *cache = Some(ModelsCache {
+            data: data.clone(),
+            created_at: now,
+            refreshing: false,
+        });
+    }
+    Json(json!({ "data": data, "stale": false, "cached_at": now })).into_response()
+}
+
+/// Fetch and merge models from all accounts. Extracted so it can be called
+/// both synchronously (cold start) and from a background task (refresh).
+async fn do_fetch_models(state: &AppState) -> Vec<Value> {
     let accounts = match get_active_accounts(&state.pool, None, &state.master_key).await {
         Ok(a) => a,
         Err(e) => {
-            return crate::error::simple_error(
-                format!("Failed to list models: {e}"),
-                StatusCode::INTERNAL_SERVER_ERROR,
-            );
+            tracing::error!("Failed to list accounts for model fetch: {e}");
+            return vec![];
         }
     };
 
     if accounts.is_empty() {
-        tracing::warn!("🔀 No active accounts found for model listing");
-        return Json(Value::Array(vec![])).into_response();
+        return vec![];
     }
 
-    // Fetch models from all accounts in parallel
     let futures: Vec<_> = accounts
         .iter()
         .map(|account| {
-            let pool = state.pool.clone();
             let account = account.clone();
             async move {
-                let provider_type = {
-                    let pt = sqlx::query_scalar::<_, Option<String>>(
-                        "SELECT type FROM providers WHERE id = ?",
-                    )
-                    .bind(&account.provider_id)
-                    .fetch_optional(&pool)
-                    .await
-                    .ok()
-                    .flatten()
-                    .flatten();
-                    resolve_provider_type(pt.as_deref(), &account.provider_id)
-                };
+                let provider_type = resolve_provider_type(None, &account.provider_id);
                 let (models, fetch_error) = fetch_provider_models(&account, &provider_type).await;
                 (account.alias, models, fetch_error)
             }
         })
         .collect();
 
-    let results: Vec<(String, Vec<Value>, Option<String>)> = futures_util::future::join_all(futures).await;
+    let results: Vec<(String, Vec<Value>, Option<String>)> =
+        futures_util::future::join_all(futures).await;
 
     let mut all_models: Vec<Value> = Vec::new();
     let mut seen_keys = std::collections::HashSet::new();
 
     for (alias, models, fetch_error) in results {
         if models.is_empty() {
-            // Provider API failed (e.g., geo-blocked), show the account with error
             let key = format!("{}:__unavailable__", alias);
             if seen_keys.insert(key) {
                 let mut placeholder = json!({
@@ -140,7 +187,7 @@ pub async fn get_available_models(Extension(state): Extension<AppState>) -> Resp
         }
     }
 
-    // Merge custom models from aliases (models not returned by provider APIs)
+    // Merge custom models from aliases
     let alias_model_rows = sqlx::query(
         "SELECT DISTINCT target_model, provider_id FROM model_aliases \
          WHERE target_model IS NOT NULL AND target_model != ''",
@@ -157,7 +204,6 @@ pub async fn get_available_models(Extension(state): Extension<AppState>) -> Resp
         if model_id.is_empty() {
             continue;
         }
-        // Use the provider_id as owned_by — this is the account alias stored in model_aliases
         let owned_by = if provider.is_empty() {
             "custom".to_string()
         } else {
@@ -174,22 +220,14 @@ pub async fn get_available_models(Extension(state): Extension<AppState>) -> Resp
         }
     }
 
-    // Update cache
-    {
-        let mut cache = state.models_cache.lock().unwrap();
-        *cache = Some(ModelsCache {
-            data: all_models.clone(),
-            created: std::time::Instant::now(),
-        });
-        tracing::info!(
-            "🤖 Cached {} models ({} from APIs, {} from aliases)",
-            all_models.len(),
-            all_models.len().saturating_sub(alias_model_count),
-            alias_model_count,
-        );
-    }
+    tracing::info!(
+        "🤖 Fetched {} models ({} from APIs, {} from aliases)",
+        all_models.len(),
+        all_models.len().saturating_sub(alias_model_count),
+        alias_model_count,
+    );
 
-    Json(Value::Array(all_models)).into_response()
+    all_models
 }
 
 pub async fn fetch_provider_models(
