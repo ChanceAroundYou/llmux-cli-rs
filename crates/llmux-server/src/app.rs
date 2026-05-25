@@ -28,6 +28,27 @@ pub struct ModelsCache {
     pub refreshing: bool,
 }
 
+#[derive(Debug, Clone)]
+pub enum TuiEvent {
+    Request {
+        timestamp: String,
+        method: String,
+        path: String,
+        status: u16,
+        latency_ms: i64,
+    },
+    Dispatch {
+        account: String,
+        model: String,
+        url: String,
+    },
+    Retry {
+        account: String,
+        status: u16,
+        message: String,
+    },
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub pool: SqlitePool,
@@ -36,24 +57,31 @@ pub struct AppState {
     pub test_queue: Arc<Mutex<TestQueueState>>,
     pub dispatcher_state: Arc<Mutex<DispatcherState>>,
     pub models_cache: Arc<Mutex<Option<ModelsCache>>>,
+    pub tui_tx: Option<tokio::sync::mpsc::UnboundedSender<TuiEvent>>,
 }
 
 pub type AppRouter = Router;
 
 /// Layer that logs every request with method + path + key headers
 #[derive(Clone)]
-struct RequestLogLayer;
+struct RequestLogLayer {
+    tui_tx: Option<tokio::sync::mpsc::UnboundedSender<TuiEvent>>,
+}
 
 impl<S> Layer<S> for RequestLogLayer {
     type Service = RequestLogMiddleware<S>;
     fn layer(&self, inner: S) -> Self::Service {
-        RequestLogMiddleware { inner }
+        RequestLogMiddleware {
+            inner,
+            tui_tx: self.tui_tx.clone(),
+        }
     }
 }
 
 #[derive(Clone)]
 struct RequestLogMiddleware<S> {
     inner: S,
+    tui_tx: Option<tokio::sync::mpsc::UnboundedSender<TuiEvent>>,
 }
 
 impl<S, B> Service<http::Request<B>> for RequestLogMiddleware<S>
@@ -74,6 +102,8 @@ where
         let method = req.method().clone();
         let uri = req.uri().clone();
         let path = uri.path().to_string();
+        let tui_tx = self.tui_tx.clone();
+        let start = std::time::Instant::now();
 
         // Skip logging for dev static files
         let is_static = path.ends_with(".svg") || path.ends_with(".ico") || path.ends_with(".png");
@@ -83,6 +113,7 @@ where
             let res = fut.await?;
             let status = res.status();
             let code = status.as_u16();
+            let latency_ms = start.elapsed().as_millis() as i64;
 
             if !is_static {
                 let kind_icon = if path.starts_with("/v1/chat/completions") || path.starts_with("/v1/messages") {
@@ -112,6 +143,18 @@ where
                 tracing::info!(
                     "{status_icon} {code} → {kind_icon} {method} {path}",
                 );
+                if let Some(tx) = &tui_tx {
+                    let ts = time::OffsetDateTime::now_utc()
+                        .format(&time::format_description::parse("[hour]:[minute]:[second]").unwrap())
+                        .unwrap_or_default();
+                    let _ = tx.send(TuiEvent::Request {
+                        timestamp: ts,
+                        method: method.to_string(),
+                        path: path.clone(),
+                        status: code,
+                        latency_ms,
+                    });
+                }
             }
             Ok(res)
         })
@@ -119,6 +162,7 @@ where
 }
 
 pub fn app(state: AppState) -> AppRouter {
+    let tui_tx = state.tui_tx.clone();
     Router::new()
         .route("/v1/chat/completions", post(v1::chat_completions))
         .route("/v1/responses", post(v1::responses))
@@ -213,7 +257,7 @@ pub fn app(state: AppState) -> AppRouter {
         .fallback(fallback)
         .layer(cors_layer())
         .layer(TraceLayer::new_for_http())
-        .layer(RequestLogLayer)
+        .layer(RequestLogLayer { tui_tx })
 }
 
 fn cors_layer() -> CorsLayer {
@@ -257,6 +301,7 @@ pub async fn test_state() -> AppState {
         test_queue: Arc::new(Mutex::new(TestQueueState::default())),
         dispatcher_state: Arc::new(Mutex::new(DispatcherState::default())),
         models_cache: Arc::new(Mutex::new(None)),
+        tui_tx: None,
     }
 }
 

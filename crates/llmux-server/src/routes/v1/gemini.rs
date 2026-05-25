@@ -14,7 +14,7 @@ use serde_json::Value;
 use llmux_core::adapters::{self, execute_provider_request, ProviderRequest};
 use llmux_core::dispatcher::{self, get_accounts_by_ids, get_active_accounts, is_retryable_status, select_accounts_for_dispatch};
 
-use crate::app::AppState;
+use crate::app::{AppState, TuiEvent};
 use crate::middleware::{self, AuthContext};
 
 use super::helpers::{log_usage, normalize_base_url};
@@ -156,6 +156,7 @@ pub async fn gemini(
             (url, h)
         };
 
+        let dispatch_url = url.clone();
         let provider_request = ProviderRequest {
             method: "POST".to_string(),
             url,
@@ -169,6 +170,13 @@ pub async fn gemini(
             model_resolution.target_model,
             base_url,
         );
+        if let Some(tx) = &state.tui_tx {
+            let _ = tx.send(TuiEvent::Dispatch {
+                account: account.alias.clone(),
+                model: model_resolution.target_model.clone(),
+                url: dispatch_url,
+            });
+        }
 
         let response = match execute_provider_request(&provider_request).await {
             Ok(r) => r,

@@ -8,6 +8,9 @@ use llmux_server::app::{app, AppState};
 use llmux_server::routes::models::TestQueueState;
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
+
+mod tui;
 
 #[derive(Debug, Parser)]
 #[command(name = "llmux")]
@@ -22,6 +25,9 @@ enum Command {
     Start {
         #[arg(long)]
         port: Option<u16>,
+
+        #[arg(long)]
+        no_tui: bool,
     },
     Status,
     Stop,
@@ -29,61 +35,118 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "llmux=info,tower_http=info".into()),
-        )
-        .with_target(false)
-        .with_timer(
-            tracing_subscriber::fmt::time::LocalTime::new(
-                time::macros::format_description!("[month]-[day] [hour]:[minute]:[second]"),
-            ),
-        )
-        .init();
-
     let cli = Cli::parse();
-    match cli.command.unwrap_or(Command::Start { port: None }) {
-        Command::Start { port } => start(port).await?,
+    let use_tui = !matches!(&cli.command, Some(Command::Start { no_tui: true, .. }));
+
+    if !use_tui {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| "llmux=info,tower_http=info".into()),
+            )
+            .with_target(false)
+            .with_timer(tracing_subscriber::fmt::time::LocalTime::new(
+                time::macros::format_description!("[month]-[day] [hour]:[minute]:[second]"),
+            ))
+            .init();
+    }
+
+    match cli.command.unwrap_or(Command::Start { port: None, no_tui: false }) {
+        Command::Start { port, no_tui } => start(port, !no_tui).await?,
         Command::Status => println!("Status functionality is reserved for daemon management."),
         Command::Stop => println!("Stop functionality is reserved for daemon management."),
     }
     Ok(())
 }
 
-async fn start(port_override: Option<u16>) -> anyhow::Result<()> {
+async fn start(port_override: Option<u16>, use_tui: bool) -> anyhow::Result<()> {
     let config = AppConfig::from_env()?;
     let effective_port = port_override.unwrap_or(config.port);
 
     std::fs::create_dir_all(&config.data_dir)?;
     let database_url = sqlite_url_from_path(&config.database_path);
     let pool = connect_sqlite(&database_url).await?;
-    tracing::info!(path = %config.database_path.display(), "🗄️  Connecting to database");
     init_db(&pool).await?;
-    tracing::info!("🗄️  Database initialized");
 
     let master_key = get_or_create_master_key(&config.data_dir, config.master_key.as_deref())?;
-    tracing::info!("🔐 Master key loaded");
 
     let dispatcher_state = Arc::new(Mutex::new(llmux_core::dispatcher::DispatcherState::default()));
     let test_queue = Arc::new(Mutex::new(TestQueueState::default()));
     let models_cache = Arc::new(Mutex::new(None));
-    let router = app(AppState { pool, master_key, data_dir: config.data_dir.clone(), test_queue, dispatcher_state, models_cache });
+
+    let lan_ip = get_local_lan_ip();
+
+    let (tui_tx, tui_rx) = if use_tui {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+
+    // Gather dashboard data before moving pool into AppState
+    let pool_for_counts = pool.clone();
+    let (active_count, total_count, key_count, alias_count, account_aliases) = if use_tui {
+        query_dashboard_counts(&pool_for_counts).await
+    } else {
+        (0, 0, 0, 0, vec![])
+    };
+
+    let db_path = config.database_path.display().to_string();
+    let state = AppState {
+        pool,
+        master_key,
+        data_dir: config.data_dir.clone(),
+        test_queue,
+        dispatcher_state,
+        models_cache,
+        tui_tx,
+    };
+    let router = app(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], effective_port));
     let listener = TcpListener::bind(addr).await?;
-    let lan_ip = get_local_lan_ip();
-    tracing::info!(
-        port = effective_port,
-        "🚀 Server running at http://{}:{} | http://localhost:{}",
-        lan_ip,
-        effective_port,
-        effective_port
-    );
 
-    axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    if use_tui {
+        let dashboard = tui::DashboardInfo {
+            lan_ip,
+            port: effective_port,
+            db_path,
+            db_ok: true,
+            master_key_ok: true,
+            active_accounts: active_count,
+            total_accounts: total_count,
+            api_keys: key_count,
+            aliases: alias_count,
+            account_aliases,
+        };
+
+        // Spawn server in background
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .with_graceful_shutdown(shutdown_signal())
+                .await
+                .ok();
+        });
+
+        // Run TUI on main thread (blocking)
+        let rx = tui_rx.unwrap();
+        tui::run_tui(rx, dashboard).await?;
+
+        server.abort();
+        tracing::info!("🛑 Shutting down...");
+    } else {
+        tracing::info!(
+            port = effective_port,
+            "🚀 Server running at http://{}:{} | http://localhost:{}",
+            lan_ip,
+            effective_port,
+            effective_port
+        );
+
+        axum::serve(listener, router)
+            .with_graceful_shutdown(shutdown_signal())
+            .await?;
+    }
 
     Ok(())
 }
@@ -96,6 +159,32 @@ fn get_local_lan_ip() -> String {
             s.local_addr().ok().map(|a| a.ip().to_string())
         })
         .unwrap_or_else(|| "127.0.0.1".to_string())
+}
+
+async fn query_dashboard_counts(pool: &sqlx::SqlitePool) -> (usize, usize, usize, usize, Vec<String>) {
+    let active = sqlx::query_scalar::<_, i64>("SELECT COUNT(1) FROM accounts WHERE is_active = 1")
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0) as usize;
+    let total = sqlx::query_scalar::<_, i64>("SELECT COUNT(1) FROM accounts")
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0) as usize;
+    let keys = sqlx::query_scalar::<_, i64>("SELECT COUNT(1) FROM api_keys")
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0) as usize;
+    let aliases = sqlx::query_scalar::<_, i64>("SELECT COUNT(1) FROM model_aliases")
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0) as usize;
+    let account_aliases: Vec<String> = sqlx::query_scalar::<_, String>(
+        "SELECT alias FROM accounts WHERE is_active = 1 ORDER BY alias"
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    (active, total, keys, aliases, account_aliases)
 }
 
 async fn shutdown_signal() {
@@ -120,6 +209,4 @@ async fn shutdown_signal() {
         _ = ctrl_c => {},
         _ = terminate => {},
     }
-
-    tracing::info!("🛑 Shutting down...");
 }

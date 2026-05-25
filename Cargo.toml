@@ -7,7 +7,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.1.1"
+version = "0.2.1"
 edition = "2021"
 license = "AGPL-3.0"
 authors = ["Moody"]
@@ -39,6 +39,8 @@ tower-http = { version = "0.6", features = ["cors", "trace"] }
 time = { version = "0.3", features = ["macros", "formatting"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "time", "local-time"] }
+ratatui = { version = "0.29", features = ["crossterm"] }
+crossterm = "0.28"
 url = "2"
 uuid = { version = "1", features = ["v4"] }
 zeroize = "1"

@@ -58,7 +58,8 @@ async fn api_read_routes_match_gateway_empty_placeholder_shapes() {
         ),
         ("/api/accounts", json!([])),
         ("/api/keys", json!([])),
-        ("/api/models/available", json!([])),
+        // /api/models/available returns { data, stale, cached_at } — check shape below
+        ("/api/models/available", json!({"data": []})),
         ("/api/models/aliases", json!([])),
         ("/api/models/health", json!([])),
         (
@@ -76,7 +77,13 @@ async fn api_read_routes_match_gateway_empty_placeholder_shapes() {
     for (path, expected) in cases {
         let (status, body) = request_json(Method::GET, path, None).await;
         assert_eq!(status, StatusCode::OK, "{path}");
-        assert_eq!(body, expected, "{path}");
+        if path == "/api/models/available" {
+            // Response is { data, stale, cached_at }
+            assert!(body["data"].is_array(), "{path}: data must be array");
+            assert!(body["stale"].is_boolean(), "{path}: stale must be bool");
+        } else {
+            assert_eq!(body, expected, "{path}");
+        }
     }
 }
 

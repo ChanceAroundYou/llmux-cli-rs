@@ -13,7 +13,7 @@ use llmux_core::adapters::{self, execute_provider_request};
 use llmux_core::dispatcher::{self, get_accounts_by_ids, get_active_accounts, is_retryable_status, select_accounts_for_dispatch};
 use llmux_core::proxy::{build_anthropic_passthrough_request, extract_anthropic_usage_from_sse};
 
-use crate::app::AppState;
+use crate::app::{AppState, TuiEvent};
 use crate::middleware::{self, AuthContext};
 
 use super::helpers::log_usage;
@@ -126,6 +126,13 @@ pub async fn messages(
                     model_resolution.target_model,
                     base_url,
                 );
+                if let Some(tx) = &state.tui_tx {
+                    let _ = tx.send(TuiEvent::Dispatch {
+                        account: account.alias.clone(),
+                        model: model_resolution.target_model.clone(),
+                        url: base_url.to_string(),
+                    });
+                }
                 r
             }
             Err(e) => {

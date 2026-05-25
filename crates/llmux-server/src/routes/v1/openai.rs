@@ -14,7 +14,7 @@ use serde_json::Value;
 use llmux_core::adapters::{self, execute_provider_request, ProviderRequest};
 use llmux_core::dispatcher::{self, get_accounts_by_ids, get_active_accounts, is_retryable_status, select_accounts_for_dispatch};
 
-use crate::app::AppState;
+use crate::app::{AppState, TuiEvent};
 use crate::middleware::{self, AuthContext};
 
 use super::helpers::{log_usage, normalize_base_url};
@@ -193,6 +193,13 @@ async fn openai_dispatch(
             base_url,
             endpoint,
         );
+        if let Some(tx) = &state.tui_tx {
+            let _ = tx.send(TuiEvent::Dispatch {
+                account: account.alias.clone(),
+                model: model_resolution.target_model.clone(),
+                url: format!("{}/{}", base_url, endpoint),
+            });
+        }
 
         let response = match execute_provider_request(&provider_request).await {
             Ok(r) => r,
