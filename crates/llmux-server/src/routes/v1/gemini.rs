@@ -129,7 +129,7 @@ pub async fn gemini(
             .get("x-goog-api-client")
             .and_then(|v| v.to_str().ok());
 
-        // Auth: for default Google API, use ?key= query param.
+        // Auth: for default Google API, use x-goog-api-key header.
         // For custom proxies, use Bearer header (common proxy convention).
         let (url, req_headers) = if is_custom_base {
             let url = format!("{base_url}/{new_path}");
@@ -143,15 +143,13 @@ pub async fn gemini(
             }
             (url, h)
         } else {
-            let query: String = uri
-                .query()
-                .map(|q| format!("{q}&key={}", account.api_key))
-                .unwrap_or_else(|| format!("key={}", account.api_key));
-            let url = format!("{base_url}/{new_path}?{query}");
+            let query = uri.query().map(|q| format!("?{q}")).unwrap_or_default();
+            let url = format!("{base_url}/{new_path}{query}");
             let mut h = BTreeMap::from([(
                 "content-type".to_string(),
                 "application/json".to_string(),
             )]);
+            h.insert("x-goog-api-key".to_string(), account.api_key.clone());
             if let Some(v) = goog_api_client {
                 h.insert("x-goog-api-client".to_string(), v.to_string());
             }
