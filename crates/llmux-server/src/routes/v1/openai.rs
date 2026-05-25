@@ -130,6 +130,22 @@ async fn openai_dispatch(
         );
     }
 
+    // Filter: for gemini provider, only use accounts with openai_compatible enabled.
+    // These will route through Gemini's OpenAI-compatible endpoint
+    // (https://generativelanguage.googleapis.com/v1beta/openai).
+    let accounts: Vec<_> = accounts.into_iter().filter(|a| {
+        a.provider_id != "gemini" || a.openai_compatible == 1
+    }).collect();
+
+    if accounts.is_empty() {
+        return middleware::send_error(
+            &format!("No active accounts available for model '{}' — Gemini accounts must enable OpenAI compatible mode", model_resolution.target_model),
+            "server_error",
+            StatusCode::SERVICE_UNAVAILABLE,
+            is_anthropic,
+        );
+    }
+
     let ordered_accounts = {
         let mut ds = state.dispatcher_state.lock().unwrap();
         select_accounts_for_dispatch(&accounts, &model_resolution.provider_id, &mut ds)
@@ -143,11 +159,17 @@ async fn openai_dispatch(
     let mut last_error: Option<String> = None;
 
     for account in &ordered_accounts {
+        let default_base = if account.provider_id == "gemini" {
+            "https://generativelanguage.googleapis.com/v1beta/openai"
+        } else {
+            "https://api.openai.com/v1"
+        };
         let base_url = normalize_base_url(
             account
                 .base_url
                 .as_deref()
-                .unwrap_or("https://api.openai.com/v1"),
+                .filter(|u| !u.is_empty())
+                .unwrap_or(default_base),
         );
         let mut req_headers = BTreeMap::from([(
             "content-type".to_string(),

@@ -13,7 +13,7 @@ use crate::routes::models::fetch_provider_models;
 
 pub async fn list_accounts(Extension(state): Extension<AppState>) -> Response {
     match sqlx::query_as::<_, AccountPublic>(
-        "SELECT id, alias, provider_id, base_url, anthropic_base_url, CAST(is_active AS INTEGER) as is_active, weight, notes, created_at FROM accounts ORDER BY id DESC",
+        "SELECT id, alias, provider_id, base_url, anthropic_base_url, CAST(is_active AS INTEGER) as is_active, weight, notes, openai_compatible, created_at FROM accounts ORDER BY id DESC",
     )
     .fetch_all(&state.pool)
     .await
@@ -49,6 +49,7 @@ pub async fn create_account(
     let is_active = body["is_active"].as_i64().unwrap_or(1);
     let weight = body["weight"].as_i64().unwrap_or(1);
     let notes = body["notes"].as_str().map(|s| s.to_string());
+    let openai_compatible = body["openai_compatible"].as_i64().unwrap_or(0);
     let skip_validation = body["skip_validation"].as_bool().unwrap_or(false);
 
     if alias.is_empty() || provider_id.is_empty() || api_key_plain.is_empty() {
@@ -68,6 +69,7 @@ pub async fn create_account(
         anthropic_base_url: anthropic_base_url.clone(),
         is_active,
         weight,
+        openai_compatible,
     };
 
     let provider_type = {
@@ -103,8 +105,8 @@ pub async fn create_account(
     };
 
     match sqlx::query(
-        "INSERT INTO accounts (alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight, notes)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO accounts (alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight, notes, openai_compatible)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&alias)
     .bind(&provider_id)
@@ -114,6 +116,7 @@ pub async fn create_account(
     .bind(is_active)
     .bind(weight)
     .bind(&notes)
+    .bind(openai_compatible)
     .execute(&state.pool)
     .await
     {
@@ -142,7 +145,7 @@ pub async fn update_account(
 ) -> Response {
     // Verify the account exists.
     let existing = sqlx::query_as::<_, llmux_core::models::Account>(
-        "SELECT id, alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight, notes, limits_cache, limits_cache_updated_at, created_at FROM accounts WHERE id = ?",
+        "SELECT id, alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight, notes, limits_cache, limits_cache_updated_at, openai_compatible, created_at FROM accounts WHERE id = ?",
     )
     .bind(id)
     .fetch_optional(&state.pool)
@@ -198,6 +201,10 @@ pub async fn update_account(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .or(existing.notes);
+    let openai_compatible = body
+        .get("openai_compatible")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(existing.openai_compatible.unwrap_or(0));
 
     // Handle API key: if a new one is provided, encrypt it; otherwise keep the old ciphertext.
     // Bun only re-validates when api_key !== "********" or base_url is present.
@@ -221,6 +228,7 @@ pub async fn update_account(
                 anthropic_base_url: anthropic_base_url.clone(),
                 is_active,
                 weight,
+                openai_compatible,
             };
 
             let provider_type = {
@@ -259,7 +267,7 @@ pub async fn update_account(
     };
 
     match sqlx::query(
-        "UPDATE accounts SET alias = ?, provider_id = ?, api_key = ?, base_url = ?, anthropic_base_url = ?, is_active = ?, weight = ?, notes = ? WHERE id = ?",
+        "UPDATE accounts SET alias = ?, provider_id = ?, api_key = ?, base_url = ?, anthropic_base_url = ?, is_active = ?, weight = ?, notes = ?, openai_compatible = ? WHERE id = ?",
     )
     .bind(&alias)
     .bind(&provider_id)
@@ -269,6 +277,7 @@ pub async fn update_account(
     .bind(is_active)
     .bind(weight)
     .bind(&notes)
+    .bind(openai_compatible)
     .bind(id)
     .execute(&state.pool)
     .await

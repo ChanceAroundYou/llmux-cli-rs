@@ -298,6 +298,7 @@ pub async fn test_model(
                             .try_get::<i64, _>("is_active")
                             .unwrap_or(1),
                         weight: row.try_get("weight").unwrap_or(1),
+                        openai_compatible: row.try_get("openai_compatible").unwrap_or(0),
                     }],
                     Err(_) => vec![],
                 }

@@ -72,9 +72,12 @@ async fn start(port_override: Option<u16>) -> anyhow::Result<()> {
 
     let addr = SocketAddr::from(([0, 0, 0, 0], effective_port));
     let listener = TcpListener::bind(addr).await?;
+    let lan_ip = get_local_lan_ip();
     tracing::info!(
         port = effective_port,
-        "🚀 Server running at http://0.0.0.0:{}",
+        "🚀 Server running at http://{}:{} | http://localhost:{}",
+        lan_ip,
+        effective_port,
         effective_port
     );
 
@@ -83,6 +86,16 @@ async fn start(port_override: Option<u16>) -> anyhow::Result<()> {
         .await?;
 
     Ok(())
+}
+
+fn get_local_lan_ip() -> String {
+    std::net::UdpSocket::bind("0.0.0.0:0")
+        .ok()
+        .and_then(|s| {
+            s.connect("8.8.8.8:80").ok()?;
+            s.local_addr().ok().map(|a| a.ip().to_string())
+        })
+        .unwrap_or_else(|| "127.0.0.1".to_string())
 }
 
 async fn shutdown_signal() {

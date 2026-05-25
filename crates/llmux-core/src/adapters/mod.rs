@@ -39,6 +39,7 @@ pub struct Account {
     pub anthropic_base_url: Option<String>,
     pub is_active: i64,
     pub weight: i64,
+    pub openai_compatible: i64,
 }
 
 impl From<crate::models::Account> for Account {
@@ -52,6 +53,7 @@ impl From<crate::models::Account> for Account {
             anthropic_base_url: value.anthropic_base_url,
             is_active: value.is_active,
             weight: value.weight,
+            openai_compatible: value.openai_compatible.unwrap_or(0),
         }
     }
 }
@@ -67,6 +69,7 @@ impl From<Account> for crate::models::Account {
             anthropic_base_url: value.anthropic_base_url,
             is_active: value.is_active,
             weight: value.weight,
+            openai_compatible: Some(value.openai_compatible),
             notes: None,
             limits_cache: None,
             limits_cache_updated_at: None,
@@ -232,7 +235,8 @@ pub async fn test_provider_connection(account: &Account) -> Result<(), String> {
             .await
     } else if account.provider_id == "gemini" {
         client
-            .get(format!("{base_url}/models?key={}", account.api_key))
+            .get(format!("{base_url}/models"))
+            .header("x-goog-api-key", &account.api_key)
             .send()
             .await
     } else {

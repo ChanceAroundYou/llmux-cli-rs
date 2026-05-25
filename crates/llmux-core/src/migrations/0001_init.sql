@@ -10,6 +10,7 @@ CREATE TABLE IF NOT EXISTS accounts (
   notes TEXT,
   limits_cache TEXT,
   limits_cache_updated_at DATETIME,
+  openai_compatible INTEGER DEFAULT 0,
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 

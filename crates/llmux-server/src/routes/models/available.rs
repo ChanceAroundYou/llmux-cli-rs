@@ -231,11 +231,13 @@ pub async fn fetch_provider_models(
             (url, headers)
         }
         "gemini" => {
-            let url = format!(
-                "https://generativelanguage.googleapis.com/v1beta/models?key={}",
-                account.api_key
+            let url = "https://generativelanguage.googleapis.com/v1beta/models".to_string();
+            let mut headers = std::collections::BTreeMap::new();
+            headers.insert(
+                "x-goog-api-key".to_string(),
+                account.api_key.clone(),
             );
-            (url, std::collections::BTreeMap::new())
+            (url, headers)
         }
         _ => {
             // Custom / OpenAI-compatible

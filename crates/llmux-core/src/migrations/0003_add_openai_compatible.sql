@@ -1,0 +1,1 @@
+ALTER TABLE accounts ADD COLUMN openai_compatible INTEGER DEFAULT 0;

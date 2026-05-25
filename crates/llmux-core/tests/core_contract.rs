@@ -338,6 +338,7 @@ fn model_structs_preserve_legacy_field_names() {
         anthropic_base_url: None,
         is_active: 1,
         weight: 1,
+        openai_compatible: Some(0),
         notes: None,
         limits_cache: None,
         limits_cache_updated_at: None,

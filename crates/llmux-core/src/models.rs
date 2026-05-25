@@ -12,6 +12,7 @@ pub struct Account {
     pub is_active: i64,
     pub weight: i64,
     pub notes: Option<String>,
+    pub openai_compatible: Option<i64>,
     pub limits_cache: Option<String>,
     pub limits_cache_updated_at: Option<String>,
     pub created_at: Option<String>,
@@ -63,6 +64,7 @@ pub struct AccountPublic {
     pub is_active: i64,
     pub weight: i64,
     pub notes: Option<String>,
+    pub openai_compatible: Option<i64>,
     pub created_at: Option<String>,
 }
 

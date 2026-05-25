@@ -159,7 +159,7 @@ pub async fn get_accounts_by_ids(
     // Build query with dynamic placeholders
     let placeholders: Vec<String> = ids.iter().map(|_| "?".to_string()).collect();
     let sql = format!(
-        "SELECT id, alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight \
+        "SELECT id, alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight, openai_compatible \
          FROM accounts WHERE id IN ({}) AND is_active = 1 ORDER BY weight DESC, id ASC",
         placeholders.join(",")
     );
@@ -182,6 +182,7 @@ pub async fn get_accounts_by_ids(
                 anthropic_base_url: row.try_get("anthropic_base_url").ok(),
                 is_active: row.try_get::<i64, _>("is_active").unwrap_or(1),
                 weight: row.try_get("weight").unwrap_or(1),
+                openai_compatible: row.try_get("openai_compatible").unwrap_or(0),
             });
         } else {
             let alias: String = row.try_get("alias").unwrap_or_default();
@@ -209,18 +210,18 @@ pub async fn get_active_accounts(
         .fetch_one(pool)
         .await?;
         if provider_count > 0 {
-            sqlx::query("SELECT id, alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight FROM accounts WHERE provider_id = ? AND is_active = 1 ORDER BY weight DESC, id ASC")
+            sqlx::query("SELECT id, alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight, openai_compatible FROM accounts WHERE provider_id = ? AND is_active = 1 ORDER BY weight DESC, id ASC")
                 .bind(provider)
                 .fetch_all(pool)
                 .await?
         } else {
-            sqlx::query("SELECT id, alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight FROM accounts WHERE alias = ? AND is_active = 1 ORDER BY weight DESC, id ASC")
+            sqlx::query("SELECT id, alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight, openai_compatible FROM accounts WHERE alias = ? AND is_active = 1 ORDER BY weight DESC, id ASC")
                 .bind(provider)
                 .fetch_all(pool)
                 .await?
         }
     } else {
-        sqlx::query("SELECT id, alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight FROM accounts WHERE is_active = 1 ORDER BY weight DESC, id ASC")
+        sqlx::query("SELECT id, alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight, openai_compatible FROM accounts WHERE is_active = 1 ORDER BY weight DESC, id ASC")
             .fetch_all(pool)
             .await?
     };
@@ -238,6 +239,7 @@ pub async fn get_active_accounts(
                 anthropic_base_url: row.try_get("anthropic_base_url").ok(),
                 is_active: row.try_get::<i64, _>("is_active").unwrap_or(1),
                 weight: row.try_get("weight").unwrap_or(1),
+                openai_compatible: row.try_get("openai_compatible").unwrap_or(0),
             });
         } else {
             let alias: String = row.try_get("alias").unwrap_or_default();

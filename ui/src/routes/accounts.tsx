@@ -36,9 +36,11 @@ export default function Accounts() {
   const [editingAccount, setEditingAccount] = useState<any>(null);
   const [formData, setFormData] = useState({ alias: '', provider_id: 'custom', api_key: '', base_url: '', anthropic_base_url: '' });
   const [formSupportsAnthropic, setFormSupportsAnthropic] = useState(false);
+  const [formOpenAICompat, setFormOpenAICompat] = useState(false);
   const [formSkipValidation, setFormSkipValidation] = useState(false);
   const [editData, setEditData] = useState({ alias: '', provider_id: '', api_key: '', base_url: '', anthropic_base_url: '', notes: '' });
   const [editSupportsAnthropic, setEditSupportsAnthropic] = useState(false);
+  const [editOpenAICompat, setEditOpenAICompat] = useState(false);
   const [editSkipValidation, setEditSkipValidation] = useState(false);
   const [accountToDelete, setAccountToDelete] = useState<{id: number, name: string} | null>(null);
   const [isValidating, setIsValidating] = useState(false);
@@ -53,10 +55,11 @@ export default function Accounts() {
     setIsValidating(true);
     setValidationError(null);
     try {
-      await addAccount({ ...formData, skip_validation: formSkipValidation });
+      await addAccount({ ...formData, openai_compatible: formOpenAICompat ? 1 : 0, skip_validation: formSkipValidation });
       setIsModalOpen(false);
       setFormData({ alias: '', provider_id: 'custom', api_key: '', base_url: '', anthropic_base_url: '' });
       setFormSupportsAnthropic(false);
+      setFormOpenAICompat(false);
       setFormSkipValidation(false);
     } catch (err: any) {
       setValidationError(err.message || "Validation failed");
@@ -70,6 +73,7 @@ export default function Accounts() {
     setEditingAccount(acc);
     setEditData({ alias: acc.alias, provider_id: acc.provider_id, api_key: '', base_url: acc.base_url || '', anthropic_base_url: acc.anthropic_base_url || '', notes: acc.notes || '' });
     setEditSupportsAnthropic(!!acc.anthropic_base_url);
+    setEditOpenAICompat(!!acc.openai_compatible);
     setIsEditOpen(true);
   };
 
@@ -79,7 +83,7 @@ export default function Accounts() {
     setIsValidating(true);
     setValidationError(null);
     try {
-      await updateAccount(editingAccount.id, { ...editData, skip_validation: editSkipValidation });
+      await updateAccount(editingAccount.id, { ...editData, openai_compatible: editOpenAICompat ? 1 : 0, skip_validation: editSkipValidation });
       setIsEditOpen(false);
       setEditingAccount(null);
     } catch (err: any) {
@@ -276,6 +280,21 @@ export default function Accounts() {
               />
               <p className="text-xs text-muted-foreground">{t('accounts.baseUrlHint')}</p>
             </div>
+            {formData.provider_id === 'gemini' && (
+              <div className="space-y-1.5 border-t border-border pt-3">
+                <label className="flex items-center gap-2 cursor-pointer select-none">
+                  <input
+                    type="checkbox"
+                    checked={formOpenAICompat}
+                    disabled={isValidating}
+                    onChange={e => setFormOpenAICompat(e.target.checked)}
+                    className="w-4 h-4 rounded accent-primary"
+                  />
+                  <span className="text-xs font-bold text-muted-foreground uppercase">OpenAI 兼容模式</span>
+                </label>
+                <p className="text-xs text-muted-foreground ml-6">通过 Gemini 的 OpenAI 兼容端点同时支持 /v1/chat/completions 请求</p>
+              </div>
+            )}
             {formData.provider_id === 'custom' && (
               <>
                 <div className="space-y-1.5 border-t border-border pt-3">
@@ -419,6 +438,21 @@ export default function Accounts() {
               />
               <p className="text-xs text-muted-foreground">{t('accounts.baseUrlHint')}</p>
             </div>
+            {editData.provider_id === 'gemini' && (
+              <div className="space-y-1.5 border-t border-border pt-3">
+                <label className="flex items-center gap-2 cursor-pointer select-none">
+                  <input
+                    type="checkbox"
+                    checked={editOpenAICompat}
+                    disabled={isValidating}
+                    onChange={e => setEditOpenAICompat(e.target.checked)}
+                    className="w-4 h-4 rounded accent-primary"
+                  />
+                  <span className="text-xs font-bold text-muted-foreground uppercase">OpenAI 兼容模式</span>
+                </label>
+                <p className="text-xs text-muted-foreground ml-6">通过 Gemini 的 OpenAI 兼容端点同时支持 /v1/chat/completions 请求</p>
+              </div>
+            )}
             {editData.provider_id === 'custom' && (
               <>
                 <div className="space-y-1.5 border-t border-border pt-3">

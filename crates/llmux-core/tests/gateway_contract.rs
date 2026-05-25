@@ -19,6 +19,7 @@ fn account(provider_id: &str) -> Account {
         anthropic_base_url: None,
         is_active: 1,
         weight: 10,
+        openai_compatible: 0,
     }
 }
 
