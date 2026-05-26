@@ -27,17 +27,17 @@
 
 As a developer, you probably have accounts across OpenAI, Anthropic, and Google — each with their own SDKs, rate limits, and API formats. You hit a quota cap on one account mid-session, switch manually, and re-configure your tools. You want to share API access with teammates without exposing your actual keys.
 
-LLMux solves all of this. It's a local gateway that runs on your machine and exposes a single unified endpoint. Your tools talk to LLMux; LLMux handles the rest — routing, protocol passthrough, load balancing, and key scoping.
+LLMux solves all of this. It's a local gateway that runs on your machine and exposes a single unified endpoint. Your tools talk to LLMux; LLMux handles the rest — routing, protocol passthrough, sticky-session failover, and key scoping.
 
 ## What It Does
 
-**One endpoint for everything.** Point any OpenAI-compatible client to `http://localhost:25975/v1` and reach any model across any provider.
+**One endpoint for everything.** Point any OpenAI-compatible client to `http://localhost:25976/v1` and reach any model across any provider.
 
 **Multi-Protocol Passthrough.** Native support for OpenAI, Anthropic, and Gemini protocols. Tools like Claude Code, Codex, and Gemini CLI connect directly through LLMux — no client-side changes required.
 
-**Self-Healing Load Balancer.** When an account is rate-limited or unhealthy, LLMux automatically routes to the next available account in milliseconds. No manual intervention, no dropped requests.
+**Sticky Session + Smart Failover.** Requests stick to a preferred account to keep prompt caches warm. When an account fails (rate-limited, auth error, or network issue), LLMux automatically fails over to a backup account. It periodically probes the preferred account with exponential backoff and switches back as soon as it recovers. No manual intervention, no dropped requests.
 
-> **Note:** LLMux is designed for multi-account load distribution. The self-healing and load balancing features rely on having multiple accounts per provider. For best results — especially in shared or team environments — add multiple accounts to maximize throughput and resilience.
+> **Note:** LLMux is designed for multi-account failover. The sticky and failover features rely on having multiple accounts per provider. For best results — especially in shared or team environments — add multiple accounts to maximize throughput and resilience.
 
 **Model Aliases.** Map verbose model IDs like `claude-3-7-sonnet-20250219` to short aliases like `c37`. Swap the underlying model anytime without touching client configuration.
 
@@ -67,34 +67,39 @@ Start the gateway:
 ./target/release/llmux
 ```
 
-The management dashboard opens at `http://localhost:25975`.
+The management dashboard opens at `http://localhost:25976`.
 
 **Setup in 5 steps:**
 
 1. **Accounts** — add your API keys (OpenAI, Anthropic, Gemini, or any custom endpoint)
 2. **Models** — create aliases and run connection tests
 3. **Keys** — generate a gateway API key, optionally restrict to specific models
-4. **Setup** — one-click config for Claude Code, Codex, or Gemini CLI, or manually set your tool's Base URL to `http://localhost:25975/v1`
+4. **Setup** — one-click config for Claude Code, Codex, or Gemini CLI, or manually set your tool's Base URL to `http://localhost:25976/v1`
 5. Done — LLMux handles routing, failover, and load balancing automatically
 
 ## Environment Variables
 
 | Variable     | Default           | Description                                     |
 | ------------ | ----------------- | ----------------------------------------------- |
-| `PORT`       | `25975`           | Gateway and dashboard port                      |
+| `PORT`       | `25976`           | Gateway and dashboard port                      |
 | `LOG_LEVEL`  | `info`            | Log verbosity: `debug`, `info`, `warn`, `error` |
 | `DATA_DIR`   | `~/.config/llmux` | Location of `db.sqlite` and logs                |
 | `MASTER_KEY` | (auto)            | Encryption key for stored credentials           |
 
-## Dashboard
+## Dashboard & TUI
 
-The web UI at `http://localhost:25975` provides:
+**Web UI** at `http://localhost:25976`:
 
 - **Dashboard** — real-time overview of accounts, models, and gateway status
 - **Accounts** — enable/disable accounts, set routing weights
-- **Models** — manage aliases, map short names to provider model IDs, run connection tests
+- **Models** — manage aliases, map short names to provider model IDs, set preferred accounts, run connection tests
 - **Keys** — create and manage gateway API keys with model whitelists
 - **Setup** — one-click configuration for Claude Code, Codex, and Gemini CLI, with config diff preview and backup history
+
+**Terminal TUI** (built-in, runs alongside the gateway):
+
+- **Dashboard** — live account health, request counts, system info
+- **Traffic** — real-time request log (with model names, latency, HTTP status) and dispatch log (routing decisions, retries, failover probes) in a split view
 
 ## Architecture Notes
 
