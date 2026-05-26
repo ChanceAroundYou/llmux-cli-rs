@@ -10,6 +10,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, List, ListItem, Paragraph, Tabs};
 use ratatui::{Frame, Terminal};
 use ratatui::backend::CrosstermBackend;
+use time;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use llmux_server::app::TuiEvent;
@@ -27,10 +28,12 @@ struct LogEntry {
     path: String,
     status: u16,
     latency_ms: i64,
+    model: String,
 }
 
 #[derive(Clone)]
 struct DispatchEntry {
+    timestamp: String,
     line: String,
 }
 
@@ -66,6 +69,7 @@ struct UiState {
     request_scroll: usize,
     dispatch_scroll: usize,
     pinned_to_bottom: bool,
+    traffic_focus: usize, // 0 = Requests top, 1 = Dispatch bottom
 }
 
 // ---------------------------------------------------------------------------
@@ -100,6 +104,7 @@ pub async fn run_tui(
         request_scroll: 0,
         dispatch_scroll: 0,
         pinned_to_bottom: true,
+        traffic_focus: 0,
     };
 
     loop {
@@ -118,8 +123,8 @@ pub async fn run_tui(
                     KeyCode::Esc | KeyCode::Char('q') => break,
                     KeyCode::Char('1') => { ui.active_tab = 0; ui.pinned_to_bottom = true; }
                     KeyCode::Char('2') => { ui.active_tab = 1; ui.pinned_to_bottom = true; }
-                    KeyCode::Char('3') => { ui.active_tab = 2; ui.pinned_to_bottom = true; }
-                    KeyCode::Tab => { ui.active_tab = (ui.active_tab + 1) % 3; ui.pinned_to_bottom = true; }
+                    KeyCode::Tab => { ui.active_tab = (ui.active_tab + 1) % 2; ui.pinned_to_bottom = true; }
+                    KeyCode::Char(' ') if ui.active_tab == 1 => { ui.traffic_focus ^= 1; }
                     KeyCode::Up | KeyCode::Char('k') => { ui.pinned_to_bottom = false; scroll_up(&mut ui); }
                     KeyCode::Down | KeyCode::Char('j') => { scroll_down(&mut ui); }
                     KeyCode::PageUp => { ui.pinned_to_bottom = false; page_up(&mut ui); }
@@ -147,9 +152,9 @@ pub async fn run_tui(
 
 fn handle_event(ui: &mut UiState, event: TuiEvent) {
     match event {
-        TuiEvent::Request { timestamp, method, path, status, latency_ms } => {
+        TuiEvent::Request { timestamp, method, path, status, latency_ms, model } => {
             ui.request_logs.push_back(LogEntry {
-                timestamp, method, path, status, latency_ms,
+                timestamp, method, path, status, latency_ms, model,
             });
             if ui.request_logs.len() > MAX_LOG_ENTRIES {
                 ui.request_logs.pop_front();
@@ -158,9 +163,10 @@ fn handle_event(ui: &mut UiState, event: TuiEvent) {
                 ui.request_scroll = ui.request_logs.len().saturating_sub(1);
             }
         }
-        TuiEvent::Dispatch { account, model, url } => {
-            let line = format!("⚡ {} → {} → {}", account, model, url);
-            ui.dispatch_logs.push_back(DispatchEntry { line });
+        TuiEvent::Dispatch { timestamp, account, model, url, tag } => {
+            let tag_str = tag.map(|t| format!(" [{}]", t)).unwrap_or_default();
+            let line = format!("⚡{tag_str} {} → {} → {}", account, model, url);
+            ui.dispatch_logs.push_back(DispatchEntry { timestamp, line });
             if ui.dispatch_logs.len() > MAX_LOG_ENTRIES {
                 ui.dispatch_logs.pop_front();
             }
@@ -173,8 +179,12 @@ fn handle_event(ui: &mut UiState, event: TuiEvent) {
             if ui.pinned_to_bottom { ui.dispatch_scroll = ui.dispatch_logs.len().saturating_sub(1); }
         }
         TuiEvent::Retry { account, status, message } => {
+            let ts = time::OffsetDateTime::now_local()
+                .unwrap_or_else(|_| time::OffsetDateTime::now_utc())
+                .format(&time::format_description::parse("[hour]:[minute]:[second]").unwrap())
+                .unwrap_or_default();
             let line = format!("🔀 Account {} ({}): {}", account, status, message);
-            ui.dispatch_logs.push_back(DispatchEntry { line });
+            ui.dispatch_logs.push_back(DispatchEntry { timestamp: ts, line });
             if ui.dispatch_logs.len() > MAX_LOG_ENTRIES {
                 ui.dispatch_logs.pop_front();
             }
@@ -191,73 +201,70 @@ fn handle_event(ui: &mut UiState, event: TuiEvent) {
 // ---------------------------------------------------------------------------
 
 fn scroll_up(ui: &mut UiState) {
-    match ui.active_tab {
-        1 => ui.request_scroll = ui.request_scroll.saturating_sub(1),
-        2 => ui.dispatch_scroll = ui.dispatch_scroll.saturating_sub(1),
-        _ => {}
+    if ui.active_tab == 1 {
+        if ui.traffic_focus == 0 {
+            ui.request_scroll = ui.request_scroll.saturating_sub(1);
+        } else {
+            ui.dispatch_scroll = ui.dispatch_scroll.saturating_sub(1);
+        }
     }
 }
 
 fn scroll_down(ui: &mut UiState) {
-    match ui.active_tab {
-        1 => ui.request_scroll = (ui.request_scroll + 1)
-            .min(ui.request_logs.len().saturating_sub(1)),
-        2 => ui.dispatch_scroll = (ui.dispatch_scroll + 1)
-            .min(ui.dispatch_logs.len().saturating_sub(1)),
-        _ => {}
-    }
-    // Check if at bottom to re-pin
-    let (len, scroll) = match ui.active_tab {
-        1 => (ui.request_logs.len(), ui.request_scroll),
-        2 => (ui.dispatch_logs.len(), ui.dispatch_scroll),
-        _ => (0, 0),
-    };
-    if scroll >= len.saturating_sub(1) {
-        ui.pinned_to_bottom = true;
+    if ui.active_tab == 1 {
+        if ui.traffic_focus == 0 {
+            let max_r = ui.request_logs.len().saturating_sub(1);
+            ui.request_scroll = (ui.request_scroll + 1).min(max_r);
+            if ui.request_scroll >= max_r { ui.pinned_to_bottom = true; }
+        } else {
+            let max_d = ui.dispatch_logs.len().saturating_sub(1);
+            ui.dispatch_scroll = (ui.dispatch_scroll + 1).min(max_d);
+            if ui.dispatch_scroll >= max_d { ui.pinned_to_bottom = true; }
+        }
     }
 }
 
 fn page_up(ui: &mut UiState) {
-    match ui.active_tab {
-        1 => ui.request_scroll = ui.request_scroll.saturating_sub(10),
-        2 => ui.dispatch_scroll = ui.dispatch_scroll.saturating_sub(10),
-        _ => {}
+    if ui.active_tab == 1 {
+        if ui.traffic_focus == 0 {
+            ui.request_scroll = ui.request_scroll.saturating_sub(10);
+        } else {
+            ui.dispatch_scroll = ui.dispatch_scroll.saturating_sub(10);
+        }
     }
 }
 
 fn page_down(ui: &mut UiState) {
-    match ui.active_tab {
-        1 => {
-            ui.request_scroll = (ui.request_scroll + 10)
-                .min(ui.request_logs.len().saturating_sub(1));
-            if ui.request_scroll >= ui.request_logs.len().saturating_sub(1) {
-                ui.pinned_to_bottom = true;
-            }
+    if ui.active_tab == 1 {
+        if ui.traffic_focus == 0 {
+            let max_r = ui.request_logs.len().saturating_sub(1);
+            ui.request_scroll = (ui.request_scroll + 10).min(max_r);
+            if ui.request_scroll >= max_r { ui.pinned_to_bottom = true; }
+        } else {
+            let max_d = ui.dispatch_logs.len().saturating_sub(1);
+            ui.dispatch_scroll = (ui.dispatch_scroll + 10).min(max_d);
+            if ui.dispatch_scroll >= max_d { ui.pinned_to_bottom = true; }
         }
-        2 => {
-            ui.dispatch_scroll = (ui.dispatch_scroll + 10)
-                .min(ui.dispatch_logs.len().saturating_sub(1));
-            if ui.dispatch_scroll >= ui.dispatch_logs.len().saturating_sub(1) {
-                ui.pinned_to_bottom = true;
-            }
-        }
-        _ => {}
     }
 }
 
 fn scroll_home(ui: &mut UiState) {
-    match ui.active_tab {
-        1 => ui.request_scroll = 0,
-        2 => ui.dispatch_scroll = 0,
-        _ => {}
+    if ui.active_tab == 1 {
+        if ui.traffic_focus == 0 {
+            ui.request_scroll = 0;
+        } else {
+            ui.dispatch_scroll = 0;
+        }
     }
 }
 
 fn scroll_end(ui: &mut UiState) {
-    match ui.active_tab {
-        1 => ui.request_scroll = ui.request_logs.len().saturating_sub(1),
-        2 => ui.dispatch_scroll = ui.dispatch_logs.len().saturating_sub(1),
-        _ => {}
+    if ui.active_tab == 1 {
+        if ui.traffic_focus == 0 {
+            ui.request_scroll = ui.request_logs.len().saturating_sub(1);
+        } else {
+            ui.dispatch_scroll = ui.dispatch_logs.len().saturating_sub(1);
+        }
     }
 }
 
@@ -286,7 +293,7 @@ fn render(f: &mut Frame, ui: &UiState) {
         .constraints([
             Constraint::Length(3),  // banner
             Constraint::Length(2),  // tabs
-            Constraint::Min(40),    // content
+            Constraint::Min(0),     // content — shrinks before header/tabs
             Constraint::Length(1),  // status bar
         ])
         .split(area);
@@ -295,15 +302,14 @@ fn render(f: &mut Frame, ui: &UiState) {
     render_tabs(f, chunks[1], ui.active_tab);
     match ui.active_tab {
         0 => render_dashboard(f, chunks[2], ui),
-        1 => render_request_logs(f, chunks[2], ui),
-        2 => render_dispatch_logs(f, chunks[2], ui),
+        1 => render_traffic(f, chunks[2], ui),
         _ => {}
     }
     render_status_bar(f, chunks[3], ui);
 }
 
 fn render_tabs(f: &mut Frame, area: Rect, active: usize) {
-    let titles = vec![" Dashboard ", " Requests ", " Dispatch "];
+    let titles = vec![" Dashboard ", " Traffic "];
     let tab_widgets: Vec<Line> = titles
         .iter()
         .enumerate()
@@ -394,11 +400,25 @@ fn dash(label: &str, value: &str, color: Color) -> ListItem<'static> {
     ListItem::new(line)
 }
 
-fn render_request_logs(f: &mut Frame, area: Rect, ui: &UiState) {
+fn render_traffic(f: &mut Frame, area: Rect, ui: &UiState) {
+    let splits = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Ratio(1, 2),
+            Constraint::Ratio(1, 2),
+        ])
+        .split(area);
+
+    render_request_logs(f, splits[0], ui, ui.traffic_focus == 0);
+    render_dispatch_logs(f, splits[1], ui, ui.traffic_focus == 1);
+}
+
+fn render_request_logs(f: &mut Frame, area: Rect, ui: &UiState, focused: bool) {
     let logs: Vec<&LogEntry> = ui.request_logs.iter().collect();
     let vis_height = area.height.saturating_sub(2) as usize;
     let end = (ui.request_scroll + vis_height).min(logs.len());
-    let window = &logs[ui.request_scroll.min(logs.len().saturating_sub(1))..end];
+    let start = ui.request_scroll.min(logs.len().saturating_sub(1));
+    let window = &logs[start..end];
 
     let items: Vec<ListItem> = window
         .iter()
@@ -416,7 +436,7 @@ fn render_request_logs(f: &mut Frame, area: Rect, ui: &UiState) {
                 "--".to_string()
             };
 
-            let line = Line::from(vec![
+            let mut spans = vec![
                 Span::styled(entry.timestamp.clone(), Style::default().fg(Color::DarkGray)),
                 Span::raw("  "),
                 Span::styled(status_icon, Style::default().fg(status_color)),
@@ -425,23 +445,28 @@ fn render_request_logs(f: &mut Frame, area: Rect, ui: &UiState) {
                 Span::raw("  "),
                 Span::styled(format!("{:>4}", latency), Style::default().fg(Color::Cyan)),
                 Span::raw("  "),
-                Span::styled(format!("{} {}", entry.method, entry.path), Style::default().fg(Color::White)),
-            ]);
-            ListItem::new(line)
+            ];
+            if !entry.model.is_empty() {
+                spans.push(Span::styled(format!("{} ", entry.model), Style::default().fg(Color::Magenta)));
+            }
+            spans.push(Span::styled(format!("{} {}", entry.method, entry.path), Style::default().fg(Color::White)));
+            ListItem::new(Line::from(spans))
         })
         .collect();
 
+    let title_style = if focused { Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD) } else { Style::default() };
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(" Requests "));
+        .block(Block::default().borders(Borders::ALL).title(" Requests ").title_style(title_style));
 
     f.render_widget(list, area);
 }
 
-fn render_dispatch_logs(f: &mut Frame, area: Rect, ui: &UiState) {
+fn render_dispatch_logs(f: &mut Frame, area: Rect, ui: &UiState, focused: bool) {
     let logs: Vec<&DispatchEntry> = ui.dispatch_logs.iter().collect();
     let vis_height = area.height.saturating_sub(2) as usize;
     let end = (ui.dispatch_scroll + vis_height).min(logs.len());
-    let window = &logs[ui.dispatch_scroll.min(logs.len().saturating_sub(1))..end];
+    let start = ui.dispatch_scroll.min(logs.len().saturating_sub(1));
+    let window = &logs[start..end];
 
     let items: Vec<ListItem> = window
         .iter()
@@ -453,21 +478,28 @@ fn render_dispatch_logs(f: &mut Frame, area: Rect, ui: &UiState) {
             } else {
                 Color::White
             };
-            ListItem::new(Line::from(Span::styled(entry.line.clone(), Style::default().fg(color))))
+            ListItem::new(Line::from(vec![
+                Span::styled(entry.timestamp.clone(), Style::default().fg(Color::DarkGray)),
+                Span::raw(" "),
+                Span::styled(entry.line.clone(), Style::default().fg(color)),
+            ]))
         })
         .collect();
 
+    let title_style = if focused { Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD) } else { Style::default() };
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(" Dispatch "));
+        .block(Block::default().borders(Borders::ALL).title(" Dispatch ").title_style(title_style));
 
     f.render_widget(list, area);
 }
 
 fn render_status_bar(f: &mut Frame, area: Rect, ui: &UiState) {
     let hint = match ui.active_tab {
-        0 => "Tab/1-3:switch  q:quit".to_string(),
-        1 => format!("↑↓/jk:scroll  gg/G:jump  End:latest  |  {} entries", ui.request_logs.len()),
-        2 => format!("↑↓/jk:scroll  gg/G:jump  End:latest  |  {} entries", ui.dispatch_logs.len()),
+        0 => "Tab/1-2:switch  q:quit".to_string(),
+        1 => {
+            let focus = if ui.traffic_focus == 0 { "[▼Requests]" } else { "[▼Dispatch]" };
+            format!("{focus} Space:switch  ↑↓/jk:scroll  gg/G:jump  End:latest  |  Reqs:{}  Disp:{}", ui.request_logs.len(), ui.dispatch_logs.len())
+        }
         _ => String::new(),
     };
     let status = Line::from(Span::styled(hint, Style::default().fg(Color::DarkGray)));

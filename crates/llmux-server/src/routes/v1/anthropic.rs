@@ -16,7 +16,7 @@ use llmux_core::proxy::{build_anthropic_passthrough_request, extract_anthropic_u
 use crate::app::{AppState, TuiEvent};
 use crate::middleware::{self, AuthContext};
 
-use super::helpers::log_usage;
+use super::helpers::{log_usage, send_tui_request};
 
 // ---------------------------------------------------------------------------
 // /v1/messages  (Anthropic Messages API) — pure passthrough only
@@ -110,6 +110,14 @@ pub async fn messages(
         router.select(&dispatch_key, &accounts, preferred_id)
     };
 
+    let dispatch_tag = if dispatch_meta.is_probe {
+        Some("probe".to_string())
+    } else if ordered_accounts.first().map(|a| a.id) != Some(preferred_id) {
+        Some("fallback".to_string())
+    } else {
+        None
+    };
+
     let start = Instant::now();
     let mut last_error: Option<String> = None;
 
@@ -138,9 +146,14 @@ pub async fn messages(
                 );
                 if let Some(tx) = &state.tui_tx {
                     let _ = tx.send(TuiEvent::Dispatch {
+                        timestamp: time::OffsetDateTime::now_local()
+                            .unwrap_or_else(|_| time::OffsetDateTime::now_utc())
+                            .format(&time::format_description::parse("[hour]:[minute]:[second]").unwrap())
+                            .unwrap_or_default(),
                         account: account.alias.clone(),
                         model: model_resolution.target_model.clone(),
                         url: base_url.to_string(),
+                        tag: dispatch_tag.clone(),
                     });
                 }
                 r
@@ -148,6 +161,13 @@ pub async fn messages(
             Err(e) => {
                 tracing::error!("📡 Failed to build passthrough request: {e}");
                 last_error = Some(format!("Failed to build passthrough request: {e}"));
+                if let Some(tx) = &state.tui_tx {
+                    let _ = tx.send(TuiEvent::Retry {
+                        account: account.alias.clone(),
+                        status: 0,
+                        message: format!("Build error: {e}"),
+                    });
+                }
                 if account.id == preferred_id {
                     let mut router = state.dispatch_router.lock().unwrap();
                     router.record_result(&dispatch_key, &dispatch_meta, 0, false);
@@ -161,6 +181,13 @@ pub async fn messages(
             Err(e) => {
                 tracing::error!("📡 passthrough failed: {e}");
                 last_error = Some(format!("Passthrough request failed: {e}"));
+                if let Some(tx) = &state.tui_tx {
+                    let _ = tx.send(TuiEvent::Retry {
+                        account: account.alias.clone(),
+                        status: 0,
+                        message: format!("Network error: {e}"),
+                    });
+                }
                 if account.id == preferred_id {
                     let mut router = state.dispatch_router.lock().unwrap();
                     router.record_result(&dispatch_key, &dispatch_meta, 0, false);
@@ -181,6 +208,13 @@ pub async fn messages(
                     account.id,
                     status.as_u16()
                 );
+                if let Some(tx) = &state.tui_tx {
+                    let _ = tx.send(TuiEvent::Retry {
+                        account: account.alias.clone(),
+                        status: status.as_u16(),
+                        message: error_body.clone(),
+                    });
+                }
                 if account.id == preferred_id {
                     let mut router = state.dispatch_router.lock().unwrap();
                     router.record_result(&dispatch_key, &dispatch_meta, 0, false);
@@ -203,6 +237,7 @@ pub async fn messages(
                         .map(str::to_string)
                 })
                 .unwrap_or_else(|| error_body.clone());
+            send_tui_request(&state.tui_tx, "/v1/messages", status.as_u16(), start, &model_resolution.target_model);
             return (
                 status,
                 Json(serde_json::json!({
@@ -222,6 +257,7 @@ pub async fn messages(
                 let mut router = state.dispatch_router.lock().unwrap();
                 router.record_result(&dispatch_key, &dispatch_meta, account.id, true);
             }
+            send_tui_request(&state.tui_tx, "/v1/messages", status.as_u16(), start, &model_resolution.target_model);
             return anthropic_streaming_passthrough(
                 response,
                 &model_resolution.target_model,
@@ -291,6 +327,7 @@ pub async fn messages(
             let mut router = state.dispatch_router.lock().unwrap();
             router.record_result(&dispatch_key, &dispatch_meta, account.id, true);
         }
+        send_tui_request(&state.tui_tx, "/v1/messages", 200, start, &model_resolution.target_model);
         return Json(data).into_response();
     }
 
@@ -318,6 +355,7 @@ pub async fn messages(
         )
         .await;
     }
+    send_tui_request(&state.tui_tx, "/v1/messages", 502, start, &model_resolution.target_model);
     middleware::send_error(&error_msg, "upstream_error", StatusCode::BAD_GATEWAY, is_anthropic)
 }
 

@@ -1,7 +1,36 @@
 use llmux_core::adapters;
+use std::time::Instant;
+
+use crate::app::TuiEvent;
 
 pub fn normalize_base_url(value: &str) -> String {
     value.trim_end_matches('/').to_string()
+}
+
+pub fn send_tui_request(
+    tui_tx: &Option<tokio::sync::mpsc::UnboundedSender<TuiEvent>>,
+    path: &str,
+    status: u16,
+    start: Instant,
+    model: &str,
+) {
+    if let Some(tx) = tui_tx {
+        let ts = time::OffsetDateTime::now_local()
+            .unwrap_or_else(|_| time::OffsetDateTime::now_utc())
+            .format(
+                &time::format_description::parse("[hour]:[minute]:[second]").unwrap(),
+            )
+            .unwrap_or_default();
+        let latency_ms = start.elapsed().as_millis() as i64;
+        let _ = tx.send(TuiEvent::Request {
+            timestamp: ts,
+            method: "POST".to_string(),
+            path: path.to_string(),
+            status,
+            latency_ms,
+            model: model.to_string(),
+        });
+    }
 }
 
 // ---------------------------------------------------------------------------

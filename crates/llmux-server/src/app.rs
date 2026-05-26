@@ -36,11 +36,14 @@ pub enum TuiEvent {
         path: String,
         status: u16,
         latency_ms: i64,
+        model: String,
     },
     Dispatch {
+        timestamp: String,
         account: String,
         model: String,
         url: String,
+        tag: Option<String>,
     },
     Retry {
         account: String,
@@ -143,17 +146,24 @@ where
                 tracing::info!(
                     "{status_icon} {code} → {kind_icon} {method} {path}",
                 );
-                if let Some(tx) = &tui_tx {
-                    let ts = time::OffsetDateTime::now_utc()
-                        .format(&time::format_description::parse("[hour]:[minute]:[second]").unwrap())
-                        .unwrap_or_default();
-                    let _ = tx.send(TuiEvent::Request {
-                        timestamp: ts,
-                        method: method.to_string(),
-                        path: path.clone(),
-                        status: code,
-                        latency_ms,
-                    });
+                // AI routes: Request events are sent from route handlers (with model name).
+                // Non-AI routes: send here without model.
+                let is_ai = path.starts_with("/v1/");
+                if !is_ai {
+                    if let Some(tx) = &tui_tx {
+                        let ts = time::OffsetDateTime::now_local()
+                            .unwrap_or_else(|_| time::OffsetDateTime::now_utc())
+                            .format(&time::format_description::parse("[hour]:[minute]:[second]").unwrap())
+                            .unwrap_or_default();
+                        let _ = tx.send(TuiEvent::Request {
+                            timestamp: ts,
+                            method: method.to_string(),
+                            path: path.clone(),
+                            status: code,
+                            latency_ms,
+                            model: String::new(),
+                        });
+                    }
                 }
             }
             Ok(res)

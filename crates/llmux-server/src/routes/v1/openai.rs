@@ -17,7 +17,7 @@ use llmux_core::dispatcher::{self, get_accounts_by_ids, get_active_accounts, is_
 use crate::app::{AppState, TuiEvent};
 use crate::middleware::{self, AuthContext};
 
-use super::helpers::{log_usage, normalize_base_url};
+use super::helpers::{log_usage, normalize_base_url, send_tui_request};
 
 // ---------------------------------------------------------------------------
 // /v1/chat/completions  — pure OpenAI-compatible passthrough
@@ -161,6 +161,14 @@ async fn openai_dispatch(
         router.select(&dispatch_key, &accounts, preferred_id)
     };
 
+    let dispatch_tag = if dispatch_meta.is_probe {
+        Some("probe".to_string())
+    } else if ordered_accounts.first().map(|a| a.id) != Some(preferred_id) {
+        Some("fallback".to_string())
+    } else {
+        None
+    };
+
     // Patch the model field in the body to the resolved target model.
     let mut patched_body = body;
     patched_body["model"] = serde_json::Value::String(model_resolution.target_model.clone());
@@ -205,9 +213,14 @@ async fn openai_dispatch(
         );
         if let Some(tx) = &state.tui_tx {
             let _ = tx.send(TuiEvent::Dispatch {
+                timestamp: time::OffsetDateTime::now_local()
+                    .unwrap_or_else(|_| time::OffsetDateTime::now_utc())
+                    .format(&time::format_description::parse("[hour]:[minute]:[second]").unwrap())
+                    .unwrap_or_default(),
                 account: account.alias.clone(),
                 model: model_resolution.target_model.clone(),
                 url: format!("{}/{}", base_url, endpoint),
+                tag: dispatch_tag.clone(),
             });
         }
 
@@ -220,6 +233,13 @@ async fn openai_dispatch(
                     account.id
                 );
                 last_error = Some(format!("Provider request failed: {e}"));
+                if let Some(tx) = &state.tui_tx {
+                    let _ = tx.send(TuiEvent::Retry {
+                        account: account.alias.clone(),
+                        status: 0,
+                        message: format!("Network error: {e}"),
+                    });
+                }
                 if account.id == preferred_id {
                     let mut router = state.dispatch_router.lock().unwrap();
                     router.record_result(&dispatch_key, &dispatch_meta, 0, false);
@@ -241,6 +261,13 @@ async fn openai_dispatch(
                     account.id,
                     status.as_u16()
                 );
+                if let Some(tx) = &state.tui_tx {
+                    let _ = tx.send(TuiEvent::Retry {
+                        account: account.alias.clone(),
+                        status: status.as_u16(),
+                        message: error_body.clone(),
+                    });
+                }
                 if account.id == preferred_id {
                     let mut router = state.dispatch_router.lock().unwrap();
                     router.record_result(&dispatch_key, &dispatch_meta, 0, false);
@@ -262,6 +289,7 @@ async fn openai_dispatch(
                 &last_error,
             )
             .await;
+            send_tui_request(&state.tui_tx, normalized_uri.path(), status.as_u16(), start, &model_resolution.target_model);
             if let Ok(json_val) = serde_json::from_str::<Value>(&error_body) {
                 return (status, Json(json_val)).into_response();
             }
@@ -273,6 +301,7 @@ async fn openai_dispatch(
                 let mut router = state.dispatch_router.lock().unwrap();
                 router.record_result(&dispatch_key, &dispatch_meta, account.id, true);
             }
+            send_tui_request(&state.tui_tx, normalized_uri.path(), status.as_u16(), start, &model_resolution.target_model);
             return openai_streaming_passthrough(
                 response,
                 &model_resolution.target_model,
@@ -321,6 +350,7 @@ async fn openai_dispatch(
             let mut router = state.dispatch_router.lock().unwrap();
             router.record_result(&dispatch_key, &dispatch_meta, account.id, true);
         }
+        send_tui_request(&state.tui_tx, normalized_uri.path(), 200, start, &model_resolution.target_model);
         return Json(data).into_response();
     }
 
@@ -347,6 +377,7 @@ async fn openai_dispatch(
         )
         .await;
     }
+    send_tui_request(&state.tui_tx, normalized_uri.path(), 502, start, &model_resolution.target_model);
     middleware::send_error(
         &error_msg,
         "upstream_error",
