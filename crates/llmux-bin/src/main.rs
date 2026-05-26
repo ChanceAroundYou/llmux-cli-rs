@@ -70,7 +70,7 @@ async fn start(port_override: Option<u16>, use_tui: bool) -> anyhow::Result<()> 
 
     let master_key = get_or_create_master_key(&config.data_dir, config.master_key.as_deref())?;
 
-    let dispatcher_state = Arc::new(Mutex::new(llmux_core::dispatcher::DispatcherState::default()));
+    let dispatch_router = Arc::new(Mutex::new(llmux_core::dispatcher::DispatchRouter::default()));
     let test_queue = Arc::new(Mutex::new(TestQueueState::default()));
     let models_cache = Arc::new(Mutex::new(None));
 
@@ -97,7 +97,7 @@ async fn start(port_override: Option<u16>, use_tui: bool) -> anyhow::Result<()> 
         master_key,
         data_dir: config.data_dir.clone(),
         test_queue,
-        dispatcher_state,
+        dispatch_router,
         models_cache,
         tui_tx,
     };

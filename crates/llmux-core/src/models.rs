@@ -34,6 +34,7 @@ pub struct ModelAlias {
     pub target_model: String,
     pub provider_id: Option<String>,
     pub account_ids: Option<String>,
+    pub preferred_account_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, PartialEq)]

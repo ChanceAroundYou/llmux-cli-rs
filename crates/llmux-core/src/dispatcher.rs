@@ -4,6 +4,7 @@ use crate::models::ModelAlias;
 use serde_json::Value;
 use sqlx::{Row, SqlitePool};
 use std::collections::HashMap;
+use std::time::Instant;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelResolution {
@@ -11,23 +12,218 @@ pub struct ModelResolution {
     pub target_model: String,
     /// If set, load only these account IDs (cross-provider). Supersedes provider_id grouping.
     pub account_ids: Vec<i64>,
+    pub preferred_account_id: Option<i64>,
+    pub alias_name: Option<String>,
 }
 
-#[derive(Debug, Default, Clone)]
-pub struct DispatcherState {
-    indices: HashMap<String, usize>,
+// ---------------------------------------------------------------------------
+// Sticky-session dispatch router
+// ---------------------------------------------------------------------------
+
+const PROBE_TRIGGER_COUNT: u32 = 5;
+const INITIAL_PROBE_BACKOFF_SECS: u64 = 30;
+const MAX_PROBE_BACKOFF_SECS: u64 = 600;
+
+/// The sticky routing mode for a single dispatch key.
+#[derive(Debug, Clone)]
+enum StickyMode {
+    /// Using the preferred account. All requests go to it.
+    Primary,
+    /// Using a fallback account. Periodically probes preferred.
+    Fallback {
+        /// The account ID we are currently stuck to as fallback (for cache warmth).
+        sticky_fallback_id: i64,
+        /// Consecutive successful requests on fallback accounts.
+        consecutive_successes: u32,
+        /// When we last attempted to probe the preferred account.
+        last_probe: Instant,
+        /// Current probe backoff in seconds (doubles on each failed probe).
+        probe_backoff_secs: u64,
+    },
 }
 
-impl DispatcherState {
-    pub fn next_start_index(&mut self, provider_id: &str, account_len: usize) -> usize {
-        if account_len == 0 {
-            return 0;
+#[derive(Debug, Clone)]
+struct StickyEntry {
+    mode: StickyMode,
+}
+
+impl Default for StickyEntry {
+    fn default() -> Self {
+        Self {
+            mode: StickyMode::Primary,
         }
-        let idx = self.indices.get(provider_id).copied().unwrap_or_default() % account_len;
-        self.indices
-            .insert(provider_id.to_string(), (idx + 1) % account_len);
-        idx
     }
+}
+
+/// Metadata about a dispatch decision, returned by `DispatchRouter::select`.
+#[derive(Debug, Clone)]
+pub struct DispatchMeta {
+    pub is_probe: bool,
+    pub preferred_id: i64,
+}
+
+/// Sticky-session routing state machine with failover and exponential backoff.
+#[derive(Debug, Clone, Default)]
+pub struct DispatchRouter {
+    entries: HashMap<String, StickyEntry>,
+}
+
+impl DispatchRouter {
+    /// Determine the ordered list of accounts to try for this request.
+    pub fn select(
+        &mut self,
+        dispatch_key: &str,
+        accounts: &[Account],
+        preferred_id: i64,
+    ) -> (Vec<Account>, DispatchMeta) {
+        let entry = self.entries.entry(dispatch_key.to_string()).or_default();
+
+        let preferred_exists = accounts.iter().any(|a| a.id == preferred_id);
+        if !preferred_exists {
+            entry.mode = StickyMode::Primary;
+        }
+
+        match &entry.mode {
+            StickyMode::Primary => {
+                let ordered = order_with_preferred_first(accounts, preferred_id);
+                (
+                    ordered,
+                    DispatchMeta {
+                        is_probe: false,
+                        preferred_id,
+                    },
+                )
+            }
+            StickyMode::Fallback {
+                sticky_fallback_id,
+                consecutive_successes,
+                last_probe,
+                probe_backoff_secs,
+            } => {
+                let should_probe = *consecutive_successes >= PROBE_TRIGGER_COUNT
+                    || last_probe.elapsed().as_secs() >= *probe_backoff_secs;
+
+                if should_probe {
+                    let ordered = order_with_preferred_first(accounts, preferred_id);
+                    (
+                        ordered,
+                        DispatchMeta {
+                            is_probe: true,
+                            preferred_id,
+                        },
+                    )
+                } else {
+                    let ordered =
+                        order_with_fallback_first(accounts, preferred_id, *sticky_fallback_id);
+                    (
+                        ordered,
+                        DispatchMeta {
+                            is_probe: false,
+                            preferred_id,
+                        },
+                    )
+                }
+            }
+        }
+    }
+
+    /// Update state after a dispatch attempt completes.
+    pub fn record_result(
+        &mut self,
+        dispatch_key: &str,
+        meta: &DispatchMeta,
+        used_account_id: i64,
+        success: bool,
+    ) {
+        let entry = self.entries.entry(dispatch_key.to_string()).or_default();
+
+        match &mut entry.mode {
+            StickyMode::Primary => {
+                if !success || used_account_id != meta.preferred_id {
+                    let sticky = if used_account_id != 0 && used_account_id != meta.preferred_id {
+                        used_account_id
+                    } else {
+                        0
+                    };
+                    entry.mode = StickyMode::Fallback {
+                        sticky_fallback_id: sticky,
+                        consecutive_successes: if sticky != 0 { 1 } else { 0 },
+                        last_probe: Instant::now(),
+                        probe_backoff_secs: INITIAL_PROBE_BACKOFF_SECS,
+                    };
+                }
+            }
+            StickyMode::Fallback {
+                sticky_fallback_id,
+                consecutive_successes,
+                last_probe,
+                probe_backoff_secs,
+            } => {
+                if meta.is_probe {
+                    if success && used_account_id == meta.preferred_id {
+                        entry.mode = StickyMode::Primary;
+                    } else {
+                        *probe_backoff_secs =
+                            (*probe_backoff_secs * 2).min(MAX_PROBE_BACKOFF_SECS);
+                        *consecutive_successes = 0;
+                        *last_probe = Instant::now();
+                        if success && used_account_id != 0 && used_account_id != meta.preferred_id {
+                            *sticky_fallback_id = used_account_id;
+                        }
+                    }
+                } else {
+                    if success {
+                        *consecutive_successes += 1;
+                        if used_account_id != 0 {
+                            *sticky_fallback_id = used_account_id;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn order_with_preferred_first(accounts: &[Account], preferred_id: i64) -> Vec<Account> {
+    let mut result: Vec<Account> = Vec::with_capacity(accounts.len());
+    let mut preferred: Option<Account> = None;
+    for a in accounts {
+        if a.id == preferred_id {
+            preferred = Some(a.clone());
+        } else {
+            result.push(a.clone());
+        }
+    }
+    if let Some(p) = preferred {
+        result.insert(0, p);
+    }
+    result
+}
+
+fn order_with_fallback_first(
+    accounts: &[Account],
+    preferred_id: i64,
+    sticky_fallback_id: i64,
+) -> Vec<Account> {
+    let mut result: Vec<Account> = Vec::with_capacity(accounts.len());
+    let mut sticky: Option<Account> = None;
+    let mut preferred: Option<Account> = None;
+    for a in accounts {
+        if a.id == sticky_fallback_id {
+            sticky = Some(a.clone());
+        } else if a.id == preferred_id {
+            preferred = Some(a.clone());
+        } else {
+            result.push(a.clone());
+        }
+    }
+    if let Some(s) = sticky {
+        result.insert(0, s);
+    }
+    if let Some(p) = preferred {
+        result.push(p);
+    }
+    result
 }
 
 /// Strip ANSI escape sequences, control characters, and Claude Code
@@ -71,13 +267,15 @@ pub fn resolve_model_by_prefix(model_name: &str) -> ModelResolution {
         provider_id: provider_id.to_string(),
         target_model: model_name.to_string(),
         account_ids: Vec::new(),
+        preferred_account_id: None,
+        alias_name: None,
     }
 }
 
 pub async fn resolve_model(pool: &SqlitePool, model_name: &str) -> anyhow::Result<ModelResolution> {
     let model_name = sanitize_model_name(model_name);
     let alias = sqlx::query_as::<_, ModelAlias>(
-        "SELECT id, alias, target_model, provider_id, account_ids FROM model_aliases WHERE alias = ?",
+        "SELECT id, alias, target_model, provider_id, account_ids, preferred_account_id FROM model_aliases WHERE alias = ?",
     )
     .bind(&model_name)
     .fetch_optional(pool)
@@ -91,11 +289,15 @@ pub async fn resolve_model(pool: &SqlitePool, model_name: &str) -> anyhow::Resul
             .and_then(|s| serde_json::from_str(s).ok())
             .unwrap_or_default();
 
+        let alias_name = Some(alias.alias.clone());
+
         if !account_ids.is_empty() {
             return Ok(ModelResolution {
                 provider_id: alias.provider_id.unwrap_or_default(),
                 target_model: alias.target_model,
                 account_ids,
+                preferred_account_id: alias.preferred_account_id,
+                alias_name,
             });
         }
 
@@ -104,6 +306,8 @@ pub async fn resolve_model(pool: &SqlitePool, model_name: &str) -> anyhow::Resul
                 provider_id,
                 target_model: alias.target_model,
                 account_ids: Vec::new(),
+                preferred_account_id: alias.preferred_account_id,
+                alias_name,
             });
         }
     }
@@ -127,24 +331,6 @@ pub fn resolve_provider_type(provider_type: Option<&str>, provider_id: &str) -> 
 
 pub fn is_retryable_status(status: u16) -> bool {
     matches!(status, 401 | 403 | 429)
-}
-
-pub fn order_accounts_for_attempts(accounts: &[Account], start_index: usize) -> Vec<Account> {
-    if accounts.is_empty() {
-        return Vec::new();
-    }
-    (0..accounts.len())
-        .map(|offset| accounts[(start_index + offset) % accounts.len()].clone())
-        .collect()
-}
-
-pub fn select_accounts_for_dispatch(
-    accounts: &[Account],
-    provider_id: &str,
-    state: &mut DispatcherState,
-) -> Vec<Account> {
-    let start = state.next_start_index(provider_id, accounts.len());
-    order_accounts_for_attempts(accounts, start)
 }
 
 /// Load accounts by explicit IDs (for cross-provider alias binding).

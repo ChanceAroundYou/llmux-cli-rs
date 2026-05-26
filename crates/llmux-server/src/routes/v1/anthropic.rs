@@ -10,7 +10,7 @@ use futures_util::StreamExt;
 use serde_json::Value;
 
 use llmux_core::adapters::{self, execute_provider_request};
-use llmux_core::dispatcher::{self, get_accounts_by_ids, get_active_accounts, is_retryable_status, select_accounts_for_dispatch};
+use llmux_core::dispatcher::{self, get_accounts_by_ids, get_active_accounts, is_retryable_status};
 use llmux_core::proxy::{build_anthropic_passthrough_request, extract_anthropic_usage_from_sse};
 
 use crate::app::{AppState, TuiEvent};
@@ -95,9 +95,19 @@ pub async fn messages(
         );
     }
 
-    let ordered_accounts = {
-        let mut ds = state.dispatcher_state.lock().unwrap();
-        select_accounts_for_dispatch(&accounts, &model_resolution.provider_id, &mut ds)
+    let dispatch_key = model_resolution
+        .alias_name
+        .as_deref()
+        .map(|n| format!("alias:{}", n))
+        .unwrap_or_else(|| format!("provider:{}", model_resolution.provider_id));
+
+    let preferred_id = model_resolution
+        .preferred_account_id
+        .unwrap_or_else(|| accounts.first().map(|a| a.id).unwrap_or(0));
+
+    let (ordered_accounts, dispatch_meta) = {
+        let mut router = state.dispatch_router.lock().unwrap();
+        router.select(&dispatch_key, &accounts, preferred_id)
     };
 
     let start = Instant::now();
@@ -138,6 +148,10 @@ pub async fn messages(
             Err(e) => {
                 tracing::error!("📡 Failed to build passthrough request: {e}");
                 last_error = Some(format!("Failed to build passthrough request: {e}"));
+                if account.id == preferred_id {
+                    let mut router = state.dispatch_router.lock().unwrap();
+                    router.record_result(&dispatch_key, &dispatch_meta, 0, false);
+                }
                 continue;
             }
         };
@@ -147,6 +161,10 @@ pub async fn messages(
             Err(e) => {
                 tracing::error!("📡 passthrough failed: {e}");
                 last_error = Some(format!("Passthrough request failed: {e}"));
+                if account.id == preferred_id {
+                    let mut router = state.dispatch_router.lock().unwrap();
+                    router.record_result(&dispatch_key, &dispatch_meta, 0, false);
+                }
                 continue;
             }
         };
@@ -163,6 +181,10 @@ pub async fn messages(
                     account.id,
                     status.as_u16()
                 );
+                if account.id == preferred_id {
+                    let mut router = state.dispatch_router.lock().unwrap();
+                    router.record_result(&dispatch_key, &dispatch_meta, 0, false);
+                }
                 continue;
             }
 
@@ -196,6 +218,10 @@ pub async fn messages(
 
         // Success — streaming or non-streaming
         if streaming {
+            {
+                let mut router = state.dispatch_router.lock().unwrap();
+                router.record_result(&dispatch_key, &dispatch_meta, account.id, true);
+            }
             return anthropic_streaming_passthrough(
                 response,
                 &model_resolution.target_model,
@@ -261,10 +287,19 @@ pub async fn messages(
             }
         };
 
+        {
+            let mut router = state.dispatch_router.lock().unwrap();
+            router.record_result(&dispatch_key, &dispatch_meta, account.id, true);
+        }
         return Json(data).into_response();
     }
 
     // All accounts exhausted
+    {
+        let mut router = state.dispatch_router.lock().unwrap();
+        router.record_result(&dispatch_key, &dispatch_meta, 0, false);
+    }
+
     let latency_ms = start.elapsed().as_millis() as i64;
     let error_msg = last_error.unwrap_or_else(|| "All accounts exhausted".to_string());
     if let Some(account) = ordered_accounts.first() {

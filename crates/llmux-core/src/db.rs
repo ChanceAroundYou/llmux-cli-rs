@@ -6,6 +6,7 @@ use std::str::FromStr;
 pub const INIT_SQL: &str = include_str!("migrations/0001_init.sql");
 pub const MIGRATION_002: &str = include_str!("migrations/0002_add_account_ids.sql");
 pub const MIGRATION_003: &str = include_str!("migrations/0003_add_openai_compatible.sql");
+pub const MIGRATION_004: &str = include_str!("migrations/0004_add_preferred_account_id.sql");
 
 pub async fn connect_sqlite(database_url: &str) -> Result<SqlitePool> {
     let options = SqliteConnectOptions::from_str(database_url)?.create_if_missing(true);
@@ -31,6 +32,12 @@ pub async fn init_db(pool: &SqlitePool) -> Result<()> {
         }
     }
     for statement in MIGRATION_003.split(';') {
+        let statement = statement.trim();
+        if !statement.is_empty() {
+            let _ = pool.execute(statement).await;
+        }
+    }
+    for statement in MIGRATION_004.split(';') {
         let statement = statement.trim();
         if !statement.is_empty() {
             let _ = pool.execute(statement).await;

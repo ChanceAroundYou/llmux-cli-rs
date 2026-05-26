@@ -69,6 +69,8 @@ pub async fn start_test_queue(
                     provider_id: provider_id_override.unwrap_or("openai").to_string(),
                     target_model: model_name.to_string(),
                     account_ids: vec![],
+                    preferred_account_id: None,
+                    alias_name: None,
                 }
             });
 

@@ -2,7 +2,7 @@ use llmux_core::adapters::{
     build_custom_request, build_openai_request, Account, ChatMessage, ChatRequest,
 };
 use llmux_core::dispatcher::{
-    is_retryable_status, order_accounts_for_attempts, resolve_model_by_prefix, resolve_provider_type,
+    is_retryable_status, resolve_model_by_prefix, resolve_provider_type, DispatchRouter,
 };
 use llmux_core::proxy::{
     build_anthropic_passthrough_request, build_anthropic_target_url, extract_anthropic_usage_from_sse,
@@ -164,7 +164,10 @@ fn dispatcher_helpers_resolve_and_order_failover_attempts() {
             ..account("openai")
         },
     ];
-    let ordered = order_accounts_for_attempts(&accounts, 1);
-    let ids: Vec<i64> = ordered.into_iter().map(|a| a.id).collect();
-    assert_eq!(ids, vec![2, 3, 1]);
+    let mut router = DispatchRouter::default();
+    let (ordered, meta) = router.select("test_key", &accounts, 1);
+    assert!(!meta.is_probe);
+    assert_eq!(meta.preferred_id, 1);
+    // Preferred account (id=1) should be first
+    assert_eq!(ordered[0].id, 1);
 }

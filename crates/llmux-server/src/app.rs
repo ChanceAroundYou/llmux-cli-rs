@@ -10,7 +10,7 @@ use axum::{
 };
 use std::task::{Context, Poll};
 use tower::{Layer, Service};
-use llmux_core::dispatcher::DispatcherState;
+use llmux_core::dispatcher::DispatchRouter;
 use serde_json::Value;
 use sqlx::SqlitePool;
 use tower_http::{
@@ -55,7 +55,7 @@ pub struct AppState {
     pub master_key: String,
     pub data_dir: std::path::PathBuf,
     pub test_queue: Arc<Mutex<TestQueueState>>,
-    pub dispatcher_state: Arc<Mutex<DispatcherState>>,
+    pub dispatch_router: Arc<Mutex<DispatchRouter>>,
     pub models_cache: Arc<Mutex<Option<ModelsCache>>>,
     pub tui_tx: Option<tokio::sync::mpsc::UnboundedSender<TuiEvent>>,
 }
@@ -299,7 +299,7 @@ pub async fn test_state() -> AppState {
         master_key: "test-master-key".to_string(),
         data_dir: std::path::PathBuf::from("."),
         test_queue: Arc::new(Mutex::new(TestQueueState::default())),
-        dispatcher_state: Arc::new(Mutex::new(DispatcherState::default())),
+        dispatch_router: Arc::new(Mutex::new(DispatchRouter::default())),
         models_cache: Arc::new(Mutex::new(None)),
         tui_tx: None,
     }

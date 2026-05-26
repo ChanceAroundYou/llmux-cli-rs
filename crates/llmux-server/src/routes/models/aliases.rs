@@ -12,7 +12,7 @@ use crate::app::AppState;
 
 pub async fn get_model_aliases(Extension(state): Extension<AppState>) -> Response {
     match sqlx::query_as::<_, ModelAlias>(
-        "SELECT id, alias, target_model, provider_id, account_ids FROM model_aliases ORDER BY id",
+        "SELECT id, alias, target_model, provider_id, account_ids, preferred_account_id FROM model_aliases ORDER BY id",
     )
     .fetch_all(&state.pool)
     .await
@@ -53,13 +53,18 @@ pub async fn set_model_alias(
         }
     });
 
+    let preferred_account_id = body
+        .get("preferred_account_id")
+        .and_then(|v| v.as_i64());
+
     match sqlx::query(
-        "INSERT OR REPLACE INTO model_aliases (alias, target_model, provider_id, account_ids) VALUES (?, ?, ?, ?)",
+        "INSERT OR REPLACE INTO model_aliases (alias, target_model, provider_id, account_ids, preferred_account_id) VALUES (?, ?, ?, ?, ?)",
     )
     .bind(alias)
     .bind(target_model)
     .bind(provider_id)
     .bind(&account_ids)
+    .bind(preferred_account_id)
     .execute(&state.pool)
     .await
     {
@@ -83,7 +88,7 @@ pub async fn delete_model_alias(
     Path(id): Path<String>,
 ) -> Response {
     let alias_row = match sqlx::query_as::<_, ModelAlias>(
-        "SELECT id, alias, target_model, provider_id, account_ids FROM model_aliases WHERE id = ?",
+        "SELECT id, alias, target_model, provider_id, account_ids, preferred_account_id FROM model_aliases WHERE id = ?",
     )
     .bind(&id)
     .fetch_optional(&state.pool)

@@ -73,7 +73,7 @@ export function Dialog({
         onInteractOutside={closeOnOverlay ? undefined : (e) => e.preventDefault()}
         hideClose={hideClose}
       >
-        {(title || description) && (
+        {title || description ? (
           <DialogHeader className={cn('flex flex-row items-start gap-3 px-6 py-4 border-b border-border', headerColor)}>
             {icon}
             <div className="flex-1 min-w-0">
@@ -81,7 +81,10 @@ export function Dialog({
               {description && <DialogDescription className="text-xs text-muted-foreground mt-0.5">{description}</DialogDescription>}
             </div>
           </DialogHeader>
+        ) : (
+          <DialogTitle className="sr-only" />
         )}
+        <DialogDescription className="sr-only" />
         {children && <div className="px-6 py-4">{children}</div>}
         {footer && <DialogFooter className="px-6 py-4 border-t border-border bg-muted/30">{footer}</DialogFooter>}
       </DialogContent>

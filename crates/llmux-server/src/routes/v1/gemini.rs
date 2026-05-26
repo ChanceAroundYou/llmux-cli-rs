@@ -12,7 +12,7 @@ use futures_util::StreamExt;
 use serde_json::Value;
 
 use llmux_core::adapters::{self, execute_provider_request, ProviderRequest};
-use llmux_core::dispatcher::{self, get_accounts_by_ids, get_active_accounts, is_retryable_status, select_accounts_for_dispatch};
+use llmux_core::dispatcher::{self, get_accounts_by_ids, get_active_accounts, is_retryable_status};
 
 use crate::app::{AppState, TuiEvent};
 use crate::middleware::{self, AuthContext};
@@ -97,9 +97,19 @@ pub async fn gemini(
         );
     }
 
-    let ordered_accounts = {
-        let mut ds = state.dispatcher_state.lock().unwrap();
-        select_accounts_for_dispatch(&accounts, &model_resolution.provider_id, &mut ds)
+    let dispatch_key = model_resolution
+        .alias_name
+        .as_deref()
+        .map(|n| format!("alias:{}", n))
+        .unwrap_or_else(|| format!("provider:{}", model_resolution.provider_id));
+
+    let preferred_id = model_resolution
+        .preferred_account_id
+        .unwrap_or_else(|| accounts.first().map(|a| a.id).unwrap_or(0));
+
+    let (ordered_accounts, dispatch_meta) = {
+        let mut router = state.dispatch_router.lock().unwrap();
+        router.select(&dispatch_key, &accounts, preferred_id)
     };
 
     let start = Instant::now();
@@ -187,6 +197,10 @@ pub async fn gemini(
                     account.id
                 );
                 last_error = Some(format!("Provider request failed: {e}"));
+                if account.id == preferred_id {
+                    let mut router = state.dispatch_router.lock().unwrap();
+                    router.record_result(&dispatch_key, &dispatch_meta, 0, false);
+                }
                 continue;
             }
         };
@@ -203,6 +217,10 @@ pub async fn gemini(
                     account.id,
                     status.as_u16()
                 );
+                if account.id == preferred_id {
+                    let mut router = state.dispatch_router.lock().unwrap();
+                    router.record_result(&dispatch_key, &dispatch_meta, 0, false);
+                }
                 continue;
             }
             let latency_ms = start.elapsed().as_millis() as i64;
@@ -234,6 +252,10 @@ pub async fn gemini(
         let is_stream = content_type.contains("text/event-stream");
 
         if is_stream {
+            {
+                let mut router = state.dispatch_router.lock().unwrap();
+                router.record_result(&dispatch_key, &dispatch_meta, account.id, true);
+            }
             return gemini_streaming_passthrough(
                 response,
                 &model_resolution.target_model,
@@ -280,7 +302,16 @@ pub async fn gemini(
         )
         .await;
 
+        {
+            let mut router = state.dispatch_router.lock().unwrap();
+            router.record_result(&dispatch_key, &dispatch_meta, account.id, true);
+        }
         return Json(data).into_response();
+    }
+
+    {
+        let mut router = state.dispatch_router.lock().unwrap();
+        router.record_result(&dispatch_key, &dispatch_meta, 0, false);
     }
 
     let latency_ms = start.elapsed().as_millis() as i64;

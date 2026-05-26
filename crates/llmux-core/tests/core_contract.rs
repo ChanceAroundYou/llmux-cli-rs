@@ -350,6 +350,7 @@ fn model_structs_preserve_legacy_field_names() {
         target_model: "gpt".into(),
         provider_id: Some("openai".into()),
         account_ids: None,
+        preferred_account_id: None,
     };
     let key = ApiKey {
         id: Some(1),

@@ -4,7 +4,29 @@ import path from 'path'
 
 // https://vitejs.dev/config/
 export default defineConfig({
-  plugins: [react()],
+  plugins: [
+    react(),
+    {
+      name: 'sanitize-chunk-names',
+      generateBundle(_, bundle) {
+        const renames: Record<string, string> = {};
+        for (const fileName of Object.keys(bundle)) {
+          if (/[-_]ad(?=[a-f0-9]*[-_.])/.test(fileName)) {
+            renames[fileName] = fileName.replace(/([-_])ad/, '$1x0');
+          }
+        }
+        for (const [oldName, newName] of Object.entries(renames)) {
+          bundle[oldName].fileName = newName;
+        }
+        for (const entry of Object.values(bundle)) {
+          if (entry.type !== 'chunk') continue;
+          for (const [oldName, newName] of Object.entries(renames)) {
+            entry.code = entry.code.split(oldName).join(newName);
+          }
+        }
+      },
+    },
+  ],
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),

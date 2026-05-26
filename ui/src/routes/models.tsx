@@ -36,7 +36,7 @@ export default function Models() {
   const [search, setSearch] = useState('');
   const [activeProvider, setActiveProvider] = useState<string>('');
   const [isModalOpen, setIsModalOpen] = useState(false);
-  const [aliasForm, setAliasForm] = useState({ alias: '', target: '', provider: '', selectedAccountIds: [] as number[] });
+  const [aliasForm, setAliasForm] = useState({ alias: '', target: '', provider: '', selectedAccountIds: [] as number[], preferredAccountId: null as number | null });
   const [testResults, setTestResults] = useState<Record<string, { success: boolean; latency?: number; error?: string; loading?: boolean; lastChecked?: string; limitsCache?: any; limitsUpdatedAt?: string }>>({});
   const [queueStatus, setQueueStatus] = useState<{ isRunning: boolean; current: number; total: number; progress: number }>({ isRunning: false, current: 0, total: 0, progress: 0 });
   const { startTestQueue, fetchTestQueueStatus } = useModelsStore();
@@ -191,11 +191,12 @@ export default function Models() {
         aliasForm.alias,
         aliasForm.target,
         aliasForm.provider || undefined,
-        aliasForm.selectedAccountIds.length > 0 ? aliasForm.selectedAccountIds : undefined
+        aliasForm.selectedAccountIds.length > 0 ? aliasForm.selectedAccountIds : undefined,
+        aliasForm.preferredAccountId ?? undefined
       );
       setIsModalOpen(false);
       setEditingAliasId(null);
-      setAliasForm({ alias: '', target: '', provider: '', selectedAccountIds: [] });
+      setAliasForm({ alias: '', target: '', provider: '', selectedAccountIds: [], preferredAccountId: null });
     } catch (err) {
       console.error(err);
     }
@@ -204,7 +205,7 @@ export default function Models() {
   const closeAliasModal = () => {
     setIsModalOpen(false);
     setEditingAliasId(null);
-    setAliasForm({ alias: '', target: '', provider: '', selectedAccountIds: [] });
+    setAliasForm({ alias: '', target: '', provider: '', selectedAccountIds: [], preferredAccountId: null });
   };
 
   const handleVerify = async () => {
@@ -275,7 +276,7 @@ export default function Models() {
            </Button>
            <Button
              size="sm"
-             onClick={() => { setEditingAliasId(null); setAliasForm({ alias: '', target: '', provider: '', selectedAccountIds: [] }); setIsModalOpen(true); }}
+             onClick={() => { setEditingAliasId(null); setAliasForm({ alias: '', target: '', provider: '', selectedAccountIds: [], preferredAccountId: null }); setIsModalOpen(true); }}
            >
              <Plus size={16} />
              {t('models.createAlias')}
@@ -314,6 +315,7 @@ export default function Models() {
                         target: a.target_model,
                         provider: a.provider_id || '',
                         selectedAccountIds: selectedIds,
+                        preferredAccountId: a.preferred_account_id,
                       });
                       setEditingAliasId(a.id);
                       setIsModalOpen(true);
@@ -483,7 +485,7 @@ export default function Models() {
                       setEditingAliasId(null);
                       const matchingOwners = [...new Set(safeModels.filter(x => x.id === model.id).map(x => x.owned_by))];
                       const matchingIds = safeAccounts.filter(a => matchingOwners.includes(a.alias) && a.is_active === 1).map(a => a.id);
-                      setAliasForm({ alias: '', target: model.id, provider: model.owned_by, selectedAccountIds: matchingIds });
+                      setAliasForm({ alias: '', target: model.id, provider: model.owned_by, selectedAccountIds: matchingIds, preferredAccountId: null });
                       setIsModalOpen(true);
                    }}
                    className="flex items-center gap-1 text-primary hover:opacity-80 transition-opacity"
@@ -600,6 +602,24 @@ export default function Models() {
                     <p className="text-xs text-muted-foreground p-2">{t('accounts.noAccounts')}</p>
                   )}
                 </div>
+                {aliasForm.selectedAccountIds.length > 0 && (
+                  <div className="space-y-1.5 border-t border-border pt-3">
+                    <label className="text-xs font-bold text-muted-foreground uppercase">
+                      {t('models.preferredAccount')}
+                    </label>
+                    <p className="text-xs text-muted-foreground">{t('models.preferredAccountHint')}</p>
+                    <select
+                      value={aliasForm.preferredAccountId ?? ''}
+                      onChange={e => setAliasForm({...aliasForm, preferredAccountId: e.target.value ? Number(e.target.value) : null})}
+                      className="w-full h-10 px-3 py-2 rounded-md border border-input bg-background text-sm ring-offset-background focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2"
+                    >
+                      <option value="">{t('models.preferredAccountAuto')}</option>
+                      {matchingAccounts.filter(a => aliasForm.selectedAccountIds.includes(a.id)).map(a => (
+                        <option key={a.id} value={a.id}>[{a.provider_id}] {a.alias}</option>
+                      ))}
+                    </select>
+                  </div>
+                )}
               </div>
             );
           })()}

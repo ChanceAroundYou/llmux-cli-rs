@@ -15,6 +15,7 @@ export interface ModelAlias {
   target_model: string;
   provider_id: string | null;
   account_ids: string | null;
+  preferred_account_id: number | null;
 }
 
 export interface Account {
@@ -35,7 +36,7 @@ interface ModelsState {
   fetchModels: (force?: boolean) => Promise<void>;
   fetchAliases: () => Promise<void>;
   fetchAccounts: () => Promise<void>;
-  addAlias: (alias: string, targetModel: string, providerId?: string, accountIds?: number[]) => Promise<void>;
+  addAlias: (alias: string, targetModel: string, providerId?: string, accountIds?: number[], preferredAccountId?: number) => Promise<void>;
   deleteAlias: (id: number) => Promise<void>;
   testModel: (modelId: string, providerId?: string, accountId?: number) => Promise<{ success: boolean; error?: string; latency?: number }>;
   startTestQueue: (models: { model: string, providerId: string }[]) => Promise<{ success: boolean; error?: string }>;
@@ -89,11 +90,14 @@ export const useModelsStore = create<ModelsState>((set, get) => ({
     }
   },
 
-  addAlias: async (alias, targetModel, providerId, accountIds) => {
+  addAlias: async (alias, targetModel, providerId, accountIds, preferredAccountId) => {
     try {
       const body: any = { alias, target_model: targetModel, provider_id: providerId };
       if (accountIds && accountIds.length > 0) {
         body.account_ids = accountIds;
+      }
+      if (preferredAccountId != null) {
+        body.preferred_account_id = preferredAccountId;
       }
       const res = await fetch('/api/models/aliases', {
         method: 'POST',
