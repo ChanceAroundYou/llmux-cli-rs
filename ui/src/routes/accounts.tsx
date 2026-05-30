@@ -15,7 +15,6 @@ import {
   Copy,
   CheckCircle2,
   Pencil,
-  Download,
   ShieldAlert,
   Power
 } from 'lucide-react';
@@ -97,27 +96,6 @@ export default function Accounts() {
     return `(async()=>{const p="${formData.provider_id}";console.log("🚀 LLMux Syncing...");const t=localStorage.getItem("token")||document.cookie;fetch("http://localhost:25975/api/auth/sync",{method:"POST",body:JSON.stringify({provider:p,token:t})})})();`;
   };
 
-  const handleExport = async (id?: number, alias?: string) => {
-    const targetId = id || accountToDelete?.id;
-    const targetName = alias || accountToDelete?.name;
-    if (!targetId) return;
-    
-    try {
-      const res = await fetch(`/api/accounts/${targetId}/export`);
-      const blob = await res.blob();
-      const url = window.URL.createObjectURL(blob);
-      const link = document.createElement('a');
-      link.href = url;
-      link.setAttribute('download', `usage_history_${targetName || targetId}.csv`);
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-      window.URL.revokeObjectURL(url);
-    } catch (err) {
-      console.error('Export failed:', err);
-    }
-  };
-
   return (
     <div className="space-y-10 animate-fadeIn">
       <div className="flex items-center justify-between">
@@ -166,15 +144,6 @@ export default function Accounts() {
             </div>
 
               <div className="flex items-center gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    onClick={() => handleExport(acc.id, acc.alias)}
-                    className="text-primary hover:text-primary hover:bg-primary/10"
-                    title={t('accounts.exportData')}
-                  >
-                    <Download size={16} />
-                  </Button>
                   <Button
                     variant="ghost"
                     size="icon"
@@ -541,15 +510,7 @@ export default function Accounts() {
         variant="danger"
         size="md"
         footer={
-          <div className="flex items-center justify-between w-full">
-            <Button
-               variant="ghost"
-               size="sm"
-               onClick={() => handleExport()}
-            >
-               <Download size={14} />
-               {t('accounts.exportData')}
-            </Button>
+          <div className="flex items-center justify-end w-full">
             <div className="flex items-center gap-3">
               <Button variant="outline" size="sm" onClick={() => setAccountToDelete(null)}>
                 {t('common.cancel')}

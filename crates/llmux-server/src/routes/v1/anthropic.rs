@@ -106,7 +106,7 @@ pub async fn messages(
         .unwrap_or_else(|| accounts.first().map(|a| a.id).unwrap_or(0));
 
     let (ordered_accounts, dispatch_meta) = {
-        let mut router = state.dispatch_router.lock().unwrap();
+        let mut router = state.dispatch_router.lock().await;
         router.select(&dispatch_key, &accounts, preferred_id)
     };
 
@@ -169,8 +169,8 @@ pub async fn messages(
                     });
                 }
                 if account.id == preferred_id {
-                    let mut router = state.dispatch_router.lock().unwrap();
-                    router.record_result(&dispatch_key, &dispatch_meta, 0, false);
+                    let mut router = state.dispatch_router.lock().await;
+                    router.record_result(&dispatch_key, &dispatch_meta, None, false);
                 }
                 continue;
             }
@@ -189,8 +189,8 @@ pub async fn messages(
                     });
                 }
                 if account.id == preferred_id {
-                    let mut router = state.dispatch_router.lock().unwrap();
-                    router.record_result(&dispatch_key, &dispatch_meta, 0, false);
+                    let mut router = state.dispatch_router.lock().await;
+                    router.record_result(&dispatch_key, &dispatch_meta, None, false);
                 }
                 continue;
             }
@@ -216,8 +216,8 @@ pub async fn messages(
                     });
                 }
                 if account.id == preferred_id {
-                    let mut router = state.dispatch_router.lock().unwrap();
-                    router.record_result(&dispatch_key, &dispatch_meta, 0, false);
+                    let mut router = state.dispatch_router.lock().await;
+                    router.record_result(&dispatch_key, &dispatch_meta, None, false);
                 }
                 continue;
             }
@@ -254,8 +254,8 @@ pub async fn messages(
         // Success — streaming or non-streaming
         if streaming {
             {
-                let mut router = state.dispatch_router.lock().unwrap();
-                router.record_result(&dispatch_key, &dispatch_meta, account.id, true);
+                let mut router = state.dispatch_router.lock().await;
+                router.record_result(&dispatch_key, &dispatch_meta, Some(account.id), true);
             }
             send_tui_request(&state.tui_tx, "/v1/messages", status.as_u16(), start, &model_resolution.target_model);
             return anthropic_streaming_passthrough(
@@ -324,8 +324,8 @@ pub async fn messages(
         };
 
         {
-            let mut router = state.dispatch_router.lock().unwrap();
-            router.record_result(&dispatch_key, &dispatch_meta, account.id, true);
+            let mut router = state.dispatch_router.lock().await;
+            router.record_result(&dispatch_key, &dispatch_meta, Some(account.id), true);
         }
         send_tui_request(&state.tui_tx, "/v1/messages", 200, start, &model_resolution.target_model);
         return Json(data).into_response();
@@ -333,8 +333,8 @@ pub async fn messages(
 
     // All accounts exhausted
     {
-        let mut router = state.dispatch_router.lock().unwrap();
-        router.record_result(&dispatch_key, &dispatch_meta, 0, false);
+        let mut router = state.dispatch_router.lock().await;
+        router.record_result(&dispatch_key, &dispatch_meta, None, false);
     }
 
     let latency_ms = start.elapsed().as_millis() as i64;

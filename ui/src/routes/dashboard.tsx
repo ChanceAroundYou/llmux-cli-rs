@@ -111,10 +111,13 @@ export default function Dashboard() {
     return {
       labels: displayLogs.map(() => ''),
       datasets: [{
-        data: displayLogs.map(l => l.latency_ms || 0),
+        data: displayLogs.map(l => {
+          if (l.success !== 1) return 0.8;
+          return (l.latency_ms || 0) > 2000 ? 1.2 : 1;
+        }),
         backgroundColor: displayLogs.map(l => {
           if (l.success !== 1) return '#ef4444';
-          return (l.latency_ms || 0) > 2000 ? 'rgba(59, 130, 246, 0.4)' : '#3b82f6';
+          return (l.latency_ms || 0) > 2000 ? '#f59e0b' : '#22c55e';
         }),
         borderRadius: 0,
         barThickness: 3,
@@ -135,7 +138,13 @@ export default function Dashboard() {
         bodyFont: { size: 10 },
         displayColors: false,
         callbacks: {
-          label: (context) => ` ${context.parsed.y}ms`
+          label: (context) => {
+            const logs = [...activityLogs.slice(0, 100)].reverse();
+            const log = logs[context.dataIndex];
+            if (!log) return '';
+            if (log.success !== 1) return ` Error: ${log.error_message || 'ERR'}`;
+            return ` ${log.latency_ms}ms`;
+          }
         }
       }
     },
@@ -144,7 +153,7 @@ export default function Dashboard() {
       y: {
         display: false,
         beginAtZero: true,
-        max: activityLogs.length > 0 ? Math.max(...activityLogs.slice(0, 100).map(l => l.latency_ms || 0)) * 1.1 : 1000
+        max: 1.5
       }
     }
   }), [activityLogs]);

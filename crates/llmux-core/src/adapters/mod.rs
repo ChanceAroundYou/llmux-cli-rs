@@ -7,7 +7,13 @@ use std::time::Duration;
 static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
 fn get_client() -> &'static reqwest::Client {
-    CLIENT.get_or_init(reqwest::Client::new)
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(600))
+            .build()
+            .expect("failed to build reqwest client")
+    })
 }
 
 pub async fn execute_provider_request(

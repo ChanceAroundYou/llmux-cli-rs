@@ -62,6 +62,8 @@ pub struct DispatchMeta {
     pub preferred_id: i64,
 }
 
+const MAX_ENTRIES: usize = 1024;
+
 /// Sticky-session routing state machine with failover and exponential backoff.
 #[derive(Debug, Clone, Default)]
 pub struct DispatchRouter {
@@ -128,26 +130,25 @@ impl DispatchRouter {
     }
 
     /// Update state after a dispatch attempt completes.
+    /// `used_account_id` is `Some(id)` when a specific account handled the
+    /// request, or `None` when no account could be reached.
     pub fn record_result(
         &mut self,
         dispatch_key: &str,
         meta: &DispatchMeta,
-        used_account_id: i64,
+        used_account_id: Option<i64>,
         success: bool,
     ) {
+        self.maybe_evict();
         let entry = self.entries.entry(dispatch_key.to_string()).or_default();
 
         match &mut entry.mode {
             StickyMode::Primary => {
-                if !success || used_account_id != meta.preferred_id {
-                    let sticky = if used_account_id != 0 && used_account_id != meta.preferred_id {
-                        used_account_id
-                    } else {
-                        0
-                    };
+                if !success || used_account_id != Some(meta.preferred_id) {
+                    let sticky = used_account_id.filter(|&id| id != meta.preferred_id);
                     entry.mode = StickyMode::Fallback {
-                        sticky_fallback_id: sticky,
-                        consecutive_successes: if sticky != 0 { 1 } else { 0 },
+                        sticky_fallback_id: sticky.unwrap_or(0),
+                        consecutive_successes: if sticky.is_some() { 1 } else { 0 },
                         last_probe: Instant::now(),
                         probe_backoff_secs: INITIAL_PROBE_BACKOFF_SECS,
                     };
@@ -160,27 +161,44 @@ impl DispatchRouter {
                 probe_backoff_secs,
             } => {
                 if meta.is_probe {
-                    if success && used_account_id == meta.preferred_id {
+                    if success && used_account_id == Some(meta.preferred_id) {
                         entry.mode = StickyMode::Primary;
                     } else {
                         *probe_backoff_secs =
                             (*probe_backoff_secs * 2).min(MAX_PROBE_BACKOFF_SECS);
                         *consecutive_successes = 0;
                         *last_probe = Instant::now();
-                        if success && used_account_id != 0 && used_account_id != meta.preferred_id {
-                            *sticky_fallback_id = used_account_id;
+                        if let Some(id) = used_account_id {
+                            if id != meta.preferred_id {
+                                *sticky_fallback_id = id;
+                            }
                         }
                     }
                 } else {
                     if success {
                         *consecutive_successes += 1;
-                        if used_account_id != 0 {
-                            *sticky_fallback_id = used_account_id;
+                        if let Some(id) = used_account_id {
+                            *sticky_fallback_id = id;
                         }
                     }
                 }
             }
         }
+    }
+
+    /// Drop Primary entries when the map grows beyond MAX_ENTRIES.
+    /// Fallback entries are kept — they represent active failover state.
+    fn maybe_evict(&mut self) {
+        if self.entries.len() <= MAX_ENTRIES {
+            return;
+        }
+        self.entries.retain(|_, e| {
+            matches!(e.mode, StickyMode::Fallback { .. })
+        });
+        tracing::info!(
+            "DispatchRouter evicted stale entries, {} fallback entries retained",
+            self.entries.len()
+        );
     }
 }
 

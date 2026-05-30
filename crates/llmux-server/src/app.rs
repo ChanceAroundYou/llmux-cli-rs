@@ -58,7 +58,7 @@ pub struct AppState {
     pub master_key: String,
     pub data_dir: std::path::PathBuf,
     pub test_queue: Arc<Mutex<TestQueueState>>,
-    pub dispatch_router: Arc<Mutex<DispatchRouter>>,
+    pub dispatch_router: Arc<tokio::sync::Mutex<DispatchRouter>>,
     pub models_cache: Arc<Mutex<Option<ModelsCache>>>,
     pub tui_tx: Option<tokio::sync::mpsc::UnboundedSender<TuiEvent>>,
 }
@@ -309,7 +309,7 @@ pub async fn test_state() -> AppState {
         master_key: "test-master-key".to_string(),
         data_dir: std::path::PathBuf::from("."),
         test_queue: Arc::new(Mutex::new(TestQueueState::default())),
-        dispatch_router: Arc::new(Mutex::new(DispatchRouter::default())),
+        dispatch_router: Arc::new(tokio::sync::Mutex::new(DispatchRouter::default())),
         models_cache: Arc::new(Mutex::new(None)),
         tui_tx: None,
     }

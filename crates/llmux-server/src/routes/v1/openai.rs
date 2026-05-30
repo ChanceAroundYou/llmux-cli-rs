@@ -51,13 +51,12 @@ async fn openai_dispatch(
     state: AppState,
     auth: AuthContext,
     uri: axum::http::Uri,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     body: Value,
     endpoint: &str,
 ) -> Response {
     let normalized_uri = crate::app::normalize_gateway_uri(&uri);
-    let is_anthropic =
-        headers.contains_key("x-api-key") || normalized_uri.path().ends_with("/messages");
+    let is_anthropic = false;
 
     // Extract model and stream from the JSON body without requiring a
     // specific schema — the Responses API has different fields ("input"
@@ -157,7 +156,7 @@ async fn openai_dispatch(
         .unwrap_or_else(|| accounts.first().map(|a| a.id).unwrap_or(0));
 
     let (ordered_accounts, dispatch_meta) = {
-        let mut router = state.dispatch_router.lock().unwrap();
+        let mut router = state.dispatch_router.lock().await;
         router.select(&dispatch_key, &accounts, preferred_id)
     };
 
@@ -241,8 +240,8 @@ async fn openai_dispatch(
                     });
                 }
                 if account.id == preferred_id {
-                    let mut router = state.dispatch_router.lock().unwrap();
-                    router.record_result(&dispatch_key, &dispatch_meta, 0, false);
+                    let mut router = state.dispatch_router.lock().await;
+                    router.record_result(&dispatch_key, &dispatch_meta, None, false);
                 }
                 continue;
             }
@@ -269,8 +268,8 @@ async fn openai_dispatch(
                     });
                 }
                 if account.id == preferred_id {
-                    let mut router = state.dispatch_router.lock().unwrap();
-                    router.record_result(&dispatch_key, &dispatch_meta, 0, false);
+                    let mut router = state.dispatch_router.lock().await;
+                    router.record_result(&dispatch_key, &dispatch_meta, None, false);
                 }
                 continue;
             }
@@ -298,8 +297,8 @@ async fn openai_dispatch(
 
         if streaming {
             {
-                let mut router = state.dispatch_router.lock().unwrap();
-                router.record_result(&dispatch_key, &dispatch_meta, account.id, true);
+                let mut router = state.dispatch_router.lock().await;
+                router.record_result(&dispatch_key, &dispatch_meta, Some(account.id), true);
             }
             send_tui_request(&state.tui_tx, normalized_uri.path(), status.as_u16(), start, &model_resolution.target_model);
             return openai_streaming_passthrough(
@@ -347,16 +346,16 @@ async fn openai_dispatch(
         .await;
 
         {
-            let mut router = state.dispatch_router.lock().unwrap();
-            router.record_result(&dispatch_key, &dispatch_meta, account.id, true);
+            let mut router = state.dispatch_router.lock().await;
+            router.record_result(&dispatch_key, &dispatch_meta, Some(account.id), true);
         }
         send_tui_request(&state.tui_tx, normalized_uri.path(), 200, start, &model_resolution.target_model);
         return Json(data).into_response();
     }
 
     {
-        let mut router = state.dispatch_router.lock().unwrap();
-        router.record_result(&dispatch_key, &dispatch_meta, 0, false);
+        let mut router = state.dispatch_router.lock().await;
+        router.record_result(&dispatch_key, &dispatch_meta, None, false);
     }
 
     let latency_ms = start.elapsed().as_millis() as i64;

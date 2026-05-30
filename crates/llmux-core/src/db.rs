@@ -24,23 +24,30 @@ pub async fn init_db(pool: &SqlitePool) -> Result<()> {
             pool.execute(statement).await?;
         }
     }
-    // Run migrations (ignore errors for already-applied migrations)
-    for statement in MIGRATION_002.split(';') {
-        let statement = statement.trim();
-        if !statement.is_empty() {
-            let _ = pool.execute(statement).await;
-        }
-    }
-    for statement in MIGRATION_003.split(';') {
-        let statement = statement.trim();
-        if !statement.is_empty() {
-            let _ = pool.execute(statement).await;
-        }
-    }
-    for statement in MIGRATION_004.split(';') {
-        let statement = statement.trim();
-        if !statement.is_empty() {
-            let _ = pool.execute(statement).await;
+    // Run migrations (ignore errors for already-applied statements)
+    let migrations = [
+        ("0002", MIGRATION_002),
+        ("0003", MIGRATION_003),
+        ("0004", MIGRATION_004),
+    ];
+    for (name, sql) in &migrations {
+        for statement in sql.split(';') {
+            let statement = statement.trim();
+            if !statement.is_empty() {
+                match pool.execute(statement).await {
+                    Ok(_) => {}
+                    Err(e) => {
+                        // SQLite "duplicate column" errors are expected for already-applied
+                        // migrations. Log unexpected errors at warn level.
+                        let msg = e.to_string();
+                        if msg.contains("duplicate column") || msg.contains("already exists") {
+                            tracing::debug!("Migration {name} already applied: {msg}");
+                        } else {
+                            tracing::warn!("Migration {name} statement failed: {msg}");
+                        }
+                    }
+                }
+            }
         }
     }
     Ok(())

@@ -75,8 +75,7 @@ impl SettingsService {
         let suffix: String = thread_rng()
             .sample_iter(&Alphanumeric)
             .take(26)
-            .map(char::from)
-            .map(|ch| ch.to_ascii_lowercase())
+            .map(|b| (b as char).to_ascii_lowercase())
             .collect();
         let key = format!("sk-llmux-{suffix}");
         sqlx::query("INSERT OR REPLACE INTO settings (key, value) VALUES ('gateway_key', ?)")
