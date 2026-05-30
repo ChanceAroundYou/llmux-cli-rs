@@ -1,4 +1,5 @@
 use std::sync::{Arc, Mutex};
+use tokio::sync::Mutex as TokioMutex;
 
 use clap::{Parser, Subcommand};
 use llmux_core::config::AppConfig;
@@ -70,7 +71,7 @@ async fn start(port_override: Option<u16>, use_tui: bool) -> anyhow::Result<()> 
 
     let master_key = get_or_create_master_key(&config.data_dir, config.master_key.as_deref())?;
 
-    let dispatch_router = Arc::new(Mutex::new(llmux_core::dispatcher::DispatchRouter::default()));
+    let dispatch_router = Arc::new(TokioMutex::new(llmux_core::dispatcher::DispatchRouter::default()));
     let test_queue = Arc::new(Mutex::new(TestQueueState::default()));
     let models_cache = Arc::new(Mutex::new(None));
 

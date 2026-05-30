@@ -108,7 +108,7 @@ pub async fn gemini(
         .unwrap_or_else(|| accounts.first().map(|a| a.id).unwrap_or(0));
 
     let (ordered_accounts, dispatch_meta) = {
-        let mut router = state.dispatch_router.lock().unwrap();
+        let mut router = state.dispatch_router.lock().await;
         router.select(&dispatch_key, &accounts, preferred_id)
     };
 
@@ -218,8 +218,8 @@ pub async fn gemini(
                     });
                 }
                 if account.id == preferred_id {
-                    let mut router = state.dispatch_router.lock().unwrap();
-                    router.record_result(&dispatch_key, &dispatch_meta, 0, false);
+                    let mut router = state.dispatch_router.lock().await;
+                    router.record_result(&dispatch_key, &dispatch_meta, None, false);
                 }
                 continue;
             }
@@ -245,8 +245,8 @@ pub async fn gemini(
                     });
                 }
                 if account.id == preferred_id {
-                    let mut router = state.dispatch_router.lock().unwrap();
-                    router.record_result(&dispatch_key, &dispatch_meta, 0, false);
+                    let mut router = state.dispatch_router.lock().await;
+                    router.record_result(&dispatch_key, &dispatch_meta, None, false);
                 }
                 continue;
             }
@@ -281,8 +281,8 @@ pub async fn gemini(
 
         if is_stream {
             {
-                let mut router = state.dispatch_router.lock().unwrap();
-                router.record_result(&dispatch_key, &dispatch_meta, account.id, true);
+                let mut router = state.dispatch_router.lock().await;
+                router.record_result(&dispatch_key, &dispatch_meta, Some(account.id), true);
             }
             send_tui_request(&state.tui_tx, "/v1beta/models/...", status.as_u16(), start, &model_resolution.target_model);
             return gemini_streaming_passthrough(
@@ -332,16 +332,16 @@ pub async fn gemini(
         .await;
 
         {
-            let mut router = state.dispatch_router.lock().unwrap();
-            router.record_result(&dispatch_key, &dispatch_meta, account.id, true);
+            let mut router = state.dispatch_router.lock().await;
+            router.record_result(&dispatch_key, &dispatch_meta, Some(account.id), true);
         }
         send_tui_request(&state.tui_tx, "/v1beta/models/...", 200, start, &model_resolution.target_model);
         return Json(data).into_response();
     }
 
     {
-        let mut router = state.dispatch_router.lock().unwrap();
-        router.record_result(&dispatch_key, &dispatch_meta, 0, false);
+        let mut router = state.dispatch_router.lock().await;
+        router.record_result(&dispatch_key, &dispatch_meta, None, false);
     }
 
     let latency_ms = start.elapsed().as_millis() as i64;
@@ -374,16 +374,16 @@ pub async fn gemini(
 /// Extract token counts from Gemini response format.
 fn gemini_usage(data: &Value) -> (i64, i64) {
     let meta = &data["usageMetadata"];
-    (
-        meta["promptTokenCount"].as_i64().unwrap_or_default(),
-        meta["candidatesTokenCount"]
+    let prompt = meta["promptTokenCount"].as_i64().unwrap_or_default();
+    let candidates = meta["candidatesTokenCount"].as_i64();
+    let thoughts = meta["thoughtsTokenCount"].as_i64().unwrap_or_default();
+    let completion = candidates.unwrap_or_else(|| {
+        meta["totalTokenCount"]
             .as_i64()
-            .or_else(|| meta["totalTokenCount"].as_i64().map(|t| {
-                let prompt = meta["promptTokenCount"].as_i64().unwrap_or_default();
-                t.saturating_sub(prompt)
-            }))
-            .unwrap_or_default(),
-    )
+            .map(|t| t.saturating_sub(prompt).saturating_sub(thoughts))
+            .unwrap_or_default()
+    });
+    (prompt, completion)
 }
 
 /// Passthrough streaming for Gemini responses (SSE).
