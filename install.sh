@@ -597,7 +597,7 @@ else
 fi
 
 maybe_help_setup_path
-
+9
 echo ""
 echo "$(select_text "启动后会打开本地网关，管理界面通常在：" "After launch, the local gateway is available at:")"
 echo "  http://localhost:25976"
