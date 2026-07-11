@@ -118,12 +118,26 @@ function Invoke-MenuPicker($titleZh, $titleEn, $opt1Zh, $opt1En, $opt2Zh, $opt2E
 }
 
 function Resolve-LatestReleaseTag {
+    # 方法1: 通过重定向获取最新 tag（不依赖 API，不容易被限流）
+    try {
+        $response = Invoke-WebRequest -Uri "https://github.com/zhMoody/llmux-cli-rs/releases/latest" -UseBasicParsing -MaximumRedirection 0 -ErrorAction Stop
+    } catch {
+        $statusCode = $_.Exception.Response.StatusCode.value__
+        if ($statusCode -eq 302 -or $statusCode -eq 301) {
+            $location = $_.Exception.Response.Headers.GetValues("Location")[0]
+            if ($location -match 'tag/([^/]+)$') {
+                return $matches[1]
+            }
+        }
+    }
+
+    # 方法2: 使用 API（有未认证限流风险）
     try {
         $response = Invoke-RestMethod -Uri "$API_BASE/releases/latest" -TimeoutSec 20 -ErrorAction Stop
         return $response.tag_name
-    } catch {
-        return $null
-    }
+    } catch {}
+
+    return $null
 }
 
 function Get-InstalledVersion {
@@ -165,6 +179,7 @@ function Compare-Version($leftVersion, $rightVersion) {
 function Test-Command($cmd) {
     return (Get-Command $cmd -ErrorAction SilentlyContinue) -ne $null
 }
+
 
 function Require-Command($cmd) {
     if (-not (Test-Command $cmd)) {

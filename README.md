@@ -70,13 +70,13 @@ curl -fsSL https://raw.githubusercontent.com/zhMoody/llmux-cli-rs/main/install.s
 One-line install (downloads prebuilt binary):
 
 ```powershell
-powershell -c "irm https://raw.githubusercontent.com/zhMoody/llmux-cli-rs/main/install.ps1 | iex"
+powershell -c "iwr -UseBasicParsing https://raw.githubusercontent.com/zhMoody/llmux-cli-rs/main/install.ps1 -OutFile $env:TEMP\llmux-install.ps1; & $env:TEMP\llmux-install.ps1"
 ```
 
 Or with options:
 
 ```powershell
-powershell -c "$script = (irm https://raw.githubusercontent.com/zhMoody/llmux-cli-rs/main/install.ps1); & ([scriptblock]::Create($script)) -Mode release -Lang zh"
+powershell -c "iwr -UseBasicParsing https://raw.githubusercontent.com/zhMoody/llmux-cli-rs/main/install.ps1 -OutFile $env:TEMP\llmux-install.ps1; & $env:TEMP\llmux-install.ps1 -Mode release -Lang zh"
 ```
 
 ### From source (any platform)

@@ -70,13 +70,13 @@ curl -fsSL https://raw.githubusercontent.com/zhMoody/llmux-cli-rs/main/install.s
 一行命令安装（下载预编译二进制）：
 
 ```powershell
-powershell -c "irm https://raw.githubusercontent.com/zhMoody/llmux-cli-rs/main/install.ps1 | iex"
+powershell -c "iwr -UseBasicParsing https://raw.githubusercontent.com/zhMoody/llmux-cli-rs/main/install.ps1 -OutFile $env:TEMP\llmux-install.ps1; & $env:TEMP\llmux-install.ps1"
 ```
 
 或带选项：
 
 ```powershell
-powershell -c "$script = (irm https://raw.githubusercontent.com/zhMoody/llmux-cli-rs/main/install.ps1); & ([scriptblock]::Create($script)) -Mode release -Lang zh"
+powershell -c "iwr -UseBasicParsing https://raw.githubusercontent.com/zhMoody/llmux-cli-rs/main/install.ps1 -OutFile $env:TEMP\llmux-install.ps1; & $env:TEMP\llmux-install.ps1 -Mode release -Lang zh"
 ```
 
 ### 从源码构建（全平台）
