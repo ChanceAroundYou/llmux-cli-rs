@@ -97,7 +97,7 @@ export function ClaudeCodePanel({
     initializedFromSettings.current = true;
 
     const env = currentSettings?.env ?? {};
-    const backupApiKey = env.ANTHROPIC_API_KEY ?? env.ANTHROPIC_AUTH_TOKEN ?? '';
+    const backupApiKey = env.ANTHROPIC_AUTH_TOKEN ?? env.ANTHROPIC_AUTH_TOKEN ?? '';
     const matchedKey = keys.find(k => k.key === backupApiKey);
 
     skipNextKeyCleanup.current = 2;
@@ -151,7 +151,7 @@ export function ClaudeCodePanel({
     setIsRestoring(false);
 
     const env = content.env ?? {};
-    const backupApiKey = env.ANTHROPIC_API_KEY ?? env.ANTHROPIC_AUTH_TOKEN ?? '';
+    const backupApiKey = env.ANTHROPIC_AUTH_TOKEN ?? env.ANTHROPIC_AUTH_TOKEN ?? '';
     const matchedKey = keys.find(k => k.key === backupApiKey);
     restoringRef.current = true;
     let notice: string | null = null;
@@ -182,7 +182,7 @@ export function ClaudeCodePanel({
     const newEnv: Record<string, string> = {
       ...baseEnv,
       ANTHROPIC_BASE_URL: `${gatewayUrl}/v1`,
-      ANTHROPIC_API_KEY: selectedKey.key,
+      ANTHROPIC_AUTH_TOKEN: selectedKey.key,
     };
     const opusVal   = withLongContext(opusModel, opus1m);
     const sonnetVal = withLongContext(sonnetModel, sonnet1m);

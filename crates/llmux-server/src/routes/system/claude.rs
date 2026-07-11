@@ -52,7 +52,7 @@ pub async fn get_claude_settings() -> Json<Value> {
 /// the settings.json env section used by the Claude CLI.
 ///
 /// Accepts: { apiBaseUrl, apiKey, opusModel?, sonnetModel?, haikuModel? }
-/// Translates to env.{ ANTHROPIC_BASE_URL, ANTHROPIC_API_KEY,
+/// Translates to env.{ ANTHROPIC_BASE_URL, ANTHROPIC_AUTH_TOKEN,
 ///   ANTHROPIC_DEFAULT_OPUS_MODEL?, ... }
 pub async fn apply_claude_settings(
     Extension(state): Extension<AppState>,
@@ -158,7 +158,7 @@ pub async fn apply_claude_settings(
         json!(api_base_url),
     );
     base_env.insert(
-        "ANTHROPIC_API_KEY".to_string(),
+        "ANTHROPIC_AUTH_TOKEN".to_string(),
         json!(api_key),
     );
 
