@@ -469,7 +469,7 @@ if [ "$INSTALL_MODE" = "release" ]; then
     echo "$(select_text "使用 release 版本：" "Using release tag:") $RELEASE_TAG"
     CANDIDATE_VERSION="$RELEASE_TAG"
     maybe_skip_if_not_newer "$CANDIDATE_VERSION"
-    RELEASE_BASE_URL="$RELEASE_REPO_URL/releases/download/$RELEASE_TAG"
+    RELEASE_BASE_URL="$RELEASE_REPO_URL/releases/$RELEASE_TAG"
     case "$OS_NAME-$ARCH_NAME" in
         linux-x64) DOWNLOAD_URL="$RELEASE_BASE_URL/llmux-linux-x64" ;;
         linux-arm64) DOWNLOAD_URL="$RELEASE_BASE_URL/llmux-linux-arm64" ;;
