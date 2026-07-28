@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# LLMux CLI - Unix Bootstrapper Script (Bash/Zsh/Fish)
+# LLMux CLI - Unix Bootstrapper Script (Bash/Zsh)
 #
 # Clones the repository, builds the native binary, and installs it locally.
 #
@@ -10,6 +10,7 @@ set -euo pipefail
 # 1. Default Setup & Constants
 REPO_URL="https://github.com/zhMoody/llmux-cli-rs.git"
 RELEASE_REPO_URL="https://github.com/zhMoody/llmux-cli-rs"
+REPO_PATH="zhMoody/llmux-cli-rs"
 SYSTEM_BIN_DIR=""
 TARGET_DIR="$HOME/.local/bin"
 CUSTOM_DIR=""
@@ -27,6 +28,11 @@ UI_MODE="text"
 INSTALLED_VERSION=""
 CANDIDATE_VERSION=""
 SETUP_PATH="auto"
+
+# GitHub release 下载加速镜像（空格分隔；末尾留空 = 直连兜底）
+# 用环境变量 LLMUX_MIRRORS 覆盖，例如：LLMUX_MIRRORS="https://ghfast.top"
+# 设为单个空格可强制只走直连：LLMUX_MIRRORS=" "
+GITHUB_MIRRORS="${LLMUX_MIRRORS:-https://ghfast.top https://ghproxy.net}"
 
 # Helper: Display usage instructions
 show_usage() {
@@ -133,26 +139,37 @@ detect_language() {
     UI_LANG=""
 }
 
+# 优先用 GitHub API 取最新 tag（api.github.com 比 releases/latest 重定向稳）
+# 失败再回退到原来的 releases/latest 重定向方式
 resolve_latest_release_tag() {
-    local latest_release_url="$RELEASE_REPO_URL/releases/latest"
-    local resolved_url=""
+    local api_url="https://api.github.com/repos/${REPO_PATH}/releases/latest"
+    local tag=""
 
     if command -v curl >/dev/null 2>&1; then
-        resolved_url=$(curl --connect-timeout 10 --max-time 20 -fsSL -o /dev/null -w '%{url_effective}' "$latest_release_url" 2>/dev/null || true)
-        if [ -n "$resolved_url" ]; then
-            printf '%s' "${resolved_url##*/}"
-            return 0
-        fi
+        tag=$(curl --connect-timeout 10 --max-time 20 -fsSL "$api_url" 2>/dev/null \
+              | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)
+    fi
+    if [ -z "$tag" ] && command -v wget >/dev/null 2>&1; then
+        tag=$(wget -T 20 -qO- "$api_url" 2>/dev/null \
+              | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)
     fi
 
-    if command -v wget >/dev/null 2>&1; then
-        resolved_url=$(wget -T 20 -qO- "$latest_release_url" 2>/dev/null | sed -n 's#.*releases/tag/\([^"/]*\).*#\1#p' | head -n1 || true)
-        if [ -n "$resolved_url" ]; then
-            printf '%s' "$resolved_url"
-            return 0
+    # 兜底：releases/latest 重定向方式（可能也走不通，但保留）
+    if [ -z "$tag" ]; then
+        local latest_release_url="$RELEASE_REPO_URL/releases/latest"
+        local resolved_url=""
+        if command -v curl >/dev/null 2>&1; then
+            resolved_url=$(curl --connect-timeout 10 --max-time 20 -fsSL -o /dev/null -w '%{url_effective}' "$latest_release_url" 2>/dev/null || true)
+        elif command -v wget >/dev/null 2>&1; then
+            resolved_url=$(wget -T 20 -qO- "$latest_release_url" 2>/dev/null | sed -n 's#.*releases/tag/\([^"/]*\).*#\1#p' | head -n1 || true)
         fi
+        [ -n "$resolved_url" ] && tag="${resolved_url##*/}"
     fi
 
+    if [ -n "$tag" ]; then
+        printf '%s' "$tag"
+        return 0
+    fi
     return 1
 }
 
@@ -497,6 +514,34 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM HUP QUIT
 
+# 经镜像列表下载：依次尝试各镜像，最后直连兜底；单源失败自动换下一个
+download_with_mirrors() {
+    local dest="$1"
+    local url="$2"
+    local try_url=""
+
+    # $GITHUB_MIRRORS 不加引号以触发分词；末尾追加空串作为直连兜底
+    for mirror in $GITHUB_MIRRORS ""; do
+        try_url="${mirror:+${mirror}/}${url}"
+        echo "$(select_text "  尝试源：$try_url" "  Trying: $try_url")"
+        if command -v curl >/dev/null 2>&1; then
+            if curl --connect-timeout 10 --max-time 120 -fL --retry 2 -C - --progress-bar --show-error -o "$dest" "$try_url"; then
+                return 0
+            fi
+        elif command -v wget >/dev/null 2>&1; then
+            if wget -T 120 -t 2 -c -O "$dest" "$try_url"; then
+                return 0
+            fi
+        else
+            echo "$(select_text "致命错误：需要 curl 或 wget。" "Fatal: curl or wget is required.")" >&2
+            exit 1
+        fi
+        # 该源失败，清理半成品后换下一个
+        rm -f "$dest" 2>/dev/null || true
+    done
+    return 1
+}
+
 if [ "$INSTALL_MODE" = "release" ]; then
     echo "$(select_text "⠋ 下载编译好的版本..." "⠋ Downloading prebuilt release...")"
     WORK_DIR=$(mktemp -d "$TMP_BASE_DIR/llmux-release.XXXXXX")
@@ -505,18 +550,8 @@ if [ "$INSTALL_MODE" = "release" ]; then
     echo "$(select_text "下载地址：" "Download URL:") $DOWNLOAD_URL"
     echo "$(select_text "下载中，请稍等..." "Downloading, please wait...")"
 
-    if command -v curl >/dev/null 2>&1; then
-        if ! curl --connect-timeout 10 --max-time 120 -fL --progress-bar --show-error -o "$BINARY_SOURCE" "$DOWNLOAD_URL"; then
-            echo "$(select_text "下载失败：无法获取 release 文件。" "Download failed: could not fetch the release binary.")" >&2
-            exit 1
-        fi
-    elif command -v wget >/dev/null 2>&1; then
-        if ! wget -T 120 -O "$BINARY_SOURCE" "$DOWNLOAD_URL"; then
-            echo "$(select_text "下载失败：无法获取 release 文件。" "Download failed: could not fetch the release binary.")" >&2
-            exit 1
-        fi
-    else
-        echo "$(select_text "致命错误：需要 curl 或 wget。" "Fatal: curl or wget is required.")" >&2
+    if ! download_with_mirrors "$BINARY_SOURCE" "$DOWNLOAD_URL"; then
+        echo "$(select_text "下载失败：所有下载源均不可用。" "Download failed: all download sources are unreachable.")" >&2
         exit 1
     fi
 
@@ -589,15 +624,15 @@ if command -v llmux >/dev/null 2>&1; then
     echo "$(select_text "现在可以直接输入：" "You can now run:")"
     echo "  llmux"
 else
-        echo "$(select_text "当前终端还找不到 llmux，可能需要刷新 shell 缓存或设置 PATH。" "Your shell cannot find llmux yet. You may need to refresh shell cache or set PATH.")"
+    echo "$(select_text "当前终端还找不到 llmux，可能需要刷新 shell 缓存或设置 PATH。" "Your shell cannot find llmux yet. You may need to refresh shell cache or set PATH.")"
     echo "$(select_text "可以先临时执行：" "You can run this temporarily:")"
     echo "  export PATH=\"\$HOME/.local/bin:\$PATH\""
-        echo "  hash -r"
+    echo "  hash -r"
     echo ""
 fi
 
 maybe_help_setup_path
-9
+
 echo ""
 echo "$(select_text "启动后会打开本地网关，管理界面通常在：" "After launch, the local gateway is available at:")"
 echo "  http://localhost:25976"
