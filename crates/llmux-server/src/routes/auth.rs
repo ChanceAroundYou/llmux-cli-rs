@@ -2,9 +2,30 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use llmux_core::crypto::encrypt_api_key;
+use llmux_core::repo;
 use serde_json::{json, Value};
 
 use crate::app::AppState;
+
+/// 把 web session 的 provider 名解析成 vendors.id。
+/// 优先精确匹配；再按协议猜测；都没有则回退 openai。
+async fn resolve_vendor_id(state: &AppState, provider: &str) -> String {
+    if let Ok(Some(_)) = repo::get_vendor(&state.pool, provider).await {
+        return provider.to_string();
+    }
+    // 协议猜测：claude/anthropic → anthropic；gemini → gemini
+    let guessed = if provider.contains("anthropic") || provider.contains("claude") {
+        "anthropic"
+    } else if provider.contains("gemini") {
+        "gemini"
+    } else {
+        "openai"
+    };
+    if let Ok(Some(_)) = repo::get_vendor(&state.pool, guessed).await {
+        return guessed.to_string();
+    }
+    guessed.to_string()
+}
 
 pub async fn handle_web_session(
     Extension(state): Extension<AppState>,
@@ -34,7 +55,8 @@ pub async fn handle_web_session(
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| format!("{provider}-web"));
 
-    let provider_id = format!("{provider}-web");
+    let vendor_id = resolve_vendor_id(&state, provider).await;
+    let name = alias.clone();
 
     // Encrypt the token before storing.
     let encrypted_token = match encrypt_api_key(token, &state.master_key) {
@@ -47,22 +69,12 @@ pub async fn handle_web_session(
         }
     };
 
-    // Check for an existing web-session account for this provider and alias.
-    if let Ok(Some(existing_id)) = sqlx::query_scalar::<_, i64>(
-        "SELECT id FROM accounts WHERE provider_id = ? AND alias = ?",
-    )
-    .bind(&provider_id)
-    .bind(&alias)
-    .fetch_optional(&state.pool)
-    .await
+    // Check for an existing web-session account for this vendor and name.
+    if let Ok(Some(existing_id)) =
+        repo::find_account_by_vendor_and_name(&state.pool, &vendor_id, &name).await
     {
         // Update existing web session.
-        match sqlx::query("UPDATE accounts SET api_key = ? WHERE id = ?")
-            .bind(&encrypted_token)
-            .bind(existing_id)
-            .execute(&state.pool)
-            .await
-        {
+        match repo::set_account_api_key_enc(&state.pool, existing_id, &encrypted_token).await {
             Ok(_) => {
                 tracing::info!("🔐 Successfully updated Web Session for {provider}");
                 return Json(json!({
@@ -81,16 +93,7 @@ pub async fn handle_web_session(
     }
 
     // Insert new web session account.
-    match sqlx::query(
-        "INSERT INTO accounts (alias, provider_id, api_key, is_active, weight)
-         VALUES (?, ?, ?, 1, 1)",
-    )
-    .bind(&alias)
-    .bind(&provider_id)
-    .bind(&encrypted_token)
-    .execute(&state.pool)
-    .await
-    {
+    match repo::create_account(&state.pool, &vendor_id, &name, &encrypted_token, None, None, 1, 1, None).await {
         Ok(_) => {
             tracing::info!("🔐 Successfully imported Web Session for {provider}");
             Json(json!({

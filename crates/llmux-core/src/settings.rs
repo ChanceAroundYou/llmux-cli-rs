@@ -15,7 +15,7 @@ impl SettingsService {
     }
 
     pub async fn get_all(&self) -> Result<Map<String, Value>> {
-        let rows = sqlx::query_as::<_, (String, Option<String>)>("SELECT key, value FROM settings")
+        let rows = sqlx::query_as::<_, (String, Option<String>)>("SELECT key, value FROM app_settings")
             .fetch_all(&self.pool)
             .await?;
 
@@ -36,7 +36,7 @@ impl SettingsService {
             other => serde_json::to_string(&other)?,
         };
 
-        sqlx::query("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)")
+        sqlx::query("INSERT OR REPLACE INTO app_settings (key, value) VALUES (?, ?)")
             .bind(key)
             .bind(value)
             .execute(&self.pool)
@@ -51,7 +51,7 @@ impl SettingsService {
                 Value::String(text) => text.clone(),
                 other => serde_json::to_string(other)?,
             };
-            sqlx::query("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)")
+            sqlx::query("INSERT OR REPLACE INTO app_settings (key, value) VALUES (?, ?)")
                 .bind(key)
                 .bind(value)
                 .execute(&mut *tx)
@@ -63,7 +63,7 @@ impl SettingsService {
 
     pub async fn get_or_create_gateway_key(&self) -> Result<String> {
         if let Some(existing) =
-            sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = 'gateway_key'")
+            sqlx::query_scalar::<_, String>("SELECT value FROM app_settings WHERE key = 'gateway_key'")
                 .fetch_optional(&self.pool)
                 .await?
         {
@@ -78,7 +78,7 @@ impl SettingsService {
             .map(|b| (b as char).to_ascii_lowercase())
             .collect();
         let key = format!("sk-llmux-{suffix}");
-        sqlx::query("INSERT OR REPLACE INTO settings (key, value) VALUES ('gateway_key', ?)")
+        sqlx::query("INSERT OR REPLACE INTO app_settings (key, value) VALUES ('gateway_key', ?)")
             .bind(&key)
             .execute(&self.pool)
             .await?;

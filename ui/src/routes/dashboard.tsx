@@ -27,7 +27,7 @@ ChartJS.register(CategoryScale, LinearScale, BarElement, Tooltip)
 interface ProviderHealth { id: string; name?: string; status: string; totalChecks: number; }
 interface ActivityEntry { id: number; timestamp: number; model: string; success: number; latency_ms: number; error_message: string | null; account_name: string; }
 interface ModelHealthEntry { model: string; success: number; latency: number; error: string | null; last_checked: number; account_name: string; }
-interface ModelAlias { id: number; alias: string; target_model: string; provider_id: string | null; }
+interface ModelAlias { id: number; alias: string; target_model: string; vendor_id: string | null; }
 
 export default function Dashboard() {
   const { t } = useTranslation();
@@ -81,7 +81,7 @@ export default function Dashboard() {
     return aliases.map(a => {
       const h = bestByModel.get(a.target_model);
       return {
-        alias: a.alias, target_model: a.target_model, provider: a.provider_id || '',
+        alias: a.alias, target_model: a.target_model, provider: a.vendor_id || '',
         success: h ? h.success === 1 : false, latency: h?.latency ?? null, lastChecked: h?.last_checked ?? null,
       };
     });

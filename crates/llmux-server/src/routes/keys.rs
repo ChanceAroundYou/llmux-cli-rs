@@ -2,39 +2,63 @@ use axum::extract::Path;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
-use llmux_core::models::ApiKey;
+use llmux_core::repo;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::app::AppState;
 
-/// Normalize allowed_models from JSON body to storage format.
-/// Bun stores as `"*"` or a JSON array string like `["gpt-4","claude-3"]`.
-fn normalize_allowed_models(value: Option<&Value>) -> String {
+/// 白名单解析：`"*"` = 不限制；JSON 数组（或数组字符串）→ 多个模型；裸字符串 → 单个模型名。
+/// 注意：裸字符串必须按「限制为这一个模型」处理，否则调用方以为限制了、实际却放行全部（安全）。
+fn parse_allowed_models(value: &Value) -> Vec<String> {
     match value {
-        None | Some(Value::Null) => "*".to_string(),
-        Some(Value::String(s)) if s == "*" => "*".to_string(),
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Array(_)) => {
-            serde_json::to_string(value.unwrap()).unwrap_or_else(|_| "*".to_string())
+        Value::String(s) if s == "*" => vec![],
+        Value::String(s) => {
+            // 兼容 JSON 数组字符串 "[\"a\",\"b\"]"
+            serde_json::from_str::<Vec<String>>(s)
+                .unwrap_or_else(|_| vec![s.to_string()])
         }
-        _ => "*".to_string(),
+        Value::Array(arr) => arr
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+        _ => vec![],
     }
 }
 
 pub async fn list_api_keys(Extension(state): Extension<AppState>) -> Response {
-    match sqlx::query_as::<_, ApiKey>(
-        "SELECT id, name, key, allowed_models, created_at FROM api_keys ORDER BY id",
-    )
-    .fetch_all(&state.pool)
-    .await
-    {
-        Ok(keys) => Json(serde_json::to_value(keys).unwrap_or(Value::Array(vec![]))).into_response(),
-        Err(e) => crate::error::simple_error(
-            format!("Database error: {e}"),
-            StatusCode::INTERNAL_SERVER_ERROR,
-        ),
+    let rows = match repo::list_api_keys(&state.pool).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            return crate::error::simple_error(
+                format!("Database error: {e}"),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            );
+        }
+    };
+
+    let mut result = Vec::with_capacity(rows.len());
+    for key in rows {
+        let models: Vec<String> = repo::list_key_models(&state.pool, key.id.unwrap_or_default())
+            .await
+            .unwrap_or_default();
+        let allowed_models = if models.is_empty() {
+            Value::String("*".to_string())
+        } else {
+            Value::Array(models.into_iter().map(Value::String).collect())
+        };
+        result.push(json!({
+            "id": key.id,
+            "name": key.name,
+            "key": key.key,
+            "enabled": key.enabled,
+            "last_used_at": key.last_used_at,
+            "created_at": key.created_at,
+            "allowed_models": allowed_models,
+        }));
     }
+
+    Json(Value::Array(result)).into_response()
 }
 
 pub async fn create_api_key(
@@ -45,26 +69,36 @@ pub async fn create_api_key(
         .get("name")
         .and_then(|v| v.as_str())
         .unwrap_or("Unnamed Key");
-    let allowed_models = normalize_allowed_models(body.get("allowed_models"));
+    let allowed_models = parse_allowed_models(
+        body.get("allowed_models").unwrap_or(&Value::String("*".into())),
+    );
+
+    // 网关 key 明文存储（厂商 key 已单独加密，见 schema 注释），可随时回读用于一键配置
     let key = format!("sk-llmux-{}", Uuid::new_v4().simple());
 
-    match sqlx::query("INSERT INTO api_keys (name, key, allowed_models) VALUES (?, ?, ?)")
-        .bind(name)
-        .bind(&key)
-        .bind(&allowed_models)
-        .execute(&state.pool)
-        .await
-    {
-        Ok(_) => Json(json!({
-            "success": true,
-            "key": key,
-        }))
-        .into_response(),
-        Err(e) => crate::error::simple_error(
-            format!("Failed to create API key: {e}"),
+    let key_id = match repo::create_api_key(&state.pool, name, &key).await {
+        Ok(id) => id,
+        Err(e) => {
+            return crate::error::simple_error(
+                format!("Failed to create API key: {e}"),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            );
+        }
+    };
+
+    if let Err(e) = repo::replace_key_models(&state.pool, key_id, &allowed_models).await {
+        return crate::error::simple_error(
+            format!("Failed to store allowed model: {e}"),
             StatusCode::INTERNAL_SERVER_ERROR,
-        ),
+        );
     }
+
+    Json(json!({
+        "success": true,
+        "id": key_id,
+        "key": key,
+    }))
+    .into_response()
 }
 
 pub async fn update_api_key(
@@ -77,50 +111,35 @@ pub async fn update_api_key(
         .and_then(|v| v.as_str())
         .unwrap_or("Untitled Key");
 
-    // Read existing allowed_models so we can fall back to it when the body
-    // doesn't include the field.  Bun silently succeeds even when the key
-    // doesn't exist, so we don't verify existence beforehand.
-    let existing_models: Option<String> =
-        sqlx::query_scalar("SELECT allowed_models FROM api_keys WHERE id = ?")
-            .bind(id)
-            .fetch_optional(&state.pool)
-            .await
-            .ok()
-            .flatten();
-
-    let allowed_models = if body.get("allowed_models").is_some() {
-        normalize_allowed_models(body.get("allowed_models"))
-    } else if let Some(existing) = existing_models {
-        existing
-    } else {
-        "*".to_string()
-    };
-
-    match sqlx::query("UPDATE api_keys SET name = ?, allowed_models = ? WHERE id = ?")
-        .bind(name)
-        .bind(&allowed_models)
-        .bind(id)
-        .execute(&state.pool)
-        .await
-    {
-        Ok(_) => Json(json!({ "success": true })).into_response(),
-        Err(e) => crate::error::simple_error(
+    // Bun 在 key 不存在时也静默成功，保持一致。
+    if let Err(e) = repo::update_api_key_name(&state.pool, id, name).await {
+        return crate::error::simple_error(
             format!("Failed to update API key: {e}"),
             StatusCode::INTERNAL_SERVER_ERROR,
-        ),
+        );
     }
+
+    // 白名单替换
+    if let Some(rule) = body.get("allowed_models") {
+        let allowed_models = parse_allowed_models(rule);
+        if let Err(e) = repo::replace_key_models(&state.pool, id, &allowed_models).await {
+            return crate::error::simple_error(
+                format!("Failed to reset allowed models: {e}"),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            );
+        }
+    }
+
+    Json(json!({ "success": true })).into_response()
 }
 
 pub async fn delete_api_key(
     Extension(state): Extension<AppState>,
     Path(id): Path<i64>,
 ) -> Response {
-    // Bun silently succeeds even when the key doesn't exist — match that.
-    match sqlx::query("DELETE FROM api_keys WHERE id = ?")
-        .bind(id)
-        .execute(&state.pool)
-        .await
-    {
+    // Bun 在 key 不存在时也静默成功 —— 保持一致。
+    // 外键开启时 api_key_models 白名单自动 CASCADE 清空。
+    match repo::delete_api_key(&state.pool, id).await {
         Ok(_) => Json(json!({ "success": true })).into_response(),
         Err(e) => crate::error::simple_error(
             format!("Failed to delete API key: {e}"),

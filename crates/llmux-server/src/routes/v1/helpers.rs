@@ -18,7 +18,7 @@ pub fn send_tui_request(
         let ts = time::OffsetDateTime::now_local()
             .unwrap_or_else(|_| time::OffsetDateTime::now_utc())
             .format(
-                &time::format_description::parse("[hour]:[minute]:[second]").unwrap(),
+                &time::format_description::parse_borrowed::<2>("[hour]:[minute]:[second]").unwrap(),
             )
             .unwrap_or_default();
         let latency_ms = start.elapsed().as_millis() as i64;
@@ -71,48 +71,33 @@ pub fn iso8601_now() -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Usage logging
+// Usage logging（最小化：无 token 列，account_name 写时快照）
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_arguments)]
 pub async fn log_usage(
     pool: &sqlx::SqlitePool,
     account: &adapters::Account,
     model: &str,
-    provider_id: &str,
-    input_tokens: i64,
-    output_tokens: i64,
-    cache_read_input_tokens: i64,
-    cache_creation_input_tokens: i64,
     latency_ms: i64,
     success: bool,
     error_message: &Option<String>,
 ) -> anyhow::Result<()> {
-    let timestamp = std::time::SystemTime::now()
+    let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64;
 
     let result = sqlx::query(
-        "INSERT INTO usage_logs (
-            timestamp, account_id, provider_id, model,
-            input_tokens, output_tokens,
-            cache_read_input_tokens, cache_creation_input_tokens,
-            latency_ms, success, error_message, is_test
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO usage_logs (ts, account_id, account_name, model, latency_ms, success, error_message)
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
     )
-    .bind(timestamp)
+    .bind(ts)
     .bind(account.id)
-    .bind(provider_id)
+    .bind(&account.name)
     .bind(model)
-    .bind(input_tokens)
-    .bind(output_tokens)
-    .bind(cache_read_input_tokens)
-    .bind(cache_creation_input_tokens)
     .bind(latency_ms)
     .bind(if success { 1 } else { 0 })
     .bind(error_message.as_deref())
-    .bind(0)
     .execute(pool)
     .await;
 

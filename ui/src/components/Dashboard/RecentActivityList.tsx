@@ -12,7 +12,6 @@ interface ActivityEntry {
   latency_ms: number;
   error_message: string | null;
   account_name: string;
-  provider_id: string;
 }
 
 interface ActivityItemProps {

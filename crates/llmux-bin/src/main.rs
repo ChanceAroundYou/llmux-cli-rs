@@ -66,8 +66,8 @@ async fn start(port_override: Option<u16>, use_tui: bool) -> anyhow::Result<()> 
 
     std::fs::create_dir_all(&config.data_dir)?;
     let database_url = sqlite_url_from_path(&config.database_path);
-    let pool = connect_sqlite(&database_url).await?;
-    init_db(&pool).await?;
+    let mut pool = connect_sqlite(&database_url).await?;
+    init_db(&mut pool, &database_url).await?;
 
     let master_key = get_or_create_master_key(&config.data_dir, config.master_key.as_deref())?;
 
@@ -163,7 +163,7 @@ fn get_local_lan_ip() -> String {
 }
 
 async fn query_dashboard_counts(pool: &sqlx::SqlitePool) -> (usize, usize, usize, usize, Vec<String>) {
-    let active = sqlx::query_scalar::<_, i64>("SELECT COUNT(1) FROM accounts WHERE is_active = 1")
+    let active = sqlx::query_scalar::<_, i64>("SELECT COUNT(1) FROM accounts WHERE enabled = 1")
         .fetch_one(pool)
         .await
         .unwrap_or(0) as usize;
@@ -180,7 +180,7 @@ async fn query_dashboard_counts(pool: &sqlx::SqlitePool) -> (usize, usize, usize
         .await
         .unwrap_or(0) as usize;
     let account_aliases: Vec<String> = sqlx::query_scalar::<_, String>(
-        "SELECT alias FROM accounts WHERE is_active = 1 ORDER BY alias"
+        "SELECT name FROM accounts WHERE enabled = 1 ORDER BY name"
     )
     .fetch_all(pool)
     .await

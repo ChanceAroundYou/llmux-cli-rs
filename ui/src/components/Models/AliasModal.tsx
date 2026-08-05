@@ -10,10 +10,10 @@ interface Props {
   isEditing: boolean;
   alias: string;
   target: string;
-  provider: string;
+  vendor: string;
   selectedAccountIds: number[];
   safeModels: { id: string; owned_by: string }[];
-  safeAccounts: { id: number; alias: string; provider_id: string; is_active: number }[];
+  safeAccounts: { id: number; vendor_id: string; name: string; enabled: number }[];
   onAliasChange: (alias: string) => void;
   onTargetChange: (target: string) => void;
   onAccountIdsChange: (ids: number[]) => void;
@@ -22,7 +22,7 @@ interface Props {
 }
 
 export function AliasModal({
-  isOpen, isEditing, alias, target, provider, selectedAccountIds,
+  isOpen, isEditing, alias, target, vendor, selectedAccountIds,
   safeModels, safeAccounts,
   onAliasChange, onTargetChange, onAccountIdsChange, onClose, onSubmit,
 }: Props) {
@@ -31,8 +31,8 @@ export function AliasModal({
   const matchingAliases = target
     ? [...new Set(safeModels.filter(x => x.id === target).map(x => x.owned_by))]
     : [];
-  const matchingAccounts = safeAccounts.filter(a => matchingAliases.includes(a.alias) && a.is_active === 1);
-  const otherAccounts = safeAccounts.filter(a => !matchingAliases.includes(a.alias) && a.is_active === 1);
+  const matchingAccounts = safeAccounts.filter(a => matchingAliases.includes(a.vendor_id) && a.enabled === 1);
+  const otherAccounts = safeAccounts.filter(a => !matchingAliases.includes(a.vendor_id) && a.enabled === 1);
 
   return (
     <Dialog isOpen={isOpen} onClose={onClose} title={isEditing ? t('models.editAlias') : t('models.createAlias')}>
@@ -102,7 +102,7 @@ export function AliasModal({
                     }}
                     className="w-3.5 h-3.5 rounded accent-primary"
                   />
-                  <span className="text-xs">[{a.provider_id}] {a.alias}</span>
+                  <span className="text-xs">[{a.vendor_id}] {a.name}</span>
                 </label>
               ))}
               {matchingAccounts.length === 0 && (

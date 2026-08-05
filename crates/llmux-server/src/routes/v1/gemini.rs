@@ -82,11 +82,17 @@ pub async fn gemini(
             Err(e) => return middleware::send_error(&format!("Failed to load accounts: {e}"), "server_error", StatusCode::INTERNAL_SERVER_ERROR, false),
         }
     } else {
-        match get_active_accounts(&state.pool, Some(&model_resolution.provider_id), &state.master_key).await {
+        match get_active_accounts(&state.pool, Some(&model_resolution.vendor_id), &state.master_key).await {
             Ok(a) => a,
             Err(e) => return middleware::send_error(&format!("Failed to load accounts: {e}"), "server_error", StatusCode::INTERNAL_SERVER_ERROR, false),
         }
     };
+
+    // 按协议过滤：Gemini 原生请求只用 gemini 协议账户
+    let accounts: Vec<_> = accounts
+        .into_iter()
+        .filter(|a| a.protocol == "gemini")
+        .collect();
 
     if accounts.is_empty() {
         return middleware::send_error(
@@ -101,7 +107,7 @@ pub async fn gemini(
         .alias_name
         .as_deref()
         .map(|n| format!("alias:{}", n))
-        .unwrap_or_else(|| format!("provider:{}", model_resolution.provider_id));
+        .unwrap_or_else(|| format!("vendor:{}", model_resolution.vendor_id));
 
     let preferred_id = model_resolution
         .preferred_account_id
@@ -124,7 +130,7 @@ pub async fn gemini(
     let mut last_error: Option<String> = None;
 
     for account in &ordered_accounts {
-        let is_custom_base = account.base_url.as_deref().is_some_and(|u| !u.is_empty());
+        let is_custom_base = account.custom_base_url;
         let default_base = "https://generativelanguage.googleapis.com/v1beta";
         let base_url = normalize_base_url(
             account
@@ -184,7 +190,7 @@ pub async fn gemini(
 
         tracing::info!(
             "⚡ {} → {} → {}",
-            account.alias,
+            account.name,
             model_resolution.target_model,
             base_url,
         );
@@ -192,9 +198,9 @@ pub async fn gemini(
             let _ = tx.send(TuiEvent::Dispatch {
                 timestamp: time::OffsetDateTime::now_local()
                     .unwrap_or_else(|_| time::OffsetDateTime::now_utc())
-                    .format(&time::format_description::parse("[hour]:[minute]:[second]").unwrap())
+                    .format(&time::format_description::parse_borrowed::<2>("[hour]:[minute]:[second]").unwrap())
                     .unwrap_or_default(),
-                account: account.alias.clone(),
+                account: account.name.clone(),
                 model: model_resolution.target_model.clone(),
                 url: dispatch_url,
                 tag: dispatch_tag.clone(),
@@ -206,13 +212,13 @@ pub async fn gemini(
             Err(e) => {
                 tracing::error!(
                     "🔀 Account {} (id={}) request failed: {e}",
-                    account.alias,
+                    account.name,
                     account.id
                 );
                 last_error = Some(format!("Provider request failed: {e}"));
                 if let Some(tx) = &state.tui_tx {
                     let _ = tx.send(TuiEvent::Retry {
-                        account: account.alias.clone(),
+                        account: account.name.clone(),
                         status: 0,
                         message: format!("Network error: {e}"),
                     });
@@ -233,13 +239,13 @@ pub async fn gemini(
             if is_retryable_status(status.as_u16()) {
                 tracing::warn!(
                     "🔀 Account {} (id={}) failed ({}) — trying next...",
-                    account.alias,
+                    account.name,
                     account.id,
                     status.as_u16()
                 );
                 if let Some(tx) = &state.tui_tx {
                     let _ = tx.send(TuiEvent::Retry {
-                        account: account.alias.clone(),
+                        account: account.name.clone(),
                         status: status.as_u16(),
                         message: error_body.clone(),
                     });
@@ -255,11 +261,6 @@ pub async fn gemini(
                 &state.pool,
                 account,
                 &model_resolution.target_model,
-                &model_resolution.provider_id,
-                0,
-                0,
-                0,
-                0,
                 latency_ms,
                 false,
                 &last_error,
@@ -290,7 +291,6 @@ pub async fn gemini(
                 &model_resolution.target_model,
                 account,
                 state.pool.clone(),
-                &model_resolution.provider_id,
                 start,
             )
             .await;
@@ -313,18 +313,11 @@ pub async fn gemini(
             }
         };
 
-        // Extract usage from Gemini format: usageMetadata.{promptTokenCount, candidatesTokenCount}
-        let (prompt_tokens, completion_tokens) = gemini_usage(&data);
         let latency_ms = start.elapsed().as_millis() as i64;
         let _ = log_usage(
             &state.pool,
             account,
             &model_resolution.target_model,
-            &model_resolution.provider_id,
-            prompt_tokens,
-            completion_tokens,
-            0,
-            0,
             latency_ms,
             true,
             &None,
@@ -351,11 +344,6 @@ pub async fn gemini(
             &state.pool,
             account,
             &model_resolution.target_model,
-            &model_resolution.provider_id,
-            0,
-            0,
-            0,
-            0,
             latency_ms,
             false,
             &Some(error_msg.clone()),
@@ -371,37 +359,20 @@ pub async fn gemini(
     )
 }
 
-/// Extract token counts from Gemini response format.
-fn gemini_usage(data: &Value) -> (i64, i64) {
-    let meta = &data["usageMetadata"];
-    let prompt = meta["promptTokenCount"].as_i64().unwrap_or_default();
-    let candidates = meta["candidatesTokenCount"].as_i64();
-    let thoughts = meta["thoughtsTokenCount"].as_i64().unwrap_or_default();
-    let completion = candidates.unwrap_or_else(|| {
-        meta["totalTokenCount"]
-            .as_i64()
-            .map(|t| t.saturating_sub(prompt).saturating_sub(thoughts))
-            .unwrap_or_default()
-    });
-    (prompt, completion)
-}
-
 /// Passthrough streaming for Gemini responses (SSE).
 async fn gemini_streaming_passthrough(
     response: reqwest::Response,
     model: &str,
     account: &adapters::Account,
     pool: sqlx::SqlitePool,
-    provider_id: &str,
     start: Instant,
 ) -> Response {
     let model = model.to_string();
     let account = account.clone();
-    let provider_id = provider_id.to_string();
 
     tracing::info!(
         "⚡ streaming {} → {}",
-        provider_id,
+        account.name,
         model,
     );
 
@@ -417,11 +388,6 @@ async fn gemini_streaming_passthrough(
             &pool_clone,
             &account,
             &model,
-            &provider_id,
-            0,
-            0,
-            0,
-            0,
             latency_ms,
             true,
             &None,

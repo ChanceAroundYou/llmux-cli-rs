@@ -3,9 +3,9 @@ use axum::{
     Extension, Json,
 };
 use serde_json::{json, Value};
-use sqlx::Row;
 
-use llmux_core::dispatcher::{get_active_accounts, resolve_provider_type};
+use llmux_core::dispatcher::get_active_accounts;
+use llmux_core::repo;
 
 use crate::app::{AppState, ModelsCache};
 
@@ -144,29 +144,31 @@ async fn do_fetch_models(state: &AppState) -> Vec<Value> {
         .map(|account| {
             let account = account.clone();
             async move {
-                let provider_type = resolve_provider_type(None, &account.provider_id);
+                // 协议直接取厂商 protocol，无需再查 providers 表
+                let provider_type = account.protocol.clone();
                 let (models, fetch_error) = fetch_provider_models(&account, &provider_type).await;
-                (account.alias, models, fetch_error)
+                (account.name, account.vendor_id.clone(), models, fetch_error)
             }
         })
         .collect();
 
-    let results: Vec<(String, Vec<Value>, Option<String>)> =
+    let results: Vec<(String, String, Vec<Value>, Option<String>)> =
         futures_util::future::join_all(futures).await;
 
     let mut all_models: Vec<Value> = Vec::new();
     let mut seen_keys = std::collections::HashSet::new();
 
-    for (alias, models, fetch_error) in results {
+    for (name, vendor_id, models, fetch_error) in results {
         if models.is_empty() {
-            let key = format!("{}:__unavailable__", alias);
+            let key = format!("{}:__unavailable__", name);
             if seen_keys.insert(key) {
                 let mut placeholder = json!({
-                    "id": format!("{}-models-unavailable", alias),
-                    "name": alias,
+                    "id": format!("{}-models-unavailable", name),
+                    "name": name,
                     "object": "model",
                     "created": 0,
-                    "owned_by": alias,
+                    // owned_by 语义 = 提供模型的厂商 id（alias 路由按 vendor_id 走）
+                    "owned_by": vendor_id,
                 });
                 if let Some(err) = &fetch_error {
                     placeholder["error"] = json!(err);
@@ -177,10 +179,10 @@ async fn do_fetch_models(state: &AppState) -> Vec<Value> {
         }
         for mut m in models {
             let id = m.get("id").and_then(Value::as_str).unwrap_or("").to_string();
-            let key = format!("{}:{}", alias, id);
+            let key = format!("{}:{}", vendor_id, id);
             if seen_keys.insert(key) {
                 if let Value::Object(obj) = &mut m {
-                    obj.insert("owned_by".to_string(), json!(alias));
+                    obj.insert("owned_by".to_string(), json!(vendor_id));
                 }
                 all_models.push(m);
             }
@@ -188,27 +190,17 @@ async fn do_fetch_models(state: &AppState) -> Vec<Value> {
     }
 
     // Merge custom models from aliases
-    let alias_model_rows = sqlx::query(
-        "SELECT DISTINCT target_model, provider_id FROM model_aliases \
-         WHERE target_model IS NOT NULL AND target_model != ''",
-    )
-    .fetch_all(&state.pool)
-    .await
-    .unwrap_or_default();
+    let alias_models = repo::list_alias_custom_models(&state.pool)
+        .await
+        .unwrap_or_default();
 
-    let alias_model_count = alias_model_rows.len();
+    let alias_model_count = alias_models.len();
 
-    for row in alias_model_rows {
-        let model_id: String = row.try_get("target_model").unwrap_or_default();
-        let provider: String = row.try_get("provider_id").unwrap_or_default();
+    for (model_id, vendor) in alias_models {
         if model_id.is_empty() {
             continue;
         }
-        let owned_by = if provider.is_empty() {
-            "custom".to_string()
-        } else {
-            provider.clone()
-        };
+        let owned_by = vendor.unwrap_or_else(|| "custom".to_string());
         let key = format!("{}:{}", owned_by, model_id);
         if seen_keys.insert(key) {
             all_models.push(json!({
@@ -301,7 +293,7 @@ pub async fn fetch_provider_models(
     let response = match req.send().await {
         Ok(r) => r,
         Err(e) => {
-            tracing::error!("🤖 [{}] listModels error for {}: {e}", provider_type, account.alias);
+            tracing::error!("🤖 [{}] listModels error for {}: {e}", provider_type, account.name);
             return (vec![], Some(format!("Network error: {e}")));
         }
     };
@@ -317,7 +309,7 @@ pub async fn fetch_provider_models(
             "🤖 [{}] listModels HTTP {} for {}: {}",
             provider_type,
             status,
-            account.alias,
+            account.name,
             err_msg
         );
         return (vec![], Some(err_msg));
@@ -330,7 +322,7 @@ pub async fn fetch_provider_models(
             tracing::warn!(
                 "🤖 [{}] listModels JSON parse error for {}: {}",
                 provider_type,
-                account.alias,
+                account.name,
                 e
             );
             return (vec![], Some(format!("JSON parse error: {e}")));
@@ -361,7 +353,7 @@ pub async fn fetch_provider_models(
         "🤖 [{}] Successfully listed {} models from {}",
         provider_type,
         models.len(),
-        account.alias
+        account.name
     );
 
     (models, None)

@@ -4,10 +4,10 @@ use axum::{
     Extension, Json,
 };
 use serde_json::{json, Value};
-use sqlx::Row;
 
-use llmux_core::crypto::decrypt_api_key;
-use llmux_core::dispatcher::{get_active_accounts, resolve_model, resolve_provider_type, ModelResolution};
+use llmux_core::dispatcher::{
+    get_accounts_by_ids, get_active_accounts, resolve_model, ModelResolution,
+};
 
 use crate::app::AppState;
 
@@ -58,7 +58,7 @@ pub async fn start_test_queue(
                 .and_then(Value::as_str)
                 .unwrap_or("unknown");
             let provider_id_override = model_entry
-                .get("providerId")
+                .get("vendorId")
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty());
 
@@ -66,7 +66,7 @@ pub async fn start_test_queue(
             // Try resolve_model first (by alias), fall back to providerId, then prefix guess
             let resolution = resolve_model(&pool, model_name).await.unwrap_or_else(|_| {
                 ModelResolution {
-                    provider_id: provider_id_override.unwrap_or("openai").to_string(),
+                    vendor_id: provider_id_override.unwrap_or("openai").to_string(),
                     target_model: model_name.to_string(),
                     account_ids: vec![],
                     preferred_account_id: None,
@@ -74,38 +74,34 @@ pub async fn start_test_queue(
                 }
             });
 
-            // Override resolved provider with explicit providerId when resolution guessed wrong
-            let effective_provider = if resolution.provider_id == "openai" || resolution.provider_id == "gemini" || resolution.provider_id == "anthropic" {
-                provider_id_override.unwrap_or(&resolution.provider_id)
+            // Override resolved vendor with explicit vendorId when resolution guessed wrong
+            let effective_vendor = if resolution.vendor_id == "openai"
+                || resolution.vendor_id == "gemini"
+                || resolution.vendor_id == "anthropic"
+            {
+                provider_id_override.unwrap_or(&resolution.vendor_id)
             } else {
-                &resolution.provider_id
+                &resolution.vendor_id
             };
 
             if let Ok(accounts) =
-                get_active_accounts(&pool, Some(effective_provider), &master_key).await
+                get_active_accounts(&pool, Some(effective_vendor), &master_key).await
             {
                 if let Some(account) = accounts.first() {
-                        let provider_type = {
-                            let pt = sqlx::query_scalar::<_, Option<String>>(
-                                "SELECT type FROM providers WHERE id = ?",
-                            )
-                            .bind(&account.provider_id)
-                            .fetch_optional(&pool)
-                            .await
-                            .ok()
-                            .flatten()
-                            .flatten();
-                            resolve_provider_type(pt.as_deref(), &account.provider_id)
-                        };
+                        // 协议直接取厂商 protocol
+                        let provider_type = account.protocol.clone();
 
                         let (url, headers, body) = match provider_type.as_str() {
                             "anthropic" => {
-                                let base = account.anthropic_base_url.as_deref().unwrap_or(
-                                    account
-                                        .base_url
-                                        .as_deref()
-                                        .unwrap_or("https://api.anthropic.com/v1"),
-                                );
+                                // 与 v1/anthropic.rs 一致：按「是否显式配置」决策，避免 COALESCE 默认值吃掉代理 base_url。
+                                let base = if account.custom_anthropic_base_url {
+                                    account.anthropic_base_url.as_deref()
+                                } else if account.custom_base_url {
+                                    account.base_url.as_deref()
+                                } else {
+                                    account.anthropic_base_url.as_deref()
+                                }
+                                .unwrap_or("https://api.anthropic.com/v1");
                                 let url = format!("{}/messages", base.trim_end_matches('/'));
                                 let mut headers = std::collections::BTreeMap::new();
                                 headers.insert(
@@ -196,28 +192,14 @@ pub async fn start_test_queue(
                             false
                         };
                         let latency_ms = start.elapsed().as_millis() as i64;
-
-                        // Log test result
-                        let _ = sqlx::query(
-                            "INSERT INTO usage_logs \
-                             (timestamp, account_id, provider_id, model, input_tokens, output_tokens, \
-                              cache_read_input_tokens, cache_creation_input_tokens, \
-                              latency_ms, success, error_message, is_test) \
-                             VALUES (?, ?, ?, ?, 0, 0, 0, 0, ?, ?, NULL, 1)",
-                        )
-                        .bind(
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_millis() as i64,
-                        )
-                        .bind(account.id)
-                        .bind(&account.provider_id)
-                        .bind(model_name)
-                        .bind(latency_ms)
-                        .bind(if test_success { 1 } else { 0 })
-                        .execute(&pool)
-                        .await;
+                        // 测试结果不入 usage_logs（监控域只记录真实请求）
+                        tracing::debug!(
+                            "🧪 test {} via {}: success={} {}ms",
+                            model_name,
+                            account.name,
+                            test_success,
+                            latency_ms
+                        );
                     }
                 }
 
@@ -255,7 +237,7 @@ pub async fn test_model(
     };
 
     let provider_id_override = body
-        .get("providerId")
+        .get("vendorId")
         .and_then(Value::as_str)
         .map(String::from);
     let account_id_override = body.get("accountId").and_then(|v| v.as_i64());
@@ -271,51 +253,19 @@ pub async fn test_model(
         }
     };
 
-    // Use providerId override if provided (matching Bun behavior)
-    let effective_provider = provider_id_override
+    // Use vendorId override if provided (matching Bun behavior)
+    let effective_vendor = provider_id_override
         .as_deref()
-        .unwrap_or(&resolution.provider_id);
+        .unwrap_or(&resolution.vendor_id);
 
     let accounts = if let Some(acc_id) = account_id_override {
-        // Directly fetch the specified account
-        match sqlx::query(
-            "SELECT id, alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight \
-             FROM accounts WHERE id = ? AND is_active = 1",
-        )
-        .bind(acc_id)
-        .fetch_optional(&state.pool)
-        .await
-        {
-            Ok(Some(row)) => {
-                let encrypted: String = row.try_get("api_key").unwrap_or_default();
-                match decrypt_api_key(&encrypted, &state.master_key) {
-                    Ok(api_key) => vec![llmux_core::adapters::Account {
-                        id: row.try_get("id").unwrap_or_default(),
-                        alias: row.try_get("alias").unwrap_or_default(),
-                        provider_id: row.try_get("provider_id").unwrap_or_default(),
-                        api_key,
-                        base_url: row.try_get("base_url").ok(),
-                        anthropic_base_url: row.try_get("anthropic_base_url").ok(),
-                        is_active: row
-                            .try_get::<i64, _>("is_active")
-                            .unwrap_or(1),
-                        weight: row.try_get("weight").unwrap_or(1),
-                        openai_compatible: row.try_get("openai_compatible").unwrap_or(0),
-                    }],
-                    Err(_) => vec![],
-                }
-            }
-            Ok(None) => vec![],
+        // Directly fetch the specified account（enabled 过滤与 decrypt 由 get_accounts_by_ids 处理）
+        match get_accounts_by_ids(&state.pool, &[acc_id], &state.master_key).await {
+            Ok(a) => a,
             Err(_) => vec![],
         }
     } else {
-        match get_active_accounts(
-            &state.pool,
-            Some(effective_provider),
-            &state.master_key,
-        )
-        .await
-        {
+        match get_active_accounts(&state.pool, Some(effective_vendor), &state.master_key).await {
             Ok(a) => a,
             Err(e) => {
                 return crate::error::simple_error(
@@ -329,22 +279,13 @@ pub async fn test_model(
     let Some(account) = accounts.first() else {
         return Json(json!({
             "success": false,
-            "error": format!("No active account found for provider {}", effective_provider)
+            "error": format!("No active account found for vendor {}", effective_vendor)
         }))
         .into_response();
     };
 
-    let provider_type = {
-        let pt =
-            sqlx::query_scalar::<_, Option<String>>("SELECT type FROM providers WHERE id = ?")
-                .bind(&account.provider_id)
-                .fetch_optional(&state.pool)
-                .await
-                .ok()
-                .flatten()
-                .flatten();
-        resolve_provider_type(pt.as_deref(), &account.provider_id)
-    };
+    // 协议直接取厂商 protocol
+    let provider_type = account.protocol.clone();
 
     let (url, headers, req_body) = match provider_type.as_str() {
         "anthropic" => {
@@ -462,16 +403,16 @@ pub async fn test_model(
         tracing::info!(
             "🧪 {} | {} | {} | {}ms | OK",
             model_name,
-            account.alias,
-            effective_provider,
+            account.name,
+            effective_vendor,
             latency_ms
         );
     } else {
         tracing::warn!(
             "🧪 {} | {} | {} | {}ms | FAILED: {}",
             model_name,
-            account.alias,
-            effective_provider,
+            account.name,
+            effective_vendor,
             latency_ms,
             error_msg.as_deref().unwrap_or("unknown error")
         );

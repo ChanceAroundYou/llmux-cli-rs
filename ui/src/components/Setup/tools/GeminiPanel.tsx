@@ -60,11 +60,7 @@ export function GeminiPanel({
 
   const [selectedKeyId, setSelectedKeyId] = useState<number | ''>(() => {
     if (!currentSettings || keys.length === 0) return '';
-    const envContent = (currentSettings.env as string) ?? '';
-    const keyMatch = envContent.match(/GEMINI_API_KEY=(.+)/);
-    const existingKey = keyMatch ? keyMatch[1].trim() : '';
-    const matchedKey = keys.find(k => k.key === existingKey);
-    return matchedKey ? matchedKey.id : (keys[0]?.id ?? '');
+    return keys[0]?.id ?? '';
   });
   const [model, setModel] = useState(() => getInitialModel(currentSettings));
 
@@ -115,21 +111,19 @@ export function GeminiPanel({
     setPendingFillContent(null);
     setIsRestoring(false);
 
-    const envContent = content.env ?? '';
     const settingsContent = content.settings ?? '';
-    const keyMatch = (envContent as string).match(/GEMINI_API_KEY=(.+)/);
-    const backupApiKey = keyMatch ? keyMatch[1].trim() : '';
-    const matchedKey = keys.find(k => k.key === backupApiKey);
     skipKeyClear.current += 1;
     let notice: string | null = null;
+    // 备份 key 仍在本机密钥列表时优先选中它；否则回退到当前选中/第一个 key 并提示替换。
+    const backupKeyMatch = (settingsContent as string).match(/^GEMINI_API_KEY=(\S+)$/m);
+    const backupApiKey = backupKeyMatch?.[1] ?? '';
+    const matchedKey = backupApiKey ? keys.find(k => k.key === backupApiKey) : undefined;
+    const fallback = keys.find(k => k.id === selectedKeyId) ?? keys[0];
     if (matchedKey) {
       setSelectedKeyId(matchedKey.id);
-    } else {
-      const fallback = keys.find(k => k.id === selectedKeyId) ?? keys[0];
-      if (fallback) {
-        setSelectedKeyId(fallback.id);
-        notice = `备份中的 API Key 不在当前密钥列表，已自动替换为「${fallback.name}」。`;
-      }
+    } else if (fallback) {
+      setSelectedKeyId(fallback.id);
+      notice = `备份中的 API Key 不在当前密钥列表，已自动替换为「${fallback.name}」。`;
     }
     const extracted = extractFromSettings(settingsContent as string);
     if (extracted) setModel(extracted);
@@ -140,11 +134,11 @@ export function GeminiPanel({
   const previewEnv = useMemo(() => {
     if (!selectedKey) return null;
     let result = (currentSettings?.env as string) ?? '';
-    result = result.replace(/^GEMINI_API_KEY=.*/m, `GEMINI_API_KEY=${selectedKey.key}`);
+    result = result.replace(/^GEMINI_API_KEY=.*$/m, `GEMINI_API_KEY=${selectedKey.key}`);
     if (!/^GEMINI_API_KEY=/m.test(result)) {
       result = result.trimEnd() + `\nGEMINI_API_KEY=${selectedKey.key}`;
     }
-    result = result.replace(/^GOOGLE_GEMINI_BASE_URL=.*/m, `GOOGLE_GEMINI_BASE_URL=${gatewayUrl}`);
+    result = result.replace(/^GOOGLE_GEMINI_BASE_URL=.*$/m, `GOOGLE_GEMINI_BASE_URL=${gatewayUrl}`);
     if (!/^GOOGLE_GEMINI_BASE_URL=/m.test(result)) {
       result = result.trimEnd() + `\nGOOGLE_GEMINI_BASE_URL=${gatewayUrl}`;
     }

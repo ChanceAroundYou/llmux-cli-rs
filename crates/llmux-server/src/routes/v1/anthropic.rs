@@ -80,11 +80,18 @@ pub async fn messages(
             Err(e) => return middleware::send_error(&format!("Failed to load accounts: {e}"), "server_error", StatusCode::INTERNAL_SERVER_ERROR, is_anthropic),
         }
     } else {
-        match get_active_accounts(&state.pool, Some(&model_resolution.provider_id), &state.master_key).await {
+        match get_active_accounts(&state.pool, Some(&model_resolution.vendor_id), &state.master_key).await {
             Ok(a) => a,
             Err(e) => return middleware::send_error(&format!("Failed to load accounts: {e}"), "server_error", StatusCode::INTERNAL_SERVER_ERROR, is_anthropic),
         }
     };
+
+    // 按协议过滤：Anthropic 请求用 anthropic 协议账户，或显式配置了
+    // anthropic_base_url（Anthropic 兼容端点）的 openai/custom 账户。
+    let accounts: Vec<_> = accounts
+        .into_iter()
+        .filter(|a| a.protocol == "anthropic" || a.custom_anthropic_base_url)
+        .collect();
 
     if accounts.is_empty() {
         return middleware::send_error(
@@ -99,7 +106,7 @@ pub async fn messages(
         .alias_name
         .as_deref()
         .map(|n| format!("alias:{}", n))
-        .unwrap_or_else(|| format!("provider:{}", model_resolution.provider_id));
+        .unwrap_or_else(|| format!("vendor:{}", model_resolution.vendor_id));
 
     let preferred_id = model_resolution
         .preferred_account_id
@@ -123,12 +130,19 @@ pub async fn messages(
 
     for account in &ordered_accounts {
         // Determine the base URL for Anthropic passthrough.
-        // Prefer anthropic_base_url; fall back to base_url if anthropic_base_url is not set.
-        let base_url = account
-            .anthropic_base_url
-            .as_deref()
-            .or(account.base_url.as_deref())
-            .unwrap_or("https://api.anthropic.com/v1");
+        // dispatcher 已把未显式配置的 anthropic_base_url 填成厂商默认值，
+        // 因此按「是否用户显式配置」决策，而不是按字段是否为空：
+        // - 显式配置了 anthropic 兼容端点 → 用它
+        // - 只显式配置了自定义 base_url（代理）→ anthropic 请求也走它
+        // - 都没配置 → 用 dispatcher 解析出的厂商默认 anthropic 端点
+        let base_url = if account.custom_anthropic_base_url {
+            account.anthropic_base_url.as_deref()
+        } else if account.custom_base_url {
+            account.base_url.as_deref()
+        } else {
+            account.anthropic_base_url.as_deref()
+        }
+        .unwrap_or("https://api.anthropic.com/v1");
 
         let provider_request = match build_anthropic_passthrough_request(
             &body,
@@ -140,7 +154,7 @@ pub async fn messages(
             Ok(r) => {
                 tracing::info!(
                     "⚡ {} → {} → {}",
-                    account.alias,
+                    account.name,
                     model_resolution.target_model,
                     base_url,
                 );
@@ -148,9 +162,9 @@ pub async fn messages(
                     let _ = tx.send(TuiEvent::Dispatch {
                         timestamp: time::OffsetDateTime::now_local()
                             .unwrap_or_else(|_| time::OffsetDateTime::now_utc())
-                            .format(&time::format_description::parse("[hour]:[minute]:[second]").unwrap())
+                            .format(&time::format_description::parse_borrowed::<2>("[hour]:[minute]:[second]").unwrap())
                             .unwrap_or_default(),
-                        account: account.alias.clone(),
+                        account: account.name.clone(),
                         model: model_resolution.target_model.clone(),
                         url: base_url.to_string(),
                         tag: dispatch_tag.clone(),
@@ -163,7 +177,7 @@ pub async fn messages(
                 last_error = Some(format!("Failed to build passthrough request: {e}"));
                 if let Some(tx) = &state.tui_tx {
                     let _ = tx.send(TuiEvent::Retry {
-                        account: account.alias.clone(),
+                        account: account.name.clone(),
                         status: 0,
                         message: format!("Build error: {e}"),
                     });
@@ -183,7 +197,7 @@ pub async fn messages(
                 last_error = Some(format!("Passthrough request failed: {e}"));
                 if let Some(tx) = &state.tui_tx {
                     let _ = tx.send(TuiEvent::Retry {
-                        account: account.alias.clone(),
+                        account: account.name.clone(),
                         status: 0,
                         message: format!("Network error: {e}"),
                     });
@@ -204,13 +218,13 @@ pub async fn messages(
             if is_retryable_status(status.as_u16()) {
                 tracing::warn!(
                     "🔀 Account {} (id={}) failed ({}) — trying next...",
-                    account.alias,
+                    account.name,
                     account.id,
                     status.as_u16()
                 );
                 if let Some(tx) = &state.tui_tx {
                     let _ = tx.send(TuiEvent::Retry {
-                        account: account.alias.clone(),
+                        account: account.name.clone(),
                         status: status.as_u16(),
                         message: error_body.clone(),
                     });
@@ -263,7 +277,6 @@ pub async fn messages(
                 &model_resolution.target_model,
                 account,
                 state.pool.clone(),
-                &model_resolution.provider_id,
                 start,
             )
             .await;
@@ -300,11 +313,6 @@ pub async fn messages(
             &state.pool,
             account,
             &model_resolution.target_model,
-            &model_resolution.provider_id,
-            usage.input_tokens,
-            usage.output_tokens,
-            usage.cache_read_input_tokens,
-            usage.cache_creation_input_tokens,
             latency_ms,
             true,
             &None,
@@ -344,11 +352,6 @@ pub async fn messages(
             &state.pool,
             account,
             &model_resolution.target_model,
-            &model_resolution.provider_id,
-            0,
-            0,
-            0,
-            0,
             latency_ms,
             false,
             &Some(error_msg.clone()),
@@ -367,16 +370,14 @@ async fn anthropic_streaming_passthrough(
     model: &str,
     account: &adapters::Account,
     pool: sqlx::SqlitePool,
-    provider_id: &str,
     start: Instant,
 ) -> Response {
     let model = model.to_string();
     let account = account.clone();
-    let provider_id = provider_id.to_string();
 
     tracing::info!(
         "⚡ streaming {} → {}",
-        account.alias,
+        account.name,
         model,
     );
 
@@ -392,11 +393,6 @@ async fn anthropic_streaming_passthrough(
             &pool_clone,
             &account,
             &model,
-            &provider_id,
-            0,
-            0,
-            0,
-            0,
             latency_ms,
             true,
             &None,

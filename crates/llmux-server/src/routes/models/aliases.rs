@@ -4,26 +4,48 @@ use axum::{
     response::{IntoResponse, Response},
     Extension, Json,
 };
+use llmux_core::repo;
 use serde_json::{json, Value};
-
-use llmux_core::models::ModelAlias;
 
 use crate::app::AppState;
 
+/// 读取一个 alias 的绑定账户集：返回 (account_ids, preferred_account_id)。
+async fn load_bindings(state: &AppState, alias_id: i64) -> (Vec<i64>, Option<i64>) {
+    let rows = repo::list_alias_bindings(&state.pool, alias_id)
+        .await
+        .unwrap_or_default();
+    let account_ids = rows.iter().map(|(id, _)| *id).collect();
+    let preferred = rows.iter().find(|(_, p)| *p == 1).map(|(id, _)| *id);
+    (account_ids, preferred)
+}
+
 pub async fn get_model_aliases(Extension(state): Extension<AppState>) -> Response {
-    match sqlx::query_as::<_, ModelAlias>(
-        "SELECT id, alias, target_model, provider_id, account_ids, preferred_account_id FROM model_aliases ORDER BY id",
-    )
-    .fetch_all(&state.pool)
-    .await
-    {
-        Ok(aliases) => Json(serde_json::to_value(aliases).unwrap_or(Value::Array(vec![])))
-            .into_response(),
-        Err(e) => crate::error::simple_error(
-            format!("Failed to list aliases: {e}"),
-            StatusCode::INTERNAL_SERVER_ERROR,
-        ),
+    let rows = match repo::list_aliases(&state.pool).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            return crate::error::simple_error(
+                format!("Failed to list aliases: {e}"),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            );
+        }
+    };
+
+    let mut aliases = Vec::with_capacity(rows.len());
+    for alias in &rows {
+        let id = alias.id.unwrap_or_default();
+        let (account_ids, preferred_account_id) = load_bindings(&state, id).await;
+        aliases.push(json!({
+            "id": id,
+            "alias": alias.alias,
+            "target_model": alias.target_model,
+            "vendor_id": alias.vendor_id,
+            "created_at": alias.created_at,
+            "account_ids": account_ids,
+            "preferred_account_id": preferred_account_id,
+        }));
     }
+
+    Json(Value::Array(aliases)).into_response()
 }
 
 pub async fn set_model_alias(
@@ -42,59 +64,59 @@ pub async fn set_model_alias(
             StatusCode::BAD_REQUEST,
         );
     };
-    let provider_id = body.get("provider_id").and_then(Value::as_str);
+    let vendor_id = body.get("vendor_id").and_then(Value::as_str);
 
-    // Parse account_ids: JSON array like [1,5] or comma-separated "1,5"
-    let account_ids = body.get("account_ids").and_then(|v| {
-        if v.is_array() {
-            Some(serde_json::to_string(v).unwrap_or_default())
-        } else {
-            v.as_str().map(|s| s.to_string())
-        }
-    });
-
+    // 绑定账户集：[1,5] 或逗号串 "1,5"；preferred_account_id 为其中首选
+    let account_ids: Vec<i64> = match body.get("account_ids") {
+        Some(Value::Array(arr)) => arr.iter().filter_map(|v| v.as_i64()).collect(),
+        Some(Value::String(s)) => s
+            .split(',')
+            .filter_map(|p| p.trim().parse::<i64>().ok())
+            .collect(),
+        _ => vec![],
+    };
     let preferred_account_id = body
         .get("preferred_account_id")
         .and_then(|v| v.as_i64());
 
-    match sqlx::query(
-        "INSERT OR REPLACE INTO model_aliases (alias, target_model, provider_id, account_ids, preferred_account_id) VALUES (?, ?, ?, ?, ?)",
-    )
-    .bind(alias)
-    .bind(target_model)
-    .bind(provider_id)
-    .bind(&account_ids)
-    .bind(preferred_account_id)
-    .execute(&state.pool)
-    .await
-    {
-        Ok(_) => {
-            // Invalidate models cache so custom models appear immediately
-            if let Ok(mut cache) = state.models_cache.lock() {
-                *cache = None;
-            }
-            tracing::info!("🏷️ Set alias {} -> {} (provider: {:?}), cache invalidated", alias, target_model, provider_id);
-            Json(json!({ "success": true, "message": "Alias set successfully" })).into_response()
-        },
-        Err(e) => crate::error::simple_error(
-            format!("Failed to set alias: {e}"),
+    let alias_id = match repo::upsert_alias(&state.pool, alias, target_model, vendor_id).await {
+        Ok(id) => id,
+        Err(e) => {
+            return crate::error::simple_error(
+                format!("Failed to set alias: {e}"),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            );
+        }
+    };
+
+    // 替换绑定集（repo 内部事务保证 清空+写入 原子性）
+    if let Err(e) = repo::replace_alias_bindings(&state.pool, alias_id, &account_ids, preferred_account_id).await {
+        return crate::error::simple_error(
+            format!("Failed to reset bindings: {e}"),
             StatusCode::INTERNAL_SERVER_ERROR,
-        ),
+        );
     }
+
+    // Invalidate models cache so custom models appear immediately
+    if let Ok(mut cache) = state.models_cache.lock() {
+        *cache = None;
+    }
+    tracing::info!(
+        "🏷️ Set alias {} -> {} (vendor: {:?}, {} bindings), cache invalidated",
+        alias,
+        target_model,
+        vendor_id,
+        account_ids.len()
+    );
+    Json(json!({ "success": true, "message": "Alias set successfully" })).into_response()
 }
 
 pub async fn delete_model_alias(
     Extension(state): Extension<AppState>,
-    Path(id): Path<String>,
+    Path(id): Path<i64>,
 ) -> Response {
-    let alias_row = match sqlx::query_as::<_, ModelAlias>(
-        "SELECT id, alias, target_model, provider_id, account_ids, preferred_account_id FROM model_aliases WHERE id = ?",
-    )
-    .bind(&id)
-    .fetch_optional(&state.pool)
-    .await
-    {
-        Ok(Some(row)) => row,
+    let alias_name = match repo::get_alias_name_by_id(&state.pool, id).await {
+        Ok(Some(name)) => name,
         Ok(None) => {
             return crate::error::simple_error("Alias not found", StatusCode::NOT_FOUND);
         }
@@ -106,60 +128,21 @@ pub async fn delete_model_alias(
         }
     };
 
-    // Delete the alias
-    if let Err(e) = sqlx::query("DELETE FROM model_aliases WHERE id = ?")
-        .bind(&id)
-        .execute(&state.pool)
-        .await
-    {
+    // 删 alias → 绑定行 CASCADE 清空
+    if let Err(e) = repo::delete_alias(&state.pool, id).await {
         return crate::error::simple_error(
             format!("Failed to delete alias: {e}"),
             StatusCode::INTERNAL_SERVER_ERROR,
         );
     }
 
-    // Cascade-clean API keys: remove the alias name from allowed_models.
-    // Bun stores allowed_models as JSON arrays like ["gpt-4","claude-3"].
-    let api_keys: Vec<(i64, String)> =
-        match sqlx::query_as("SELECT id, allowed_models FROM api_keys")
-            .fetch_all(&state.pool)
-            .await
-        {
-            Ok(rows) => rows,
-            Err(_) => {
-                return Json(
-                    json!({ "success": true, "message": "Alias deleted and API Keys synced successfully" }),
-                )
-                .into_response();
-            }
-        };
-
-    for (key_id, allowed_models) in &api_keys {
-        if allowed_models == "*" {
-            continue;
-        }
-        if let Ok(mut models) = serde_json::from_str::<Vec<String>>(allowed_models) {
-            if models.contains(&alias_row.alias) {
-                models.retain(|m| m != &alias_row.alias);
-                let updated = if models.is_empty() {
-                    "*".to_string()
-                } else {
-                    serde_json::to_string(&models).unwrap_or_else(|_| "*".to_string())
-                };
-                let _ = sqlx::query("UPDATE api_keys SET allowed_models = ? WHERE id = ?")
-                    .bind(&updated)
-                    .bind(key_id)
-                    .execute(&state.pool)
-                    .await;
-                tracing::info!("🔄 Removed alias {} from API Key ID: {}", alias_row.alias, key_id);
-            }
-        }
-    }
+    // 顺带清理 key 白名单里指向该 alias 的条目（避免悬挂引用）
+    let _ = repo::delete_key_model_by_name(&state.pool, &alias_name).await;
 
     // Invalidate models cache
     if let Ok(mut cache) = state.models_cache.lock() {
         *cache = None;
     }
 
-    Json(json!({ "success": true, "message": "Alias deleted and API Keys synced successfully" })).into_response()
+    Json(json!({ "success": true, "message": "Alias deleted successfully" })).into_response()
 }

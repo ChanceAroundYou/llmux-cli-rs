@@ -7,3 +7,4 @@ pub mod settings;
 pub mod system;
 pub mod usage;
 pub mod v1;
+pub mod vendors;

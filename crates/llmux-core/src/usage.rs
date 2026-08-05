@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqlitePool};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// 最小化监控服务：仅成功率 / 延迟 / 最近活动（spec §3.3），无 token 列。
 #[derive(Debug, Clone)]
 pub struct UsageService {
     pool: SqlitePool,
@@ -11,10 +12,6 @@ pub struct UsageService {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct UsageSummary {
-    pub total_input: i64,
-    pub total_output: i64,
-    pub total_cache_read: i64,
-    pub total_cache_create: i64,
     pub avg_latency: f64,
     pub total_requests: i64,
     pub success_requests: i64,
@@ -23,39 +20,19 @@ pub struct UsageSummary {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct UsageLogRecord {
     pub id: i64,
-    pub timestamp: i64,
+    pub ts: i64,
     pub account_id: Option<i64>,
-    pub provider_id: Option<String>,
+    pub account_name: Option<String>,
     pub model: Option<String>,
-    pub input_tokens: i64,
-    pub output_tokens: i64,
-    pub cache_read_input_tokens: i64,
-    pub cache_creation_input_tokens: i64,
     pub latency_ms: i64,
     pub success: bool,
     pub error_message: Option<String>,
-    pub is_test: bool,
-    pub account_name: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct ProviderBreakdown {
-    pub id: Option<String>,
-    pub input: i64,
-    pub output: i64,
-    pub total_tokens: i64,
-    pub requests: i64,
-    pub success_count: i64,
-    pub avg_latency: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelBreakdown {
     pub model: Option<String>,
-    pub input: i64,
-    pub output: i64,
     pub requests: i64,
     pub success_count: i64,
     pub avg_latency: f64,
@@ -66,10 +43,16 @@ pub struct ModelBreakdown {
 pub struct AccountBreakdown {
     pub id: i64,
     pub name: String,
-    pub provider: String,
-    pub input: i64,
-    pub output: i64,
-    pub total_tokens: i64,
+    pub vendor: String,
+    pub requests: i64,
+    pub success_count: i64,
+    pub avg_latency: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct VendorBreakdown {
+    pub id: Option<String>,
     pub requests: i64,
     pub success_count: i64,
     pub avg_latency: f64,
@@ -87,7 +70,6 @@ pub struct DetailedLogQuery {
     pub start_time: Option<i64>,
     pub end_time: Option<i64>,
     pub model: Option<String>,
-    pub provider: Option<String>,
     pub success: Option<bool>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
@@ -99,28 +81,20 @@ impl UsageService {
     }
 
     pub async fn log_usage(&self, params: UsageLogParams) -> Result<()> {
-        let timestamp = params.timestamp.unwrap_or_else(now_millis);
+        let ts = params.timestamp.unwrap_or_else(now_millis);
         let mut tx = self.pool.begin().await?;
 
         sqlx::query(
-            "INSERT INTO usage_logs (
-                timestamp, account_id, provider_id, model, input_tokens, output_tokens,
-                cache_read_input_tokens, cache_creation_input_tokens,
-                latency_ms, success, error_message, is_test
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO usage_logs (ts, account_id, account_name, model, latency_ms, success, error_message)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
-        .bind(timestamp)
+        .bind(ts)
         .bind(params.account_id)
-        .bind(params.provider_id)
+        .bind(params.account_name)
         .bind(params.model)
-        .bind(params.input_tokens)
-        .bind(params.output_tokens)
-        .bind(params.cache_read_input_tokens)
-        .bind(params.cache_creation_input_tokens)
         .bind(params.latency_ms)
         .bind(bool_to_i64(params.success))
         .bind(params.error_message)
-        .bind(bool_to_i64(params.is_test))
         .execute(&mut *tx)
         .await?;
 
@@ -146,9 +120,9 @@ impl UsageService {
         start_time: Option<i64>,
         end_time: Option<i64>,
     ) -> Result<Vec<UsageLogRecord>> {
-        let mut sql = base_log_select("WHERE l.is_test = 0");
+        let mut sql = base_log_select("WHERE 1=1");
         append_time_filter(&mut sql, "l", start_time, end_time);
-        sql.push_str(" ORDER BY l.timestamp DESC LIMIT ?");
+        sql.push_str(" ORDER BY l.ts DESC LIMIT ?");
 
         let mut query = sqlx::query(&sql);
         query = bind_time_filter(query, start_time, end_time);
@@ -163,25 +137,16 @@ impl UsageService {
     ) -> Result<UsageSummary> {
         let mut sql = String::from(
             "SELECT
-                IFNULL(SUM(input_tokens), 0) AS total_input,
-                IFNULL(SUM(output_tokens), 0) AS total_output,
-                IFNULL(SUM(cache_read_input_tokens), 0) AS total_cache_read,
-                IFNULL(SUM(cache_creation_input_tokens), 0) AS total_cache_create,
                 CAST(IFNULL(AVG(latency_ms), 0) AS REAL) AS avg_latency,
                 COUNT(*) AS total_requests,
                 IFNULL(SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END), 0) AS success_requests
-             FROM usage_logs
-             WHERE is_test = 0",
+             FROM usage_logs",
         );
         append_time_filter(&mut sql, "", start_time, end_time);
         let mut query = sqlx::query(&sql);
         query = bind_time_filter(query, start_time, end_time);
         let row = query.fetch_one(&self.pool).await?;
         Ok(UsageSummary {
-            total_input: row.try_get("total_input")?,
-            total_output: row.try_get("total_output")?,
-            total_cache_read: row.try_get("total_cache_read")?,
-            total_cache_create: row.try_get("total_cache_create")?,
             avg_latency: row.try_get("avg_latency")?,
             total_requests: row.try_get("total_requests")?,
             success_requests: row.try_get("success_requests")?,
@@ -197,7 +162,7 @@ impl UsageService {
             "SELECT COUNT(*) AS failed_requests,
                     IFNULL(SUM(CASE WHEN error_message LIKE '%429%' OR error_message LIKE '%401%' OR error_message LIKE '%403%' THEN 1 ELSE 0 END), 0) AS failover_triggers
              FROM usage_logs
-             WHERE is_test = 0 AND success = 0",
+             WHERE success = 0",
         );
         append_time_filter(&mut failure_sql, "", start_time, end_time);
         let mut failure_query = sqlx::query(&failure_sql);
@@ -222,34 +187,29 @@ impl UsageService {
         })
     }
 
-    pub async fn get_breakdown_by_provider(
+    pub async fn get_breakdown_by_vendor(
         &self,
         start_time: Option<i64>,
         end_time: Option<i64>,
-    ) -> Result<Vec<ProviderBreakdown>> {
+    ) -> Result<Vec<VendorBreakdown>> {
         let mut sql = String::from(
-            "SELECT provider_id AS id,
-                    IFNULL(SUM(input_tokens), 0) AS input,
-                    IFNULL(SUM(output_tokens), 0) AS output,
-                    IFNULL(SUM(input_tokens + output_tokens), 0) AS total_tokens,
-                    COUNT(*) AS requests,
-                    IFNULL(SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END), 0) AS success_count,
-                    CAST(IFNULL(AVG(latency_ms), 0) AS REAL) AS avg_latency
-             FROM usage_logs
-             WHERE is_test = 0",
+            "SELECT v.id AS id,
+                    COUNT(l.id) AS requests,
+                    IFNULL(SUM(CASE WHEN l.success = 1 THEN 1 ELSE 0 END), 0) AS success_count,
+                    CAST(IFNULL(AVG(l.latency_ms), 0) AS REAL) AS avg_latency
+             FROM usage_logs l
+             LEFT JOIN accounts a ON l.account_id = a.id
+             LEFT JOIN vendors v ON a.vendor_id = v.id",
         );
-        append_time_filter(&mut sql, "", start_time, end_time);
-        sql.push_str(" GROUP BY provider_id");
+        append_time_filter(&mut sql, "l", start_time, end_time);
+        sql.push_str(" GROUP BY v.id");
         let mut query = sqlx::query(&sql);
         query = bind_time_filter(query, start_time, end_time);
         let rows = query.fetch_all(&self.pool).await?;
         rows.into_iter()
             .map(|row| {
-                Ok(ProviderBreakdown {
+                Ok(VendorBreakdown {
                     id: row.try_get("id")?,
-                    input: row.try_get("input")?,
-                    output: row.try_get("output")?,
-                    total_tokens: row.try_get("total_tokens")?,
                     requests: row.try_get("requests")?,
                     success_count: row.try_get("success_count")?,
                     avg_latency: row.try_get("avg_latency")?,
@@ -265,16 +225,13 @@ impl UsageService {
     ) -> Result<Vec<ModelBreakdown>> {
         let mut sql = String::from(
             "SELECT model,
-                    IFNULL(SUM(input_tokens), 0) AS input,
-                    IFNULL(SUM(output_tokens), 0) AS output,
                     COUNT(*) AS requests,
                     IFNULL(SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END), 0) AS success_count,
                     CAST(IFNULL(AVG(latency_ms), 0) AS REAL) AS avg_latency
-             FROM usage_logs
-             WHERE is_test = 0",
+             FROM usage_logs",
         );
         append_time_filter(&mut sql, "", start_time, end_time);
-        sql.push_str(" GROUP BY model ORDER BY (input + output) DESC");
+        sql.push_str(" GROUP BY model ORDER BY requests DESC");
         let mut query = sqlx::query(&sql);
         query = bind_time_filter(query, start_time, end_time);
         let rows = query.fetch_all(&self.pool).await?;
@@ -282,8 +239,6 @@ impl UsageService {
             .map(|row| {
                 Ok(ModelBreakdown {
                     model: row.try_get("model")?,
-                    input: row.try_get("input")?,
-                    output: row.try_get("output")?,
                     requests: row.try_get("requests")?,
                     success_count: row.try_get("success_count")?,
                     avg_latency: row.try_get("avg_latency")?,
@@ -299,20 +254,17 @@ impl UsageService {
     ) -> Result<Vec<AccountBreakdown>> {
         let mut sql = String::from(
             "SELECT a.id AS id,
-                    a.alias AS name,
-                    a.provider_id AS provider,
-                    IFNULL(SUM(l.input_tokens), 0) AS input,
-                    IFNULL(SUM(l.output_tokens), 0) AS output,
-                    IFNULL(SUM(l.input_tokens + l.output_tokens), 0) AS total_tokens,
-                    COUNT(*) AS requests,
+                    a.name AS name,
+                    v.id AS vendor,
+                    COUNT(l.id) AS requests,
                     IFNULL(SUM(CASE WHEN l.success = 1 THEN 1 ELSE 0 END), 0) AS success_count,
                     CAST(IFNULL(AVG(l.latency_ms), 0) AS REAL) AS avg_latency
              FROM usage_logs l
              JOIN accounts a ON l.account_id = a.id
-             WHERE l.is_test = 0",
+             JOIN vendors v ON a.vendor_id = v.id",
         );
         append_time_filter(&mut sql, "l", start_time, end_time);
-        sql.push_str(" GROUP BY a.id, a.alias");
+        sql.push_str(" GROUP BY a.id, a.name");
         let mut query = sqlx::query(&sql);
         query = bind_time_filter(query, start_time, end_time);
         let rows = query.fetch_all(&self.pool).await?;
@@ -321,10 +273,7 @@ impl UsageService {
                 Ok(AccountBreakdown {
                     id: row.try_get("id")?,
                     name: row.try_get("name")?,
-                    provider: row.try_get("provider")?,
-                    input: row.try_get("input")?,
-                    output: row.try_get("output")?,
-                    total_tokens: row.try_get("total_tokens")?,
+                    vendor: row.try_get("vendor")?,
                     requests: row.try_get("requests")?,
                     success_count: row.try_get("success_count")?,
                     avg_latency: row.try_get("avg_latency")?,
@@ -339,21 +288,18 @@ impl UsageService {
     ) -> Result<Vec<UsageLogRecord>> {
         let mut sql = base_log_select("WHERE 1=1");
         if options.start_time.is_some() {
-            sql.push_str(" AND l.timestamp >= ?");
+            sql.push_str(" AND l.ts >= ?");
         }
         if options.end_time.is_some() {
-            sql.push_str(" AND l.timestamp <= ?");
+            sql.push_str(" AND l.ts <= ?");
         }
         if options.model.is_some() {
             sql.push_str(" AND l.model LIKE ?");
         }
-        if options.provider.is_some() {
-            sql.push_str(" AND l.provider_id = ?");
-        }
         if options.success.is_some() {
             sql.push_str(" AND l.success = ?");
         }
-        sql.push_str(" ORDER BY l.timestamp DESC");
+        sql.push_str(" ORDER BY l.ts DESC");
         if options.limit.is_some() {
             sql.push_str(" LIMIT ?");
         }
@@ -370,9 +316,6 @@ impl UsageService {
         }
         if let Some(model) = options.model {
             query = query.bind(format!("%{model}%"));
-        }
-        if let Some(provider) = options.provider {
-            query = query.bind(provider);
         }
         if let Some(success) = options.success {
             query = query.bind(bool_to_i64(success));
@@ -405,12 +348,9 @@ fn bool_to_i64(value: bool) -> i64 {
 
 fn base_log_select(where_clause: &str) -> String {
     format!(
-        "SELECT l.id, l.timestamp, l.account_id, l.provider_id, l.model,
-                l.input_tokens, l.output_tokens, l.cache_read_input_tokens,
-                l.cache_creation_input_tokens, l.latency_ms, l.success,
-                l.error_message, l.is_test, a.alias AS account_name
+        "SELECT l.id, l.ts, l.account_id, l.account_name, l.model,
+                l.latency_ms, l.success, l.error_message
          FROM usage_logs l
-         LEFT JOIN accounts a ON l.account_id = a.id
          {where_clause}"
     )
 }
@@ -422,9 +362,9 @@ fn append_time_filter(
     end_time: Option<i64>,
 ) {
     let prefix = if table_alias.is_empty() {
-        "timestamp".to_string()
+        "ts".to_string()
     } else {
-        format!("{table_alias}.timestamp")
+        format!("{table_alias}.ts")
     };
     if start_time.is_some() && end_time.is_some() {
         sql.push_str(&format!(" AND {prefix} BETWEEN ? AND ?"));
@@ -454,19 +394,13 @@ fn rows_to_logs(rows: Vec<sqlx::sqlite::SqliteRow>) -> Result<Vec<UsageLogRecord
         .map(|row| {
             Ok(UsageLogRecord {
                 id: row.try_get("id")?,
-                timestamp: row.try_get("timestamp")?,
+                ts: row.try_get("ts")?,
                 account_id: row.try_get("account_id")?,
-                provider_id: row.try_get("provider_id")?,
+                account_name: row.try_get("account_name")?,
                 model: row.try_get("model")?,
-                input_tokens: row.try_get("input_tokens")?,
-                output_tokens: row.try_get("output_tokens")?,
-                cache_read_input_tokens: row.try_get("cache_read_input_tokens")?,
-                cache_creation_input_tokens: row.try_get("cache_creation_input_tokens")?,
                 latency_ms: row.try_get("latency_ms")?,
                 success: row.try_get::<i64, _>("success")? != 0,
                 error_message: row.try_get("error_message")?,
-                is_test: row.try_get::<i64, _>("is_test")? != 0,
-                account_name: row.try_get("account_name")?,
             })
         })
         .collect()

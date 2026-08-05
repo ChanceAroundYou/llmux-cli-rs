@@ -1,25 +1,25 @@
 use llmux_core::adapters::{
     build_custom_request, build_openai_request, Account, ChatMessage, ChatRequest,
 };
-use llmux_core::dispatcher::{
-    is_retryable_status, resolve_model_by_prefix, resolve_provider_type, DispatchRouter,
-};
+use llmux_core::dispatcher::{is_retryable_status, resolve_model_by_prefix, DispatchRouter};
 use llmux_core::proxy::{
     build_anthropic_passthrough_request, build_anthropic_target_url, extract_anthropic_usage_from_sse,
 };
 use serde_json::json;
 
-fn account(provider_id: &str) -> Account {
+fn account(protocol: &str) -> Account {
     Account {
         id: 7,
-        alias: "primary".to_string(),
-        provider_id: provider_id.to_string(),
+        name: "primary".to_string(),
+        vendor_id: protocol.to_string(),
+        protocol: protocol.to_string(),
         api_key: "sk-test".to_string(),
         base_url: None,
         anthropic_base_url: None,
-        is_active: 1,
+        custom_base_url: false,
+        custom_anthropic_base_url: false,
+        enabled: 1,
         weight: 10,
-        openai_compatible: 0,
     }
 }
 
@@ -127,19 +127,14 @@ fn sse_usage_parsing_merges_max_tokens_across_events() {
 #[test]
 fn dispatcher_helpers_resolve_and_order_failover_attempts() {
     assert_eq!(
-        resolve_model_by_prefix("claude-3-haiku").provider_id,
+        resolve_model_by_prefix("claude-3-haiku").vendor_id,
         "anthropic"
     );
     assert_eq!(
-        resolve_model_by_prefix("gemini-1.5-pro").provider_id,
+        resolve_model_by_prefix("gemini-1.5-pro").vendor_id,
         "gemini"
     );
-    assert_eq!(resolve_model_by_prefix("gpt-4o").provider_id, "openai");
-    assert_eq!(
-        resolve_provider_type(Some("custom-anthropic"), "anything"),
-        "anthropic"
-    );
-    assert_eq!(resolve_provider_type(Some("poe"), "poe"), "custom");
+    assert_eq!(resolve_model_by_prefix("gpt-4o").vendor_id, "openai");
     assert!(is_retryable_status(429));
     assert!(is_retryable_status(401));
     assert!(!is_retryable_status(500));
@@ -147,19 +142,19 @@ fn dispatcher_helpers_resolve_and_order_failover_attempts() {
     let accounts = vec![
         Account {
             id: 1,
-            alias: "a".into(),
+            name: "a".into(),
             weight: 1,
             ..account("openai")
         },
         Account {
             id: 2,
-            alias: "b".into(),
+            name: "b".into(),
             weight: 1,
             ..account("openai")
         },
         Account {
             id: 3,
-            alias: "c".into(),
+            name: "c".into(),
             weight: 1,
             ..account("openai")
         },

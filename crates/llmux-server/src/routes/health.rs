@@ -1,16 +1,13 @@
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
+use llmux_core::repo;
 use serde_json::{json, Value};
-use sqlx::Row;
 
 use crate::app::AppState;
 
 pub async fn get_health_status(Extension(state): Extension<AppState>) -> Response {
-    let accounts = match sqlx::query("SELECT id, alias FROM accounts ORDER BY id")
-        .fetch_all(&state.pool)
-        .await
-    {
+    let accounts = match repo::list_account_id_name(&state.pool).await {
         Ok(rows) => rows,
         Err(e) => {
             return crate::error::simple_error(
@@ -24,29 +21,14 @@ pub async fn get_health_status(Extension(state): Extension<AppState>) -> Respons
 
     let mut health_data: Vec<Value> = Vec::new();
 
-    for account in &accounts {
-        let acc_id: i64 = account.try_get("id").unwrap_or_default();
-        let alias: String = account.try_get("alias").unwrap_or_default();
+    for (acc_id, alias) in &accounts {
+        let acc_id = *acc_id;
 
         // Query the last 50 usage logs for this account
-        let stats = sqlx::query(
-            "SELECT COUNT(*) as total,
-                    SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) as success
-             FROM usage_logs
-             WHERE account_id = ?
-             ORDER BY timestamp DESC
-             LIMIT 50",
-        )
-        .bind(acc_id)
-        .fetch_optional(&state.pool)
-        .await;
+        let stats = repo::get_account_usage_stats(&state.pool, acc_id).await;
 
         let (total, success_count) = match stats {
-            Ok(Some(row)) => {
-                let t: i64 = row.try_get("total").unwrap_or_default();
-                let s: i64 = row.try_get("success").unwrap_or_default();
-                (t, s)
-            }
+            Ok(Some((t, s))) => (t, s),
             _ => (0, 0),
         };
 

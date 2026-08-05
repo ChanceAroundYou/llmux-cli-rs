@@ -1,45 +1,37 @@
 import React, { useEffect, useState } from 'react';
 import { useAccountsStore } from '../stores/accounts';
-import { useModelsStore } from '../stores/models';
-import { 
-  Users, 
-  Trash2, 
-  Plus, 
-  Settings2, 
-  Key, 
+import { useVendorsStore } from '../stores/vendors';
+import {
+  Users,
+  Trash2,
+  Plus,
+  Key,
   Globe,
   Loader2,
   AlertCircle,
   Save,
-  Monitor,
-  Copy,
-  CheckCircle2,
   Pencil,
   ShieldAlert,
   Power
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import { Dialog, ConfirmDialog } from '../components/Modal';
-import { CopyButton } from '../components/CopyButton';
-import { cn } from '../lib/utils';
+import { Dialog } from '../components/Modal';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { StatusBadge } from '@/components/shared/StatusBadge';
 
 export default function Accounts() {
   const { t } = useTranslation();
-  const { accounts, isLoading, fetchAccounts, addAccount, updateAccount, deleteAccount, toggleActive } = useAccountsStore();
-  const { fetchModels, startTestQueue, availableModels } = useModelsStore();
+  const { accounts, isLoading, fetchAccounts, addAccount, updateAccount, deleteAccount, toggleEnabled } = useAccountsStore();
+  const { vendors, fetchVendors } = useVendorsStore();
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [isEditOpen, setIsEditOpen] = useState(false);
   const [editingAccount, setEditingAccount] = useState<any>(null);
-  const [formData, setFormData] = useState({ alias: '', provider_id: 'custom', api_key: '', base_url: '', anthropic_base_url: '' });
+  const [formData, setFormData] = useState({ vendor_id: '', name: '', api_key: '', base_url: '', anthropic_base_url: '' });
   const [formSupportsAnthropic, setFormSupportsAnthropic] = useState(false);
-  const [formOpenAICompat, setFormOpenAICompat] = useState(false);
   const [formSkipValidation, setFormSkipValidation] = useState(false);
-  const [editData, setEditData] = useState({ alias: '', provider_id: '', api_key: '', base_url: '', anthropic_base_url: '', notes: '' });
+  const [editData, setEditData] = useState({ vendor_id: '', name: '', api_key: '', base_url: '', anthropic_base_url: '', notes: '' });
   const [editSupportsAnthropic, setEditSupportsAnthropic] = useState(false);
-  const [editOpenAICompat, setEditOpenAICompat] = useState(false);
   const [editSkipValidation, setEditSkipValidation] = useState(false);
   const [accountToDelete, setAccountToDelete] = useState<{id: number, name: string} | null>(null);
   const [isValidating, setIsValidating] = useState(false);
@@ -47,18 +39,34 @@ export default function Accounts() {
 
   useEffect(() => {
     fetchAccounts();
+    fetchVendors();
   }, []);
+
+  // 查找厂商协议，用于 base_url 占位与 anthropic 端点显示
+  const getVendor = (vendorId: string) => vendors.find(v => v.id === vendorId);
+
+  const getBaseUrlPlaceholder = (vendorId: string) => {
+    const protocol = getVendor(vendorId)?.protocol;
+    if (protocol === 'anthropic') return 'https://api.anthropic.com/v1';
+    if (protocol === 'gemini') return 'https://generativelanguage.googleapis.com/v1beta';
+    return 'https://api.openai.com/v1';
+  };
+
+  // anthropic 兼容端点仅对 openai/custom 协议厂商开放
+  const shouldShowAnthropic = (vendorId: string) => {
+    const protocol = getVendor(vendorId)?.protocol;
+    return protocol === 'openai' || protocol === 'custom';
+  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setIsValidating(true);
     setValidationError(null);
     try {
-      await addAccount({ ...formData, openai_compatible: formOpenAICompat ? 1 : 0, skip_validation: formSkipValidation });
+      await addAccount({ ...formData, skip_validation: formSkipValidation });
       setIsModalOpen(false);
-      setFormData({ alias: '', provider_id: 'custom', api_key: '', base_url: '', anthropic_base_url: '' });
+      setFormData({ vendor_id: '', name: '', api_key: '', base_url: '', anthropic_base_url: '' });
       setFormSupportsAnthropic(false);
-      setFormOpenAICompat(false);
       setFormSkipValidation(false);
     } catch (err: any) {
       setValidationError(err.message || "Validation failed");
@@ -70,9 +78,8 @@ export default function Accounts() {
 
   const openEdit = (acc: any) => {
     setEditingAccount(acc);
-    setEditData({ alias: acc.alias, provider_id: acc.provider_id, api_key: '', base_url: acc.base_url || '', anthropic_base_url: acc.anthropic_base_url || '', notes: acc.notes || '' });
+    setEditData({ vendor_id: acc.vendor_id, name: acc.name, api_key: '', base_url: acc.base_url || '', anthropic_base_url: acc.anthropic_base_url || '', notes: acc.notes || '' });
     setEditSupportsAnthropic(!!acc.anthropic_base_url);
-    setEditOpenAICompat(!!acc.openai_compatible);
     setIsEditOpen(true);
   };
 
@@ -82,7 +89,7 @@ export default function Accounts() {
     setIsValidating(true);
     setValidationError(null);
     try {
-      await updateAccount(editingAccount.id, { ...editData, openai_compatible: editOpenAICompat ? 1 : 0, skip_validation: editSkipValidation });
+      await updateAccount(editingAccount.id, { ...editData, skip_validation: editSkipValidation });
       setIsEditOpen(false);
       setEditingAccount(null);
     } catch (err: any) {
@@ -90,10 +97,6 @@ export default function Accounts() {
     } finally {
       setIsValidating(false);
     }
-  };
-
-  const getSyncScript = () => {
-    return `(async()=>{const p="${formData.provider_id}";console.log("🚀 LLMux Syncing...");const t=localStorage.getItem("token")||document.cookie;fetch("http://localhost:25975/api/auth/sync",{method:"POST",body:JSON.stringify({provider:p,token:t})})})();`;
   };
 
   return (
@@ -128,15 +131,15 @@ export default function Accounts() {
           <div key={acc.id} className="p-4 rounded-xl border border-border bg-card hover:bg-muted/30 transition-all flex items-center justify-between group">
             <div className="flex items-center gap-4">
               <div className="w-10 h-10 rounded-lg bg-muted flex items-center justify-center font-bold text-xs uppercase border border-border">
-                {acc.provider_id.slice(0, 2)}
+                {acc.vendor_id.slice(0, 2)}
               </div>
               <div>
                 <div className="flex items-center gap-2">
-                   <h3 className="font-semibold text-sm">{acc.alias}</h3>
-                   <StatusBadge status={acc.is_active === 1 ? 'online' : 'offline'} label={acc.is_active === 1 ? t('common.online') : t('accounts.offline')} />
+                   <h3 className="font-semibold text-sm">{acc.name}</h3>
+                   <StatusBadge status={acc.enabled === 1 ? 'online' : 'offline'} label={acc.enabled === 1 ? t('common.online') : t('accounts.offline')} />
                 </div>
                 <div className="text-xs text-muted-foreground mt-0.5 flex items-center gap-2 uppercase tracking-tight">
-                  <Globe size={10} /> {acc.provider_id}
+                  <Globe size={10} /> {acc.vendor_id}
                   <span className="opacity-20">|</span>
                   <Key size={10} /> {t('accounts.apiKey')}: ****
                 </div>
@@ -156,16 +159,16 @@ export default function Accounts() {
                   <Button
                     variant="ghost"
                     size="icon"
-                    onClick={() => toggleActive(acc.id, acc.is_active)}
-                    className={acc.is_active === 1 ? "text-success hover:text-success hover:bg-success/10" : "text-muted-foreground/40 hover:text-muted-foreground hover:bg-muted"}
-                    title={acc.is_active === 1 ? t('common.online') : t('accounts.offline')}
+                    onClick={() => toggleEnabled(acc.id, acc.enabled)}
+                    className={acc.enabled === 1 ? "text-success hover:text-success hover:bg-success/10" : "text-muted-foreground/40 hover:text-muted-foreground hover:bg-muted"}
+                    title={acc.enabled === 1 ? t('common.online') : t('accounts.offline')}
                   >
                     <Power size={16} />
                   </Button>
                   <Button
                     variant="ghost"
                     size="icon"
-                    onClick={() => setAccountToDelete({ id: acc.id, name: acc.alias })}
+                    onClick={() => setAccountToDelete({ id: acc.id, name: acc.name })}
                     className="text-destructive hover:text-destructive hover:bg-destructive/10"
                   >
                     <Trash2 size={16} />
@@ -182,9 +185,9 @@ export default function Accounts() {
         )}
       </div>
 
-      <Dialog 
-        isOpen={isModalOpen} 
-        onClose={() => !isValidating && setIsModalOpen(false)} 
+      <Dialog
+        isOpen={isModalOpen}
+        onClose={() => !isValidating && setIsModalOpen(false)}
         title={t('accounts.registerTitle')}
       >
         <div className="space-y-6">
@@ -197,34 +200,32 @@ export default function Accounts() {
 
           <form onSubmit={handleSubmit} className="space-y-4">
             <div className="space-y-1.5">
-              <label className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.alias')}</label>
+              <label className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.name')}</label>
               <Input
-                type="text" required value={formData.alias}
+                type="text" required value={formData.name}
                 disabled={isValidating}
-                onChange={e => setFormData({...formData, alias: e.target.value})}
+                onChange={e => setFormData({...formData, name: e.target.value})}
                 placeholder={t('accounts.aliasPlaceholder')}
               />
             </div>
             <div className="space-y-1.5">
               <label className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.provider')}</label>
               <select
-                value={formData.provider_id}
+                value={formData.vendor_id}
+                required
                 disabled={isValidating}
                 onChange={e => {
-                  const pid = e.target.value;
-                  let burl = '';
-                  if (pid === 'openai') burl = '';
-                  else if (pid === 'anthropic') burl = '';
-                  else if (pid === 'gemini') burl = '';
-                  setFormData({...formData, provider_id: pid, base_url: burl});
+                  const vid = e.target.value;
+                  // 不预填厂商默认 URL：base_url 留空则由后端回退厂商默认，
+                  // 避免非空 base_url 被判定为 custom_base_url（如 Gemini 原生鉴权被切成 Bearer）。
+                  setFormData({...formData, vendor_id: vid, base_url: '', anthropic_base_url: ''});
                 }}
                 className="w-full h-10 px-3 py-2 rounded-md border border-input bg-background text-sm ring-offset-background focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:opacity-50"
               >
-                <option value="custom">{t('accounts.custom')}</option>
-                <option value="custom-anthropic" hidden>{t('accounts.customAnthropic')}</option>
-                <option value="openai">{t('accounts.openai')}</option>
-                <option value="anthropic">{t('accounts.anthropic')}</option>
-                <option value="gemini">{t('accounts.gemini')}</option>
+                <option value="">{t('accounts.selectVendor')}</option>
+                {vendors.map(v => (
+                  <option key={v.id} value={v.id}>{v.name}</option>
+                ))}
               </select>
               <p className="text-xs text-muted-foreground mt-1">{t('accounts.providerHint')}</p>
             </div>
@@ -244,27 +245,12 @@ export default function Accounts() {
                 type="text" value={formData.base_url}
                 disabled={isValidating}
                 onChange={e => setFormData({...formData, base_url: e.target.value})}
-                placeholder={formData.provider_id === 'anthropic' ? 'https://api.anthropic.com/v1' : formData.provider_id === 'gemini' ? 'https://generativelanguage.googleapis.com/v1beta' : 'https://api.openai.com/v1'}
+                placeholder={getBaseUrlPlaceholder(formData.vendor_id)}
                 className="font-mono"
               />
               <p className="text-xs text-muted-foreground">{t('accounts.baseUrlHint')}</p>
             </div>
-            {formData.provider_id === 'gemini' && (
-              <div className="space-y-1.5 border-t border-border pt-3">
-                <label className="flex items-center gap-2 cursor-pointer select-none">
-                  <input
-                    type="checkbox"
-                    checked={formOpenAICompat}
-                    disabled={isValidating}
-                    onChange={e => setFormOpenAICompat(e.target.checked)}
-                    className="w-4 h-4 rounded accent-primary"
-                  />
-                  <span className="text-xs font-bold text-muted-foreground uppercase">OpenAI 兼容模式</span>
-                </label>
-                <p className="text-xs text-muted-foreground ml-6">通过 Gemini 的 OpenAI 兼容端点同时支持 /v1/chat/completions 请求</p>
-              </div>
-            )}
-            {formData.provider_id === 'custom' && (
+            {formData.vendor_id && shouldShowAnthropic(formData.vendor_id) && (
               <>
                 <div className="space-y-1.5 border-t border-border pt-3">
                   <label className="flex items-center gap-2 cursor-pointer select-none">
@@ -345,9 +331,9 @@ export default function Accounts() {
       </Dialog>
 
       {/* 编辑账户 Modal */}
-      <Dialog 
-        isOpen={isEditOpen} 
-        onClose={() => !isValidating && setIsEditOpen(false)} 
+      <Dialog
+        isOpen={isEditOpen}
+        onClose={() => !isValidating && setIsEditOpen(false)}
         title={t('accounts.editAccount')}
       >
         <div className="space-y-6">
@@ -360,26 +346,30 @@ export default function Accounts() {
 
           <form onSubmit={handleEditSubmit} className="space-y-4">
             <div className="space-y-1.5">
-              <label className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.alias')}</label>
+              <label className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.name')}</label>
               <Input
-                type="text" required value={editData.alias}
+                type="text" required value={editData.name}
                 disabled={isValidating}
-                onChange={e => setEditData({...editData, alias: e.target.value})}
+                onChange={e => setEditData({...editData, name: e.target.value})}
               />
             </div>
             <div className="space-y-1.5">
               <label className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.provider')}</label>
               <select
-                value={editData.provider_id}
+                value={editData.vendor_id}
+                required
                 disabled={isValidating}
-                onChange={e => setEditData({...editData, provider_id: e.target.value})}
+                onChange={e => {
+                  const vid = e.target.value;
+                  // 切厂商时清空 base_url，避免残留上一厂商/被误判为自定义 base_url。
+                  setEditData({...editData, vendor_id: vid, base_url: ''});
+                }}
                 className="w-full h-10 px-3 py-2 rounded-md border border-input bg-background text-sm ring-offset-background focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:opacity-50"
               >
-                <option value="custom">{t('accounts.custom')}</option>
-                <option value="custom-anthropic" hidden>{t('accounts.customAnthropic')}</option>
-                <option value="openai">{t('accounts.openai')}</option>
-                <option value="anthropic">{t('accounts.anthropic')}</option>
-                <option value="gemini">{t('accounts.gemini')}</option>
+                <option value="">{t('accounts.selectVendor')}</option>
+                {vendors.map(v => (
+                  <option key={v.id} value={v.id}>{v.name}</option>
+                ))}
               </select>
               <p className="text-xs text-muted-foreground mt-1">{t('accounts.providerHint')}</p>
             </div>
@@ -402,27 +392,12 @@ export default function Accounts() {
                 type="text" value={editData.base_url}
                 disabled={isValidating}
                 onChange={e => setEditData({...editData, base_url: e.target.value})}
-                placeholder={editData.provider_id === 'anthropic' ? 'https://api.anthropic.com/v1' : editData.provider_id === 'gemini' ? 'https://generativelanguage.googleapis.com/v1beta' : 'https://api.openai.com/v1'}
+                placeholder={getBaseUrlPlaceholder(editData.vendor_id)}
                 className="font-mono"
               />
               <p className="text-xs text-muted-foreground">{t('accounts.baseUrlHint')}</p>
             </div>
-            {editData.provider_id === 'gemini' && (
-              <div className="space-y-1.5 border-t border-border pt-3">
-                <label className="flex items-center gap-2 cursor-pointer select-none">
-                  <input
-                    type="checkbox"
-                    checked={editOpenAICompat}
-                    disabled={isValidating}
-                    onChange={e => setEditOpenAICompat(e.target.checked)}
-                    className="w-4 h-4 rounded accent-primary"
-                  />
-                  <span className="text-xs font-bold text-muted-foreground uppercase">OpenAI 兼容模式</span>
-                </label>
-                <p className="text-xs text-muted-foreground ml-6">通过 Gemini 的 OpenAI 兼容端点同时支持 /v1/chat/completions 请求</p>
-              </div>
-            )}
-            {editData.provider_id === 'custom' && (
+            {editData.vendor_id && shouldShowAnthropic(editData.vendor_id) && (
               <>
                 <div className="space-y-1.5 border-t border-border pt-3">
                   <label className="flex items-center gap-2 cursor-pointer select-none">
@@ -503,9 +478,9 @@ export default function Accounts() {
       </Dialog>
 
       {/* 增强型删除确认弹窗 */}
-      <Dialog 
-        isOpen={!!accountToDelete} 
-        onClose={() => setAccountToDelete(null)} 
+      <Dialog
+        isOpen={!!accountToDelete}
+        onClose={() => setAccountToDelete(null)}
         title={t('common.delete')}
         variant="danger"
         size="md"

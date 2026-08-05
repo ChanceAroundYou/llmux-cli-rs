@@ -181,7 +181,7 @@ fn handle_event(ui: &mut UiState, event: TuiEvent) {
         TuiEvent::Retry { account, status, message } => {
             let ts = time::OffsetDateTime::now_local()
                 .unwrap_or_else(|_| time::OffsetDateTime::now_utc())
-                .format(&time::format_description::parse("[hour]:[minute]:[second]").unwrap())
+                .format(&time::format_description::parse_borrowed::<2>("[hour]:[minute]:[second]").unwrap())
                 .unwrap_or_default();
             let line = format!("🔀 Account {} ({}): {}", account, status, message);
             ui.dispatch_logs.push_back(DispatchEntry { timestamp: ts, line });

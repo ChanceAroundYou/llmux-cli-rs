@@ -25,6 +25,32 @@ async fn request_json(method: Method, path: &str, body: Option<Value>) -> (Statu
     (status, value)
 }
 
+/// 共享同一 app/state 的请求助手（多步流程用，如 建账户 → 绑 alias）。
+async fn request_json_shared(
+    app: &axum::Router,
+    method: Method,
+    path: &str,
+    body: Option<Value>,
+) -> (StatusCode, Value) {
+    let mut builder = Request::builder().method(method).uri(path);
+    if body.is_some() {
+        builder = builder.header(header::CONTENT_TYPE, "application/json");
+    }
+    let request = builder
+        .body(match body {
+            Some(value) => Body::from(value.to_string()),
+            None => Body::empty(),
+        })
+        .unwrap();
+    let response = llmux_server::test_request(app.clone(), request).await;
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, value)
+}
+
 async fn request_text(method: Method, path: &str) -> (StatusCode, String, Option<String>) {
     let state = llmux_server::test_state().await;
     let app = llmux_server::app(state);
@@ -54,7 +80,7 @@ async fn api_read_routes_match_gateway_empty_placeholder_shapes() {
         ("/api/settings", json!({})),
         (
             "/api/export",
-            json!({"version": 1, "accounts": [], "aliases": [], "keys": [], "settings": []}),
+            json!({"version": 2, "accounts": [], "aliases": [], "keys": [], "settings": []}),
         ),
         ("/api/accounts", json!([])),
         ("/api/keys", json!([])),
@@ -88,6 +114,23 @@ async fn api_read_routes_match_gateway_empty_placeholder_shapes() {
 }
 
 #[tokio::test]
+async fn vendors_route_returns_seeded_catalog() {
+    let (status, body) = request_json(Method::GET, "/api/vendors", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let vendors = body.as_array().expect("vendors must be an array");
+    assert!(vendors.len() >= 9, "expected seed vendors, got {}", vendors.len());
+    let ids: Vec<&str> = vendors
+        .iter()
+        .filter_map(|v| v["id"].as_str())
+        .collect();
+    assert!(ids.contains(&"openai"));
+    assert!(ids.contains(&"anthropic"));
+    assert!(ids.contains(&"gemini"));
+    // 内置厂商标记
+    assert_eq!(vendors[0]["builtin"], json!(1));
+}
+
+#[tokio::test]
 async fn api_write_routes_validate_required_fields_and_return_gateway_shapes() {
     let (status, body) = request_json(Method::POST, "/api/auth/web-session", Some(json!({}))).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -97,7 +140,7 @@ async fn api_write_routes_validate_required_fields_and_return_gateway_shapes() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(
         body,
-        json!({"error": "Missing required fields: alias, provider_id, api_key"})
+        json!({"error": "Missing required fields: vendor_id, name, api_key"})
     );
 
     let (status, body) =
@@ -154,6 +197,58 @@ async fn v1_routes_are_authenticated_placeholders_with_legacy_error_shape() {
     let (status, body) = request_json(Method::GET, "/v1/models", None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(body["error"]["code"], "401");
+}
+
+#[tokio::test]
+async fn account_alias_binding_round_trip_and_cascade() {
+    let state = llmux_server::test_state().await;
+    let app = llmux_server::app(state);
+
+    // 1. 建账户（skip_validation，不开网络校验）
+    let (status, body) = request_json_shared(
+        &app,
+        Method::POST,
+        "/api/accounts",
+        Some(json!({"vendor_id": "openai", "name": "BoundAcct", "api_key": "sk-test", "skip_validation": true})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let account_id = body["id"].as_i64().expect("account id");
+
+    // 2. 用该账户的 vendor_id 建 alias 并绑定（回归：owned_by/外键路径）
+    let (status, body) = request_json_shared(
+        &app,
+        Method::POST,
+        "/api/models/aliases",
+        Some(json!({"alias": "bounded", "target_model": "gpt-4o", "vendor_id": "openai", "account_ids": [account_id], "preferred_account_id": account_id})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "alias+binding should succeed: {body}");
+
+    // 3. 列表能看到绑定与首选
+    let (_, aliases) = request_json_shared(&app, Method::GET, "/api/models/aliases", None).await;
+    let entry = aliases
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["alias"] == "bounded")
+        .expect("alias exists");
+    assert_eq!(entry["account_ids"], json!([account_id]));
+    assert_eq!(entry["preferred_account_id"], json!(account_id));
+
+    // 4. 删账户 → 绑定 CASCADE 清空，alias 仍保留
+    let (status, _) =
+        request_json_shared(&app, Method::DELETE, &format!("/api/accounts/{account_id}"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, aliases) = request_json_shared(&app, Method::GET, "/api/models/aliases", None).await;
+    let entry = aliases
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["alias"] == "bounded")
+        .expect("alias survives account delete");
+    assert_eq!(entry["account_ids"], json!([]), "bindings cascaded");
+    assert_eq!(entry["preferred_account_id"], Value::Null);
 }
 
 #[tokio::test]

@@ -60,8 +60,16 @@ pub async fn purge_database(Extension(state): Extension<AppState>) -> Response {
 
     tracing::info!("⚙️ Purging database...");
 
-    // Delete in dependency order: usage_logs references accounts, so it goes first.
-    for table in &["usage_logs", "api_keys", "model_aliases", "accounts"] {
+    // 依赖顺序删除运行数据；vendors 目录保留（内置种子 + 用户自建厂商），dispatch_state 保留。
+    for table in &[
+        "usage_logs",
+        "model_alias_accounts",
+        "api_key_models",
+        "api_keys",
+        "model_aliases",
+        "accounts",
+        "app_settings",
+    ] {
         if let Err(e) = sqlx::query(&format!("DELETE FROM {table}"))
             .execute(&mut *tx)
             .await
@@ -138,7 +146,7 @@ pub async fn import_config(
                     "accounts": counts.accounts,
                     "aliases": counts.aliases,
                     "keys": counts.keys,
-                }
+                },
             }))
             .into_response(),
             Err(e) => crate::error::simple_error(

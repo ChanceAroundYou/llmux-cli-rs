@@ -4,20 +4,14 @@ use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use llmux_core::adapters::Account;
 use llmux_core::crypto::encrypt_api_key;
-use llmux_core::dispatcher::resolve_provider_type;
-use llmux_core::models::AccountPublic;
+use llmux_core::repo;
 use serde_json::{json, Value};
 
 use crate::app::AppState;
 use crate::routes::models::fetch_provider_models;
 
 pub async fn list_accounts(Extension(state): Extension<AppState>) -> Response {
-    match sqlx::query_as::<_, AccountPublic>(
-        "SELECT id, alias, provider_id, base_url, anthropic_base_url, CAST(is_active AS INTEGER) as is_active, weight, notes, openai_compatible, created_at FROM accounts ORDER BY id DESC",
-    )
-    .fetch_all(&state.pool)
-    .await
-    {
+    match repo::list_accounts_public(&state.pool).await {
         Ok(accounts) => Json(serde_json::to_value(accounts).unwrap_or(Value::Array(vec![])))
             .into_response(),
         Err(e) => crate::error::simple_error(
@@ -31,61 +25,64 @@ pub async fn create_account(
     Extension(state): Extension<AppState>,
     Json(body): Json<Value>,
 ) -> Response {
-    let missing = body.get("alias").is_none()
-        || body.get("provider_id").is_none()
+    let missing = body.get("vendor_id").is_none()
+        || body.get("name").is_none()
         || body.get("api_key").is_none();
     if missing {
         return crate::error::simple_error(
-            "Missing required fields: alias, provider_id, api_key",
+            "Missing required fields: vendor_id, name, api_key",
             StatusCode::BAD_REQUEST,
         );
     }
 
-    let alias = body["alias"].as_str().unwrap_or_default().to_string();
-    let provider_id = body["provider_id"].as_str().unwrap_or_default().to_string();
+    let vendor_id = body["vendor_id"].as_str().unwrap_or_default().to_string();
+    let name = body["name"].as_str().unwrap_or_default().to_string();
     let api_key_plain = body["api_key"].as_str().unwrap_or_default().to_string();
     let base_url = body["base_url"].as_str().map(|s| s.to_string());
     let anthropic_base_url = body["anthropic_base_url"].as_str().map(|s| s.to_string());
-    let is_active = body["is_active"].as_i64().unwrap_or(1);
+    let enabled = body["enabled"].as_i64().unwrap_or(1);
     let weight = body["weight"].as_i64().unwrap_or(1);
     let notes = body["notes"].as_str().map(|s| s.to_string());
-    let openai_compatible = body["openai_compatible"].as_i64().unwrap_or(0);
     let skip_validation = body["skip_validation"].as_bool().unwrap_or(false);
 
-    if alias.is_empty() || provider_id.is_empty() || api_key_plain.is_empty() {
+    if vendor_id.is_empty() || name.is_empty() || api_key_plain.is_empty() {
         return crate::error::simple_error(
-            "alias, provider_id, and api_key must not be empty",
+            "vendor_id, name, and api_key must not be empty",
             StatusCode::BAD_REQUEST,
         );
     }
 
-    // Always try to validate — but only reject on failure if skip_validation is false.
+    // 厂商校验：vendor 必须存在（DB 错误同样视为未知厂商，与旧行为一致）
+    let Some((protocol, vendor_default_base)) =
+        repo::get_vendor(&state.pool, &vendor_id).await.unwrap_or(None)
+    else {
+        return crate::error::simple_error(
+            format!("Unknown vendor: {vendor_id}"),
+            StatusCode::BAD_REQUEST,
+        );
+    };
+
+    let custom_base_url = base_url.as_deref().is_some_and(|u| !u.is_empty());
+    // 用有效 base_url 构造测试账户（base_url 为空时用厂商默认值）
+    let effective_base = base_url
+        .clone()
+        .filter(|u| !u.is_empty())
+        .or(vendor_default_base);
     let test_account = Account {
         id: 0,
-        alias: alias.clone(),
-        provider_id: provider_id.clone(),
+        name: name.clone(),
+        vendor_id: vendor_id.clone(),
+        protocol: protocol.clone(),
         api_key: api_key_plain.clone(),
-        base_url: base_url.clone(),
+        base_url: effective_base,
         anthropic_base_url: anthropic_base_url.clone(),
-        is_active,
+        custom_base_url,
+        custom_anthropic_base_url: anthropic_base_url.as_deref().is_some_and(|u| !u.is_empty()),
+        enabled,
         weight,
-        openai_compatible,
     };
 
-    let provider_type = {
-        let pt = sqlx::query_scalar::<_, Option<String>>(
-            "SELECT type FROM providers WHERE id = ?",
-        )
-        .bind(&provider_id)
-        .fetch_optional(&state.pool)
-        .await
-        .ok()
-        .flatten()
-        .flatten();
-        resolve_provider_type(pt.as_deref(), &provider_id)
-    };
-
-    let (models, _) = fetch_provider_models(&test_account, &provider_type).await;
+    let (models, _) = fetch_provider_models(&test_account, &protocol).await;
     if models.is_empty() && !skip_validation {
         return crate::error::simple_error(
             "accounts.validationFailed",
@@ -104,24 +101,20 @@ pub async fn create_account(
         }
     };
 
-    match sqlx::query(
-        "INSERT INTO accounts (alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight, notes, openai_compatible)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    match repo::create_account(
+        &state.pool,
+        &vendor_id,
+        &name,
+        &encrypted_key,
+        base_url.as_deref(),
+        anthropic_base_url.as_deref(),
+        enabled,
+        weight,
+        notes.as_deref(),
     )
-    .bind(&alias)
-    .bind(&provider_id)
-    .bind(&encrypted_key)
-    .bind(&base_url)
-    .bind(&anthropic_base_url)
-    .bind(is_active)
-    .bind(weight)
-    .bind(&notes)
-    .bind(openai_compatible)
-    .execute(&state.pool)
     .await
     {
-        Ok(result) => {
-            let id = result.last_insert_rowid();
+        Ok(id) => {
             Json(json!({
                 "success": true,
                 "id": id,
@@ -144,14 +137,7 @@ pub async fn update_account(
     Json(body): Json<Value>,
 ) -> Response {
     // Verify the account exists.
-    let existing = sqlx::query_as::<_, llmux_core::models::Account>(
-        "SELECT id, alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight, notes, limits_cache, limits_cache_updated_at, openai_compatible, created_at FROM accounts WHERE id = ?",
-    )
-    .bind(id)
-    .fetch_optional(&state.pool)
-    .await;
-
-    let existing = match existing {
+    let existing = match repo::get_account(&state.pool, id).await {
         Ok(Some(acct)) => acct,
         Ok(None) => {
             return crate::error::simple_error(
@@ -168,16 +154,16 @@ pub async fn update_account(
     };
 
     // Merge: use body values when present, otherwise keep existing.
-    let alias = body
-        .get("alias")
+    let vendor_id = body
+        .get("vendor_id")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
-        .unwrap_or(existing.alias);
-    let provider_id = body
-        .get("provider_id")
+        .unwrap_or(existing.vendor_id);
+    let name = body
+        .get("name")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
-        .unwrap_or(existing.provider_id);
+        .unwrap_or(existing.name);
     let base_url = body
         .get("base_url")
         .and_then(|v| v.as_str())
@@ -188,10 +174,10 @@ pub async fn update_account(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .or(existing.anthropic_base_url);
-    let is_active = body
-        .get("is_active")
+    let enabled = body
+        .get("enabled")
         .and_then(|v| v.as_i64())
-        .unwrap_or(existing.is_active);
+        .unwrap_or(existing.enabled);
     let weight = body
         .get("weight")
         .and_then(|v| v.as_i64())
@@ -201,13 +187,7 @@ pub async fn update_account(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .or(existing.notes);
-    let openai_compatible = body
-        .get("openai_compatible")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(existing.openai_compatible.unwrap_or(0));
 
-    // Handle API key: if a new one is provided, encrypt it; otherwise keep the old ciphertext.
-    // Bun only re-validates when api_key !== "********" or base_url is present.
     let api_key_changed = body
         .get("api_key")
         .and_then(|v| v.as_str())
@@ -219,32 +199,38 @@ pub async fn update_account(
         let new_key = body["api_key"].as_str().unwrap_or_default();
 
         if api_key_changed || base_url_changed {
+            let (protocol, vendor_default_base) =
+                match repo::get_vendor(&state.pool, &vendor_id).await.unwrap_or(None) {
+                    Some(v) => v,
+                    None => {
+                        return crate::error::simple_error(
+                            format!("Unknown vendor: {vendor_id}"),
+                            StatusCode::BAD_REQUEST,
+                        );
+                    }
+                };
+            let custom_base_url = base_url.as_deref().is_some_and(|u| !u.is_empty());
+            let effective_base = base_url
+                .clone()
+                .filter(|u| !u.is_empty())
+                .or(vendor_default_base);
             let test_account = Account {
                 id,
-                alias: alias.clone(),
-                provider_id: provider_id.clone(),
+                name: name.clone(),
+                vendor_id: vendor_id.clone(),
+                protocol: protocol.clone(),
                 api_key: new_key.to_string(),
-                base_url: base_url.clone(),
+                base_url: effective_base,
                 anthropic_base_url: anthropic_base_url.clone(),
-                is_active,
+                custom_base_url,
+                custom_anthropic_base_url: anthropic_base_url
+                    .as_deref()
+                    .is_some_and(|u| !u.is_empty()),
+                enabled,
                 weight,
-                openai_compatible,
             };
 
-            let provider_type = {
-                let pt = sqlx::query_scalar::<_, Option<String>>(
-                    "SELECT type FROM providers WHERE id = ?",
-                )
-                .bind(&test_account.provider_id)
-                .fetch_optional(&state.pool)
-                .await
-                .ok()
-                .flatten()
-                .flatten();
-                resolve_provider_type(pt.as_deref(), &test_account.provider_id)
-            };
-
-            let (models, _) = fetch_provider_models(&test_account, &provider_type).await;
+            let (models, _) = fetch_provider_models(&test_account, &protocol).await;
             if models.is_empty() && !skip_validation {
                 return crate::error::simple_error(
                     "accounts.validationFailed",
@@ -263,23 +249,21 @@ pub async fn update_account(
             }
         }
     } else {
-        existing.api_key
+        existing.api_key_enc
     };
 
-    match sqlx::query(
-        "UPDATE accounts SET alias = ?, provider_id = ?, api_key = ?, base_url = ?, anthropic_base_url = ?, is_active = ?, weight = ?, notes = ?, openai_compatible = ? WHERE id = ?",
+    match repo::update_account(
+        &state.pool,
+        id,
+        &vendor_id,
+        &name,
+        &api_key_ciphertext,
+        base_url.as_deref(),
+        anthropic_base_url.as_deref(),
+        enabled,
+        weight,
+        notes.as_deref(),
     )
-    .bind(&alias)
-    .bind(&provider_id)
-    .bind(&api_key_ciphertext)
-    .bind(&base_url)
-    .bind(&anthropic_base_url)
-    .bind(is_active)
-    .bind(weight)
-    .bind(&notes)
-    .bind(openai_compatible)
-    .bind(id)
-    .execute(&state.pool)
     .await
     {
         Ok(_) => Json(json!({ "success": true, "message": "Account updated successfully" }))
@@ -295,50 +279,19 @@ pub async fn delete_account(
     Extension(state): Extension<AppState>,
     Path(id): Path<i64>,
 ) -> Response {
-    let mut tx = match state.pool.begin().await {
-        Ok(tx) => tx,
-        Err(e) => {
-            return crate::error::simple_error(
-                format!("Failed to start transaction: {e}"),
-                StatusCode::INTERNAL_SERVER_ERROR,
-            );
-        }
-    };
-
-    // Delete usage_logs for this account first to maintain referential integrity.
-    if let Err(e) = sqlx::query("DELETE FROM usage_logs WHERE account_id = ?")
-        .bind(id)
-        .execute(&mut *tx)
-        .await
-    {
-        return crate::error::simple_error(
-            format!("Failed to delete usage logs: {e}"),
-            StatusCode::INTERNAL_SERVER_ERROR,
-        );
-    }
-
-    let result = sqlx::query("DELETE FROM accounts WHERE id = ?")
-        .bind(id)
-        .execute(&mut *tx)
-        .await;
-
-    match result {
-        Ok(query_result) => {
-            if query_result.rows_affected() == 0 {
+    // 外键开启时：删账户 → 绑定 CASCADE 清空、usage_logs.account_id SET NULL
+    //（account_name 快照保留）、dispatch_state 由调度器自然清理。
+    match repo::delete_account(&state.pool, id).await {
+        Ok(affected) => {
+            if affected == 0 {
                 return crate::error::simple_error(
                     format!("Account with id {id} not found"),
                     StatusCode::NOT_FOUND,
                 );
             }
-            if let Err(e) = tx.commit().await {
-                return crate::error::simple_error(
-                    format!("Failed to commit transaction: {e}"),
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                );
-            }
             Json(json!({
                 "success": true,
-                "message": "Account and all associated history deleted successfully"
+                "message": "Account deleted; bindings removed, history retained (snapshot kept)"
             }))
             .into_response()
         }
@@ -353,14 +306,7 @@ pub async fn export_account_usage(
     Extension(state): Extension<AppState>,
     Path(id): Path<i64>,
 ) -> Response {
-    let rows = sqlx::query_as::<_, (i64, Option<String>, i64, i64, i64, i64)>(
-        "SELECT timestamp, model, input_tokens, output_tokens, latency_ms, success FROM usage_logs WHERE account_id = ? ORDER BY timestamp DESC",
-    )
-    .bind(id)
-    .fetch_all(&state.pool)
-    .await;
-
-    let rows = match rows {
+    let rows = match repo::list_account_usage_logs(&state.pool, id).await {
         Ok(rows) => rows,
         Err(e) => {
             return crate::error::simple_error(
@@ -370,13 +316,12 @@ pub async fn export_account_usage(
         }
     };
 
-    let mut csv = String::from("Timestamp,Model,Input Tokens,Output Tokens,Latency (ms),Status\n");
-    for (timestamp, model, input, output, latency, success) in &rows {
+    let mut csv = String::from("Timestamp,Model,Latency (ms),Status,Error\n");
+    for (ts, model, latency, success, error) in &rows {
         let status = if *success != 0 { "Success" } else { "Failed" };
         let model = model.as_deref().unwrap_or("unknown");
-        csv.push_str(&format!(
-            "{timestamp},{model},{input},{output},{latency},{status}\n"
-        ));
+        let error = error.as_deref().unwrap_or("");
+        csv.push_str(&format!("{ts},{model},{latency},{status},{error}\n"));
     }
 
     let mut response = (StatusCode::OK, csv).into_response();

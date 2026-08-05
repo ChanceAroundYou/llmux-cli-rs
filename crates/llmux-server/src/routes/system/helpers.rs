@@ -56,7 +56,7 @@ pub struct BackupQuery {
 pub fn local_now_str() -> String {
     let now = time::OffsetDateTime::now_utc();
     now.format(
-        &time::format_description::parse("[year]-[month]-[day]-[hour]-[minute]-[second]")
+        &time::format_description::parse_borrowed::<2>("[year]-[month]-[day]-[hour]-[minute]-[second]")
             .unwrap(),
     )
     .unwrap_or_else(|_| "unknown".to_string())
@@ -71,7 +71,7 @@ pub fn format_local_time(t: std::time::SystemTime) -> String {
         .unwrap_or_else(|_| time::OffsetDateTime::now_utc());
     utc
         .format(
-            &time::format_description::parse("[year]-[month]-[day] [hour]:[minute]:[second]")
+            &time::format_description::parse_borrowed::<2>("[year]-[month]-[day] [hour]:[minute]:[second]")
                 .unwrap(),
         )
         .unwrap_or_else(|_| "unknown".to_string())

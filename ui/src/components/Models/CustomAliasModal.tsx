@@ -8,9 +8,9 @@ import { Input } from '@/components/ui/input';
 
 interface Account {
   id: number;
-  alias: string;
-  provider_id: string;
-  is_active: number;
+  vendor_id: string;
+  name: string;
+  enabled: number;
 }
 
 interface ModelItem {
@@ -61,7 +61,7 @@ export function CustomAliasModal({
     setIsVerifying(true);
     setVerifyResult(null);
     try {
-      const result = await testModel(target, account.provider_id, account.id);
+      const result = await testModel(target, account.vendor_id, account.id);
       setVerifyResult(result);
     } catch (err: any) {
       setVerifyResult({ success: false, error: err.message });
@@ -85,8 +85,8 @@ export function CustomAliasModal({
             className="w-full h-10 px-3 py-2 rounded-md border border-input bg-background text-sm ring-offset-background focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2"
           >
             <option value="">{t('models.selectAccountPlaceholder')}</option>
-            {safeAccounts.filter(a => a.is_active === 1).map(a => (
-              <option key={a.id} value={a.id}>[{a.provider_id}] {a.alias}</option>
+            {safeAccounts.filter(a => a.enabled === 1).map(a => (
+              <option key={a.id} value={a.id}>[{a.vendor_id}] {a.name}</option>
             ))}
           </select>
         </div>
@@ -114,7 +114,7 @@ export function CustomAliasModal({
               .filter(m => {
                 if (!accountId) return true;
                 const account = safeAccounts.find(a => a.id === Number(accountId));
-                return account ? m.owned_by === account.provider_id : true;
+                return account ? m.owned_by === account.vendor_id : true;
               })
               .map(m => (
                 <option key={m.id} value={m.id} />

@@ -99,9 +99,7 @@ function getInitialKeyId(
   keys: ApiKey[],
 ): number | '' {
   if (!currentSettings || keys.length === 0) return '';
-  const backupApiKey = (currentSettings.auth as Record<string, any> | null)?.OPENAI_API_KEY ?? '';
-  const matchedKey = keys.find(k => k.key === backupApiKey);
-  return matchedKey ? matchedKey.id : (keys[0]?.id ?? '');
+  return keys[0]?.id ?? '';
 }
 
 function getInitialModel(currentSettings: Record<string, any> | null): string {
@@ -194,20 +192,20 @@ export function CodexPanel({
     setPendingFillContent(null);
     setIsRestoring(false);
 
-    const auth = content.auth ?? {};
     const configToml = content.configToml ?? '';
-    const backupApiKey = auth.OPENAI_API_KEY ?? '';
-    const matchedKey = keys.find(k => k.key === backupApiKey);
     skipKeyClear.current += 1; // 跳过因 restore 触发的 key 切换清空
     let notice: string | null = null;
+    // 备份 key 仍在本机密钥列表时优先选中它；否则回退到当前选中/第一个 key 并提示替换。
+    const backupApiKey = (content.auth as Record<string, unknown> | undefined)?.OPENAI_API_KEY;
+    const matchedKey = typeof backupApiKey === 'string' && backupApiKey
+      ? keys.find(k => k.key === backupApiKey)
+      : undefined;
+    const fallback = keys.find(k => k.id === selectedKeyId) ?? keys[0];
     if (matchedKey) {
       setSelectedKeyId(matchedKey.id);
-    } else {
-      const fallback = keys.find(k => k.id === selectedKeyId) ?? keys[0];
-      if (fallback) {
-        setSelectedKeyId(fallback.id);
-        notice = `备份中的 API Key 不在当前密钥列表，已自动替换为「${fallback.name}」。`;
-      }
+    } else if (fallback) {
+      setSelectedKeyId(fallback.id);
+      notice = `备份中的 API Key 不在当前密钥列表，已自动替换为「${fallback.name}」。`;
     }
     const extracted = extractFromToml(configToml);
     if (extracted.model) setModel(extracted.model);

@@ -2,13 +2,13 @@ import { create } from 'zustand';
 
 export interface Account {
   id: number;
-  alias: string;
-  provider_id: string;
+  vendor_id: string;
+  name: string;
   base_url: string | null;
-  is_active: number;
+  anthropic_base_url: string | null;
+  enabled: number;
   weight: number;
   notes: string | null;
-  openai_compatible: number | null;
   created_at: string;
 }
 
@@ -17,10 +17,10 @@ interface AccountsState {
   isLoading: boolean;
   error: string | null;
   fetchAccounts: () => Promise<void>;
-  addAccount: (account: { alias: string; provider_id: string; api_key: string; base_url?: string; anthropic_base_url?: string; openai_compatible?: number; skip_validation?: boolean }) => Promise<void>;
-  updateAccount: (id: number, account: { alias?: string; provider_id?: string; api_key?: string; base_url?: string; anthropic_base_url?: string; notes?: string; openai_compatible?: number; skip_validation?: boolean }) => Promise<void>;
+  addAccount: (account: { vendor_id: string; name: string; api_key: string; base_url?: string; anthropic_base_url?: string; enabled?: number; weight?: number; notes?: string; skip_validation?: boolean }) => Promise<void>;
+  updateAccount: (id: number, account: { vendor_id?: string; name?: string; api_key?: string; base_url?: string; anthropic_base_url?: string; enabled?: number; weight?: number; notes?: string; skip_validation?: boolean }) => Promise<void>;
   deleteAccount: (id: number) => Promise<void>;
-  toggleActive: (id: number, currentStatus: number) => Promise<void>;
+  toggleEnabled: (id: number, currentStatus: number) => Promise<void>;
 }
 
 export const useAccountsStore = create<AccountsState>((set, get) => ({
@@ -87,12 +87,12 @@ export const useAccountsStore = create<AccountsState>((set, get) => ({
     }
   },
 
-  toggleActive: async (id, currentStatus) => {
+  toggleEnabled: async (id, currentStatus) => {
     try {
       const res = await fetch(`/api/accounts/${id}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ is_active: currentStatus === 1 ? 0 : 1 }),
+        body: JSON.stringify({ enabled: currentStatus === 1 ? 0 : 1 }),
       });
       if (!res.ok) throw new Error('Failed to update account');
       await get().fetchAccounts();

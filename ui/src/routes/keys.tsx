@@ -2,20 +2,18 @@ import React, { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useKeysStore, ApiKey } from '../stores/keys';
 import { useModelsStore } from '../stores/models';
-import { 
-  Key, 
-  Plus, 
-  Copy, 
-  Trash2, 
-  ShieldCheck, 
-  Check,
+import {
+  Key,
+  Plus,
+  Trash2,
+  ShieldCheck,
   Calendar,
   Lock,
-  Eye,
-  EyeOff,
   Terminal,
   BookOpen,
-  Edit2
+  Edit2,
+  Eye,
+  EyeOff
 } from 'lucide-react';
 import { Dialog, ConfirmDialog } from '../components/Modal';
 import { CopyButton } from '../components/CopyButton';
@@ -25,8 +23,10 @@ import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
 import { parseServerDate } from '../utils/date';
 
-function parseAllowedModels(raw: string): string[] {
-  if (!raw || raw === '*') return [];
+function parseAllowedModels(raw: string | string[]): string[] {
+  if (!raw) return [];
+  if (Array.isArray(raw)) return raw;
+  if (raw === '*') return [];
   try {
     const parsed = JSON.parse(raw);
     return Array.isArray(parsed) ? parsed : [];
@@ -92,7 +92,7 @@ export default function KeysPage() {
   };
 
   // 限制：只能选择已创建别名的模型
-  const sortedModels = aliases.map(a => ({ id: a.alias, provider: a.provider_id }));
+  const sortedModels = aliases.map(a => ({ id: a.alias }));
 
   // 提交条件：有别名才能创建 key；指定模型时必须至少勾选一个
   const canSubmit = sortedModels.length > 0 && (
@@ -158,12 +158,12 @@ export default function KeysPage() {
                     })}
                   </span>
                 </div>
-                <div className="flex items-center gap-2 font-mono text-sm bg-muted/30 p-2 rounded-lg border border-border/50 group/key max-w-2xl">
+                <div className="flex items-center gap-2 font-mono text-sm bg-muted/30 p-2 rounded-lg border border-border/50 max-w-2xl">
                   <span className="text-muted-foreground truncate">
                     {visibleKeys[k.id] ? k.key : '••••••••••••••••••••••••'}
                   </span>
                   <div className="flex items-center gap-1 ml-auto shrink-0">
-                    <button 
+                    <button
                       onClick={() => toggleVisibility(k.id)}
                       className="p-1 hover:bg-background rounded transition-colors text-muted-foreground hover:text-foreground"
                     >

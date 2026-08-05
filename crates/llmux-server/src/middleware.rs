@@ -5,8 +5,8 @@ use axum::{
     response::{IntoResponse, Response},
     Extension, Json,
 };
+use llmux_core::repo;
 use serde_json::json;
-use sqlx::Row;
 
 use crate::app::AppState;
 
@@ -68,26 +68,27 @@ fn extract_api_key(headers: &HeaderMap) -> Option<String> {
     None
 }
 
+/// 校验网关 key：明文比对（网关 key 明文存储，见 schema 注释）。
 async fn validate_api_key(
     pool: &sqlx::SqlitePool,
     key: &str,
 ) -> anyhow::Result<AuthContext> {
-    let row = sqlx::query("SELECT name, allowed_models FROM api_keys WHERE key = ?")
-        .bind(key)
-        .fetch_optional(pool)
-        .await?;
+    // 单条 LEFT JOIN 一次取回 key + 白名单，避免热路径两次 DB 往返
+    let Some((id, name, models)) = repo::find_api_key_with_models(pool, key).await? else {
+        return Err(anyhow::anyhow!("API key not found"));
+    };
 
-    match row {
-        Some(row) => {
-            let name: String = row.try_get("name")?;
-            let allowed_models: String = row.try_get("allowed_models")?;
-            Ok(AuthContext {
-                key_name: name,
-                allowed_models,
-            })
-        }
-        None => Err(anyhow::anyhow!("API key not found")),
-    }
+    let _ = repo::update_api_key_last_used(pool, id).await;
+    // 白名单来自 api_key_models（空表 = 不限制）
+    let allowed_models = if models.is_empty() {
+        "*".to_string()
+    } else {
+        serde_json::to_string(&models).unwrap_or_else(|_| "*".to_string())
+    };
+    Ok(AuthContext {
+        key_name: name,
+        allowed_models,
+    })
 }
 
 /// Returns a dual-format error response.

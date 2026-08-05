@@ -1,30 +1,49 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+// ---------------------------------------------------------------------------
+// 配置域
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, PartialEq)]
+pub struct Vendor {
+    pub id: String,
+    pub name: String,
+    pub protocol: String,
+    pub default_base_url: Option<String>,
+    pub default_anthropic_url: Option<String>,
+    pub builtin: i64,
+    pub created_at: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, PartialEq)]
 pub struct Account {
     pub id: Option<i64>,
-    pub alias: String,
-    pub provider_id: String,
-    pub api_key: String,
+    pub vendor_id: String,
+    pub name: String,
+    pub api_key_enc: String,
     pub base_url: Option<String>,
     pub anthropic_base_url: Option<String>,
-    pub is_active: i64,
+    pub enabled: i64,
     pub weight: i64,
     pub notes: Option<String>,
-    pub openai_compatible: Option<i64>,
     pub limits_cache: Option<String>,
     pub limits_cache_updated_at: Option<String>,
     pub created_at: Option<String>,
 }
 
+/// 对外展示的账户视图：不含 api_key_enc 密文。
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, PartialEq)]
-pub struct Provider {
-    pub id: String,
+pub struct AccountPublic {
+    pub id: Option<i64>,
+    pub vendor_id: String,
     pub name: String,
-    #[serde(rename = "type")]
-    pub provider_type: String,
     pub base_url: Option<String>,
+    pub anthropic_base_url: Option<String>,
+    pub enabled: i64,
+    pub weight: i64,
+    pub notes: Option<String>,
+    pub created_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, PartialEq)]
@@ -32,79 +51,70 @@ pub struct ModelAlias {
     pub id: Option<i64>,
     pub alias: String,
     pub target_model: String,
-    pub provider_id: Option<String>,
-    pub account_ids: Option<String>,
-    pub preferred_account_id: Option<i64>,
+    pub vendor_id: Option<String>,
+    pub created_at: Option<String>,
 }
 
+/// alias↔账户 绑定行（替代旧 account_ids JSON 列）。
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, PartialEq)]
-pub struct ModelPrice {
-    pub model_id: String,
-    pub vendor: Option<String>,
-    pub input_price: Option<f64>,
-    pub output_price: Option<f64>,
-    pub updated_at: Option<String>,
+pub struct ModelAliasAccount {
+    pub id: Option<i64>,
+    pub alias_id: i64,
+    pub account_id: i64,
+    pub position: i64,
+    pub is_preferred: i64,
 }
 
+// ---------------------------------------------------------------------------
+// 权限域
+// ---------------------------------------------------------------------------
+
+/// API key 视图：网关 key 明文存储（用户决定不加密），列表可直接回读用于一键配置。
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, PartialEq)]
 pub struct ApiKey {
     pub id: Option<i64>,
     pub name: String,
     pub key: String,
-    pub allowed_models: String,
+    pub enabled: i64,
+    pub last_used_at: Option<String>,
     pub created_at: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, PartialEq)]
-pub struct AccountPublic {
-    pub id: Option<i64>,
-    pub alias: String,
-    pub provider_id: String,
-    pub base_url: Option<String>,
-    pub anthropic_base_url: Option<String>,
-    pub is_active: i64,
-    pub weight: i64,
-    pub notes: Option<String>,
-    pub openai_compatible: Option<i64>,
-    pub created_at: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, PartialEq)]
-pub struct SettingRow {
-    pub key: String,
-    pub value: String,
-}
+// ---------------------------------------------------------------------------
+// 监控域
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, PartialEq)]
 pub struct UsageLog {
     pub id: Option<i64>,
-    pub timestamp: i64,
+    pub ts: i64,
     pub account_id: Option<i64>,
-    pub provider_id: Option<String>,
+    pub account_name: Option<String>,
     pub model: Option<String>,
-    pub input_tokens: i64,
-    pub output_tokens: i64,
-    pub cache_read_input_tokens: i64,
-    pub cache_creation_input_tokens: i64,
     pub latency_ms: i64,
     pub success: bool,
     pub error_message: Option<String>,
-    pub is_test: bool,
 }
 
+/// 写入 usage_logs 的参数：无 token 列，account_name 为写时快照。
 #[derive(Debug, Clone, PartialEq)]
 pub struct UsageLogParams {
     pub timestamp: Option<i64>,
     pub account_id: i64,
-    pub provider_id: String,
+    pub account_name: String,
     pub model: String,
-    pub input_tokens: i64,
-    pub output_tokens: i64,
-    pub cache_read_input_tokens: i64,
-    pub cache_creation_input_tokens: i64,
     pub latency_ms: i64,
     pub success: bool,
     pub error_message: Option<String>,
     pub limit_cache: Option<Value>,
-    pub is_test: bool,
+}
+
+// ---------------------------------------------------------------------------
+// 配置域（类型化 key-value）
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SettingRow {
+    pub key: String,
+    pub value: String,
 }

@@ -35,53 +35,25 @@ pub async fn execute_provider_request(
     })
 }
 
+/// 调度/适配层使用的账户视图：api_key 为已解密明文，base_url 为已解析的有效 URL
+/// （账户自定义或厂商 default_base_url），protocol 取自厂商。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Account {
     pub id: i64,
-    pub alias: String,
-    pub provider_id: String,
+    pub name: String,
+    pub vendor_id: String,
+    pub protocol: String,
     pub api_key: String,
     pub base_url: Option<String>,
     pub anthropic_base_url: Option<String>,
-    pub is_active: i64,
+    /// 账户是否显式自定义了 base_url（区别于厂商默认值）。
+    /// gemini 原生协议用它区分「官方 x-goog-api-key」与「自定义代理 Bearer」。
+    pub custom_base_url: bool,
+    /// 账户是否显式配置了 anthropic_base_url —— 表示该账户提供 Anthropic 兼容端点，
+    /// 即使厂商 protocol 是 openai/custom 也能服务 /v1/messages。
+    pub custom_anthropic_base_url: bool,
+    pub enabled: i64,
     pub weight: i64,
-    pub openai_compatible: i64,
-}
-
-impl From<crate::models::Account> for Account {
-    fn from(value: crate::models::Account) -> Self {
-        Self {
-            id: value.id.unwrap_or_default(),
-            alias: value.alias,
-            provider_id: value.provider_id,
-            api_key: value.api_key,
-            base_url: value.base_url,
-            anthropic_base_url: value.anthropic_base_url,
-            is_active: value.is_active,
-            weight: value.weight,
-            openai_compatible: value.openai_compatible.unwrap_or(0),
-        }
-    }
-}
-
-impl From<Account> for crate::models::Account {
-    fn from(value: Account) -> Self {
-        Self {
-            id: Some(value.id),
-            alias: value.alias,
-            provider_id: value.provider_id,
-            api_key: value.api_key,
-            base_url: value.base_url,
-            anthropic_base_url: value.anthropic_base_url,
-            is_active: value.is_active,
-            weight: value.weight,
-            openai_compatible: Some(value.openai_compatible),
-            notes: None,
-            limits_cache: None,
-            limits_cache_updated_at: None,
-            created_at: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -178,15 +150,6 @@ pub fn build_openai_passthrough(
     }
 }
 
-pub fn usage_from_openai_response_body(data: &Value) -> (i64, i64) {
-    (
-        data["usage"]["prompt_tokens"].as_i64().unwrap_or_default(),
-        data["usage"]["completion_tokens"]
-            .as_i64()
-            .unwrap_or_default(),
-    )
-}
-
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -222,24 +185,21 @@ pub async fn test_provider_connection(account: &Account) -> Result<(), String> {
         account
             .base_url
             .as_deref()
-            .unwrap_or(match account.provider_id.as_str() {
-                "openai" => "https://api.openai.com/v1",
-                "anthropic" | "custom-anthropic" => "https://api.anthropic.com/v1",
+            .unwrap_or(match account.protocol.as_str() {
+                "anthropic" => "https://api.anthropic.com/v1",
                 "gemini" => "https://generativelanguage.googleapis.com/v1beta",
                 _ => "https://api.openai.com/v1",
             }),
     );
 
-    let response = if account.provider_id == "anthropic"
-        || account.provider_id == "custom-anthropic"
-    {
+    let response = if account.protocol == "anthropic" {
         client
             .get(format!("{base_url}/models"))
             .header("x-api-key", &account.api_key)
             .header("anthropic-version", "2023-06-01")
             .send()
             .await
-    } else if account.provider_id == "gemini" {
+    } else if account.protocol == "gemini" {
         client
             .get(format!("{base_url}/models"))
             .header("x-goog-api-key", &account.api_key)

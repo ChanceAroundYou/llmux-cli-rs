@@ -13,17 +13,18 @@ export interface ModelAlias {
   id: number;
   alias: string;
   target_model: string;
-  provider_id: string | null;
-  account_ids: string | null;
+  vendor_id: string | null;
+  account_ids: number[];
   preferred_account_id: number | null;
+  created_at: string | null;
 }
 
 export interface Account {
   id: number;
-  alias: string;
-  provider_id: string;
+  vendor_id: string;
+  name: string;
   base_url: string | null;
-  is_active: number;
+  enabled: number;
 }
 
 interface ModelsState {
@@ -36,10 +37,10 @@ interface ModelsState {
   fetchModels: (force?: boolean) => Promise<void>;
   fetchAliases: () => Promise<void>;
   fetchAccounts: () => Promise<void>;
-  addAlias: (alias: string, targetModel: string, providerId?: string, accountIds?: number[], preferredAccountId?: number) => Promise<void>;
+  addAlias: (alias: string, targetModel: string, vendorId?: string, accountIds?: number[], preferredAccountId?: number) => Promise<void>;
   deleteAlias: (id: number) => Promise<void>;
-  testModel: (modelId: string, providerId?: string, accountId?: number) => Promise<{ success: boolean; error?: string; latency?: number }>;
-  startTestQueue: (models: { model: string, providerId: string }[]) => Promise<{ success: boolean; error?: string }>;
+  testModel: (modelId: string, vendorId?: string, accountId?: number) => Promise<{ success: boolean; error?: string; latency?: number }>;
+  startTestQueue: (models: { model: string, vendorId: string }[]) => Promise<{ success: boolean; error?: string }>;
   fetchTestQueueStatus: () => Promise<{ isRunning: boolean; current: number; total: number; progress: number }>;
 }
 
@@ -90,9 +91,9 @@ export const useModelsStore = create<ModelsState>((set, get) => ({
     }
   },
 
-  addAlias: async (alias, targetModel, providerId, accountIds, preferredAccountId) => {
+  addAlias: async (alias, targetModel, vendorId, accountIds, preferredAccountId) => {
     try {
-      const body: any = { alias, target_model: targetModel, provider_id: providerId };
+      const body: any = { alias, target_model: targetModel, vendor_id: vendorId };
       if (accountIds && accountIds.length > 0) {
         body.account_ids = accountIds;
       }
@@ -126,12 +127,12 @@ export const useModelsStore = create<ModelsState>((set, get) => ({
     }
   },
 
-  testModel: async (modelId, providerId, accountId) => {
+  testModel: async (modelId, vendorId, accountId) => {
     try {
       const res = await fetch('/api/models/test', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model: modelId, providerId, accountId }),
+        body: JSON.stringify({ model: modelId, vendorId, accountId }),
       });
       return await res.json();
     } catch (err: any) {

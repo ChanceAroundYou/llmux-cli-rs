@@ -114,7 +114,7 @@ async fn openai_dispatch(
             Err(e) => return middleware::send_error(&format!("Failed to load accounts: {e}"), "server_error", StatusCode::INTERNAL_SERVER_ERROR, is_anthropic),
         }
     } else {
-        match get_active_accounts(&state.pool, Some(&model_resolution.provider_id), &state.master_key).await {
+        match get_active_accounts(&state.pool, Some(&model_resolution.vendor_id), &state.master_key).await {
             Ok(a) => a,
             Err(e) => return middleware::send_error(&format!("Failed to load accounts: {e}"), "server_error", StatusCode::INTERNAL_SERVER_ERROR, is_anthropic),
         }
@@ -129,16 +129,15 @@ async fn openai_dispatch(
         );
     }
 
-    // Filter: for gemini provider, only use accounts with openai_compatible enabled.
-    // These will route through Gemini's OpenAI-compatible endpoint
-    // (https://generativelanguage.googleapis.com/v1beta/openai).
-    let accounts: Vec<_> = accounts.into_iter().filter(|a| {
-        a.provider_id != "gemini" || a.openai_compatible == 1
-    }).collect();
+    // 按协议过滤：OpenAI 兼容请求只用 openai / custom 协议账户
+    let accounts: Vec<_> = accounts
+        .into_iter()
+        .filter(|a| matches!(a.protocol.as_str(), "openai" | "custom"))
+        .collect();
 
     if accounts.is_empty() {
         return middleware::send_error(
-            &format!("No active accounts available for model '{}' — Gemini accounts must enable OpenAI compatible mode", model_resolution.target_model),
+            &format!("No active accounts available for model '{}' — no OpenAI-compatible accounts", model_resolution.target_model),
             "server_error",
             StatusCode::SERVICE_UNAVAILABLE,
             is_anthropic,
@@ -149,7 +148,7 @@ async fn openai_dispatch(
         .alias_name
         .as_deref()
         .map(|n| format!("alias:{}", n))
-        .unwrap_or_else(|| format!("provider:{}", model_resolution.provider_id));
+        .unwrap_or_else(|| format!("vendor:{}", model_resolution.vendor_id));
 
     let preferred_id = model_resolution
         .preferred_account_id
@@ -176,17 +175,13 @@ async fn openai_dispatch(
     let mut last_error: Option<String> = None;
 
     for account in &ordered_accounts {
-        let default_base = if account.provider_id == "gemini" {
-            "https://generativelanguage.googleapis.com/v1beta/openai"
-        } else {
-            "https://api.openai.com/v1"
-        };
+        // base_url 已在加载时解析（账户自定义或厂商 default_base_url）
         let base_url = normalize_base_url(
             account
                 .base_url
                 .as_deref()
                 .filter(|u| !u.is_empty())
-                .unwrap_or(default_base),
+                .unwrap_or("https://api.openai.com/v1"),
         );
         let mut req_headers = BTreeMap::from([(
             "content-type".to_string(),
@@ -205,7 +200,7 @@ async fn openai_dispatch(
 
         tracing::info!(
             "⚡ {} → {} → {}/{}",
-            account.alias,
+            account.name,
             model_resolution.target_model,
             base_url,
             endpoint,
@@ -214,9 +209,9 @@ async fn openai_dispatch(
             let _ = tx.send(TuiEvent::Dispatch {
                 timestamp: time::OffsetDateTime::now_local()
                     .unwrap_or_else(|_| time::OffsetDateTime::now_utc())
-                    .format(&time::format_description::parse("[hour]:[minute]:[second]").unwrap())
+                    .format(&time::format_description::parse_borrowed::<2>("[hour]:[minute]:[second]").unwrap())
                     .unwrap_or_default(),
-                account: account.alias.clone(),
+                account: account.name.clone(),
                 model: model_resolution.target_model.clone(),
                 url: format!("{}/{}", base_url, endpoint),
                 tag: dispatch_tag.clone(),
@@ -228,13 +223,13 @@ async fn openai_dispatch(
             Err(e) => {
                 tracing::error!(
                     "🔀 Account {} (id={}) request failed: {e}",
-                    account.alias,
+                    account.name,
                     account.id
                 );
                 last_error = Some(format!("Provider request failed: {e}"));
                 if let Some(tx) = &state.tui_tx {
                     let _ = tx.send(TuiEvent::Retry {
-                        account: account.alias.clone(),
+                        account: account.name.clone(),
                         status: 0,
                         message: format!("Network error: {e}"),
                     });
@@ -256,13 +251,13 @@ async fn openai_dispatch(
             if is_retryable_status(status.as_u16()) {
                 tracing::warn!(
                     "🔀 Account {} (id={}) failed ({}) — trying next...",
-                    account.alias,
+                    account.name,
                     account.id,
                     status.as_u16()
                 );
                 if let Some(tx) = &state.tui_tx {
                     let _ = tx.send(TuiEvent::Retry {
-                        account: account.alias.clone(),
+                        account: account.name.clone(),
                         status: status.as_u16(),
                         message: error_body.clone(),
                     });
@@ -278,11 +273,6 @@ async fn openai_dispatch(
                 &state.pool,
                 account,
                 &model_resolution.target_model,
-                &model_resolution.provider_id,
-                0,
-                0,
-                0,
-                0,
                 latency_ms,
                 false,
                 &last_error,
@@ -327,18 +317,11 @@ async fn openai_dispatch(
             }
         };
 
-        let (prompt_tokens, completion_tokens) =
-            adapters::usage_from_openai_response_body(&data);
         let latency_ms = start.elapsed().as_millis() as i64;
         let _ = log_usage(
             &state.pool,
             account,
             &model_resolution.target_model,
-            &model_resolution.provider_id,
-            prompt_tokens,
-            completion_tokens,
-            0,
-            0,
             latency_ms,
             true,
             &None,
@@ -365,11 +348,6 @@ async fn openai_dispatch(
             &state.pool,
             account,
             &model_resolution.target_model,
-            &model_resolution.provider_id,
-            0,
-            0,
-            0,
-            0,
             latency_ms,
             false,
             &Some(error_msg.clone()),
@@ -418,11 +396,6 @@ async fn openai_streaming_passthrough(
             &pool_clone,
             &account,
             &model_clone,
-            &account.provider_id,
-            0,
-            0,
-            0,
-            0,
             latency_ms,
             true,
             &None,

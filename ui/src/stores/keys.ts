@@ -4,8 +4,10 @@ export interface ApiKey {
   id: number;
   name: string;
   key: string;
-  allowed_models: string;
+  enabled: number;
+  last_used_at: string | null;
   created_at: string;
+  allowed_models: string | string[];
 }
 
 interface KeysState {
@@ -40,7 +42,7 @@ export const useKeysStore = create<KeysState>((set, get) => ({
     });
     if (!res.ok) throw new Error('Failed to create API key');
     const data = await res.json();
-    
+
     await get().fetchKeys();
     return data.key;
   },

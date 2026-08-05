@@ -1,17 +1,18 @@
 use crate::adapters::Account;
 use crate::crypto::decrypt_api_key;
 use crate::models::ModelAlias;
-use serde_json::Value;
 use sqlx::{Row, SqlitePool};
 use std::collections::HashMap;
 use std::time::Instant;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelResolution {
-    pub provider_id: String,
+    /// 请求路由的厂商 id（无显式绑定时按此厂商取账户）。
+    pub vendor_id: String,
     pub target_model: String,
-    /// If set, load only these account IDs (cross-provider). Supersedes provider_id grouping.
+    /// 显式绑定账户集（跨厂商），非空时优先于 vendor_id 分组。
     pub account_ids: Vec<i64>,
+    /// 绑定集内首选账户（`is_preferred` 标记）。
     pub preferred_account_id: Option<i64>,
     pub alias_name: Option<String>,
 }
@@ -65,6 +66,9 @@ pub struct DispatchMeta {
 const MAX_ENTRIES: usize = 1024;
 
 /// Sticky-session routing state machine with failover and exponential backoff.
+///
+/// 注意：spec 要求 `dispatch_state` 表持久化回退状态；当前实现保持内存态
+/// （Instant 计时不可序列化），表已建好供后续持久化改造使用。
 #[derive(Debug, Clone, Default)]
 pub struct DispatchRouter {
     entries: HashMap<String, StickyEntry>,
@@ -273,8 +277,9 @@ pub fn sanitize_model_name(name: &str) -> String {
     result.trim().to_string()
 }
 
+/// 前缀回退：`claude-` → anthropic，`gemini-` → gemini，其余 → openai。
 pub fn resolve_model_by_prefix(model_name: &str) -> ModelResolution {
-    let provider_id = if model_name.starts_with("claude-") {
+    let vendor_id = if model_name.starts_with("claude-") {
         "anthropic"
     } else if model_name.starts_with("gemini-") || model_name.starts_with("models/gemini-") {
         "gemini"
@@ -282,7 +287,7 @@ pub fn resolve_model_by_prefix(model_name: &str) -> ModelResolution {
         "openai"
     };
     ModelResolution {
-        provider_id: provider_id.to_string(),
+        vendor_id: vendor_id.to_string(),
         target_model: model_name.to_string(),
         account_ids: Vec::new(),
         preferred_account_id: None,
@@ -290,41 +295,52 @@ pub fn resolve_model_by_prefix(model_name: &str) -> ModelResolution {
     }
 }
 
+/// 解析模型名 → 路由信息（spec §4.3）：
+/// - alias 有绑定 → JOIN model_alias_accounts 取精确账户集（is_preferred 优先）
+/// - alias 无绑定但绑了 vendor → 按该厂商路由
+/// - 无 alias → 前缀回退
 pub async fn resolve_model(pool: &SqlitePool, model_name: &str) -> anyhow::Result<ModelResolution> {
     let model_name = sanitize_model_name(model_name);
     let alias = sqlx::query_as::<_, ModelAlias>(
-        "SELECT id, alias, target_model, provider_id, account_ids, preferred_account_id FROM model_aliases WHERE alias = ?",
+        "SELECT id, alias, target_model, vendor_id, created_at FROM model_aliases WHERE alias = ?",
     )
     .bind(&model_name)
     .fetch_optional(pool)
     .await?;
 
     if let Some(alias) = alias {
-        // Parse account_ids JSON array e.g. "[1,5,7]"
-        let account_ids: Vec<i64> = alias
-            .account_ids
-            .as_deref()
-            .and_then(|s| serde_json::from_str(s).ok())
-            .unwrap_or_default();
+        let alias_id = alias.id.unwrap_or_default();
+        let bindings = sqlx::query_as::<_, (i64, i64)>(
+            "SELECT account_id, is_preferred FROM model_alias_accounts
+             WHERE alias_id = ? ORDER BY position, id",
+        )
+        .bind(alias_id)
+        .fetch_all(pool)
+        .await?;
 
+        let account_ids: Vec<i64> = bindings.iter().map(|(a, _)| *a).collect();
+        let preferred_account_id = bindings
+            .iter()
+            .find(|(_, preferred)| *preferred == 1)
+            .map(|(a, _)| *a);
         let alias_name = Some(alias.alias.clone());
 
         if !account_ids.is_empty() {
             return Ok(ModelResolution {
-                provider_id: alias.provider_id.unwrap_or_default(),
+                vendor_id: alias.vendor_id.unwrap_or_default(),
                 target_model: alias.target_model,
                 account_ids,
-                preferred_account_id: alias.preferred_account_id,
+                preferred_account_id,
                 alias_name,
             });
         }
 
-        if let Some(provider_id) = alias.provider_id {
+        if let Some(vendor_id) = alias.vendor_id {
             return Ok(ModelResolution {
-                provider_id,
+                vendor_id,
                 target_model: alias.target_model,
                 account_ids: Vec::new(),
-                preferred_account_id: alias.preferred_account_id,
+                preferred_account_id,
                 alias_name,
             });
         }
@@ -332,26 +348,67 @@ pub async fn resolve_model(pool: &SqlitePool, model_name: &str) -> anyhow::Resul
     Ok(resolve_model_by_prefix(&model_name))
 }
 
-/// Normalize a provider type string to one of the canonical categories:
-/// "openai", "anthropic", "gemini", or "custom".
-pub fn resolve_provider_type(provider_type: Option<&str>, provider_id: &str) -> String {
-    let raw = provider_type.unwrap_or(provider_id);
-    match raw {
-        "openai" => "openai".to_string(),
-        "anthropic" | "custom-anthropic" | "claude-native" => "anthropic".to_string(),
-        "gemini" => "gemini".to_string(),
-        "custom" | "poe" | "claude" | "qwen" | "deepseek" | "kimi" | "moonshot" | "step" => {
-            "custom".to_string()
+/// 账户选择公共 SQL：JOIN vendors 解析 protocol 与有效 base_url。
+/// - 有效 openai URL = 账户自定义 base_url（非空）或厂商 default_base_url
+/// - 有效 anthropic URL = 账户自定义 anthropic_base_url（非空）或厂商 default_anthropic_url / default_base_url
+const ACCOUNT_SELECT: &str = "SELECT
+    a.id, a.name, a.vendor_id, a.api_key_enc, a.enabled, a.weight,
+    v.protocol,
+    a.base_url AS custom_base_url_raw,
+    a.anthropic_base_url AS custom_anthropic_base_url_raw,
+    COALESCE(NULLIF(a.base_url, ''), v.default_base_url) AS base_url,
+    COALESCE(NULLIF(a.anthropic_base_url, ''), v.default_anthropic_url, v.default_base_url) AS anthropic_base_url
+  FROM accounts a
+  JOIN vendors v ON a.vendor_id = v.id";
+
+fn row_to_account(row: &sqlx::sqlite::SqliteRow, encryption_secret: &str) -> Option<Account> {
+    let encrypted_key: String = match row.try_get("api_key_enc") {
+        Ok(k) => k,
+        Err(_) => {
+            tracing::warn!("account row missing api_key_enc");
+            return None;
         }
-        other => other.to_string(),
+    };
+    match decrypt_api_key(&encrypted_key, encryption_secret) {
+        Ok(api_key) => {
+            let custom_base_url = row
+                .try_get::<Option<String>, _>("custom_base_url_raw")
+                .ok()
+                .flatten()
+                .is_some_and(|u| !u.is_empty());
+            let custom_anthropic_base_url = row
+                .try_get::<Option<String>, _>("custom_anthropic_base_url_raw")
+                .ok()
+                .flatten()
+                .is_some_and(|u| !u.is_empty());
+            Some(Account {
+                id: row.try_get("id").unwrap_or_default(),
+                name: row.try_get("name").unwrap_or_default(),
+                vendor_id: row.try_get("vendor_id").unwrap_or_default(),
+                protocol: row.try_get("protocol").unwrap_or_default(),
+                api_key,
+                base_url: row.try_get("base_url").ok(),
+                anthropic_base_url: row.try_get("anthropic_base_url").ok(),
+                custom_base_url,
+                custom_anthropic_base_url,
+                enabled: row.try_get("enabled").unwrap_or(1),
+                weight: row.try_get("weight").unwrap_or(1),
+            })
+        }
+        Err(e) => {
+            let name: String = row.try_get("name").unwrap_or_default();
+            let id: i64 = row.try_get("id").unwrap_or_default();
+            tracing::warn!(
+                "failed to decrypt API key for account {} (id={}), check MASTER_KEY: {e}",
+                name,
+                id
+            );
+            None
+        }
     }
 }
 
-pub fn is_retryable_status(status: u16) -> bool {
-    matches!(status, 401 | 403 | 429)
-}
-
-/// Load accounts by explicit IDs (for cross-provider alias binding).
+/// Load enabled accounts by explicit IDs（跨厂商绑定集）。
 pub async fn get_accounts_by_ids(
     pool: &SqlitePool,
     ids: &[i64],
@@ -360,11 +417,9 @@ pub async fn get_accounts_by_ids(
     if ids.is_empty() {
         return Ok(Vec::new());
     }
-    // Build query with dynamic placeholders
     let placeholders: Vec<String> = ids.iter().map(|_| "?".to_string()).collect();
     let sql = format!(
-        "SELECT id, alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight, openai_compatible \
-         FROM accounts WHERE id IN ({}) AND is_active = 1 ORDER BY weight DESC, id ASC",
+        "{ACCOUNT_SELECT} WHERE a.id IN ({}) AND a.enabled = 1 ORDER BY a.weight DESC, a.id ASC",
         placeholders.join(",")
     );
     let mut query = sqlx::query(&sql);
@@ -372,101 +427,38 @@ pub async fn get_accounts_by_ids(
         query = query.bind(id);
     }
     let rows = query.fetch_all(pool).await?;
-
-    let mut accounts = Vec::new();
-    for row in rows {
-        let encrypted_key: String = row.try_get("api_key")?;
-        if let Ok(api_key) = decrypt_api_key(&encrypted_key, encryption_secret) {
-            accounts.push(Account {
-                id: row.try_get("id")?,
-                alias: row.try_get("alias")?,
-                provider_id: row.try_get("provider_id")?,
-                api_key,
-                base_url: row.try_get("base_url").ok(),
-                anthropic_base_url: row.try_get("anthropic_base_url").ok(),
-                is_active: row.try_get::<i64, _>("is_active").unwrap_or(1),
-                weight: row.try_get("weight").unwrap_or(1),
-                openai_compatible: row.try_get("openai_compatible").unwrap_or(0),
-            });
-        } else {
-            let alias: String = row.try_get("alias").unwrap_or_default();
-            let id: i64 = row.try_get("id").unwrap_or_default();
-            tracing::warn!(
-                "failed to decrypt API key for account {} (id={}), check MASTER_KEY",
-                alias,
-                id
-            );
-        }
-    }
-    Ok(accounts)
+    Ok(rows
+        .iter()
+        .filter_map(|row| row_to_account(row, encryption_secret))
+        .collect())
 }
 
+/// 加载指定厂商（或全部）的 enabled 账户，按 weight 降序。
 pub async fn get_active_accounts(
     pool: &SqlitePool,
-    provider_or_alias: Option<&str>,
+    vendor_id: Option<&str>,
     encryption_secret: &str,
 ) -> anyhow::Result<Vec<Account>> {
-    let rows = if let Some(provider) = provider_or_alias {
-        let provider_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(1) FROM accounts WHERE provider_id = ? AND is_active = 1",
-        )
-        .bind(provider)
-        .fetch_one(pool)
-        .await?;
-        if provider_count > 0 {
-            sqlx::query("SELECT id, alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight, openai_compatible FROM accounts WHERE provider_id = ? AND is_active = 1 ORDER BY weight DESC, id ASC")
-                .bind(provider)
-                .fetch_all(pool)
-                .await?
-        } else {
-            sqlx::query("SELECT id, alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight, openai_compatible FROM accounts WHERE alias = ? AND is_active = 1 ORDER BY weight DESC, id ASC")
-                .bind(provider)
-                .fetch_all(pool)
-                .await?
-        }
+    let rows = if let Some(vendor) = vendor_id {
+        sqlx::query(&format!(
+            "{ACCOUNT_SELECT} WHERE a.vendor_id = ? AND a.enabled = 1 ORDER BY a.weight DESC, a.id ASC"
+        ))
+        .bind(vendor)
+        .fetch_all(pool)
+        .await?
     } else {
-        sqlx::query("SELECT id, alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight, openai_compatible FROM accounts WHERE is_active = 1 ORDER BY weight DESC, id ASC")
-            .fetch_all(pool)
-            .await?
+        sqlx::query(&format!(
+            "{ACCOUNT_SELECT} WHERE a.enabled = 1 ORDER BY a.weight DESC, a.id ASC"
+        ))
+        .fetch_all(pool)
+        .await?
     };
-
-    let mut accounts = Vec::new();
-    for row in rows {
-        let encrypted_key: String = row.try_get("api_key")?;
-        if let Ok(api_key) = decrypt_api_key(&encrypted_key, encryption_secret) {
-            accounts.push(Account {
-                id: row.try_get("id")?,
-                alias: row.try_get("alias")?,
-                provider_id: row.try_get("provider_id")?,
-                api_key,
-                base_url: row.try_get("base_url").ok(),
-                anthropic_base_url: row.try_get("anthropic_base_url").ok(),
-                is_active: row.try_get::<i64, _>("is_active").unwrap_or(1),
-                weight: row.try_get("weight").unwrap_or(1),
-                openai_compatible: row.try_get("openai_compatible").unwrap_or(0),
-            });
-        } else {
-            let alias: String = row.try_get("alias").unwrap_or_default();
-            let id: i64 = row.try_get("id").unwrap_or_default();
-            tracing::warn!(
-                "failed to decrypt API key for account {} (id={}), check MASTER_KEY",
-                alias,
-                id
-            );
-        }
-    }
-    Ok(accounts)
+    Ok(rows
+        .iter()
+        .filter_map(|row| row_to_account(row, encryption_secret))
+        .collect())
 }
 
-pub fn estimate_stream_usage_from_chunks(messages: &[Value], chunk_count: i64) -> (i64, i64) {
-    let input_chars = serde_json::to_string(messages)
-        .map(|text| text.len())
-        .unwrap_or_default();
-    let prompt_tokens = ((input_chars as f64) / 4.0).ceil() as i64;
-    let completion_tokens = if chunk_count > 0 {
-        ((chunk_count as f64) * 1.2).floor().max(1.0) as i64
-    } else {
-        0
-    };
-    (prompt_tokens, completion_tokens)
+pub fn is_retryable_status(status: u16) -> bool {
+    matches!(status, 401 | 403 | 429)
 }

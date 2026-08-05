@@ -6,5 +6,6 @@ pub mod dispatcher;
 pub mod export_import;
 pub mod models;
 pub mod proxy;
+pub mod repo;
 pub mod settings;
 pub mod usage;

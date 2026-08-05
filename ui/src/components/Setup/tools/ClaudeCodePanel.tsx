@@ -97,12 +97,9 @@ export function ClaudeCodePanel({
     initializedFromSettings.current = true;
 
     const env = currentSettings?.env ?? {};
-    const backupApiKey = env.ANTHROPIC_AUTH_TOKEN ?? env.ANTHROPIC_AUTH_TOKEN ?? '';
-    const matchedKey = keys.find(k => k.key === backupApiKey);
 
     skipNextKeyCleanup.current = 2;
-    if (matchedKey) setSelectedKeyId(matchedKey.id);
-    else setSelectedKeyId(keys[0].id);
+    setSelectedKeyId(keys[0].id);
 
     // 模型回填：直接在这里做，不依赖 allowedModelsList（避免 ref 时序问题）
     const opus   = parseModel(env.ANTHROPIC_DEFAULT_OPUS_MODEL);
@@ -151,18 +148,17 @@ export function ClaudeCodePanel({
     setIsRestoring(false);
 
     const env = content.env ?? {};
-    const backupApiKey = env.ANTHROPIC_AUTH_TOKEN ?? env.ANTHROPIC_AUTH_TOKEN ?? '';
-    const matchedKey = keys.find(k => k.key === backupApiKey);
+    const backupApiKey = env.ANTHROPIC_AUTH_TOKEN ?? '';
     restoringRef.current = true;
     let notice: string | null = null;
+    // 备份 key 仍在本机密钥列表时优先选中它；否则回退到当前选中/第一个 key 并提示替换。
+    const matchedKey = keys.find(k => k.key === backupApiKey);
+    const fallback = keys.find(k => k.id === selectedKeyId) ?? keys[0];
     if (matchedKey) {
       setSelectedKeyId(matchedKey.id);
-    } else {
-      const fallback = keys.find(k => k.id === selectedKeyId) ?? keys[0];
-      if (fallback) {
-        setSelectedKeyId(fallback.id);
-        notice = `备份中的 API Key (${backupApiKey.slice(0, 12)}••••) 不在当前密钥列表，已自动替换为「${fallback.name}」。`;
-      }
+    } else if (fallback) {
+      setSelectedKeyId(fallback.id);
+      notice = `备份中的 API Key (${backupApiKey.slice(0, 12)}••••) 不在当前密钥列表，已自动替换为「${fallback.name}」。`;
     }
     const opus   = parseModel(env.ANTHROPIC_DEFAULT_OPUS_MODEL);
     const sonnet = parseModel(env.ANTHROPIC_DEFAULT_SONNET_MODEL);
@@ -177,10 +173,8 @@ export function ClaudeCodePanel({
   const previewSettings = useMemo(() => {
     if (!selectedKey) return null;
     const existing = currentSettings ?? {};
-    const baseEnv = { ...(existing.env ?? {}) };
-    delete baseEnv.ANTHROPIC_AUTH_TOKEN;
     const newEnv: Record<string, string> = {
-      ...baseEnv,
+      ...(existing.env ?? {}),
       ANTHROPIC_BASE_URL: `${gatewayUrl}/v1`,
       ANTHROPIC_AUTH_TOKEN: selectedKey.key,
     };

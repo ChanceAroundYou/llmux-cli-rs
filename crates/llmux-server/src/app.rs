@@ -18,7 +18,7 @@ use tower_http::{
     trace::TraceLayer,
 };
 
-use crate::routes::{accounts, auth, health, keys, models, settings, system, usage, v1};
+use crate::routes::{accounts, auth, health, keys, models, settings, system, usage, v1, vendors};
 use crate::routes::models::TestQueueState;
 
 #[derive(Clone)]
@@ -153,7 +153,7 @@ where
                     if let Some(tx) = &tui_tx {
                         let ts = time::OffsetDateTime::now_local()
                             .unwrap_or_else(|_| time::OffsetDateTime::now_utc())
-                            .format(&time::format_description::parse("[hour]:[minute]:[second]").unwrap())
+                            .format(&time::format_description::parse_borrowed::<2>("[hour]:[minute]:[second]").unwrap())
                             .unwrap_or_default();
                         let _ = tx.send(TuiEvent::Request {
                             timestamp: ts,
@@ -206,6 +206,14 @@ pub fn app(state: AppState) -> AppRouter {
         .route(
             "/api/accounts/:id/export",
             get(accounts::export_account_usage),
+        )
+        .route(
+            "/api/vendors",
+            get(vendors::list_vendors).post(vendors::create_vendor),
+        )
+        .route(
+            "/api/vendors/:id",
+            put(vendors::update_vendor).delete(vendors::delete_vendor),
         )
         .route("/api/models/available", get(models::get_available_models))
         .route(
@@ -298,10 +306,10 @@ pub async fn serve(addr: std::net::SocketAddr, state: AppState) -> anyhow::Resul
 }
 
 pub async fn test_state() -> AppState {
-    let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+    let mut pool = sqlx::SqlitePool::connect("sqlite::memory:")
         .await
         .expect("failed to create in-memory test database");
-    llmux_core::db::init_db(&pool)
+    llmux_core::db::init_db(&mut pool, "sqlite::memory:")
         .await
         .expect("failed to init test database");
     AppState {
