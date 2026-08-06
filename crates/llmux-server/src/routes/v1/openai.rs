@@ -246,6 +246,17 @@ async fn openai_dispatch(
                     let mut router = state.dispatch_router.lock().await;
                     router.record_result(&dispatch_key, &dispatch_meta, None, false);
                 }
+                // 记录该账户失败（failover 统计完整化）
+                let latency_ms = start.elapsed().as_millis() as i64;
+                let _ = log_usage(
+                    &state.pool,
+                    account,
+                    &model_resolution.target_model,
+                    latency_ms,
+                    false,
+                    &last_error,
+                )
+                .await;
                 continue;
             }
         };
@@ -274,6 +285,17 @@ async fn openai_dispatch(
                     let mut router = state.dispatch_router.lock().await;
                     router.record_result(&dispatch_key, &dispatch_meta, None, false);
                 }
+                // 记录该账户失败（failover 统计完整化）
+                let latency_ms = start.elapsed().as_millis() as i64;
+                let _ = log_usage(
+                    &state.pool,
+                    account,
+                    &model_resolution.target_model,
+                    latency_ms,
+                    false,
+                    &last_error,
+                )
+                .await;
                 continue;
             }
             let latency_ms = start.elapsed().as_millis() as i64;
@@ -349,19 +371,8 @@ async fn openai_dispatch(
         router.record_result(&dispatch_key, &dispatch_meta, None, false);
     }
 
-    let latency_ms = start.elapsed().as_millis() as i64;
     let error_msg = last_error.unwrap_or_else(|| "All accounts exhausted".to_string());
-    if let Some(account) = ordered_accounts.first() {
-        let _ = log_usage(
-            &state.pool,
-            account,
-            &model_resolution.target_model,
-            latency_ms,
-            false,
-            &Some(error_msg.clone()),
-        )
-        .await;
-    }
+    // 各账户失败已在循环内逐条记录，这里不重复记 first
     send_tui_request(&state.tui_tx, normalized_uri.path(), 502, start, &model_resolution.target_model);
     middleware::send_error(
         &error_msg,
@@ -398,7 +409,7 @@ async fn openai_streaming_passthrough(
     let pool_clone = pool.clone();
     let model_clone = model.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        // 流式已返回 200：记成功 usage，latency 为上游返回首字节前的真实耗时（不固定 1s）
         let latency_ms = start.elapsed().as_millis() as i64;
         let _ = log_usage(
             &pool_clone,

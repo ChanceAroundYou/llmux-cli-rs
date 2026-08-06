@@ -143,8 +143,8 @@ pub async fn update_api_key(
         );
     }
 
-    // 白名单替换
-    if let Some(rule) = body.get("allowed_models") {
+    // 白名单替换：null 视为未提供，不更新（避免意外清空 → 受限 key 变不限）
+    if let Some(rule) = body.get("allowed_models").filter(|r| !r.is_null()) {
         let allowed_models = parse_allowed_models(rule);
         if let Err(e) = repo::replace_key_models(&state.pool, id, &allowed_models).await {
             return crate::error::simple_error(

@@ -15,6 +15,9 @@ export default function WebLoginWizard({ isOpen, onClose, provider }: Props) {
 
   if (!isOpen) return null;
 
+  // 用 UI 当前访问地址（origin）作为脚本回连地址，避免硬编码端口/域名失效
+  const gatewayOrigin = typeof window !== 'undefined' ? window.location.origin : '';
+
   const config = {
     openai: {
       url: 'https://chatgpt.com',
@@ -55,7 +58,7 @@ export default function WebLoginWizard({ isOpen, onClose, provider }: Props) {
         const match = authHeader.match(/sessionKey=([^;]+)/);
         if (match) {
           console.log('✅ Intercepted sessionKey via Fetch!');
-          fetch('http://localhost:25975/api/auth/web-session', {
+          fetch('${gatewayOrigin}/api/auth/web-session', {
              method: 'POST',
              mode: 'cors',
              headers: { 'Content-Type': 'application/json' },
@@ -75,7 +78,7 @@ export default function WebLoginWizard({ isOpen, onClose, provider }: Props) {
   }
 
   console.log('${t('auth.script.syncing')}');
-  fetch('http://localhost:25975/api/auth/web-session', {
+  fetch('${gatewayOrigin}/api/auth/web-session', {
     method: 'POST',
     mode: 'cors',
     headers: { 'Content-Type': 'application/json' },

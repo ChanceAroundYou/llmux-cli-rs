@@ -206,11 +206,7 @@ pub async fn start_test_queue(
             {
                 let mut queue = queue_state.lock().unwrap();
                 queue.current = i + 1;
-                queue.progress = if queue.total > 0 {
-                    ((i + 1) * 100) / queue.total
-                } else {
-                    0
-                };
+                queue.progress = ((i + 1) * 100).checked_div(queue.total).unwrap_or(0);
             }
         }
 
@@ -260,10 +256,9 @@ pub async fn test_model(
 
     let accounts = if let Some(acc_id) = account_id_override {
         // Directly fetch the specified account（enabled 过滤与 decrypt 由 get_accounts_by_ids 处理）
-        match get_accounts_by_ids(&state.pool, &[acc_id], &state.master_key).await {
-            Ok(a) => a,
-            Err(_) => vec![],
-        }
+        get_accounts_by_ids(&state.pool, &[acc_id], &state.master_key)
+            .await
+            .unwrap_or_default()
     } else {
         match get_active_accounts(&state.pool, Some(effective_vendor), &state.master_key).await {
             Ok(a) => a,

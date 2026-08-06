@@ -12,7 +12,7 @@
 1. **一表一职责**：配置域、权限域、监控域、运行时域严格分离。
 2. **关系全部用外键表达**：不出现 `[1,2]` 之类的 JSON 列；该加 `CHECK` / `UNIQUE` / 部分索引的地方就加。
 3. **历史数据不因删配置而消失**：删账户保留监控记录（快照归因）。
-4. **凭据安全**：网关 api_key 只存哈希，明文不落库。
+4. **凭据安全**：厂商 api_key 加密存储（`accounts.api_key_enc`）；网关 key 明文存储（单用户本地网关有意设计，创建后可回读一键写入工具配置）。
 5. **YAGNI**：页面用不到的表不进 schema。
 
 ---
@@ -107,14 +107,17 @@ CREATE UNIQUE INDEX uq_alias_one_preferred ON model_alias_accounts(alias_id) WHE
 
 ### 3.2 权限域
 
-#### api_keys —— 网关鉴权（只存哈希）
+#### api_keys —— 网关鉴权（明文存储，单用户本地网关）
+
+> 实现修正（2026-08-06）：网关 key **明文存储**而非哈希。理由：单用户本地网关，
+> 厂商 key 已单独加密（`accounts.api_key_enc`），网关 key 明文可回读、一键写入
+> 工具配置（Claude Code / Codex / Gemini）。已知取舍：库文件泄露即网关 key 泄露。
 
 ```sql
 CREATE TABLE api_keys (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
   name         TEXT NOT NULL,
-  key_hash     TEXT NOT NULL UNIQUE,   -- SHA-256(明文 key + salt)，明文不落库
-  salt         TEXT NOT NULL,
+  key          TEXT NOT NULL UNIQUE,
   enabled      INTEGER NOT NULL DEFAULT 1,
   last_used_at TEXT,
   created_at   TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -247,7 +250,7 @@ INSERT INTO vendors (id, name, protocol, default_base_url, default_anthropic_url
 | 厂商/协议 | 真实表 `vendors`，accounts 外键 | 收编散落的硬编码 URL；支持"选厂商自动填 base_url"；复用用户自建厂商 |
 | `account_ids` | 规范化成 `model_alias_accounts` | 外键保证引用完整，JOIN 可查，删账户级联清理 |
 | 首选账户 | `is_preferred` 标记 + 部分唯一索引 | 结构性保证"首选 ∈ 绑定集"，且每个 alias 最多一个首选 |
-| api_key | 只存哈希 + salt | 库文件泄露不暴露网关密钥 |
+| api_key | 明文（单用户本地网关，可回读一键配置） | 库文件泄露会暴露网关密钥，属已知取舍 |
 | usage_logs | 保留最小形态（无 token） | dashboard 成功率/延迟/活动依赖它；无 token 展示需求 |
 | usage_daily / failover_events / health_checks | 不做 | UI 未使用，纯负担 |
 | 删账户历史 | 保留 + `account_name` 快照 | 监控历史不因删配置丢失 |
@@ -270,7 +273,7 @@ INSERT INTO vendors (id, name, protocol, default_base_url, default_anthropic_url
 以下两点在讨论中未逐条确认，文档按推荐值定稿；执行前如有异议可直接改：
 
 1. **首选账户表达**：采用 `model_alias_accounts.is_preferred`（+ 每 alias 最多一个首选的唯一索引），而非 `model_aliases.preferred_account_id` 独立列。
-2. **api_key 存储**：采用 SHA-256 哈希 + salt，明文不落库。
+2. **api_key 存储**：网关 key 明文存储（单用户本地网关有意设计，可回读一键配置）；厂商 key 加密存储于 `accounts.api_key_enc`。
 
 ---
 

@@ -7,6 +7,7 @@ use axum::{Extension, Json};
 use serde_json::{json, Value};
 
 use crate::app::AppState;
+use llmux_core::crypto::restrict_file_permissions;
 
 use super::helpers::{format_local_time, local_now_str, prune_backups, BackupQuery};
 
@@ -157,6 +158,8 @@ pub async fn apply_gemini_settings(
     });
     if let Ok(s) = serde_json::to_string_pretty(&backup_content) {
         let _ = fs::write(&backup_file, &s);
+        // 备份含明文凭据，权限收紧为仅当前用户可读
+        restrict_file_permissions(&backup_file);
     }
 
     // Write files
@@ -232,7 +235,7 @@ pub async fn list_gemini_backups(
                         return None;
                     }
                     let ts = metadata.modified().ok()
-                        .map(|t| format_local_time(t))
+                        .map(format_local_time)
                         .unwrap_or_else(|| "unknown".to_string());
                     json!({
                         "name": name,

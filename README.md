@@ -31,7 +31,7 @@ LLMux solves all of this. It's a local gateway that runs on your machine and exp
 
 ## What It Does
 
-**One endpoint for everything.** Point any OpenAI-compatible client to `http://localhost:25976/v1` and reach any model across any provider.
+**One endpoint for everything.** Point any OpenAI-compatible client to `http://localhost:25975/v1` and reach any model across any provider.
 
 **Multi-Protocol Passthrough.** Native support for OpenAI, Anthropic, and Gemini protocols. Tools like Claude Code, Codex, and Gemini CLI connect directly through LLMux — no client-side changes required.
 
@@ -99,28 +99,29 @@ Start the gateway:
 ./target/release/llmux
 ```
 
-The management dashboard opens at `http://localhost:25976`.
+The management dashboard opens at `http://localhost:25975`.
 
 **Setup in 5 steps:**
 
 1. **Accounts** — add your API keys (OpenAI, Anthropic, Gemini, or any custom endpoint)
 2. **Models** — create aliases and run connection tests
 3. **Keys** — generate a gateway API key, optionally restrict to specific models
-4. **Setup** — one-click config for Claude Code, Codex, or Gemini CLI, or manually set your tool's Base URL to `http://localhost:25976/v1`
+4. **Setup** — one-click config for Claude Code, Codex, or Gemini CLI, or manually set your tool's Base URL to `http://localhost:25975/v1`
 5. Done — LLMux handles routing, failover, and load balancing automatically
 
 ## Environment Variables
 
 | Variable     | Default           | Description                                     |
 | ------------ | ----------------- | ----------------------------------------------- |
-| `PORT`       | `25976`           | Gateway and dashboard port                      |
+| `PORT`       | `25975`           | Gateway and dashboard port                      |
 | `LOG_LEVEL`  | `info`            | Log verbosity: `debug`, `info`, `warn`, `error` |
 | `DATA_DIR`   | `~/.config/llmux` | Location of `db.sqlite` and logs                |
 | `MASTER_KEY` | (auto)            | Encryption key for stored credentials           |
+| `USAGE_RETENTION_DAYS` | `30`        | Purge usage logs older than N days at startup   |
 
 ## Dashboard & TUI
 
-**Web UI** at `http://localhost:25976`:
+**Web UI** at `http://localhost:25975`:
 
 - **Dashboard** — real-time overview of accounts, models, and gateway status
 - **Accounts** — enable/disable accounts, set routing weights

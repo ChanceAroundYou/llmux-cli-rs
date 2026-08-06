@@ -10,21 +10,32 @@ use crate::app::AppState;
 /// 把 web session 的 provider 名解析成 vendors.id。
 /// 优先精确匹配；再按协议猜测；都没有则回退 openai。
 async fn resolve_vendor_id(state: &AppState, provider: &str) -> String {
+    // 优先精确匹配厂商
     if let Ok(Some(_)) = repo::get_vendor(&state.pool, provider).await {
         return provider.to_string();
     }
-    // 协议猜测：claude/anthropic → anthropic；gemini → gemini
-    let guessed = if provider.contains("anthropic") || provider.contains("claude") {
-        "anthropic"
-    } else if provider.contains("gemini") {
-        "gemini"
-    } else {
-        "openai"
-    };
-    if let Ok(Some(_)) = repo::get_vendor(&state.pool, guessed).await {
-        return guessed.to_string();
+    // 协议明确推断：claude/anthropic → anthropic；gemini → gemini（种子厂商恒存在）
+    if provider.contains("anthropic") || provider.contains("claude") {
+        return "anthropic".to_string();
     }
-    guessed.to_string()
+    if provider.contains("gemini") {
+        return "gemini".to_string();
+    }
+    // 其余未知 provider（kimi/poe/qwen/step 等）：创建独立 vendor（protocol=openai），
+    // 避免全部回退 openai 污染默认路由池。账户挂 vendor_id=provider 下，
+    // 不会被 get_active_accounts("openai")（vendor_id 精确匹配）选中。
+    let _ = repo::create_vendor(
+        &state.pool,
+        provider,
+        provider,
+        "openai",
+        &["openai".to_string()],
+        false,
+        None,
+        None,
+    )
+    .await;
+    provider.to_string()
 }
 
 pub async fn handle_web_session(
@@ -43,6 +54,18 @@ pub async fn handle_web_session(
     let Some(provider) = provider else {
         return crate::error::simple_error("Missing token or provider", StatusCode::BAD_REQUEST);
     };
+    // 校验 provider 合法性：它会被用作 vendors 表主键（create_vendor 的 id），
+    // 限制长度与字符集，避免非法字符串写入主键
+    if provider.len() > 64
+        || !provider
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return crate::error::simple_error(
+            "Invalid provider: must be ≤64 chars of [a-zA-Z0-9_-]",
+            StatusCode::BAD_REQUEST,
+        );
+    }
     if token.is_none() {
         return crate::error::simple_error("Missing token or provider", StatusCode::BAD_REQUEST);
     }

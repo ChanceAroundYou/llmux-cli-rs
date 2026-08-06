@@ -34,8 +34,7 @@ pub async fn gemini(
     // Parse the captured path segment: "gemini-2.0-flash:generateContent"
     // Extract model name and action.
     let path = path.trim_start_matches('/');
-    let (raw_model, _action) = if path.starts_with("models/") {
-        let rest = &path["models/".len()..];
+    let (raw_model, _action) = if let Some(rest) = path.strip_prefix("models/") {
         rest.split_once(':').unwrap_or((rest, "generateContent"))
     } else {
         // Allow direct "model:action" without the models/ prefix

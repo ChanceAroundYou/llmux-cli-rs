@@ -31,7 +31,7 @@ LLMux 解决的就是这些问题。它是一个运行在本地机器上的网�
 
 ## 它能做什么
 
-**统一入口。** 将任何兼容 OpenAI 格式的客户端指向 `http://localhost:25976/v1`，即可访问所有已配置的 provider 和模型。
+**统一入口。** 将任何兼容 OpenAI 格式的客户端指向 `http://localhost:25975/v1`，即可访问所有已配置的 provider 和模型。
 
 **多协议透传。** 原生支持 OpenAI、Anthropic、Gemini 三种协议。Claude Code、Codex、Gemini CLI 等工具通过 LLMux 直接连接，客户端无需任何修改。
 
@@ -99,28 +99,29 @@ cargo build --release -p llmux
 ./target/release/llmux
 ```
 
-管理后台地址为 `http://localhost:25976`。
+管理后台地址为 `http://localhost:25975`。
 
 **5 步完成接入：**
 
 1. **Accounts** — 添加你的 API Key（支持 OpenAI、Anthropic、Gemini 及自定义端点）
 2. **Models** — 创建模型别名，并运行连接测试
 3. **Keys** — 生成网关 API Key，按需配置模型白名单
-4. **Setup** — 一键配置 Claude Code、Codex 或 Gemini CLI，或手动将工具的 Base URL 设为 `http://localhost:25976/v1`
+4. **Setup** — 一键配置 Claude Code、Codex 或 Gemini CLI，或手动将工具的 Base URL 设为 `http://localhost:25975/v1`
 5. 完成 — 路由、故障切换、负载均衡全部由 LLMux 自动处理
 
 ## 环境变量
 
 | 变量名       | 默认值            | 说明                                       |
 | ------------ | ----------------- | ------------------------------------------ |
-| `PORT`       | `25976`           | 网关与仪表盘端口                           |
+| `PORT`       | `25975`           | 网关与仪表盘端口                           |
 | `LOG_LEVEL`  | `info`            | 日志级别：`debug`、`info`、`warn`、`error` |
 | `DATA_DIR`   | `~/.config/llmux` | `db.sqlite` 和日志的存储目录               |
 | `MASTER_KEY` | （自动生成）      | 存储凭证的加密密钥                         |
+| `USAGE_RETENTION_DAYS` | `30`      | 启动时清理超过 N 天的用量日志              |
 
 ## 管理后台与终端 TUI
 
-**Web UI** 访问 `http://localhost:25976`：
+**Web UI** 访问 `http://localhost:25975`：
 
 - **Dashboard** — 账号、模型和网关状态的实时概览
 - **Accounts** — 启用/禁用账号，设置路由权重

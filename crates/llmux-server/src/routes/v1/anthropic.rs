@@ -86,11 +86,11 @@ pub async fn messages(
         }
     };
 
-    // 按协议过滤：Anthropic 请求用 anthropic 协议账户，或显式配置了
-    // anthropic_base_url（Anthropic 兼容端点）的 openai/custom 账户。
+    // 按协议过滤：厂商声明支持 anthropic（多协议厂商如 deepseek）、显式配置了
+    // anthropic_base_url（Anthropic 兼容端点）或自定义代理的账户均可服务 /v1/messages。
     let accounts: Vec<_> = accounts
         .into_iter()
-        .filter(|a| a.protocol == "anthropic" || a.custom_anthropic_base_url)
+        .filter(|a| a.serves_anthropic || a.custom_anthropic_base_url || a.custom_base_url)
         .collect();
 
     if accounts.is_empty() {
@@ -186,6 +186,17 @@ pub async fn messages(
                     let mut router = state.dispatch_router.lock().await;
                     router.record_result(&dispatch_key, &dispatch_meta, None, false);
                 }
+                // 记录该账户失败（failover 统计完整化）
+                let latency_ms = start.elapsed().as_millis() as i64;
+                let _ = log_usage(
+                    &state.pool,
+                    account,
+                    &model_resolution.target_model,
+                    latency_ms,
+                    false,
+                    &last_error,
+                )
+                .await;
                 continue;
             }
         };
@@ -206,6 +217,17 @@ pub async fn messages(
                     let mut router = state.dispatch_router.lock().await;
                     router.record_result(&dispatch_key, &dispatch_meta, None, false);
                 }
+                // 记录该账户失败（failover 统计完整化）
+                let latency_ms = start.elapsed().as_millis() as i64;
+                let _ = log_usage(
+                    &state.pool,
+                    account,
+                    &model_resolution.target_model,
+                    latency_ms,
+                    false,
+                    &last_error,
+                )
+                .await;
                 continue;
             }
         };
@@ -233,6 +255,17 @@ pub async fn messages(
                     let mut router = state.dispatch_router.lock().await;
                     router.record_result(&dispatch_key, &dispatch_meta, None, false);
                 }
+                // 记录该账户失败（failover 统计完整化）
+                let latency_ms = start.elapsed().as_millis() as i64;
+                let _ = log_usage(
+                    &state.pool,
+                    account,
+                    &model_resolution.target_model,
+                    latency_ms,
+                    false,
+                    &last_error,
+                )
+                .await;
                 continue;
             }
 
@@ -345,19 +378,8 @@ pub async fn messages(
         router.record_result(&dispatch_key, &dispatch_meta, None, false);
     }
 
-    let latency_ms = start.elapsed().as_millis() as i64;
     let error_msg = last_error.unwrap_or_else(|| "All accounts exhausted".to_string());
-    if let Some(account) = ordered_accounts.first() {
-        let _ = log_usage(
-            &state.pool,
-            account,
-            &model_resolution.target_model,
-            latency_ms,
-            false,
-            &Some(error_msg.clone()),
-        )
-        .await;
-    }
+    // 各账户失败已在循环内逐条记录，这里不重复记 first
     send_tui_request(&state.tui_tx, "/v1/messages", 502, start, &model_resolution.target_model);
     middleware::send_error(&error_msg, "upstream_error", StatusCode::BAD_GATEWAY, is_anthropic)
 }
@@ -387,7 +409,7 @@ async fn anthropic_streaming_passthrough(
 
     let pool_clone = pool.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        // 流式已返回 200：记成功 usage，latency 为上游返回首字节前的真实耗时（不固定 1s）
         let latency_ms = start.elapsed().as_millis() as i64;
         let _ = log_usage(
             &pool_clone,

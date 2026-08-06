@@ -52,6 +52,9 @@ pub struct Account {
     /// 账户是否显式配置了 anthropic_base_url —— 表示该账户提供 Anthropic 兼容端点，
     /// 即使厂商 protocol 是 openai/custom 也能服务 /v1/messages。
     pub custom_anthropic_base_url: bool,
+    /// 厂商是否声明支持 anthropic 协议（vendors.protocols 含 "anthropic"，或主协议即 anthropic）。
+    /// 多协议厂商（如 deepseek）账户即使未显式配置 anthropic_base_url 也能服务 /v1/messages。
+    pub serves_anthropic: bool,
     /// gemini 协议账户走 OpenAI 兼容端点（/v1beta/openai）时置 1，
     /// 允许该账户服务 /v1/chat/completions。
     pub openai_compatible: i64,
@@ -221,10 +224,15 @@ pub async fn test_provider_connection(account: &Account) -> Result<(), String> {
     match response {
         Ok(resp) => {
             let status = resp.status();
+            // 401/403 证明端点存在（凭据可能不对但 URL 正确），视为连通性通过；
+            // 其余非 2xx（404/500 等）视为端点不可用，返回 Err
             if status.is_success() || status.as_u16() == 401 || status.as_u16() == 403 {
                 Ok(())
             } else {
-                Ok(())
+                Err(format!(
+                    "Provider returned HTTP {} — endpoint may be unreachable or misconfigured",
+                    status.as_u16()
+                ))
             }
         }
         Err(e) => {

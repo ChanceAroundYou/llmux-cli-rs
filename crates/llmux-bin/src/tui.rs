@@ -10,7 +10,6 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, List, ListItem, Paragraph, Tabs};
 use ratatui::{Frame, Terminal};
 use ratatui::backend::CrosstermBackend;
-use time;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use llmux_server::app::TuiEvent;
@@ -309,7 +308,7 @@ fn render(f: &mut Frame, ui: &UiState) {
 }
 
 fn render_tabs(f: &mut Frame, area: Rect, active: usize) {
-    let titles = vec![" Dashboard ", " Traffic "];
+    let titles = [" Dashboard ", " Traffic "];
     let tab_widgets: Vec<Line> = titles
         .iter()
         .enumerate()

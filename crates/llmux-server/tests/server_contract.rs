@@ -325,6 +325,7 @@ fn effective_openai_base_url_routes_gemini_compat_accounts() {
             anthropic_base_url: None,
             custom_base_url,
             custom_anthropic_base_url: false,
+            serves_anthropic: protocol == "anthropic",
             openai_compatible,
             openai_responses: true,
             enabled: 1,
@@ -528,4 +529,116 @@ async fn alias_list_returns_vendor_aggregation() {
         .find(|a| a["alias"] == "nobind").expect("nobind exists");
     assert_eq!(nobind["accounts"].as_array().unwrap().len(), 0);
     assert_eq!(nobind["preferred_account_id"], Value::Null);
+}
+
+#[tokio::test]
+async fn update_api_key_null_allowed_models_preserves_whitelist() {
+    let state = llmux_server::test_state().await;
+    let app = llmux_server::app(state);
+
+    // 创建受限 key（白名单 ["gpt-4"]）
+    let (status, created) = request_json_shared(
+        &app,
+        Method::POST,
+        "/api/keys",
+        Some(json!({"name": "restricted", "allowed_models": ["gpt-4"]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let key_id = created["id"].as_i64().expect("key id");
+
+    // PUT 带 allowed_models: null —— 不应清空白名单（受限 key 变不限是权限漏洞）
+    let (status, _) = request_json_shared(
+        &app,
+        Method::PUT,
+        &format!("/api/keys/{key_id}"),
+        Some(json!({"allowed_models": null})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // 白名单应保留
+    let (_, keys) = request_json_shared(&app, Method::GET, "/api/keys", None).await;
+    let key = keys
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|k| k["id"] == key_id)
+        .expect("key exists");
+    assert_eq!(key["allowed_models"], json!(["gpt-4"]));
+}
+
+#[tokio::test]
+async fn update_vendor_partial_body_preserves_unchanged_fields() {
+    let state = llmux_server::test_state().await;
+    let app = llmux_server::app(state);
+
+    // 只传 name，其余字段应保留（合并更新，而非缺省被重置）
+    let (status, _) = request_json_shared(
+        &app,
+        Method::PUT,
+        "/api/vendors/deepseek",
+        Some(json!({"name": "DeepSeek-新"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (_, vendors) = request_json_shared(&app, Method::GET, "/api/vendors", None).await;
+    let ds = vendors
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["id"] == "deepseek")
+        .expect("deepseek exists");
+    assert_eq!(ds["name"], "DeepSeek-新");
+    // 多协议、responses 开关、anthropic 默认端点均不被覆盖
+    assert_eq!(ds["protocols"], json!(["openai", "anthropic"]));
+    assert_eq!(ds["openai_responses"], json!(true));
+    assert_eq!(ds["default_anthropic_url"], "https://api.deepseek.com/anthropic");
+}
+
+#[tokio::test]
+async fn purge_preserves_app_settings_and_gateway_key() {
+    let state = llmux_server::test_state().await;
+    let settings = llmux_core::settings::SettingsService::new(state.pool.clone());
+    let key = settings.get_or_create_gateway_key().await.expect("gateway key");
+    let app = llmux_server::app(state);
+
+    let (status, _) = request_json_shared(&app, Method::POST, "/api/settings/reset", None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // gateway_key 存于 app_settings，清库后不应失效
+    let again = settings.get_or_create_gateway_key().await.expect("still readable");
+    assert_eq!(key, again);
+}
+
+#[tokio::test]
+async fn web_session_unknown_provider_gets_own_vendor_not_openai_pool() {
+    let state = llmux_server::test_state().await;
+    let pool = state.pool.clone();
+    let app = llmux_server::app(state);
+
+    let (status, body) = request_json_shared(
+        &app,
+        Method::POST,
+        "/api/auth/web-session",
+        Some(json!({"provider": "kimi", "token": "sk-kimi-token"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["success"], true);
+
+    // 账户挂独立 vendor "kimi"，而非 openai 账户池
+    let vendor: String = sqlx::query_scalar("SELECT vendor_id FROM accounts WHERE name = 'kimi-web'")
+        .fetch_one(&pool)
+        .await
+        .expect("account exists");
+    assert_eq!(vendor, "kimi");
+
+    // 独立 vendor 已自动创建
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM vendors WHERE id = 'kimi'")
+        .fetch_one(&pool)
+        .await
+        .expect("vendor exists");
+    assert_eq!(count, 1);
 }

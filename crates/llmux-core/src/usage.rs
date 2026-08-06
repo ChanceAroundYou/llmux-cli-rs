@@ -140,7 +140,7 @@ impl UsageService {
                 CAST(IFNULL(AVG(latency_ms), 0) AS REAL) AS avg_latency,
                 COUNT(*) AS total_requests,
                 IFNULL(SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END), 0) AS success_requests
-             FROM usage_logs",
+             FROM usage_logs WHERE 1=1",
         );
         append_time_filter(&mut sql, "", start_time, end_time);
         let mut query = sqlx::query(&sql);
@@ -158,9 +158,15 @@ impl UsageService {
         start_time: Option<i64>,
         end_time: Option<i64>,
     ) -> Result<FailoverStats> {
+        // failover 触发 = 可重试状态码（401/403/429）导致的失败。
+        // 用「Provider returned <状态码>」前缀精确匹配（route 层统一写入该格式），
+        // 避免 error body 中任意出现状态码数字造成误判。
         let mut failure_sql = String::from(
             "SELECT COUNT(*) AS failed_requests,
-                    IFNULL(SUM(CASE WHEN error_message LIKE '%429%' OR error_message LIKE '%401%' OR error_message LIKE '%403%' THEN 1 ELSE 0 END), 0) AS failover_triggers
+                    IFNULL(SUM(CASE WHEN error_message LIKE 'Provider returned 429%'
+                                         OR error_message LIKE 'Provider returned 401%'
+                                         OR error_message LIKE 'Provider returned 403%'
+                               THEN 1 ELSE 0 END), 0) AS failover_triggers
              FROM usage_logs
              WHERE success = 0",
         );
@@ -199,7 +205,7 @@ impl UsageService {
                     CAST(IFNULL(AVG(l.latency_ms), 0) AS REAL) AS avg_latency
              FROM usage_logs l
              LEFT JOIN accounts a ON l.account_id = a.id
-             LEFT JOIN vendors v ON a.vendor_id = v.id",
+             LEFT JOIN vendors v ON a.vendor_id = v.id WHERE 1=1",
         );
         append_time_filter(&mut sql, "l", start_time, end_time);
         sql.push_str(" GROUP BY v.id");
@@ -228,7 +234,7 @@ impl UsageService {
                     COUNT(*) AS requests,
                     IFNULL(SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END), 0) AS success_count,
                     CAST(IFNULL(AVG(latency_ms), 0) AS REAL) AS avg_latency
-             FROM usage_logs",
+             FROM usage_logs WHERE 1=1",
         );
         append_time_filter(&mut sql, "", start_time, end_time);
         sql.push_str(" GROUP BY model ORDER BY requests DESC");
@@ -261,7 +267,7 @@ impl UsageService {
                     CAST(IFNULL(AVG(l.latency_ms), 0) AS REAL) AS avg_latency
              FROM usage_logs l
              JOIN accounts a ON l.account_id = a.id
-             JOIN vendors v ON a.vendor_id = v.id",
+             JOIN vendors v ON a.vendor_id = v.id WHERE 1=1",
         );
         append_time_filter(&mut sql, "l", start_time, end_time);
         sql.push_str(" GROUP BY a.id, a.name");
@@ -328,6 +334,16 @@ impl UsageService {
         }
 
         rows_to_logs(query.fetch_all(&self.pool).await?)
+    }
+
+    /// 清理超过保留期（天）的 usage_logs，避免表无限增长。
+    pub async fn purge_old(&self, retention_days: i64) -> Result<u64> {
+        let cutoff = now_millis() - retention_days * 86_400_000;
+        let result = sqlx::query("DELETE FROM usage_logs WHERE ts < ?")
+            .bind(cutoff)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
     }
 }
 

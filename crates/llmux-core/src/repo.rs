@@ -40,6 +40,7 @@ pub async fn list_vendors(pool: &SqlitePool) -> Result<Vec<Vendor>> {
 }
 
 /// 新建厂商（builtin 固定为 0，用户自建）。
+#[allow(clippy::too_many_arguments)]
 pub async fn create_vendor(
     pool: &SqlitePool,
     id: &str,
@@ -68,6 +69,7 @@ pub async fn create_vendor(
 }
 
 /// 更新厂商，返回受影响行数（0 = 未找到）。
+#[allow(clippy::too_many_arguments)]
 pub async fn update_vendor(
     pool: &SqlitePool,
     id: &str,
@@ -132,6 +134,7 @@ pub async fn list_accounts_public(pool: &SqlitePool) -> Result<Vec<AccountPublic
 }
 
 /// 新建账户，返回 last_insert_rowid。
+#[allow(clippy::too_many_arguments)]
 pub async fn create_account(
     pool: &SqlitePool,
     vendor_id: &str,
@@ -173,6 +176,7 @@ pub async fn get_account(pool: &SqlitePool, id: i64) -> Result<Option<Account>> 
 }
 
 /// 更新账户，返回受影响行数。
+#[allow(clippy::too_many_arguments)]
 pub async fn update_account(
     pool: &SqlitePool,
     id: i64,
@@ -515,14 +519,6 @@ pub async fn list_alias_bindings_with_vendors(
     Ok(map)
 }
 
-/// 按模型名删除 key 白名单条目（删 alias 时清理悬挂引用），返回受影响行数。
-pub async fn delete_key_model_by_name(pool: &SqlitePool, model: &str) -> Result<u64> {
-    let result = sqlx::query("DELETE FROM api_key_models WHERE model = ?")
-        .bind(model)
-        .execute(pool)
-        .await?;
-    Ok(result.rows_affected())
-}
 
 // ---------------------------------------------------------------------------
 // 查询专用：无对应 model 类型时用轻量结构/元组承载

@@ -1,8 +1,7 @@
 use anyhow::Result;
-use rand::distributions::Alphanumeric;
-use rand::{thread_rng, Rng};
 use serde_json::{Map, Value};
 use sqlx::SqlitePool;
+use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 pub struct SettingsService {
@@ -72,12 +71,8 @@ impl SettingsService {
             }
         }
 
-        let suffix: String = thread_rng()
-            .sample_iter(&Alphanumeric)
-            .take(26)
-            .map(|b| (b as char).to_ascii_lowercase())
-            .collect();
-        let key = format!("sk-llmux-{suffix}");
+        // 网关 key 用 Uuid::new_v4()（OsRng 加密随机源），与账户 key 路径一致
+        let key = format!("sk-llmux-{}", Uuid::new_v4().simple());
         sqlx::query("INSERT OR REPLACE INTO app_settings (key, value) VALUES ('gateway_key', ?)")
             .bind(&key)
             .execute(&self.pool)

@@ -64,6 +64,8 @@ jobs:
           EXT=""
           if [[ "${{ matrix.name }}" == windows* ]]; then EXT=".exe"; fi
           cp target/${{ matrix.target }}/release/llmux$EXT ./llmux-${{ matrix.name }}$EXT
+          # 生成 SHA256 校验文件（install.sh 下载后校验）
+          python3 -c "import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest(), ' ', sys.argv[1])" ./llmux-${{ matrix.name }}$EXT > ./llmux-${{ matrix.name }}$EXT.sha256
 
       - name: Upload to Release
         shell: bash
@@ -72,4 +74,4 @@ jobs:
         run: |
           EXT=""
           if [[ "${{ matrix.name }}" == windows* ]]; then EXT=".exe"; fi
-          gh release upload ${{ github.event.release.tag_name }} llmux-${{ matrix.name }}$EXT --clobber
+          gh release upload ${{ github.event.release.tag_name }} llmux-${{ matrix.name }}$EXT llmux-${{ matrix.name }}$EXT.sha256 --clobber

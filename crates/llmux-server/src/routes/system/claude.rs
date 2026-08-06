@@ -7,6 +7,7 @@ use axum::{Extension, Json};
 use serde_json::{json, Value};
 
 use crate::app::AppState;
+use llmux_core::crypto::restrict_file_permissions;
 
 use super::helpers::{format_local_time, local_now_str, prune_backups, BackupQuery};
 
@@ -126,7 +127,11 @@ pub async fn apply_claude_settings(
         let timestamp = local_now_str();
         let backup_file = backup_dir.join(format!("settings.json.{timestamp}"));
         match std::fs::copy(&path, &backup_file) {
-            Ok(_) => Some(backup_file),
+            Ok(_) => {
+                // 备份含明文凭据（settings.json 含 env token），权限收紧为仅当前用户可读
+                restrict_file_permissions(&backup_file);
+                Some(backup_file)
+            }
             Err(_) => None, // non-fatal: backup failed but we can still proceed
         }
     } else {
@@ -277,7 +282,7 @@ pub async fn list_claude_backups(
                     let formatted_ts = metadata
                         .modified()
                         .ok()
-                        .map(|t| format_local_time(t))
+                        .map(format_local_time)
                         .unwrap_or_else(|| "unknown".to_string());
                     Some(json!({
                         "name": filename,

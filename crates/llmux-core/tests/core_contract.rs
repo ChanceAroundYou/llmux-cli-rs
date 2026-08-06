@@ -1,7 +1,7 @@
 use llmux_core::config::AppConfig;
 use llmux_core::crypto::{decrypt_api_key, encrypt_api_key, get_or_create_master_key};
 use llmux_core::db::{connect_sqlite, init_db};
-use llmux_core::dispatcher::{get_active_accounts, resolve_model};
+use llmux_core::dispatcher::{get_accounts_by_ids, get_active_accounts, resolve_model};
 use llmux_core::export_import::{export_config, import_config, ConfigExport};
 use llmux_core::models::{Account, ApiKey, ModelAlias, UsageLogParams, Vendor};
 use llmux_core::repo;
@@ -140,9 +140,8 @@ fn api_key_ciphertext_is_v2_self_describing_and_round_trips() {
     );
     assert!(decrypt_api_key(&ct, "wrong").is_err());
 
-    // v1 旧格式（log_n=15）仍可解密
+    // v1 旧格式已不再支持（删库重建场景，统一 v2 参数）
     let v1 = "v1:AAAAAAAAAAAAAAAAAAAAAA:AAAAAAAAAAAAAAAAAAAAAA:c2t2ZW5kb3ItcmVhbA";
-    // 手工构造 v1 不可行（需真实 scrypt 派生），这里只验证格式解析路径不崩溃于非法盐
     assert!(decrypt_api_key(v1, secret).is_err());
 }
 
@@ -836,4 +835,184 @@ async fn list_alias_bindings_with_vendors_groups_by_alias() {
     // 空 alias_ids 返回空 map
     let empty = repo::list_alias_bindings_with_vendors(&pool, &[]).await.expect("query");
     assert!(empty.is_empty());
+}
+
+#[tokio::test]
+async fn multi_protocol_vendor_accounts_flag_serves_anthropic() {
+    let pool = memory_db().await;
+    let secret = "test-master-key";
+
+    // deepseek 种子厂商：protocol=openai 但 protocols 含 "anthropic" → 可服务 /v1/messages
+    let ds_id = repo::create_account(
+        &pool,
+        "deepseek",
+        "DS",
+        &encrypt_api_key("sk-ds", secret).expect("encrypt"),
+        None,
+        None,
+        0,
+        1,
+        1,
+        None,
+    )
+    .await
+    .expect("insert deepseek account");
+
+    // openai 厂商账户 → 不应标记为服务 anthropic
+    let oa_id = repo::create_account(
+        &pool,
+        "openai",
+        "OA",
+        &encrypt_api_key("sk-oa", secret).expect("encrypt"),
+        None,
+        None,
+        0,
+        1,
+        1,
+        None,
+    )
+    .await
+    .expect("insert openai account");
+
+    let accounts = get_accounts_by_ids(&pool, &[ds_id, oa_id], secret)
+        .await
+        .expect("load accounts");
+    let ds = accounts.iter().find(|a| a.id == ds_id).expect("deepseek");
+    assert!(ds.serves_anthropic, "multi-protocol vendor should serve anthropic");
+    let oa = accounts.iter().find(|a| a.id == oa_id).expect("openai");
+    assert!(!oa.serves_anthropic, "openai vendor should not serve anthropic");
+}
+
+#[tokio::test]
+async fn usage_breakdown_time_filters_are_applied() {
+    let pool = memory_db().await;
+    let usage = UsageService::new(pool.clone());
+
+    let account_id = repo::create_account(&pool, "openai", "Main", "encrypted", None, None, 0, 1, 1, None)
+        .await
+        .expect("insert account");
+
+    // ts=1000（start=1500 之前）
+    usage
+        .log_usage(UsageLogParams {
+            timestamp: Some(1_000),
+            account_id,
+            account_name: "Main".into(),
+            model: "gpt-4o".into(),
+            latency_ms: 50,
+            success: true,
+            error_message: None,
+            limit_cache: None,
+        })
+        .await
+        .expect("log 1");
+    // ts=2000（start=1500 之后）
+    usage
+        .log_usage(UsageLogParams {
+            timestamp: Some(2_000),
+            account_id,
+            account_name: "Main".into(),
+            model: "gpt-4o-mini".into(),
+            latency_ms: 5,
+            success: false,
+            error_message: Some("429 rate limit".into()),
+            limit_cache: None,
+        })
+        .await
+        .expect("log 2");
+
+    // get_summary 带时间下限 → 只统计 ts>=1500
+    let summary = usage.get_summary(Some(1_500), None).await.expect("summary");
+    assert_eq!(summary.total_requests, 1);
+
+    // get_breakdown_by_model 带时间下限 → 只有 ts>=1500 的模型
+    let models = usage.get_breakdown_by_model(Some(1_500), None).await.expect("models");
+    assert_eq!(models.len(), 1);
+    assert_eq!(models[0].model.as_deref(), Some("gpt-4o-mini"));
+
+    // get_breakdown_by_vendor 带时间下限 → 无 NULL 桶、计数正确
+    let vendors = usage.get_breakdown_by_vendor(Some(1_500), None).await.expect("vendors");
+    assert_eq!(vendors.len(), 1);
+    assert_eq!(vendors[0].requests, 1);
+    assert!(vendors[0].id.is_some(), "vendor id should not be NULL");
+}
+
+#[tokio::test]
+async fn import_creates_placeholder_vendor_for_unknown_custom_vendor() {
+    let source = memory_db().await;
+    let secret = "migration-secret";
+
+    // 自定义厂商 + 账户（export 不导出 vendors）
+    repo::create_vendor(
+        &source,
+        "openrouter",
+        "OpenRouter",
+        "openai",
+        &["openai".to_string()],
+        true,
+        None,
+        None,
+    )
+    .await
+    .expect("create vendor");
+    repo::create_account(
+        &source,
+        "openrouter",
+        "OR",
+        &encrypt_api_key("sk-or", secret).expect("encrypt"),
+        None,
+        None,
+        0,
+        1,
+        1,
+        None,
+    )
+    .await
+    .expect("create account");
+
+    let exported = export_config(&source, secret).await.expect("export");
+    // 全新目标库：openrouter 厂商不存在，import 应补占位 vendor 而非 FK 违例
+    let target = memory_db().await;
+    let counts = import_config(&target, exported, secret)
+        .await
+        .expect("import with placeholder vendor");
+    assert_eq!(counts.accounts, 1);
+
+    let or: String = sqlx::query_scalar("SELECT vendor_id FROM accounts WHERE name = 'OR'")
+        .fetch_one(&target)
+        .await
+        .expect("account imported");
+    assert_eq!(or, "openrouter");
+    let vendor_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM vendors WHERE id = 'openrouter'")
+            .fetch_one(&target)
+            .await
+            .expect("vendor exists");
+    assert_eq!(vendor_count, 1);
+}
+
+#[tokio::test]
+async fn import_accepts_legacy_v1_export_field_names() {
+    let secret = "migration-secret";
+    // 旧版 version 1 导出格式：alias / provider_id / is_active
+    let legacy = serde_json::from_str::<ConfigExport>(
+        r#"{"version":1,"accounts":[{"alias":"kimi-web","provider_id":"kimi","api_key":"sk-legacy","is_active":1,"weight":1}]}"#,
+    )
+    .expect("deserialize legacy export");
+
+    assert_eq!(legacy.accounts[0].vendor_id, "kimi");
+    assert_eq!(legacy.accounts[0].name, "kimi-web");
+    assert_eq!(legacy.accounts[0].enabled, 1);
+
+    // provider "kimi" 不在种子厂商，占位 vendor 应自动补齐
+    let target = memory_db().await;
+    let counts = import_config(&target, legacy, secret)
+        .await
+        .expect("import legacy config");
+    assert_eq!(counts.accounts, 1);
+    let name: String = sqlx::query_scalar("SELECT name FROM accounts WHERE vendor_id = 'kimi'")
+        .fetch_one(&target)
+        .await
+        .expect("account imported");
+    assert_eq!(name, "kimi-web");
 }

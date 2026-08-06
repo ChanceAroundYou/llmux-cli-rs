@@ -95,6 +95,7 @@ pub async fn create_account(
         anthropic_base_url: anthropic_base_url.clone(),
         custom_base_url,
         custom_anthropic_base_url: anthropic_base_url.as_deref().is_some_and(|u| !u.is_empty()),
+        serves_anthropic: protocol == "anthropic",
         openai_compatible,
         openai_responses: true,
         enabled,
@@ -260,6 +261,7 @@ pub async fn update_account(
                 custom_anthropic_base_url: anthropic_base_url
                     .as_deref()
                     .is_some_and(|u| !u.is_empty()),
+                serves_anthropic: protocol == "anthropic",
                 openai_compatible,
                 openai_responses: true,
                 enabled,
@@ -348,6 +350,15 @@ pub async fn delete_account(
     }
 }
 
+/// CSV 字段转义（RFC 4180）：含逗号/引号/换行的字段用双引号包裹，内部引号翻倍。
+fn csv_escape(field: &str) -> String {
+    if field.contains(',') || field.contains('"') || field.contains('\n') || field.contains('\r') {
+        format!("\"{}\"", field.replace('"', "\"\""))
+    } else {
+        field.to_string()
+    }
+}
+
 pub async fn export_account_usage(
     Extension(state): Extension<AppState>,
     Path(id): Path<i64>,
@@ -367,7 +378,15 @@ pub async fn export_account_usage(
         let status = if *success != 0 { "Success" } else { "Failed" };
         let model = model.as_deref().unwrap_or("unknown");
         let error = error.as_deref().unwrap_or("");
-        csv.push_str(&format!("{ts},{model},{latency},{status},{error}\n"));
+        // 字段做 CSV 转义，避免 model/error 含逗号或引号破坏列结构
+        csv.push_str(&format!(
+            "{},{},{},{},{}\n",
+            csv_escape(&ts.to_string()),
+            csv_escape(model),
+            csv_escape(&latency.to_string()),
+            csv_escape(status),
+            csv_escape(error),
+        ));
     }
 
     let mut response = (StatusCode::OK, csv).into_response();

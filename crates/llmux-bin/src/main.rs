@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand};
 use llmux_core::config::AppConfig;
 use llmux_core::crypto::get_or_create_master_key;
 use llmux_core::db::{connect_sqlite, init_db, sqlite_url_from_path};
+use llmux_core::usage::UsageService;
 use llmux_server::app::{app, AppState};
 use llmux_server::routes::models::TestQueueState;
 use std::net::SocketAddr;
@@ -91,6 +92,18 @@ async fn start(port_override: Option<u16>, use_tui: bool) -> anyhow::Result<()> 
     } else {
         (0, 0, 0, 0, vec![])
     };
+
+    // 清理过期 usage_logs（保留期默认 30 天，可用 USAGE_RETENTION_DAYS 覆盖），避免表无限增长
+    let retention_days = std::env::var("USAGE_RETENTION_DAYS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(30);
+    if let Err(e) = UsageService::new(pool.clone())
+        .purge_old(retention_days)
+        .await
+    {
+        tracing::warn!("Failed to purge old usage logs: {e}");
+    }
 
     let db_path = config.database_path.display().to_string();
     let state = AppState {

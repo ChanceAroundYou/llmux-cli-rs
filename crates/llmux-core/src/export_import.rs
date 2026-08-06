@@ -10,14 +10,21 @@ pub struct ExportAccount {
     /// 源库账户 id，import 时用于把 alias 绑定重映射到目标库新 id。
     #[serde(default)]
     pub id: i64,
+    /// 旧版 version 1 字段名 provider_id（反序列化兼容）
+    #[serde(default, alias = "provider_id")]
     pub vendor_id: String,
+    /// 旧版 version 1 字段名 alias
+    #[serde(default, alias = "alias")]
     pub name: String,
     pub api_key: String,
     pub base_url: Option<String>,
     pub anthropic_base_url: Option<String>,
     #[serde(default)]
     pub openai_compatible: i64,
+    /// 旧版 version 1 字段名 is_active
+    #[serde(default, alias = "is_active")]
     pub enabled: i64,
+    #[serde(default)]
     pub weight: i64,
     pub notes: Option<String>,
 }
@@ -135,8 +142,9 @@ pub async fn export_config(pool: &SqlitePool, encryption_secret: &str) -> Result
         });
     }
 
+    // gateway_key 是目标库本机生成的凭据，不随配置导出（否则 import 可覆盖它锁死客户端）
     let settings =
-        sqlx::query_as::<_, (String, String)>("SELECT key, value FROM app_settings ORDER BY key")
+        sqlx::query_as::<_, (String, String)>("SELECT key, value FROM app_settings WHERE key != 'gateway_key' ORDER BY key")
             .fetch_all(pool)
             .await?
             .into_iter()
@@ -159,14 +167,54 @@ pub async fn import_config(
 ) -> Result<ImportCounts> {
     let mut tx = pool.begin().await?;
 
+    // 补齐缺失 vendor：accounts.vendor_id 是外键，跨机导入自定义厂商配置时
+    // 目标库可能不存在该厂商，先补占位 vendor 避免 FOREIGN KEY 违例
+    let mut vendor_ids: Vec<String> = Vec::new();
+    for account in &config.accounts {
+        vendor_ids.push(account.vendor_id.clone());
+    }
+    for alias in &config.aliases {
+        if let Some(v) = &alias.vendor_id {
+            vendor_ids.push(v.clone());
+        }
+    }
+    for vid in vendor_ids {
+        let exists: Option<i64> = sqlx::query_scalar("SELECT 1 FROM vendors WHERE id = ?")
+            .bind(&vid)
+            .fetch_optional(&mut *tx)
+            .await?;
+        if exists.is_none() {
+            sqlx::query(
+                "INSERT OR IGNORE INTO vendors (id, name, protocol, protocols, openai_responses, builtin)
+                 VALUES (?, ?, 'openai', '[\"openai\"]', 0, 0)",
+            )
+            .bind(&vid)
+            .bind(&vid)
+            .execute(&mut *tx)
+            .await?;
+        }
+    }
+
     // 源库账户 id → 目标库新 id 映射（alias 绑定据此重映射）
     let mut account_id_map: HashMap<i64, i64> = HashMap::new();
     for account in &config.accounts {
         let encrypted_key = encrypt_api_key(&account.api_key, encryption_secret)?;
-        let result = sqlx::query(
-            "INSERT OR REPLACE INTO accounts
+        // 用 ON CONFLICT DO UPDATE 而非 INSERT OR REPLACE：REPLACE 会先删旧行再插入，
+        // 触发 ON DELETE CASCADE 清空该账户的 alias 绑定；DO UPDATE 保留原行，
+        // rowid 稳定、绑定不丢，仅更新字段
+        sqlx::query(
+            "INSERT INTO accounts
              (vendor_id, name, api_key_enc, base_url, anthropic_base_url, openai_compatible, enabled, weight, notes)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(name) DO UPDATE SET
+                vendor_id = excluded.vendor_id,
+                api_key_enc = excluded.api_key_enc,
+                base_url = excluded.base_url,
+                anthropic_base_url = excluded.anthropic_base_url,
+                openai_compatible = excluded.openai_compatible,
+                enabled = excluded.enabled,
+                weight = excluded.weight,
+                notes = excluded.notes",
         )
         .bind(&account.vendor_id)
         .bind(&account.name)
@@ -179,7 +227,12 @@ pub async fn import_config(
         .bind(&account.notes)
         .execute(&mut *tx)
         .await?;
-        account_id_map.insert(account.id, result.last_insert_rowid());
+        // 冲突更新时 last_insert_rowid 不可靠，直接按唯一键 name 取 id
+        let new_account_id: i64 = sqlx::query_scalar("SELECT id FROM accounts WHERE name = ?")
+            .bind(&account.name)
+            .fetch_one(&mut *tx)
+            .await?;
+        account_id_map.insert(account.id, new_account_id);
     }
 
     for alias in &config.aliases {
@@ -224,12 +277,21 @@ pub async fn import_config(
     }
 
     for key in &config.keys {
-        let result = sqlx::query("INSERT OR REPLACE INTO api_keys (name, key) VALUES (?, ?)")
-            .bind(&key.name)
+        // 同样用 ON CONFLICT DO UPDATE：REPLACE 会删旧行级联清 api_key_models 白名单
+        sqlx::query(
+            "INSERT INTO api_keys (name, key) VALUES (?, ?)
+             ON CONFLICT(key) DO UPDATE SET name = excluded.name",
+        )
+        .bind(&key.name)
+        .bind(&key.key)
+        .execute(&mut *tx)
+        .await?;
+        let key_id: i64 = sqlx::query_scalar("SELECT id FROM api_keys WHERE key = ?")
             .bind(&key.key)
-            .execute(&mut *tx)
+            .fetch_one(&mut *tx)
             .await?;
-        let key_id = result.last_insert_rowid();
+        // 白名单是合并语义（INSERT OR IGNORE）：重复导入时旧条目保留、新条目追加，
+        // 不做整体替换；如需整体替换需先 DELETE 该 key 的白名单再写
         for model in &key.allowed_models {
             sqlx::query("INSERT OR IGNORE INTO api_key_models (api_key_id, model) VALUES (?, ?)")
                 .bind(key_id)

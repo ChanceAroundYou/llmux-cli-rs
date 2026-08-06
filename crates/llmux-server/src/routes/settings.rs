@@ -60,7 +60,8 @@ pub async fn purge_database(Extension(state): Extension<AppState>) -> Response {
 
     tracing::info!("⚙️ Purging database...");
 
-    // 依赖顺序删除运行数据；vendors 目录保留（内置种子 + 用户自建厂商），dispatch_state 保留。
+    // 依赖顺序删除运行数据；vendors 目录保留（内置种子 + 用户自建厂商），
+    // dispatch_state 保留，app_settings（含 gateway_key）保留 —— 清库后客户端 key 不失效。
     for table in &[
         "usage_logs",
         "model_alias_accounts",
@@ -68,7 +69,6 @@ pub async fn purge_database(Extension(state): Extension<AppState>) -> Response {
         "api_keys",
         "model_aliases",
         "accounts",
-        "app_settings",
     ] {
         if let Err(e) = sqlx::query(&format!("DELETE FROM {table}"))
             .execute(&mut *tx)
@@ -169,10 +169,9 @@ pub async fn import_config(
                 StatusCode::INTERNAL_SERVER_ERROR,
             ),
         },
-        Err(_) => Json(json!({
-            "success": true,
-            "imported": { "accounts": 0, "aliases": 0, "keys": 0 }
-        }))
-        .into_response(),
+        Err(e) => crate::error::simple_error(
+            format!("Invalid config format: {e}"),
+            StatusCode::BAD_REQUEST,
+        ),
     }
 }

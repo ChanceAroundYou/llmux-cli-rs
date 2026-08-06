@@ -522,6 +522,26 @@ if [ "$INSTALL_MODE" = "release" ]; then
 
     echo "$(select_text "下载完成，正在安装..." "Download complete, installing...")"
 
+    # 校验 SHA256（发布物附带 .sha256；缺失时警告跳过，不阻塞安装）
+    CHECKSUM_URL="${DOWNLOAD_URL}.sha256"
+    CHECKSUM_FILE="$WORK_DIR/llmux.sha256"
+    if curl --connect-timeout 10 --max-time 30 -fsSL -o "$CHECKSUM_FILE" "$CHECKSUM_URL" 2>/dev/null \
+        || wget -T 30 -q -O "$CHECKSUM_FILE" "$CHECKSUM_URL" 2>/dev/null; then
+        EXPECTED=$(awk '{print $1}' "$CHECKSUM_FILE")
+        if command -v shasum >/dev/null 2>&1; then
+            ACTUAL=$(shasum -a 256 "$BINARY_SOURCE" | awk '{print $1}')
+        else
+            ACTUAL=$(sha256sum "$BINARY_SOURCE" | awk '{print $1}')
+        fi
+        if [ -n "$EXPECTED" ] && [ "$EXPECTED" != "$ACTUAL" ]; then
+            echo "$(select_text "校验失败：二进制 SHA256 不匹配，安装中止。" "Checksum mismatch: binary SHA256 does not match, aborting.")" >&2
+            exit 1
+        fi
+        echo "$(select_text "SHA256 校验通过。" "SHA256 checksum verified.")"
+    else
+        echo "$(select_text "警告：无法获取校验和文件，跳过完整性校验。" "Warning: checksum file unavailable, skipping verification.")" >&2
+    fi
+
     if ! cp "$BINARY_SOURCE" "$BINARY_PATH" 2>/dev/null; then
         echo "$(select_text "写入错误：无法安装到目标目录。" "Write Error: Permission denied when attempting to write binary to $BINARY_PATH.")" >&2
         exit 1
@@ -600,4 +620,4 @@ maybe_help_setup_path
 9
 echo ""
 echo "$(select_text "启动后会打开本地网关，管理界面通常在：" "After launch, the local gateway is available at:")"
-echo "  http://localhost:25976"
+echo "  http://localhost:25975"

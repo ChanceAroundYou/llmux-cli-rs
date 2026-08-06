@@ -10,7 +10,6 @@ use std::fs;
 use std::path::Path;
 use zeroize::Zeroize;
 
-const VERSION_PREFIX: &str = "v1";
 const VERSION_PREFIX_V2: &str = "v2";
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 12;
@@ -18,8 +17,6 @@ const KEY_LEN: usize = 32;
 /// 新密文的 scrypt 工作因子。master.key 是 32 随机字节高熵，KDF 强度非安全瓶颈，
 /// 用 log_n=13 让加解密快约 30 倍（debug ~8s → ~250ms）。
 const DEFAULT_LOG_N: u8 = 13;
-/// v1 旧密文（Params::recommended）的 scrypt 工作因子，仅用于兼容解密。
-const LEGACY_LOG_N: u8 = 15;
 
 /// 加密厂商 api_key：`v2:{log_n}:{salt}:{nonce}:{ciphertext}`。
 /// 密文自描述工作因子，未来再调强度也无需迁移旧数据。
@@ -62,9 +59,7 @@ pub fn decrypt_api_key(encoded: &str, secret: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("missing ciphertext version"))?;
 
     let log_n = match version {
-        // v1 旧格式：无显式工作因子，用 Params::recommended 的值
-        VERSION_PREFIX => LEGACY_LOG_N,
-        // v2 格式：第二个字段为 scrypt log_n
+        // v2 格式：第二个字段为 scrypt log_n（v1 旧格式不再支持）
         VERSION_PREFIX_V2 => {
             let raw = parts
                 .next()
@@ -120,6 +115,8 @@ pub fn get_or_create_master_key(data_dir: &Path, explicit: Option<&str>) -> Resu
     fs::create_dir_all(data_dir)?;
     let path = data_dir.join("master.key");
     if path.exists() {
+        // 已存在的旧 master.key（可能以默认 0644 写入）也一并收紧权限
+        restrict_file_permissions(&path);
         return Ok(fs::read_to_string(&path)?.trim().to_string());
     }
 
@@ -128,5 +125,20 @@ pub fn get_or_create_master_key(data_dir: &Path, explicit: Option<&str>) -> Resu
     let generated = hex::encode(bytes);
     bytes.zeroize();
     fs::write(&path, &generated)?;
+    restrict_file_permissions(&path);
     Ok(generated)
+}
+
+/// 收紧文件权限为仅当前用户可读写（0600）。用于含明文凭据 / 解密密钥的文件。
+/// Unix 上生效（macOS/Linux），Windows 忽略（NTFS ACL 不由此 API 控制）。
+pub fn restrict_file_permissions(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
 }

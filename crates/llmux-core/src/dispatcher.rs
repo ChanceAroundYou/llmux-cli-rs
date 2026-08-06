@@ -1,6 +1,7 @@
 use crate::adapters::Account;
 use crate::crypto::decrypt_api_key;
 use crate::models::ModelAlias;
+use serde_json;
 use sqlx::{Row, SqlitePool};
 use std::collections::HashMap;
 use std::time::Instant;
@@ -353,7 +354,7 @@ pub async fn resolve_model(pool: &SqlitePool, model_name: &str) -> anyhow::Resul
 /// - 有效 anthropic URL = 账户自定义 anthropic_base_url（非空）或厂商 default_anthropic_url / default_base_url
 const ACCOUNT_SELECT: &str = "SELECT
     a.id, a.name, a.vendor_id, a.api_key_enc, a.enabled, a.weight, a.openai_compatible,
-    v.protocol, v.openai_responses,
+    v.protocol, v.protocols, v.openai_responses,
     a.base_url AS custom_base_url_raw,
     a.anthropic_base_url AS custom_anthropic_base_url_raw,
     COALESCE(NULLIF(a.base_url, ''), v.default_base_url) AS base_url,
@@ -381,16 +382,27 @@ fn row_to_account(row: &sqlx::sqlite::SqliteRow, encryption_secret: &str) -> Opt
                 .ok()
                 .flatten()
                 .is_some_and(|u| !u.is_empty());
+            let protocol: String = row.try_get("protocol").unwrap_or_default();
+            // 厂商声明支持 anthropic（vendors.protocols JSON 含 "anthropic"）→ 可服务 /v1/messages
+            let protocols: Vec<String> = row
+                .try_get::<Option<String>, _>("protocols")
+                .ok()
+                .flatten()
+                .map(|s| serde_json::from_str(&s).unwrap_or_default())
+                .unwrap_or_default();
+            let serves_anthropic = protocol == "anthropic"
+                || protocols.iter().any(|p| p == "anthropic");
             Some(Account {
                 id: row.try_get("id").unwrap_or_default(),
                 name: row.try_get("name").unwrap_or_default(),
                 vendor_id: row.try_get("vendor_id").unwrap_or_default(),
-                protocol: row.try_get("protocol").unwrap_or_default(),
+                protocol,
                 api_key,
                 base_url: row.try_get("base_url").ok(),
                 anthropic_base_url: row.try_get("anthropic_base_url").ok(),
                 custom_base_url,
                 custom_anthropic_base_url,
+                serves_anthropic,
                 openai_compatible: row.try_get("openai_compatible").unwrap_or(0),
                 openai_responses: row.try_get::<i64, _>("openai_responses").unwrap_or(1) == 1,
                 enabled: row.try_get("enabled").unwrap_or(1),

@@ -3,6 +3,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use llmux_core::repo;
+use llmux_core::usage::UsageService;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use utoipa::ToSchema;
@@ -54,13 +55,24 @@ pub async fn get_activity(
         })
         .collect();
 
-    let total_requests: i64 = entries.len() as i64;
-    let success_count: i64 = entries.iter().filter(|e| e["success"] == 1).count() as i64;
+    // totalRequests/successCount 用全表统计（entries 只是最近 N 条窗口，非真实总量）
+    let summary = match UsageService::new(state.pool.clone())
+        .get_summary(None, None)
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            return crate::error::simple_error(
+                format!("Failed to compute usage summary: {e}"),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            );
+        }
+    };
 
     Json(json!({
         "entries": entries,
-        "totalRequests": total_requests,
-        "successCount": success_count,
+        "totalRequests": summary.total_requests,
+        "successCount": summary.success_requests,
     }))
     .into_response()
 }

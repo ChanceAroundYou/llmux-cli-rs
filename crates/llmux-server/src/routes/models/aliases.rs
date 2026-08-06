@@ -180,8 +180,9 @@ pub async fn delete_model_alias(
     Extension(state): Extension<AppState>,
     Path(id): Path<i64>,
 ) -> Response {
-    let alias_name = match repo::get_alias_name_by_id(&state.pool, id).await {
-        Ok(Some(name)) => name,
+    // 确认 alias 存在（不存在返回 404）
+    match repo::get_alias_name_by_id(&state.pool, id).await {
+        Ok(Some(_)) => {}
         Ok(None) => {
             return crate::error::simple_error("Alias not found", StatusCode::NOT_FOUND);
         }
@@ -201,8 +202,10 @@ pub async fn delete_model_alias(
         );
     }
 
-    // 顺带清理 key 白名单里指向该 alias 的条目（避免悬挂引用）
-    let _ = repo::delete_key_model_by_name(&state.pool, &alias_name).await;
+    // 不再清理 key 白名单里与 alias 同名的条目：白名单条目可能是真实 model 名，
+    // 误删会清空受限 key 的白名单 → 静默升级为全模型可用（安全漏洞）。
+    // 残留条目只会让该 key 对 alias 名的请求走前缀回退透传到上游（上游拒绝未知模型），
+    // 不会扩大 key 的真实权限，属可接受的悬挂引用。
 
     // Invalidate models cache
     if let Ok(mut cache) = state.models_cache.lock() {
