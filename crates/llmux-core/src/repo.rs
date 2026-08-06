@@ -7,6 +7,7 @@
 use crate::models::{Account, AccountPublic, ApiKey, ModelAlias, Vendor};
 use anyhow::Result;
 use sqlx::{Row, SqlitePool};
+use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
 // vendors
@@ -14,12 +15,28 @@ use sqlx::{Row, SqlitePool};
 
 /// 列出全部厂商：内置优先、id 升序。
 pub async fn list_vendors(pool: &SqlitePool) -> Result<Vec<Vendor>> {
-    Ok(sqlx::query_as::<_, Vendor>(
-        "SELECT id, name, protocol, default_base_url, default_anthropic_url, builtin, created_at
+    let rows = sqlx::query(
+        "SELECT id, name, protocol, protocols, openai_responses, default_base_url, default_anthropic_url, builtin, created_at
          FROM vendors ORDER BY builtin DESC, id",
     )
     .fetch_all(pool)
-    .await?)
+    .await?;
+    let mut vendors = Vec::with_capacity(rows.len());
+    for row in rows {
+        let protocols_raw: String = row.try_get("protocols").unwrap_or_default();
+        vendors.push(Vendor {
+            id: row.try_get("id")?,
+            name: row.try_get("name")?,
+            protocol: row.try_get("protocol")?,
+            protocols: serde_json::from_str(&protocols_raw).unwrap_or_default(),
+            openai_responses: row.try_get::<i64, _>("openai_responses").unwrap_or(1) == 1,
+            default_base_url: row.try_get("default_base_url")?,
+            default_anthropic_url: row.try_get("default_anthropic_url")?,
+            builtin: row.try_get("builtin").unwrap_or(0),
+            created_at: row.try_get("created_at")?,
+        });
+    }
+    Ok(vendors)
 }
 
 /// 新建厂商（builtin 固定为 0，用户自建）。
@@ -28,16 +45,21 @@ pub async fn create_vendor(
     id: &str,
     name: &str,
     protocol: &str,
+    protocols: &[String],
+    openai_responses: bool,
     default_base_url: Option<&str>,
     default_anthropic_url: Option<&str>,
 ) -> Result<()> {
+    let protocols_json = serde_json::to_string(protocols).unwrap_or_default();
     sqlx::query(
-        "INSERT INTO vendors (id, name, protocol, default_base_url, default_anthropic_url, builtin)
-         VALUES (?, ?, ?, ?, ?, 0)",
+        "INSERT INTO vendors (id, name, protocol, protocols, openai_responses, default_base_url, default_anthropic_url, builtin)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 0)",
     )
     .bind(id)
     .bind(name)
     .bind(protocol)
+    .bind(protocols_json)
+    .bind(if openai_responses { 1 } else { 0 })
     .bind(default_base_url)
     .bind(default_anthropic_url)
     .execute(pool)
@@ -51,14 +73,19 @@ pub async fn update_vendor(
     id: &str,
     name: &str,
     protocol: &str,
+    protocols: &[String],
+    openai_responses: bool,
     default_base_url: Option<&str>,
     default_anthropic_url: Option<&str>,
 ) -> Result<u64> {
+    let protocols_json = serde_json::to_string(protocols).unwrap_or_default();
     let result = sqlx::query(
-        "UPDATE vendors SET name = ?, protocol = ?, default_base_url = ?, default_anthropic_url = ? WHERE id = ?",
+        "UPDATE vendors SET name = ?, protocol = ?, protocols = ?, openai_responses = ?, default_base_url = ?, default_anthropic_url = ? WHERE id = ?",
     )
     .bind(name)
     .bind(protocol)
+    .bind(protocols_json)
+    .bind(if openai_responses { 1 } else { 0 })
     .bind(default_base_url)
     .bind(default_anthropic_url)
     .bind(id)
@@ -98,7 +125,7 @@ pub async fn get_vendor(pool: &SqlitePool, id: &str) -> Result<Option<(String, O
 /// 列出对外可见的账户视图（不含 api_key_enc），id 降序。
 pub async fn list_accounts_public(pool: &SqlitePool) -> Result<Vec<AccountPublic>> {
     Ok(sqlx::query_as::<_, AccountPublic>(
-        "SELECT id, vendor_id, name, base_url, anthropic_base_url, CAST(enabled AS INTEGER) as enabled, weight, notes, created_at FROM accounts ORDER BY id DESC",
+        "SELECT id, vendor_id, name, base_url, anthropic_base_url, openai_compatible, CAST(enabled AS INTEGER) as enabled, weight, notes, created_at FROM accounts ORDER BY id DESC",
     )
     .fetch_all(pool)
     .await?)
@@ -112,19 +139,21 @@ pub async fn create_account(
     api_key_enc: &str,
     base_url: Option<&str>,
     anthropic_base_url: Option<&str>,
+    openai_compatible: i64,
     enabled: i64,
     weight: i64,
     notes: Option<&str>,
 ) -> Result<i64> {
     let result = sqlx::query(
-        "INSERT INTO accounts (vendor_id, name, api_key_enc, base_url, anthropic_base_url, enabled, weight, notes)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO accounts (vendor_id, name, api_key_enc, base_url, anthropic_base_url, openai_compatible, enabled, weight, notes)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(vendor_id)
     .bind(name)
     .bind(api_key_enc)
     .bind(base_url)
     .bind(anthropic_base_url)
+    .bind(openai_compatible)
     .bind(enabled)
     .bind(weight)
     .bind(notes)
@@ -136,7 +165,7 @@ pub async fn create_account(
 /// 按 id 读取账户全列。
 pub async fn get_account(pool: &SqlitePool, id: i64) -> Result<Option<Account>> {
     Ok(sqlx::query_as::<_, Account>(
-        "SELECT id, vendor_id, name, api_key_enc, base_url, anthropic_base_url, enabled, weight, notes, limits_cache, limits_cache_updated_at, created_at FROM accounts WHERE id = ?",
+        "SELECT id, vendor_id, name, api_key_enc, base_url, anthropic_base_url, openai_compatible, enabled, weight, notes, limits_cache, limits_cache_updated_at, created_at FROM accounts WHERE id = ?",
     )
     .bind(id)
     .fetch_optional(pool)
@@ -152,18 +181,20 @@ pub async fn update_account(
     api_key_enc: &str,
     base_url: Option<&str>,
     anthropic_base_url: Option<&str>,
+    openai_compatible: i64,
     enabled: i64,
     weight: i64,
     notes: Option<&str>,
 ) -> Result<u64> {
     let result = sqlx::query(
-        "UPDATE accounts SET vendor_id = ?, name = ?, api_key_enc = ?, base_url = ?, anthropic_base_url = ?, enabled = ?, weight = ?, notes = ? WHERE id = ?",
+        "UPDATE accounts SET vendor_id = ?, name = ?, api_key_enc = ?, base_url = ?, anthropic_base_url = ?, openai_compatible = ?, enabled = ?, weight = ?, notes = ? WHERE id = ?",
     )
     .bind(vendor_id)
     .bind(name)
     .bind(api_key_enc)
     .bind(base_url)
     .bind(anthropic_base_url)
+    .bind(openai_compatible)
     .bind(enabled)
     .bind(weight)
     .bind(notes)
@@ -430,6 +461,58 @@ pub async fn replace_alias_bindings(
     }
     tx.commit().await?;
     Ok(())
+}
+
+/// alias 绑定账户行 + 账户/厂商信息（供返回形状直接使用）。
+#[derive(Debug, Clone)]
+pub struct AliasBindingRow {
+    pub account_id: i64,
+    pub account_name: String,
+    pub vendor_id: String,
+    pub vendor_name: String,
+    pub protocol: String,
+    pub is_preferred: i64,
+}
+
+/// 批量取多个 alias 的绑定账户 + 账户/厂商信息，按 alias_id 分组。
+/// 一次查询消除 N+1；alias_ids 为空时返回空 map。
+pub async fn list_alias_bindings_with_vendors(
+    pool: &SqlitePool,
+    alias_ids: &[i64],
+) -> Result<HashMap<i64, Vec<AliasBindingRow>>> {
+    let mut map: HashMap<i64, Vec<AliasBindingRow>> = HashMap::new();
+    if alias_ids.is_empty() {
+        return Ok(map);
+    }
+    let placeholders: Vec<String> = alias_ids.iter().map(|_| "?".to_string()).collect();
+    let sql = format!(
+        "SELECT b.alias_id, b.account_id, b.is_preferred,
+                a.vendor_id, a.name AS account_name, v.name AS vendor_name, v.protocol
+         FROM model_alias_accounts b
+         JOIN accounts a ON a.id = b.account_id
+         JOIN vendors v ON v.id = a.vendor_id
+         WHERE b.alias_id IN ({})
+         ORDER BY b.alias_id, b.position, b.id",
+        placeholders.join(",")
+    );
+    let mut query = sqlx::query(&sql);
+    for id in alias_ids {
+        query = query.bind(id);
+    }
+    let rows = query.fetch_all(pool).await?;
+    for row in rows {
+        let alias_id: i64 = row.try_get("alias_id")?;
+        let entry = map.entry(alias_id).or_default();
+        entry.push(AliasBindingRow {
+            account_id: row.try_get("account_id")?,
+            account_name: row.try_get("account_name")?,
+            vendor_id: row.try_get("vendor_id")?,
+            vendor_name: row.try_get("vendor_name")?,
+            protocol: row.try_get("protocol")?,
+            is_preferred: row.try_get::<i64, _>("is_preferred").unwrap_or(0),
+        });
+    }
+    Ok(map)
 }
 
 /// 按模型名删除 key 白名单条目（删 alias 时清理悬挂引用），返回受影响行数。

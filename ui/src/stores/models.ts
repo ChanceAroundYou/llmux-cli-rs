@@ -9,14 +9,23 @@ export interface AvailableModel {
   error?: string;
 }
 
+export interface AliasAccountSummary {
+  id: number;
+  name: string;
+  vendor_id: string;
+  vendor_name: string;
+  protocol: string;
+  is_preferred: boolean;
+}
+
 export interface ModelAlias {
   id: number;
   alias: string;
   target_model: string;
   vendor_id: string | null;
-  account_ids: number[];
   preferred_account_id: number | null;
   created_at: string | null;
+  accounts: AliasAccountSummary[];
 }
 
 export interface Account {

@@ -26,6 +26,13 @@ fn parse_allowed_models(value: &Value) -> Vec<String> {
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/keys",
+    responses(
+        (status = 200, description = "网关 key 列表（含 allowed_models 白名单）", body = [llmux_core::models::ApiKey])
+    )
+)]
 pub async fn list_api_keys(Extension(state): Extension<AppState>) -> Response {
     let rows = match repo::list_api_keys(&state.pool).await {
         Ok(rows) => rows,
@@ -61,6 +68,14 @@ pub async fn list_api_keys(Extension(state): Extension<AppState>) -> Response {
     Json(Value::Array(result)).into_response()
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/keys",
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "创建网关 key 成功（返回明文 key）", body = serde_json::Value)
+    )
+)]
 pub async fn create_api_key(
     Extension(state): Extension<AppState>,
     Json(body): Json<Value>,
@@ -101,6 +116,15 @@ pub async fn create_api_key(
     .into_response()
 }
 
+#[utoipa::path(
+    put,
+    path = "/api/keys/{id}",
+    params(("id" = i64, Path, description = "网关 key ID")),
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "更新网关 key 成功", body = serde_json::Value)
+    )
+)]
 pub async fn update_api_key(
     Extension(state): Extension<AppState>,
     Path(id): Path<i64>,
@@ -133,6 +157,14 @@ pub async fn update_api_key(
     Json(json!({ "success": true })).into_response()
 }
 
+#[utoipa::path(
+    delete,
+    path = "/api/keys/{id}",
+    params(("id" = i64, Path, description = "网关 key ID")),
+    responses(
+        (status = 200, description = "删除网关 key 成功", body = serde_json::Value)
+    )
+)]
 pub async fn delete_api_key(
     Extension(state): Extension<AppState>,
     Path(id): Path<i64>,

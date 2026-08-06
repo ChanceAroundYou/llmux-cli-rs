@@ -52,6 +52,11 @@ pub struct Account {
     /// 账户是否显式配置了 anthropic_base_url —— 表示该账户提供 Anthropic 兼容端点，
     /// 即使厂商 protocol 是 openai/custom 也能服务 /v1/messages。
     pub custom_anthropic_base_url: bool,
+    /// gemini 协议账户走 OpenAI 兼容端点（/v1beta/openai）时置 1，
+    /// 允许该账户服务 /v1/chat/completions。
+    pub openai_compatible: i64,
+    /// 厂商是否支持 OpenAI Responses API（/v1/responses）。多数第三方仅实现 chat/completions。
+    pub openai_responses: bool,
     pub enabled: i64,
     pub weight: i64,
 }

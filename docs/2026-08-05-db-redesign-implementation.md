@@ -10,7 +10,7 @@
 
 按 spec 推倒重来数据库 schema（9 张新表取代旧 7 表），同步重写存储层、数据访问、dispatcher 路由、API 路由层与前端 UI。期间按用户反馈修复了 3 个运行时 bug、1 个性能问题，并做了 2 次架构决策调整。
 
-**测试基线：`cargo test --workspace` 全绿（core 18 / gateway 5 / server 9）。**
+**测试基线：`cargo test --workspace` 全绿（core 17 / gateway 5 / server 11，含 2026-08-06 恢复 openai_compatible 后新增的 2 条）。**
 
 ---
 
@@ -19,7 +19,7 @@
 | 新表 | 取代 | 说明 |
 |---|---|---|
 | `vendors` | `providers` | 厂商目录，`protocol ∈ (openai,anthropic,gemini,custom)`，`builtin` 标记，9 个种子厂商（openai/anthropic/gemini/deepseek/moonshot/zhipu/siliconflow/zai/huoshan），支持用户自建持久复用 |
-| `accounts` | 旧 `accounts` | `vendor_id` 外键、`name`（原 alias）、`enabled`（原 is_active）、`api_key_enc` AES-GCM 密文、`base_url`/`anthropic_base_url`（NULL = 用厂商默认） |
+| `accounts` | 旧 `accounts` | `vendor_id` 外键、`name`（原 alias）、`enabled`（原 is_active）、`openai_compatible`（gemini 走 OpenAI 兼容端点，2026-08-06 恢复）、`api_key_enc` AES-GCM 密文、`base_url`/`anthropic_base_url`（NULL = 用厂商默认） |
 | `model_aliases` | 旧 `model_aliases` | 去掉 `account_ids`/`preferred_account_id` JSON 列，改为 `vendor_id` 外键 |
 | `model_alias_accounts` | `account_ids` JSON 列 | alias↔账户绑定，`position` + `is_preferred`，`UNIQUE(alias_id,account_id)`，部分唯一索引 `uq_alias_one_preferred`（每 alias 最多一个首选） |
 | `api_keys` | 旧 `api_keys` | 网关 key **明文存储**（用户决策，见 §4.4），`key TEXT UNIQUE` |
@@ -149,7 +149,7 @@
 
 1. **`dispatch_state` 未接入持久化**：表已建，但 sticky router 仍是内存态（`Instant` 计时不可序列化，改持久化会动热路径）。spec 要求「重启不丢回退状态」，待后续单独做。
 2. **网关 key 明文存储**：库文件泄露可读网关 key（用户决策接受；厂商 key 仍加密）。
-3. **gemini 账户的 OpenAI 兼容模式（`openai_compatible`）已随 spec 删除**：gemini 协议账户只走 gemini 原生端点；想走 OpenAI 协议需自建 openai 协议厂商。
+3. **gemini 账户的 OpenAI 兼容模式（`openai_compatible`）已恢复**（2026-08-06 用户反馈该功能系特意添加、曾被我方实施时误删）：`accounts` 加回 `openai_compatible` 列；`v1/openai.rs` 过滤放行 `protocol ∈ {openai, custom}` **或** `gemini && openai_compatible`；未自定义 base_url 的 gemini 兼容账户默认端点 = 厂商默认 base + `/openai`（`effective_openai_base_url` helper，含测试覆盖）。
 4. **协议路由收紧**：openai 请求只走 openai/custom 协议账户；anthropic 请求走 anthropic 协议或显式 anthropic_base_url 账户；gemini 只走 gemini。
 5. 前端 `i18n/locales` 中 `setup.manualApiKey` / `keys.keyShownOnce` 键已不被引用（明文回读后不再需要），留着无害可清理。
 6. `crates/llmux-server/tests/server_contract.rs` 的 `account_alias_binding` 测试耗时约 30s（含一次 scrypt 加密），属正常。

@@ -7,6 +7,28 @@ pub fn normalize_base_url(value: &str) -> String {
     value.trim_end_matches('/').to_string()
 }
 
+/// OpenAI 兼容请求的上游端点（去尾部斜杠）。
+/// gemini 协议 + openai_compatible 且未自定义 base_url → 厂商默认 base + /openai
+/// （官方 OpenAI 兼容端点，如 https://generativelanguage.googleapis.com/v1beta/openai）。
+pub fn effective_openai_base_url(account: &adapters::Account) -> String {
+    if account.protocol == "gemini" && account.openai_compatible == 1 && !account.custom_base_url {
+        let default_base = account
+            .base_url
+            .as_deref()
+            .filter(|u| !u.is_empty())
+            .unwrap_or("https://generativelanguage.googleapis.com/v1beta");
+        format!("{}/openai", default_base.trim_end_matches('/'))
+    } else {
+        account
+            .base_url
+            .as_deref()
+            .filter(|u| !u.is_empty())
+            .unwrap_or("https://api.openai.com/v1")
+            .trim_end_matches('/')
+            .to_string()
+    }
+}
+
 pub fn send_tui_request(
     tui_tx: &Option<tokio::sync::mpsc::UnboundedSender<TuiEvent>>,
     path: &str,

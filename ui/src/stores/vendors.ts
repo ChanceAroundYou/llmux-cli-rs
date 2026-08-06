@@ -4,6 +4,10 @@ export interface Vendor {
   id: string;
   name: string;
   protocol: string;
+  /** 支持的全部协议（如 ["openai","anthropic"]） */
+  protocols: string[];
+  /** 是否支持 OpenAI Responses API（/v1/responses） */
+  openai_responses: boolean;
   default_base_url: string | null;
   default_anthropic_url: string | null;
   builtin: number;
@@ -15,8 +19,8 @@ interface VendorsState {
   isLoading: boolean;
   error: string | null;
   fetchVendors: () => Promise<void>;
-  createVendor: (vendor: { id: string; name: string; protocol: string; default_base_url?: string; default_anthropic_url?: string }) => Promise<void>;
-  updateVendor: (id: string, vendor: { name?: string; protocol?: string; default_base_url?: string; default_anthropic_url?: string }) => Promise<void>;
+  createVendor: (vendor: { id: string; name: string; protocol: string; protocols?: string[]; openai_responses?: boolean; default_base_url?: string; default_anthropic_url?: string }) => Promise<void>;
+  updateVendor: (id: string, vendor: { name?: string; protocol?: string; protocols?: string[]; openai_responses?: boolean; default_base_url?: string; default_anthropic_url?: string }) => Promise<void>;
   deleteVendor: (id: string) => Promise<void>;
 }
 

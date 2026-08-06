@@ -2,10 +2,14 @@
 -- 配置域 / 权限域 / 监控域 / 运行时域 严格分离，关系全部用外键表达。
 
 -- 配置域：厂商目录（内置种子 + 用户自建）
+-- protocol = 主协议（路由默认）；protocols = 支持的全部协议（JSON 数组，如 ["openai","anthropic"]）
+-- openai_responses = 是否支持 OpenAI Responses API（/v1/responses，部分第三方仅实现 chat/completions）
 CREATE TABLE IF NOT EXISTS vendors (
   id                    TEXT PRIMARY KEY,
   name                  TEXT NOT NULL,
   protocol              TEXT NOT NULL CHECK(protocol IN ('openai','anthropic','gemini','custom')),
+  protocols             TEXT NOT NULL DEFAULT '["openai"]',
+  openai_responses      INTEGER NOT NULL DEFAULT 1,
   default_base_url      TEXT,
   default_anthropic_url TEXT,
   builtin               INTEGER NOT NULL DEFAULT 0,
@@ -20,6 +24,7 @@ CREATE TABLE IF NOT EXISTS accounts (
   api_key_enc            TEXT NOT NULL,
   base_url               TEXT,
   anthropic_base_url     TEXT,
+  openai_compatible      INTEGER NOT NULL DEFAULT 0,  -- gemini 账户走 OpenAI 兼容端点（/v1beta/openai）
   enabled                INTEGER NOT NULL DEFAULT 1,
   weight                 INTEGER NOT NULL DEFAULT 1,
   notes                  TEXT,
@@ -103,14 +108,15 @@ CREATE TABLE IF NOT EXISTS app_settings (
   updated_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 
--- 种子数据：内置厂商目录
-INSERT OR IGNORE INTO vendors (id, name, protocol, default_base_url, default_anthropic_url, builtin) VALUES
-('openai',     'OpenAI',             'openai',    'https://api.openai.com/v1',                              NULL, 1),
-('anthropic',  'Anthropic',          'anthropic', 'https://api.anthropic.com/v1',                           NULL, 1),
-('gemini',     'Google Gemini',      'gemini',    'https://generativelanguage.googleapis.com/v1beta',       NULL, 1),
-('deepseek',   'DeepSeek',           'openai',    'https://api.deepseek.com',                            NULL, 1),
-('moonshot',   'Moonshot AI',        'openai',    'https://api.moonshot.cn/v1',                             NULL, 1),
-('zhipu',      '智谱 GLM',           'openai',    'https://open.bigmodel.cn/api/paas/v4',                   NULL, 1),
-('siliconflow', 'SiliconFlow',       'openai',    'https://api.siliconflow.cn/v1',                          NULL, 1),
-('zai',        '阶跃星辰 StepFun',   'openai',    'https://api.stepfun.com/v1',                             NULL, 1),
-('huoshan',    '火山方舟 Ark',       'openai',    'https://ark.cn-beijing.volces.com/api/v3',               NULL, 1);
+-- 种子数据：内置厂商目录（protocols 声明支持的全部协议；base_url 严格照官方，不自行增删 v1）
+-- openai_responses：官方 OpenAI=1；第三方 openai 兼容厂商保守标 0（多数仅实现 chat/completions，确认支持后可改 1）
+INSERT OR IGNORE INTO vendors (id, name, protocol, protocols, openai_responses, default_base_url, default_anthropic_url, builtin) VALUES
+('openai',     'OpenAI',             'openai',    '["openai"]',                  1, 'https://api.openai.com/v1',                              NULL, 1),
+('anthropic',  'Anthropic',          'anthropic', '["anthropic"]',                 1, 'https://api.anthropic.com/v1',                           NULL, 1),
+('gemini',     'Google Gemini',      'gemini',    '["gemini"]',                    1, 'https://generativelanguage.googleapis.com/v1beta',       NULL, 1),
+('deepseek',   'DeepSeek',           'openai',    '["openai","anthropic"]',        1, 'https://api.deepseek.com',                               'https://api.deepseek.com/anthropic',   1),
+('moonshot',   'Moonshot AI',        'openai',    '["openai","anthropic"]',        0, 'https://api.moonshot.cn/v1',                             'https://api.moonshot.cn/anthropic',    1),
+('zhipu',      '智谱 GLM',           'openai',    '["openai","anthropic"]',        0, 'https://open.bigmodel.cn/api/paas/v4',                   'https://open.bigmodel.cn/api/anthropic', 1),
+('siliconflow', 'SiliconFlow',       'openai',    '["openai","anthropic"]',        0, 'https://api.siliconflow.cn/v1',                          'https://api.siliconflow.cn',            1),
+('zai',        '阶跃星辰 StepFun',   'openai',    '["openai"]',                    0, 'https://api.stepfun.com/v1',                             NULL, 1),
+('huoshan',    '火山方舟 Ark',       'openai',    '["openai"]',                    0, 'https://ark.cn-beijing.volces.com/api/v3',               NULL, 1);

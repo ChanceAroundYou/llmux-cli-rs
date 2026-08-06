@@ -33,6 +33,11 @@ export function AliasModal({
     : [];
   const matchingAccounts = safeAccounts.filter(a => matchingAliases.includes(a.vendor_id) && a.enabled === 1);
   const otherAccounts = safeAccounts.filter(a => !matchingAliases.includes(a.vendor_id) && a.enabled === 1);
+  // 按 vendor_id 分组，便于按厂商浏览账户
+  const groupedByVendor = matchingAccounts.reduce<Record<string, typeof matchingAccounts>>((acc, a) => {
+    (acc[a.vendor_id] ||= []).push(a);
+    return acc;
+  }, {});
 
   return (
     <Dialog isOpen={isOpen} onClose={onClose} title={isEditing ? t('models.editAlias') : t('models.createAlias')}>
@@ -88,22 +93,29 @@ export function AliasModal({
               </div>
             )}
             <div className="max-h-32 overflow-y-auto space-y-1 border border-border rounded-lg p-2 bg-muted/30">
-              {matchingAccounts.map(a => (
-                <label key={a.id} className="flex items-center gap-2 px-2 py-1 hover:bg-muted/50 rounded cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={selectedAccountIds.includes(a.id)}
-                    onChange={e => {
-                      if (e.target.checked) {
-                        onAccountIdsChange([...selectedAccountIds, a.id]);
-                      } else {
-                        onAccountIdsChange(selectedAccountIds.filter(id => id !== a.id));
-                      }
-                    }}
-                    className="w-3.5 h-3.5 rounded accent-primary"
-                  />
-                  <span className="text-xs">[{a.vendor_id}] {a.name}</span>
-                </label>
+              {Object.entries(groupedByVendor).map(([vendorId, accounts]) => (
+                <div key={vendorId}>
+                  <div className="px-2 py-1 text-[10px] font-bold text-muted-foreground uppercase tracking-wide">
+                    [{vendorId}] ({accounts.length})
+                  </div>
+                  {accounts.map(a => (
+                    <label key={a.id} className="flex items-center gap-2 px-2 py-1 hover:bg-muted/50 rounded cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={selectedAccountIds.includes(a.id)}
+                        onChange={e => {
+                          if (e.target.checked) {
+                            onAccountIdsChange([...selectedAccountIds, a.id]);
+                          } else {
+                            onAccountIdsChange(selectedAccountIds.filter(id => id !== a.id));
+                          }
+                        }}
+                        className="w-3.5 h-3.5 rounded accent-primary"
+                      />
+                      <span className="text-xs">[{a.vendor_id}] {a.name}</span>
+                    </label>
+                  ))}
+                </div>
               ))}
               {matchingAccounts.length === 0 && (
                 <p className="text-xs text-muted-foreground p-2">{t('accounts.noAccounts')}</p>

@@ -1,22 +1,28 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use utoipa::ToSchema;
 
 // ---------------------------------------------------------------------------
 // 配置域
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
 pub struct Vendor {
     pub id: String,
     pub name: String,
+    /// 主协议（路由默认）。
     pub protocol: String,
+    /// 支持的全部协议（如 ["openai","anthropic"]），JSON 数组列解析而来。
+    pub protocols: Vec<String>,
+    /// 是否支持 OpenAI Responses API（/v1/responses）。多数第三方仅实现 chat/completions。
+    pub openai_responses: bool,
     pub default_base_url: Option<String>,
     pub default_anthropic_url: Option<String>,
     pub builtin: i64,
     pub created_at: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, PartialEq, ToSchema)]
 pub struct Account {
     pub id: Option<i64>,
     pub vendor_id: String,
@@ -24,6 +30,7 @@ pub struct Account {
     pub api_key_enc: String,
     pub base_url: Option<String>,
     pub anthropic_base_url: Option<String>,
+    pub openai_compatible: i64,
     pub enabled: i64,
     pub weight: i64,
     pub notes: Option<String>,
@@ -33,20 +40,21 @@ pub struct Account {
 }
 
 /// 对外展示的账户视图：不含 api_key_enc 密文。
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, PartialEq, ToSchema)]
 pub struct AccountPublic {
     pub id: Option<i64>,
     pub vendor_id: String,
     pub name: String,
     pub base_url: Option<String>,
     pub anthropic_base_url: Option<String>,
+    pub openai_compatible: i64,
     pub enabled: i64,
     pub weight: i64,
     pub notes: Option<String>,
     pub created_at: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, PartialEq, ToSchema)]
 pub struct ModelAlias {
     pub id: Option<i64>,
     pub alias: String,
@@ -70,7 +78,7 @@ pub struct ModelAliasAccount {
 // ---------------------------------------------------------------------------
 
 /// API key 视图：网关 key 明文存储（用户决定不加密），列表可直接回读用于一键配置。
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, PartialEq, ToSchema)]
 pub struct ApiKey {
     pub id: Option<i64>,
     pub name: String,
@@ -113,7 +121,7 @@ pub struct UsageLogParams {
 // 配置域（类型化 key-value）
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
 pub struct SettingRow {
     pub key: String,
     pub value: String,

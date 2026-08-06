@@ -8,6 +8,13 @@ use serde_json::{json, Value};
 
 use crate::app::AppState;
 
+#[utoipa::path(
+    get,
+    path = "/api/models/health",
+    responses(
+        (status = 200, description = "模型健康状态列表（含 limits_cache）")
+    )
+)]
 pub async fn get_models_health(Extension(state): Extension<AppState>) -> Response {
     let rows = match repo::get_model_health(&state.pool).await {
         Ok(r) => r,

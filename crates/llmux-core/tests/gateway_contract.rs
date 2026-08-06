@@ -18,6 +18,8 @@ fn account(protocol: &str) -> Account {
         anthropic_base_url: None,
         custom_base_url: false,
         custom_anthropic_base_url: false,
+        openai_compatible: 0,
+        openai_responses: true,
         enabled: 1,
         weight: 10,
     }

@@ -20,6 +20,9 @@ use tower_http::{
 
 use crate::routes::{accounts, auth, health, keys, models, settings, system, usage, v1, vendors};
 use crate::routes::models::TestQueueState;
+use crate::api_docs::ApiDoc;
+use utoipa::OpenApi;
+use utoipa_swagger_ui::SwaggerUi;
 
 #[derive(Clone)]
 pub struct ModelsCache {
@@ -272,6 +275,7 @@ pub fn app(state: AppState) -> AppRouter {
         .route("/api/export", get(settings::export_config))
         .route("/api/import", post(settings::import_config))
         .layer(Extension(state))
+        .merge(SwaggerUi::new("/swagger").url("/api-docs/openapi.json", ApiDoc::openapi()))
         .fallback(fallback)
         .layer(cors_layer())
         .layer(TraceLayer::new_for_http())

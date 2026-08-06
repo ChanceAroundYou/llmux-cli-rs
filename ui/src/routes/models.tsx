@@ -305,7 +305,7 @@ export default function Models() {
                   <div
                     key={a.id}
                     onClick={() => {
-                      const selectedIds = a.account_ids || [];
+                      const selectedIds = (a.accounts || []).map(x => x.id);
                       setAliasForm({
                         alias: a.alias,
                         target: a.target_model,
@@ -318,26 +318,49 @@ export default function Models() {
                     }}
                     className="p-2.5 bg-card border border-border rounded-xl flex items-center justify-between group hover:border-primary/30 transition-all cursor-pointer"
                   >
-                    <div className="flex items-center gap-2 min-w-0">
-                        <div className="flex items-center gap-1 group/alias">
-                           <span className="px-2 py-0.5 bg-primary/10 text-primary rounded text-xs font-bold uppercase truncate shadow-sm border border-primary/5">
-                             {a.alias}
-                           </span>
-                           <CopyButton value={a.alias} size={10} className="p-1 opacity-0 group-hover/alias:opacity-100 transition-opacity" />
-                        </div>
-                        <ArrowRight size={10} className="text-muted-foreground opacity-30 shrink-0" />
+                    <div className="min-w-0 flex-1">
                         <div className="flex items-center gap-2 min-w-0">
-                          <div className="text-xs font-bold truncate text-muted-foreground">{a.target_model}</div>
-                          {result && (
-                            <div className="flex items-center gap-1.5 shrink-0">
-                              <div className={cn(
-                                "w-1.5 h-1.5 rounded-full",
-                                result.success ? "bg-success" : "bg-destructive"
-                              )} />
-                              {result.latency != null && (
-                                <span className="text-xs font-bold text-muted-foreground/50">{(result.latency / 1000).toFixed(1)}s</span>
-                              )}
+                          <div className="flex items-center gap-1 group/alias">
+                             <span className="px-2 py-0.5 bg-primary/10 text-primary rounded text-xs font-bold uppercase truncate shadow-sm border border-primary/5">
+                               {a.alias}
+                             </span>
+                             <CopyButton value={a.alias} size={10} className="p-1 opacity-0 group-hover/alias:opacity-100 transition-opacity" />
+                          </div>
+                          <ArrowRight size={10} className="text-muted-foreground opacity-30 shrink-0" />
+                          <div className="flex items-center gap-2 min-w-0">
+                            <div className="text-xs font-bold truncate text-muted-foreground">{a.target_model}</div>
+                            {result && (
+                              <div className="flex items-center gap-1.5 shrink-0">
+                                <div className={cn(
+                                  "w-1.5 h-1.5 rounded-full",
+                                  result.success ? "bg-success" : "bg-destructive"
+                                )} />
+                                {result.latency != null && (
+                                  <span className="text-xs font-bold text-muted-foreground/50">{(result.latency / 1000).toFixed(1)}s</span>
+                                )}
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                        <div className="mt-1">
+                          {a.accounts && a.accounts.length > 0 ? (
+                            <div className="flex flex-wrap gap-1">
+                              {a.accounts.map(acc => (
+                                <span
+                                  key={acc.id}
+                                  className={`text-[10px] px-1.5 py-0.5 rounded border ${
+                                    acc.is_preferred
+                                      ? 'border-primary/40 bg-primary/10 text-primary'
+                                      : 'border-border bg-muted/40 text-muted-foreground'
+                                  }`}
+                                >
+                                  [{acc.vendor_id}] {acc.name}
+                                  {acc.is_preferred && ` · ${t('models.preferred')}`}
+                                </span>
+                              ))}
                             </div>
+                          ) : (
+                            <span className="text-[10px] text-muted-foreground/60 ml-2">{t('models.prefixFallback')}</span>
                           )}
                         </div>
                     </div>
@@ -546,6 +569,11 @@ export default function Models() {
             const matchingAliases = aliasForm.target ? [...new Set(models.filter(x => x.id === aliasForm.target).map(x => x.owned_by))] : [];
             const matchingAccounts = accts.filter(a => matchingAliases.includes(a.vendor_id) && a.enabled === 1);
             const otherAccounts = accts.filter(a => !matchingAliases.includes(a.vendor_id) && a.enabled === 1);
+            // 按 vendor_id 分组，便于按厂商浏览账户
+            const groupedByVendor = matchingAccounts.reduce<Record<string, typeof matchingAccounts>>((acc, a) => {
+              (acc[a.vendor_id] ||= []).push(a);
+              return acc;
+            }, {});
             if (!aliasForm.target) return null;
             return (
               <div className="space-y-1.5 border-t border-border pt-3">
@@ -577,7 +605,12 @@ export default function Models() {
                   </div>
                 )}
                 <div className="max-h-32 overflow-y-auto space-y-1 border border-border rounded-lg p-2 bg-muted/30">
-                  {matchingAccounts.map(a => (
+                  {Object.entries(groupedByVendor).map(([vendorId, accounts]) => (
+                <div key={vendorId}>
+                  <div className="px-2 py-1 text-[10px] font-bold text-muted-foreground uppercase tracking-wide">
+                    [{vendorId}] ({accounts.length})
+                  </div>
+                  {accounts.map(a => (
                 <label key={a.id} className="flex items-center gap-2 px-2 py-1 hover:bg-muted/50 rounded cursor-pointer">
                   <input
                     type="checkbox"
@@ -593,6 +626,8 @@ export default function Models() {
                   />
                   <span className="text-xs">[{a.vendor_id}] {a.name}</span>
                 </label>
+                  ))}
+                </div>
               ))}
                   {matchingAccounts.length === 0 && (
                     <p className="text-xs text-muted-foreground p-2">{t('accounts.noAccounts')}</p>

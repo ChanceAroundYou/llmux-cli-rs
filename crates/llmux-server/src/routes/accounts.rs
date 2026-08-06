@@ -10,6 +10,13 @@ use serde_json::{json, Value};
 use crate::app::AppState;
 use crate::routes::models::fetch_provider_models;
 
+#[utoipa::path(
+    get,
+    path = "/api/accounts",
+    responses(
+        (status = 200, description = "账户列表（不含 api_key 密文）", body = [llmux_core::models::AccountPublic])
+    )
+)]
 pub async fn list_accounts(Extension(state): Extension<AppState>) -> Response {
     match repo::list_accounts_public(&state.pool).await {
         Ok(accounts) => Json(serde_json::to_value(accounts).unwrap_or(Value::Array(vec![])))
@@ -21,6 +28,15 @@ pub async fn list_accounts(Extension(state): Extension<AppState>) -> Response {
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/accounts",
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "创建账户成功（返回 id / modelCount / skippedValidation）", body = serde_json::Value),
+        (status = 400, description = "参数缺失或厂商未知/校验失败")
+    )
+)]
 pub async fn create_account(
     Extension(state): Extension<AppState>,
     Json(body): Json<Value>,
@@ -42,6 +58,7 @@ pub async fn create_account(
     let anthropic_base_url = body["anthropic_base_url"].as_str().map(|s| s.to_string());
     let enabled = body["enabled"].as_i64().unwrap_or(1);
     let weight = body["weight"].as_i64().unwrap_or(1);
+    let openai_compatible = body["openai_compatible"].as_i64().unwrap_or(0);
     let notes = body["notes"].as_str().map(|s| s.to_string());
     let skip_validation = body["skip_validation"].as_bool().unwrap_or(false);
 
@@ -78,6 +95,8 @@ pub async fn create_account(
         anthropic_base_url: anthropic_base_url.clone(),
         custom_base_url,
         custom_anthropic_base_url: anthropic_base_url.as_deref().is_some_and(|u| !u.is_empty()),
+        openai_compatible,
+        openai_responses: true,
         enabled,
         weight,
     };
@@ -108,6 +127,7 @@ pub async fn create_account(
         &encrypted_key,
         base_url.as_deref(),
         anthropic_base_url.as_deref(),
+        openai_compatible,
         enabled,
         weight,
         notes.as_deref(),
@@ -131,6 +151,16 @@ pub async fn create_account(
     }
 }
 
+#[utoipa::path(
+    put,
+    path = "/api/accounts/{id}",
+    params(("id" = i64, Path, description = "账户 ID")),
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "更新账户成功", body = serde_json::Value),
+        (status = 404, description = "账户不存在")
+    )
+)]
 pub async fn update_account(
     Extension(state): Extension<AppState>,
     Path(id): Path<i64>,
@@ -182,6 +212,10 @@ pub async fn update_account(
         .get("weight")
         .and_then(|v| v.as_i64())
         .unwrap_or(existing.weight);
+    let openai_compatible = body
+        .get("openai_compatible")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(existing.openai_compatible);
     let notes = body
         .get("notes")
         .and_then(|v| v.as_str())
@@ -226,6 +260,8 @@ pub async fn update_account(
                 custom_anthropic_base_url: anthropic_base_url
                     .as_deref()
                     .is_some_and(|u| !u.is_empty()),
+                openai_compatible,
+                openai_responses: true,
                 enabled,
                 weight,
             };
@@ -260,6 +296,7 @@ pub async fn update_account(
         &api_key_ciphertext,
         base_url.as_deref(),
         anthropic_base_url.as_deref(),
+        openai_compatible,
         enabled,
         weight,
         notes.as_deref(),
@@ -275,6 +312,15 @@ pub async fn update_account(
     }
 }
 
+#[utoipa::path(
+    delete,
+    path = "/api/accounts/{id}",
+    params(("id" = i64, Path, description = "账户 ID")),
+    responses(
+        (status = 200, description = "删除账户成功", body = serde_json::Value),
+        (status = 404, description = "账户不存在")
+    )
+)]
 pub async fn delete_account(
     Extension(state): Extension<AppState>,
     Path(id): Path<i64>,

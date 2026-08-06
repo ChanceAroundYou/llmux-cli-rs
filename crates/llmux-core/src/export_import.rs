@@ -15,6 +15,8 @@ pub struct ExportAccount {
     pub api_key: String,
     pub base_url: Option<String>,
     pub anthropic_base_url: Option<String>,
+    #[serde(default)]
+    pub openai_compatible: i64,
     pub enabled: i64,
     pub weight: i64,
     pub notes: Option<String>,
@@ -64,7 +66,7 @@ pub struct ImportCounts {
 
 pub async fn export_config(pool: &SqlitePool, encryption_secret: &str) -> Result<ConfigExport> {
     let account_rows = sqlx::query(
-        "SELECT id, vendor_id, name, api_key_enc, base_url, anthropic_base_url, enabled, weight, notes
+        "SELECT id, vendor_id, name, api_key_enc, base_url, anthropic_base_url, openai_compatible, enabled, weight, notes
          FROM accounts
          ORDER BY id",
     )
@@ -81,6 +83,7 @@ pub async fn export_config(pool: &SqlitePool, encryption_secret: &str) -> Result
             api_key: decrypt_api_key(&encrypted_key, encryption_secret)?,
             base_url: row.try_get("base_url")?,
             anthropic_base_url: row.try_get("anthropic_base_url")?,
+            openai_compatible: row.try_get("openai_compatible")?,
             enabled: row.try_get("enabled")?,
             weight: row.try_get("weight")?,
             notes: row.try_get("notes")?,
@@ -162,14 +165,15 @@ pub async fn import_config(
         let encrypted_key = encrypt_api_key(&account.api_key, encryption_secret)?;
         let result = sqlx::query(
             "INSERT OR REPLACE INTO accounts
-             (vendor_id, name, api_key_enc, base_url, anthropic_base_url, enabled, weight, notes)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+             (vendor_id, name, api_key_enc, base_url, anthropic_base_url, openai_compatible, enabled, weight, notes)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&account.vendor_id)
         .bind(&account.name)
         .bind(encrypted_key)
         .bind(&account.base_url)
         .bind(&account.anthropic_base_url)
+        .bind(account.openai_compatible)
         .bind(account.enabled)
         .bind(account.weight)
         .bind(&account.notes)

@@ -5,16 +5,24 @@ use axum::{Extension, Json};
 use llmux_core::repo;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use utoipa::ToSchema;
 
 use crate::app::AppState;
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, ToSchema)]
 #[serde(default)]
 pub struct ActivityQuery {
     pub limit: Option<i64>,
 }
 
 /// Simple activity feed for the dashboard — recent requests without token details.
+#[utoipa::path(
+    get,
+    path = "/api/activity",
+    responses(
+        (status = 200, description = "最近活动列表（entries + totalRequests + successCount）")
+    )
+)]
 pub async fn get_activity(
     Extension(state): Extension<AppState>,
     Query(params): Query<ActivityQuery>,

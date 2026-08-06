@@ -352,8 +352,8 @@ pub async fn resolve_model(pool: &SqlitePool, model_name: &str) -> anyhow::Resul
 /// - 有效 openai URL = 账户自定义 base_url（非空）或厂商 default_base_url
 /// - 有效 anthropic URL = 账户自定义 anthropic_base_url（非空）或厂商 default_anthropic_url / default_base_url
 const ACCOUNT_SELECT: &str = "SELECT
-    a.id, a.name, a.vendor_id, a.api_key_enc, a.enabled, a.weight,
-    v.protocol,
+    a.id, a.name, a.vendor_id, a.api_key_enc, a.enabled, a.weight, a.openai_compatible,
+    v.protocol, v.openai_responses,
     a.base_url AS custom_base_url_raw,
     a.anthropic_base_url AS custom_anthropic_base_url_raw,
     COALESCE(NULLIF(a.base_url, ''), v.default_base_url) AS base_url,
@@ -391,6 +391,8 @@ fn row_to_account(row: &sqlx::sqlite::SqliteRow, encryption_secret: &str) -> Opt
                 anthropic_base_url: row.try_get("anthropic_base_url").ok(),
                 custom_base_url,
                 custom_anthropic_base_url,
+                openai_compatible: row.try_get("openai_compatible").unwrap_or(0),
+                openai_responses: row.try_get::<i64, _>("openai_responses").unwrap_or(1) == 1,
                 enabled: row.try_get("enabled").unwrap_or(1),
                 weight: row.try_get("weight").unwrap_or(1),
             })

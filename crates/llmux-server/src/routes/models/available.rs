@@ -44,6 +44,13 @@ fn normalize_model(m: &mut Value) {
     obj.entry("created".to_string()).or_insert(json!(0));
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/models/available",
+    responses(
+        (status = 200, description = "可用模型列表（返回 {data, stale, cached_at}，data 为异构模型对象数组）")
+    )
+)]
 pub async fn get_available_models(
     Extension(state): Extension<AppState>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,

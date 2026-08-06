@@ -17,7 +17,7 @@ use llmux_core::dispatcher::{self, get_accounts_by_ids, get_active_accounts, is_
 use crate::app::{AppState, TuiEvent};
 use crate::middleware::{self, AuthContext};
 
-use super::helpers::{log_usage, normalize_base_url, send_tui_request};
+use super::helpers::{effective_openai_base_url, log_usage, send_tui_request};
 
 // ---------------------------------------------------------------------------
 // /v1/chat/completions  — pure OpenAI-compatible passthrough
@@ -129,10 +129,23 @@ async fn openai_dispatch(
         );
     }
 
-    // 按协议过滤：OpenAI 兼容请求只用 openai / custom 协议账户
+    // 按协议过滤：OpenAI 兼容请求用 openai / custom 协议账户，
+    // 或开启了 openai_compatible 的 gemini 账户（走官方 OpenAI 兼容端点）。
+    // Responses API 请求额外要求厂商支持 /v1/responses（多数第三方仅实现 chat/completions）。
+    let is_responses = endpoint == "responses";
     let accounts: Vec<_> = accounts
         .into_iter()
-        .filter(|a| matches!(a.protocol.as_str(), "openai" | "custom"))
+        .filter(|a| {
+            let proto_ok = matches!(a.protocol.as_str(), "openai" | "custom")
+                || (a.protocol == "gemini" && a.openai_compatible == 1);
+            if !proto_ok {
+                return false;
+            }
+            if is_responses && !a.openai_responses {
+                return false;
+            }
+            true
+        })
         .collect();
 
     if accounts.is_empty() {
@@ -175,14 +188,9 @@ async fn openai_dispatch(
     let mut last_error: Option<String> = None;
 
     for account in &ordered_accounts {
-        // base_url 已在加载时解析（账户自定义或厂商 default_base_url）
-        let base_url = normalize_base_url(
-            account
-                .base_url
-                .as_deref()
-                .filter(|u| !u.is_empty())
-                .unwrap_or("https://api.openai.com/v1"),
-        );
+        // 上游端点：gemini + openai_compatible 且未自定义 base_url 时，
+        // 自动拼官方 OpenAI 兼容后缀 /openai。
+        let base_url = effective_openai_base_url(account);
         let mut req_headers = BTreeMap::from([(
             "content-type".to_string(),
             "application/json".to_string(),

@@ -6,6 +6,7 @@ export interface Account {
   name: string;
   base_url: string | null;
   anthropic_base_url: string | null;
+  openai_compatible: number;
   enabled: number;
   weight: number;
   notes: string | null;
@@ -17,8 +18,8 @@ interface AccountsState {
   isLoading: boolean;
   error: string | null;
   fetchAccounts: () => Promise<void>;
-  addAccount: (account: { vendor_id: string; name: string; api_key: string; base_url?: string; anthropic_base_url?: string; enabled?: number; weight?: number; notes?: string; skip_validation?: boolean }) => Promise<void>;
-  updateAccount: (id: number, account: { vendor_id?: string; name?: string; api_key?: string; base_url?: string; anthropic_base_url?: string; enabled?: number; weight?: number; notes?: string; skip_validation?: boolean }) => Promise<void>;
+  addAccount: (account: { vendor_id: string; name: string; api_key: string; base_url?: string; anthropic_base_url?: string; openai_compatible?: number; enabled?: number; weight?: number; notes?: string; skip_validation?: boolean }) => Promise<void>;
+  updateAccount: (id: number, account: { vendor_id?: string; name?: string; api_key?: string; base_url?: string; anthropic_base_url?: string; openai_compatible?: number; enabled?: number; weight?: number; notes?: string; skip_validation?: boolean }) => Promise<void>;
   deleteAccount: (id: number) => Promise<void>;
   toggleEnabled: (id: number, currentStatus: number) => Promise<void>;
 }

@@ -199,7 +199,7 @@ async fn usage_service_logs_minimal_rows_updates_limit_cache() {
     let pool = memory_db().await;
     let usage = UsageService::new(pool.clone());
 
-    let account_id = repo::create_account(&pool, "openai", "Main", "encrypted", None, None, 1, 1, None)
+    let account_id = repo::create_account(&pool, "openai", "Main", "encrypted", None, None, 0, 1, 1, None)
         .await
         .expect("insert account");
 
@@ -452,10 +452,10 @@ async fn each_alias_allows_at_most_one_preferred_account() {
 #[tokio::test]
 async fn resolve_model_prefers_bindings_then_vendor_then_prefix() {
     let pool = memory_db().await;
-    let a: i64 = repo::create_account(&pool, "openai", "A", "enc", None, None, 1, 1, None)
+    let a: i64 = repo::create_account(&pool, "openai", "A", "enc", None, None, 0, 1, 1, None)
         .await
         .unwrap();
-    let b: i64 = repo::create_account(&pool, "openai", "B", "enc", None, None, 1, 1, None)
+    let b: i64 = repo::create_account(&pool, "openai", "B", "enc", None, None, 0, 1, 1, None)
         .await
         .unwrap();
 
@@ -500,6 +500,7 @@ async fn active_accounts_resolve_vendor_base_url_and_protocol() {
         &encrypt_api_key("sk-a", secret).expect("encrypt"),
         None,
         None,
+        0,
         1,
         10,
         None,
@@ -513,6 +514,8 @@ async fn active_accounts_resolve_vendor_base_url_and_protocol() {
         "my-vendor",
         "My",
         "openai",
+        &["openai".to_string()],
+        true,
         Some("https://custom.example/v1"),
         None,
     )
@@ -525,6 +528,7 @@ async fn active_accounts_resolve_vendor_base_url_and_protocol() {
         &encrypt_api_key("sk-b", secret).expect("encrypt"),
         Some("https://override.example/v2"),
         None,
+        0,
         1,
         1,
         None,
@@ -539,6 +543,7 @@ async fn active_accounts_resolve_vendor_base_url_and_protocol() {
         &encrypt_api_key("sk-c", secret).expect("encrypt"),
         None,
         None,
+        0,
         0,
         1,
         None,
@@ -615,6 +620,7 @@ async fn export_import_preserves_new_fields_and_regenerates_keys() {
         &encrypt_api_key("sk-live", secret).expect("encrypt fixture"),
         Some("https://api.openai.example/v1"),
         Some("https://anthropic.example"),
+        1,
         1,
         7,
         Some("note"),
@@ -711,6 +717,7 @@ fn model_structs_use_new_field_names() {
         api_key_enc: "enc".into(),
         base_url: None,
         anthropic_base_url: None,
+        openai_compatible: 0,
         enabled: 1,
         weight: 1,
         notes: None,
@@ -737,6 +744,8 @@ fn model_structs_use_new_field_names() {
         id: "openai".into(),
         name: "OpenAI".into(),
         protocol: "openai".into(),
+        protocols: vec!["openai".to_string()],
+        openai_responses: true,
         default_base_url: None,
         default_anthropic_url: None,
         builtin: 1,
@@ -786,4 +795,45 @@ async fn upsert_alias_returns_real_id_on_update_branch() {
         .expect("UPDATE 分支返回的 id 上绑定应成功");
     let bindings = repo::list_alias_bindings(&pool, second).await.unwrap();
     assert_eq!(bindings, vec![(acc, 0)]);
+}
+
+/// 批量取 alias 绑定 + 厂商信息：按 alias_id 分组，一次查询消除 N+1。
+#[tokio::test]
+async fn list_alias_bindings_with_vendors_groups_by_alias() {
+    let pool = memory_db().await;
+    let secret = "vendor-agg-secret";
+
+    // 建 zai 账户 + huoshan 账户
+    let zai_acct = repo::create_account(
+        &pool, "zai", "ZaiMain",
+        &encrypt_api_key("sk-zai", secret).expect("encrypt"),
+        None, None, 0, 1, 1, None,
+    ).await.expect("insert zai account");
+    let huoshan_acct = repo::create_account(
+        &pool, "huoshan", "HuoshanMain",
+        &encrypt_api_key("sk-hs", secret).expect("encrypt"),
+        None, None, 0, 1, 1, None,
+    ).await.expect("insert huoshan account");
+
+    // 建 alias 绑定两账户，zai 为首选
+    let alias_id = repo::upsert_alias(&pool, "gml52", "gml-5.2", None)
+        .await.expect("upsert alias");
+    repo::replace_alias_bindings(&pool, alias_id, &[zai_acct, huoshan_acct], Some(zai_acct))
+        .await.expect("bind");
+
+    let map = repo::list_alias_bindings_with_vendors(&pool, &[alias_id])
+        .await.expect("query");
+    let rows = map.get(&alias_id).expect("alias present");
+    assert_eq!(rows.len(), 2);
+    // 每行含厂商信息
+    let zai_row = rows.iter().find(|r| r.vendor_id == "zai").expect("zai row");
+    assert_eq!(zai_row.vendor_name, "阶跃星辰 StepFun");
+    assert_eq!(zai_row.protocol, "openai");
+    assert_eq!(zai_row.is_preferred, 1);
+    let hs_row = rows.iter().find(|r| r.vendor_id == "huoshan").expect("huoshan row");
+    assert_eq!(hs_row.is_preferred, 0);
+
+    // 空 alias_ids 返回空 map
+    let empty = repo::list_alias_bindings_with_vendors(&pool, &[]).await.expect("query");
+    assert!(empty.is_empty());
 }

@@ -93,7 +93,7 @@ pub async fn handle_web_session(
     }
 
     // Insert new web session account.
-    match repo::create_account(&state.pool, &vendor_id, &name, &encrypted_token, None, None, 1, 1, None).await {
+    match repo::create_account(&state.pool, &vendor_id, &name, &encrypted_token, None, None, 0, 1, 1, None).await {
         Ok(_) => {
             tracing::info!("🔐 Successfully imported Web Session for {provider}");
             Json(json!({

@@ -26,3 +26,5 @@ tower-http.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 time.workspace = true
+utoipa = { workspace = true, features = ["axum_extras"] }
+utoipa-swagger-ui.workspace = true

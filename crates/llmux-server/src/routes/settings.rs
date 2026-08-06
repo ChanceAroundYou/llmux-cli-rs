@@ -102,6 +102,13 @@ pub async fn purge_database(Extension(state): Extension<AppState>) -> Response {
     Json(json!({ "success": true, "message": "Database purged successfully" })).into_response()
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/export",
+    responses(
+        (status = 200, description = "导出全量配置 JSON（application/json 附件下载）")
+    )
+)]
 pub async fn export_config(Extension(state): Extension<AppState>) -> Response {
     match llmux_core::export_import::export_config(&state.pool, &state.master_key).await {
         Ok(config) => {
@@ -134,6 +141,14 @@ pub async fn export_config(Extension(state): Extension<AppState>) -> Response {
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/import",
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "导入配置结果（imported 含 accounts/aliases/keys 计数）", body = serde_json::Value)
+    )
+)]
 pub async fn import_config(
     Extension(state): Extension<AppState>,
     Json(body): Json<Value>,

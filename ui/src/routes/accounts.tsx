@@ -29,9 +29,11 @@ export default function Accounts() {
   const [editingAccount, setEditingAccount] = useState<any>(null);
   const [formData, setFormData] = useState({ vendor_id: '', name: '', api_key: '', base_url: '', anthropic_base_url: '' });
   const [formSupportsAnthropic, setFormSupportsAnthropic] = useState(false);
+  const [formOpenAICompat, setFormOpenAICompat] = useState(false);
   const [formSkipValidation, setFormSkipValidation] = useState(false);
   const [editData, setEditData] = useState({ vendor_id: '', name: '', api_key: '', base_url: '', anthropic_base_url: '', notes: '' });
   const [editSupportsAnthropic, setEditSupportsAnthropic] = useState(false);
+  const [editOpenAICompat, setEditOpenAICompat] = useState(false);
   const [editSkipValidation, setEditSkipValidation] = useState(false);
   const [accountToDelete, setAccountToDelete] = useState<{id: number, name: string} | null>(null);
   const [isValidating, setIsValidating] = useState(false);
@@ -52,10 +54,15 @@ export default function Accounts() {
     return 'https://api.openai.com/v1';
   };
 
-  // anthropic 兼容端点仅对 openai/custom 协议厂商开放
+  // 「启用 Anthropic 协议端点」仅在厂商声明支持 anthropic 协议时显示
   const shouldShowAnthropic = (vendorId: string) => {
-    const protocol = getVendor(vendorId)?.protocol;
-    return protocol === 'openai' || protocol === 'custom';
+    const vendor = getVendor(vendorId);
+    return vendor?.protocol === 'anthropic' || !!vendor?.protocols?.includes('anthropic');
+  };
+
+  // OpenAI 兼容模式仅对 gemini 协议厂商开放
+  const shouldShowOpenAICompat = (vendorId: string) => {
+    return getVendor(vendorId)?.protocol === 'gemini';
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -63,10 +70,11 @@ export default function Accounts() {
     setIsValidating(true);
     setValidationError(null);
     try {
-      await addAccount({ ...formData, skip_validation: formSkipValidation });
+      await addAccount({ ...formData, openai_compatible: formOpenAICompat ? 1 : 0, skip_validation: formSkipValidation });
       setIsModalOpen(false);
       setFormData({ vendor_id: '', name: '', api_key: '', base_url: '', anthropic_base_url: '' });
       setFormSupportsAnthropic(false);
+      setFormOpenAICompat(false);
       setFormSkipValidation(false);
     } catch (err: any) {
       setValidationError(err.message || "Validation failed");
@@ -80,6 +88,7 @@ export default function Accounts() {
     setEditingAccount(acc);
     setEditData({ vendor_id: acc.vendor_id, name: acc.name, api_key: '', base_url: acc.base_url || '', anthropic_base_url: acc.anthropic_base_url || '', notes: acc.notes || '' });
     setEditSupportsAnthropic(!!acc.anthropic_base_url);
+    setEditOpenAICompat(!!acc.openai_compatible);
     setIsEditOpen(true);
   };
 
@@ -89,7 +98,7 @@ export default function Accounts() {
     setIsValidating(true);
     setValidationError(null);
     try {
-      await updateAccount(editingAccount.id, { ...editData, skip_validation: editSkipValidation });
+      await updateAccount(editingAccount.id, { ...editData, openai_compatible: editOpenAICompat ? 1 : 0, skip_validation: editSkipValidation });
       setIsEditOpen(false);
       setEditingAccount(null);
     } catch (err: any) {
@@ -282,6 +291,21 @@ export default function Accounts() {
                 )}
               </>
             )}
+            {formData.vendor_id && shouldShowOpenAICompat(formData.vendor_id) && (
+              <div className="space-y-1.5 border-t border-border pt-3">
+                <label className="flex items-center gap-2 cursor-pointer select-none">
+                  <input
+                    type="checkbox"
+                    checked={formOpenAICompat}
+                    disabled={isValidating}
+                    onChange={e => setFormOpenAICompat(e.target.checked)}
+                    className="w-4 h-4 rounded accent-primary"
+                  />
+                  <span className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.openaiCompat')}</span>
+                </label>
+                <p className="text-xs text-muted-foreground ml-6">{t('accounts.openaiCompatHint')}</p>
+              </div>
+            )}
             <div className="space-y-1.5 border-t border-border pt-3">
               <label className="flex items-center gap-2 cursor-pointer select-none">
                 <input
@@ -428,6 +452,21 @@ export default function Accounts() {
                   </div>
                 )}
               </>
+            )}
+            {editData.vendor_id && shouldShowOpenAICompat(editData.vendor_id) && (
+              <div className="space-y-1.5 border-t border-border pt-3">
+                <label className="flex items-center gap-2 cursor-pointer select-none">
+                  <input
+                    type="checkbox"
+                    checked={editOpenAICompat}
+                    disabled={isValidating}
+                    onChange={e => setEditOpenAICompat(e.target.checked)}
+                    className="w-4 h-4 rounded accent-primary"
+                  />
+                  <span className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.openaiCompat')}</span>
+                </label>
+                <p className="text-xs text-muted-foreground ml-6">{t('accounts.openaiCompatHint')}</p>
+              </div>
             )}
             <div className="space-y-1.5 border-t border-border pt-3">
               <label className="flex items-center gap-2 cursor-pointer select-none">
