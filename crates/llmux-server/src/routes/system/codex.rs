@@ -35,6 +35,13 @@ fn codex_backups_dir(data_dir: &std::path::Path) -> std::path::PathBuf {
     data_dir.join("codex-backups")
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/system/codex-settings",
+    responses(
+        (status = 200, description = "读取 Codex 配置", body = serde_json::Value)
+    )
+)]
 pub async fn get_codex_settings() -> Json<Value> {
     let auth = codex_auth_path()
         .and_then(|p| if p.exists() { fs::read_to_string(&p).ok() } else { None })
@@ -52,6 +59,14 @@ pub async fn get_codex_settings() -> Json<Value> {
     }))
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/system/codex-settings",
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "写入 Codex 配置（含备份）", body = serde_json::Value)
+    )
+)]
 pub async fn apply_codex_settings(
     Extension(state): Extension<AppState>,
     Json(body): Json<Value>,
@@ -225,6 +240,13 @@ fn is_valid_codex_backup_name(name: &str) -> bool {
     name.starts_with("codex.") && !name.contains('/') && !name.contains("..")
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/system/codex-backups",
+    responses(
+        (status = 200, description = "列出/读取 Codex 配置备份", body = serde_json::Value)
+    )
+)]
 pub async fn list_codex_backups(
     Extension(state): Extension<AppState>,
     Query(query): Query<BackupQuery>,
@@ -284,6 +306,14 @@ pub async fn list_codex_backups(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/system/codex-backups",
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "从备份恢复 Codex 配置", body = serde_json::Value)
+    )
+)]
 pub async fn restore_codex_backup(
     Extension(state): Extension<AppState>,
     Json(body): Json<Value>,
@@ -338,6 +368,14 @@ pub async fn restore_codex_backup(
     Json(json!({ "success": true })).into_response()
 }
 
+#[utoipa::path(
+    delete,
+    path = "/api/system/codex-backups",
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "删除 Codex 配置备份", body = serde_json::Value)
+    )
+)]
 pub async fn delete_codex_backup(
     Extension(state): Extension<AppState>,
     Json(body): Json<Value>,

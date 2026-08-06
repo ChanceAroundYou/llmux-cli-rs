@@ -58,6 +58,13 @@ fn set_env_key(env_content: &str, key: &str, value: &str) -> String {
     format!("{}\n{}={}\n", env_content.trim_end(), key, value)
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/system/gemini-settings",
+    responses(
+        (status = 200, description = "读取 Gemini 配置", body = serde_json::Value)
+    )
+)]
 pub async fn get_gemini_settings() -> Json<Value> {
     let env = gemini_env_path()
         .and_then(|p| if p.exists() { fs::read_to_string(&p).ok() } else { None });
@@ -74,6 +81,14 @@ pub async fn get_gemini_settings() -> Json<Value> {
     }))
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/system/gemini-settings",
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "写入 Gemini 配置（含备份）", body = serde_json::Value)
+    )
+)]
 pub async fn apply_gemini_settings(
     Extension(state): Extension<AppState>,
     Json(body): Json<Value>,
@@ -196,6 +211,13 @@ fn is_valid_gemini_backup_name(name: &str) -> bool {
     name.starts_with("gemini.") && !name.contains('/') && !name.contains("..")
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/system/gemini-backups",
+    responses(
+        (status = 200, description = "列出/读取 Gemini 配置备份", body = serde_json::Value)
+    )
+)]
 pub async fn list_gemini_backups(
     Extension(state): Extension<AppState>,
     Query(query): Query<BackupQuery>,
@@ -255,6 +277,14 @@ pub async fn list_gemini_backups(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/system/gemini-backups",
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "从备份恢复 Gemini 配置", body = serde_json::Value)
+    )
+)]
 pub async fn restore_gemini_backup(
     Extension(state): Extension<AppState>,
     Json(body): Json<Value>,
@@ -306,6 +336,14 @@ pub async fn restore_gemini_backup(
     Json(json!({ "success": true })).into_response()
 }
 
+#[utoipa::path(
+    delete,
+    path = "/api/system/gemini-backups",
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "删除 Gemini 配置备份", body = serde_json::Value)
+    )
+)]
 pub async fn delete_gemini_backup(
     Extension(state): Extension<AppState>,
     Json(body): Json<Value>,

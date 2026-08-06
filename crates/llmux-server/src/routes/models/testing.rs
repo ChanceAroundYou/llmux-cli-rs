@@ -11,6 +11,13 @@ use llmux_core::dispatcher::{
 
 use crate::app::AppState;
 
+#[utoipa::path(
+    get,
+    path = "/api/models/test-queue/status",
+    responses(
+        (status = 200, description = "模型批量测试队列状态（isRunning/total/current/progress）", body = serde_json::Value)
+    )
+)]
 pub async fn get_test_queue_status(Extension(state): Extension<AppState>) -> Response {
     let queue = state.test_queue.lock().unwrap();
     Json(json!({
@@ -22,6 +29,15 @@ pub async fn get_test_queue_status(Extension(state): Extension<AppState>) -> Res
     .into_response()
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/models/test-all",
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "启动全量模型批量测试队列", body = serde_json::Value),
+        (status = 400, description = "models 必须为数组")
+    )
+)]
 pub async fn start_test_queue(
     Extension(state): Extension<AppState>,
     Json(body): Json<Value>,
@@ -224,6 +240,15 @@ pub async fn start_test_queue(
     .into_response()
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/models/test",
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "单模型连通性测试结果", body = serde_json::Value),
+        (status = 400, description = "缺少 model")
+    )
+)]
 pub async fn test_model(
     Extension(state): Extension<AppState>,
     Json(body): Json<Value>,

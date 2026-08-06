@@ -22,6 +22,14 @@ use super::helpers::{log_usage, send_tui_request};
 // /v1/messages  (Anthropic Messages API) — pure passthrough only
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(
+    post,
+    path = "/v1/messages",
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "Anthropic Messages API 透传（含流式）", body = serde_json::Value)
+    )
+)]
 pub async fn messages(
     Extension(state): Extension<AppState>,
     Extension(auth): Extension<AuthContext>,

@@ -22,7 +22,7 @@ use crate::routes::{accounts, auth, health, keys, models, settings, system, usag
 use crate::routes::models::TestQueueState;
 use crate::api_docs::ApiDoc;
 use utoipa::OpenApi;
-use utoipa_swagger_ui::SwaggerUi;
+use utoipa_swagger_ui::{Config, SwaggerUi};
 
 #[derive(Clone)]
 pub struct ModelsCache {
@@ -275,7 +275,15 @@ pub fn app(state: AppState) -> AppRouter {
         .route("/api/export", get(settings::export_config))
         .route("/api/import", post(settings::import_config))
         .layer(Extension(state))
-        .merge(SwaggerUi::new("/swagger").url("/api-docs/openapi.json", ApiDoc::openapi()))
+        .merge(
+            SwaggerUi::new("/swagger")
+                .config(
+                    Config::new(["/api-docs/openapi.json"])
+                        // 试调接口时展示请求代码片段（默认 curl 等），带复制按钮
+                        .request_snippets_enabled(true),
+                )
+                .url("/api-docs/openapi.json", ApiDoc::openapi()),
+        )
         .fallback(fallback)
         .layer(cors_layer())
         .layer(TraceLayer::new_for_http())

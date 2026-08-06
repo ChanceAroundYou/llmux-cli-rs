@@ -38,6 +38,15 @@ async fn resolve_vendor_id(state: &AppState, provider: &str) -> String {
     provider.to_string()
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/auth/web-session",
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "导入/更新 web session 成功", body = serde_json::Value),
+        (status = 400, description = "缺少 token/provider，或 provider 非法（≤64 位 [a-zA-Z0-9_-]）")
+    )
+)]
 pub async fn handle_web_session(
     Extension(state): Extension<AppState>,
     Json(body): Json<Value>,

@@ -15,6 +15,13 @@ use super::helpers::iso8601_now;
 // /v1/models
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(
+    get,
+    path = "/v1/models",
+    responses(
+        (status = 200, description = "网关模型列表（OpenAI/Anthropic 兼容透传）", body = serde_json::Value)
+    )
+)]
 pub async fn models(Extension(state): Extension<AppState>, headers: HeaderMap) -> Response {
     tracing::info!("🤖 Request received");
     let is_anthropic =

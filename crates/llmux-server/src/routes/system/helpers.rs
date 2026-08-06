@@ -47,7 +47,7 @@ pub fn prune_backups(dir: &std::path::Path, keep: usize, prefixes: &[&str]) {
     }
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, utoipa::ToSchema)]
 pub struct BackupQuery {
     pub name: Option<String>,
 }

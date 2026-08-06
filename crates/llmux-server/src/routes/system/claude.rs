@@ -31,6 +31,13 @@ pub fn backups_dir(data_dir: &std::path::Path) -> std::path::PathBuf {
     data_dir.join("claude-backups")
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/system/claude-settings",
+    responses(
+        (status = 200, description = "读取 Claude Code 配置", body = serde_json::Value)
+    )
+)]
 pub async fn get_claude_settings() -> Json<Value> {
     match settings_path() {
         Some(path) if path.exists() => match fs::read_to_string(&path) {
@@ -55,6 +62,14 @@ pub async fn get_claude_settings() -> Json<Value> {
 /// Accepts: { apiBaseUrl, apiKey, opusModel?, sonnetModel?, haikuModel? }
 /// Translates to env.{ ANTHROPIC_BASE_URL, ANTHROPIC_AUTH_TOKEN,
 ///   ANTHROPIC_DEFAULT_OPUS_MODEL?, ... }
+#[utoipa::path(
+    post,
+    path = "/api/system/claude-settings",
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "写入 Claude Code 配置（含备份）", body = serde_json::Value)
+    )
+)]
 pub async fn apply_claude_settings(
     Extension(state): Extension<AppState>,
     Json(body): Json<Value>,
@@ -235,6 +250,13 @@ pub async fn apply_claude_settings(
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/system/claude-backups",
+    responses(
+        (status = 200, description = "列出/读取 Claude Code 配置备份", body = serde_json::Value)
+    )
+)]
 pub async fn list_claude_backups(
     Extension(state): Extension<AppState>,
     Query(query): Query<BackupQuery>,
@@ -308,6 +330,14 @@ pub async fn list_claude_backups(
 }
 
 /// Restore a Claude settings backup. Reads { name } from JSON body.
+#[utoipa::path(
+    post,
+    path = "/api/system/claude-backups",
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "从备份恢复 Claude Code 配置", body = serde_json::Value)
+    )
+)]
 pub async fn restore_claude_backup(
     Extension(state): Extension<AppState>,
     Json(body): Json<Value>,
@@ -363,6 +393,14 @@ pub async fn restore_claude_backup(
 }
 
 /// Delete a Claude settings backup. Reads { name } from JSON body.
+#[utoipa::path(
+    delete,
+    path = "/api/system/claude-backups",
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "删除 Claude Code 配置备份", body = serde_json::Value)
+    )
+)]
 pub async fn delete_claude_backup(
     Extension(state): Extension<AppState>,
     Json(body): Json<Value>,

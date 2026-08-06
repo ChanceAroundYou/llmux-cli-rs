@@ -359,6 +359,14 @@ fn csv_escape(field: &str) -> String {
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/accounts/{id}/export",
+    params(("id" = i64, Path, description = "账户 ID")),
+    responses(
+        (status = 200, description = "账户用量历史 CSV 导出（附件下载）", content_type = "text/csv")
+    )
+)]
 pub async fn export_account_usage(
     Extension(state): Extension<AppState>,
     Path(id): Path<i64>,

@@ -23,6 +23,14 @@ use super::helpers::{effective_openai_base_url, log_usage, send_tui_request};
 // /v1/chat/completions  — pure OpenAI-compatible passthrough
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(
+    post,
+    path = "/v1/chat/completions",
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "OpenAI Chat Completions API 透传（含流式）", body = serde_json::Value)
+    )
+)]
 pub async fn chat_completions(
     Extension(state): Extension<AppState>,
     Extension(auth): Extension<AuthContext>,
@@ -34,6 +42,14 @@ pub async fn chat_completions(
 }
 
 /// POST /v1/responses — OpenAI Responses API pure passthrough
+#[utoipa::path(
+    post,
+    path = "/v1/responses",
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "OpenAI Responses API 透传（含流式）", body = serde_json::Value)
+    )
+)]
 pub async fn responses(
     Extension(state): Extension<AppState>,
     Extension(auth): Extension<AuthContext>,

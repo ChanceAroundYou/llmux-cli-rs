@@ -642,3 +642,15 @@ async fn web_session_unknown_provider_gets_own_vendor_not_openai_pool() {
         .expect("vendor exists");
     assert_eq!(count, 1);
 }
+
+#[tokio::test]
+async fn swagger_ui_injects_request_snippets_config() {
+    // config 注入在 swagger-initializer.js（index.html 通过它初始化 Swagger UI）
+    let (status, text, _) = request_text(Method::GET, "/swagger/swagger-initializer.js").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        text.contains("requestSnippetsEnabled"),
+        "swagger-initializer.js 应包含 request snippets 配置，实际: {}",
+        &text.chars().take(400).collect::<String>()
+    );
+}

@@ -23,6 +23,15 @@ use super::helpers::{log_usage, normalize_base_url, send_tui_request};
 // /v1beta/models/{model}:{action}  — Gemini native protocol passthrough
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(
+    post,
+    path = "/v1beta/{model_and_action}",
+    params(("model_and_action" = String, Path, description = "模型与动作，如 gemini-2.0-flash:generateContent 或 models/gemini-2.0-flash:generateContent")),
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "Gemini API 透传（含流式）", body = serde_json::Value)
+    )
+)]
 pub async fn gemini(
     Extension(state): Extension<AppState>,
     Extension(auth): Extension<AuthContext>,

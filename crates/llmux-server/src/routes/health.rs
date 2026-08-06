@@ -6,6 +6,13 @@ use serde_json::{json, Value};
 
 use crate::app::AppState;
 
+#[utoipa::path(
+    get,
+    path = "/api/health",
+    responses(
+        (status = 200, description = "网关健康状态（账户/模型/上游在线情况）", body = serde_json::Value)
+    )
+)]
 pub async fn get_health_status(Extension(state): Extension<AppState>) -> Response {
     let accounts = match repo::list_account_id_name(&state.pool).await {
         Ok(rows) => rows,

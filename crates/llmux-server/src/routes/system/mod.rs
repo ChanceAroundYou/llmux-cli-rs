@@ -21,6 +21,13 @@ pub use gemini::{
     restore_gemini_backup,
 };
 
+#[utoipa::path(
+    get,
+    path = "/api/system/tools",
+    responses(
+        (status = 200, description = "检测本机已安装的 CLI 工具（claude/codex/gemini/opencode/vscode）", body = serde_json::Value)
+    )
+)]
 pub async fn get_installed_tools() -> Json<Value> {
     let claude = check_tool("claude");
     let gemini = check_tool("gemini");

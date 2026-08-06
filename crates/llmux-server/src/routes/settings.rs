@@ -7,6 +7,13 @@ use serde_json::{json, Value};
 
 use crate::app::AppState;
 
+#[utoipa::path(
+    get,
+    path = "/api/settings",
+    responses(
+        (status = 200, description = "应用设置键值对", body = serde_json::Value)
+    )
+)]
 pub async fn get_settings(Extension(state): Extension<AppState>) -> Response {
     match SettingsService::new(state.pool.clone()).get_all().await {
         Ok(settings) => Json(Value::Object(settings)).into_response(),
@@ -17,6 +24,14 @@ pub async fn get_settings(Extension(state): Extension<AppState>) -> Response {
     }
 }
 
+#[utoipa::path(
+    put,
+    path = "/api/settings",
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "批量更新设置成功", body = serde_json::Value)
+    )
+)]
 pub async fn update_settings(
     Extension(state): Extension<AppState>,
     Json(body): Json<Value>,
@@ -47,6 +62,13 @@ pub async fn update_settings(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/settings/reset",
+    responses(
+        (status = 200, description = "清空运行数据（保留 vendors/dispatch_state/app_settings/gateway_key）", body = serde_json::Value)
+    )
+)]
 pub async fn purge_database(Extension(state): Extension<AppState>) -> Response {
     let mut tx = match state.pool.begin().await {
         Ok(tx) => tx,
@@ -146,7 +168,8 @@ pub async fn export_config(Extension(state): Extension<AppState>) -> Response {
     path = "/api/import",
     request_body = serde_json::Value,
     responses(
-        (status = 200, description = "导入配置结果（imported 含 accounts/aliases/keys 计数）", body = serde_json::Value)
+        (status = 200, description = "导入配置结果（imported 含 accounts/aliases/keys 计数）", body = serde_json::Value),
+        (status = 400, description = "配置格式无效")
     )
 )]
 pub async fn import_config(
