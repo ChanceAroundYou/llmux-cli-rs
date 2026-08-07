@@ -16,7 +16,7 @@ use std::collections::HashMap;
 /// 列出全部厂商：内置优先、id 升序。
 pub async fn list_vendors(pool: &SqlitePool) -> Result<Vec<Vendor>> {
     let rows = sqlx::query(
-        "SELECT id, name, protocol, protocols, openai_responses, default_base_url, default_anthropic_url, builtin, created_at
+        "SELECT id, name, protocol, protocols, openai_responses, default_base_url, default_anthropic_url, coding_plan, coding_base_url, coding_anthropic_url, builtin, created_at
          FROM vendors ORDER BY builtin DESC, id",
     )
     .fetch_all(pool)
@@ -32,6 +32,9 @@ pub async fn list_vendors(pool: &SqlitePool) -> Result<Vec<Vendor>> {
             openai_responses: row.try_get::<i64, _>("openai_responses").unwrap_or(1) == 1,
             default_base_url: row.try_get("default_base_url")?,
             default_anthropic_url: row.try_get("default_anthropic_url")?,
+            coding_plan: row.try_get("coding_plan").unwrap_or(0),
+            coding_base_url: row.try_get("coding_base_url")?,
+            coding_anthropic_url: row.try_get("coding_anthropic_url")?,
             builtin: row.try_get("builtin").unwrap_or(0),
             created_at: row.try_get("created_at")?,
         });
@@ -50,11 +53,14 @@ pub async fn create_vendor(
     openai_responses: bool,
     default_base_url: Option<&str>,
     default_anthropic_url: Option<&str>,
+    coding_plan: i64,
+    coding_base_url: Option<&str>,
+    coding_anthropic_url: Option<&str>,
 ) -> Result<()> {
     let protocols_json = serde_json::to_string(protocols).unwrap_or_default();
     sqlx::query(
-        "INSERT INTO vendors (id, name, protocol, protocols, openai_responses, default_base_url, default_anthropic_url, builtin)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 0)",
+        "INSERT INTO vendors (id, name, protocol, protocols, openai_responses, default_base_url, default_anthropic_url, coding_plan, coding_base_url, coding_anthropic_url, builtin)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
     )
     .bind(id)
     .bind(name)
@@ -63,6 +69,9 @@ pub async fn create_vendor(
     .bind(if openai_responses { 1 } else { 0 })
     .bind(default_base_url)
     .bind(default_anthropic_url)
+    .bind(coding_plan)
+    .bind(coding_base_url)
+    .bind(coding_anthropic_url)
     .execute(pool)
     .await?;
     Ok(())
@@ -79,10 +88,13 @@ pub async fn update_vendor(
     openai_responses: bool,
     default_base_url: Option<&str>,
     default_anthropic_url: Option<&str>,
+    coding_plan: i64,
+    coding_base_url: Option<&str>,
+    coding_anthropic_url: Option<&str>,
 ) -> Result<u64> {
     let protocols_json = serde_json::to_string(protocols).unwrap_or_default();
     let result = sqlx::query(
-        "UPDATE vendors SET name = ?, protocol = ?, protocols = ?, openai_responses = ?, default_base_url = ?, default_anthropic_url = ? WHERE id = ?",
+        "UPDATE vendors SET name = ?, protocol = ?, protocols = ?, openai_responses = ?, default_base_url = ?, default_anthropic_url = ?, coding_plan = ?, coding_base_url = ?, coding_anthropic_url = ? WHERE id = ?",
     )
     .bind(name)
     .bind(protocol)
@@ -90,6 +102,9 @@ pub async fn update_vendor(
     .bind(if openai_responses { 1 } else { 0 })
     .bind(default_base_url)
     .bind(default_anthropic_url)
+    .bind(coding_plan)
+    .bind(coding_base_url)
+    .bind(coding_anthropic_url)
     .bind(id)
     .execute(pool)
     .await?;

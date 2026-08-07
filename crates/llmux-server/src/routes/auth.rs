@@ -33,6 +33,9 @@ async fn resolve_vendor_id(state: &AppState, provider: &str) -> String {
         false,
         None,
         None,
+        0,
+        None,
+        None,
     )
     .await;
     provider.to_string()

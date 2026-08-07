@@ -83,6 +83,7 @@ async fn init_db_creates_fresh_schema_and_seed_vendors() {
         vendor_ids,
         vec![
             "anthropic",
+            "dashscope",
             "deepseek",
             "gemini",
             "huoshan",
@@ -517,6 +518,9 @@ async fn active_accounts_resolve_vendor_base_url_and_protocol() {
         true,
         Some("https://custom.example/v1"),
         None,
+        0,
+        None,
+        None,
     )
     .await
     .expect("insert vendor");
@@ -747,6 +751,9 @@ fn model_structs_use_new_field_names() {
         openai_responses: true,
         default_base_url: None,
         default_anthropic_url: None,
+        coding_plan: 0,
+        coding_base_url: None,
+        coding_anthropic_url: None,
         builtin: 1,
         created_at: None,
     };
@@ -950,6 +957,9 @@ async fn import_creates_placeholder_vendor_for_unknown_custom_vendor() {
         "openai",
         &["openai".to_string()],
         true,
+        None,
+        None,
+        0,
         None,
         None,
     )

@@ -18,6 +18,12 @@ pub struct Vendor {
     pub openai_responses: bool,
     pub default_base_url: Option<String>,
     pub default_anthropic_url: Option<String>,
+    /// 是否开启 coding plan 套餐（火山方舟等）。开启时路由用 coding_* URL。
+    pub coding_plan: i64,
+    /// coding plan 的 OpenAI 兼容端点。
+    pub coding_base_url: Option<String>,
+    /// coding plan 的 Anthropic 兼容端点。
+    pub coding_anthropic_url: Option<String>,
     pub builtin: i64,
     pub created_at: Option<String>,
 }

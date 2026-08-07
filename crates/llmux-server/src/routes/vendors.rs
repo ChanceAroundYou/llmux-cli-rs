@@ -88,8 +88,12 @@ pub async fn create_vendor(
     // protocols：JSON 数组或逗号串，缺省为 [主协议]；确保主协议在列表中
     let protocols = parse_protocols(&body, protocol);
     let openai_responses = body.get("openai_responses").and_then(Value::as_bool).unwrap_or(true);
+    // coding plan 字段（火山方舟等厂商的套餐开关）
+    let coding_plan = body.get("coding_plan").and_then(Value::as_i64).unwrap_or(0);
+    let coding_base_url = body.get("coding_base_url").and_then(Value::as_str);
+    let coding_anthropic_url = body.get("coding_anthropic_url").and_then(Value::as_str);
 
-    match repo::create_vendor(&state.pool, id, name, protocol, &protocols, openai_responses, default_base_url, default_anthropic_url).await
+    match repo::create_vendor(&state.pool, id, name, protocol, &protocols, openai_responses, default_base_url, default_anthropic_url, coding_plan, coding_base_url, coding_anthropic_url).await
     {
         Ok(_) => Json(json!({ "success": true, "message": "Vendor created" })).into_response(),
         Err(e) => crate::error::simple_error(
@@ -172,6 +176,22 @@ pub async fn update_vendor(
         Some(v) => v.as_str().map(str::to_string),
     };
 
+    // coding plan：未提供保留现有，显式 null 清空 URL；开关缺省保留现有
+    let coding_plan = body
+        .get("coding_plan")
+        .and_then(Value::as_i64)
+        .unwrap_or(existing.coding_plan);
+    let coding_base_url = match body.get("coding_base_url") {
+        None => existing.coding_base_url.clone(),
+        Some(Value::Null) => None,
+        Some(v) => v.as_str().map(str::to_string),
+    };
+    let coding_anthropic_url = match body.get("coding_anthropic_url") {
+        None => existing.coding_anthropic_url.clone(),
+        Some(Value::Null) => None,
+        Some(v) => v.as_str().map(str::to_string),
+    };
+
     match repo::update_vendor(
         &state.pool,
         &id,
@@ -181,6 +201,9 @@ pub async fn update_vendor(
         openai_responses,
         default_base_url.as_deref(),
         default_anthropic_url.as_deref(),
+        coding_plan,
+        coding_base_url.as_deref(),
+        coding_anthropic_url.as_deref(),
     )
     .await
     {

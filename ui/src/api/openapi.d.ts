@@ -625,6 +625,15 @@ export interface components {
         Vendor: {
             /** Format: int64 */
             builtin: number;
+            /** @description coding plan 的 Anthropic 兼容端点。 */
+            coding_anthropic_url?: string | null;
+            /** @description coding plan 的 OpenAI 兼容端点。 */
+            coding_base_url?: string | null;
+            /**
+             * Format: int64
+             * @description 是否开启 coding plan 套餐（火山方舟等）。开启时路由用 coding_* URL。
+             */
+            coding_plan: number;
             created_at?: string | null;
             default_anthropic_url?: string | null;
             default_base_url?: string | null;

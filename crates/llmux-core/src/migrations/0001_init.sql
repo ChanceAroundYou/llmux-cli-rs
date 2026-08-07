@@ -4,6 +4,7 @@
 -- 配置域：厂商目录（内置种子 + 用户自建）
 -- protocol = 主协议（路由默认）；protocols = 支持的全部协议（JSON 数组，如 ["openai","anthropic"]）
 -- openai_responses = 是否支持 OpenAI Responses API（/v1/responses，部分第三方仅实现 chat/completions）
+-- coding_plan = 火山方舟等厂商的 coding plan 套餐开关；开启时用 coding_base_url/coding_anthropic_url
 CREATE TABLE IF NOT EXISTS vendors (
   id                    TEXT PRIMARY KEY,
   name                  TEXT NOT NULL,
@@ -12,6 +13,9 @@ CREATE TABLE IF NOT EXISTS vendors (
   openai_responses      INTEGER NOT NULL DEFAULT 1,
   default_base_url      TEXT,
   default_anthropic_url TEXT,
+  coding_plan           INTEGER NOT NULL DEFAULT 0,
+  coding_base_url       TEXT,
+  coding_anthropic_url  TEXT,
   builtin               INTEGER NOT NULL DEFAULT 0,
   created_at            TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -110,13 +114,14 @@ CREATE TABLE IF NOT EXISTS app_settings (
 
 -- 种子数据：内置厂商目录（protocols 声明支持的全部协议；base_url 严格照官方，不自行增删 v1）
 -- openai_responses：官方 OpenAI=1；第三方 openai 兼容厂商保守标 0（多数仅实现 chat/completions，确认支持后可改 1）
-INSERT OR IGNORE INTO vendors (id, name, protocol, protocols, openai_responses, default_base_url, default_anthropic_url, builtin) VALUES
-('openai',     'OpenAI',             'openai',    '["openai"]',                  1, 'https://api.openai.com/v1',                              NULL, 1),
-('anthropic',  'Anthropic',          'anthropic', '["anthropic"]',                 1, 'https://api.anthropic.com/v1',                           NULL, 1),
-('gemini',     'Google Gemini',      'gemini',    '["gemini"]',                    1, 'https://generativelanguage.googleapis.com/v1beta',       NULL, 1),
-('deepseek',   'DeepSeek',           'openai',    '["openai","anthropic"]',        1, 'https://api.deepseek.com',                               'https://api.deepseek.com/anthropic',   1),
-('moonshot',   'Moonshot AI',        'openai',    '["openai","anthropic"]',        0, 'https://api.moonshot.cn/v1',                             'https://api.moonshot.cn/anthropic',    1),
-('zhipu',      '智谱 GLM',           'openai',    '["openai","anthropic"]',        0, 'https://open.bigmodel.cn/api/paas/v4',                   'https://open.bigmodel.cn/api/anthropic', 1),
-('siliconflow', 'SiliconFlow',       'openai',    '["openai","anthropic"]',        0, 'https://api.siliconflow.cn/v1',                          'https://api.siliconflow.cn',            1),
-('zai',        '阶跃星辰 StepFun',   'openai',    '["openai"]',                    0, 'https://api.stepfun.com/v1',                             NULL, 1),
-('huoshan',    '火山方舟 Ark',       'openai',    '["openai"]',                    0, 'https://ark.cn-beijing.volces.com/api/v3',               NULL, 1);
+INSERT OR IGNORE INTO vendors (id, name, protocol, protocols, openai_responses, default_base_url, default_anthropic_url, coding_plan, coding_base_url, coding_anthropic_url, builtin) VALUES
+('openai',     'OpenAI',             'openai',    '["openai"]',                  1, 'https://api.openai.com/v1',                              NULL, 0, NULL, NULL, 1),
+('anthropic',  'Anthropic',          'anthropic', '["anthropic"]',                 1, 'https://api.anthropic.com/v1',                           NULL, 0, NULL, NULL, 1),
+('gemini',     'Google Gemini',      'gemini',    '["gemini"]',                    1, 'https://generativelanguage.googleapis.com/v1beta',       NULL, 0, NULL, NULL, 1),
+('deepseek',   'DeepSeek',           'openai',    '["openai","anthropic"]',        1, 'https://api.deepseek.com',                               'https://api.deepseek.com/anthropic',   0, NULL, NULL, 1),
+('moonshot',   'Moonshot AI',        'openai',    '["openai","anthropic"]',        0, 'https://api.moonshot.cn/v1',                             'https://api.moonshot.cn/anthropic',    0, NULL, NULL, 1),
+('zhipu',      '智谱 GLM',           'openai',    '["openai","anthropic"]',        0, 'https://open.bigmodel.cn/api/paas/v4',                   'https://open.bigmodel.cn/api/anthropic', 0, NULL, NULL, 1),
+('siliconflow', 'SiliconFlow',       'openai',    '["openai","anthropic"]',        0, 'https://api.siliconflow.cn/v1',                          'https://api.siliconflow.cn',            0, NULL, NULL, 1),
+('zai',        '阶跃星辰 StepFun',   'openai',    '["openai","anthropic"]',        0, 'https://api.stepfun.com/v1',                             'https://api.stepfun.com/v1',            0, NULL, NULL, 1),
+('huoshan',    '火山方舟 Ark',       'openai',    '["openai","anthropic"]',        0, 'https://ark.cn-beijing.volces.com/api/plan/v3',          'https://ark.cn-beijing.volces.com/api/plan', 0, 'https://ark.cn-beijing.volces.com/api/coding/v3', 'https://ark.cn-beijing.volces.com/api/coding', 1),
+('dashscope',  '阿里云百炼 DashScope','openai',    '["openai","anthropic"]',        0, 'https://dashscope.aliyuncs.com/compatible-mode/v1',      'https://dashscope.aliyuncs.com/apps/anthropic', 0, NULL, NULL, 1);
