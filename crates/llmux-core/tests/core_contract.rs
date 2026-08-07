@@ -83,13 +83,21 @@ async fn init_db_creates_fresh_schema_and_seed_vendors() {
         vendor_ids,
         vec![
             "anthropic",
+            "baidu_qianfan",
             "dashscope",
             "deepseek",
             "gemini",
             "huoshan",
+            "kimi",
+            "longcat",
+            "minimax",
             "moonshot",
+            "nvidia",
             "openai",
+            "openrouter",
             "siliconflow",
+            "xai_grok",
+            "xiaomi_mimo",
             "zai",
             "zhipu",
         ]
@@ -952,8 +960,8 @@ async fn import_creates_placeholder_vendor_for_unknown_custom_vendor() {
     // 自定义厂商 + 账户（export 不导出 vendors）
     repo::create_vendor(
         &source,
-        "openrouter",
-        "OpenRouter",
+        "customco",
+        "CustomCo",
         "openai",
         &["openai".to_string()],
         true,
@@ -967,7 +975,7 @@ async fn import_creates_placeholder_vendor_for_unknown_custom_vendor() {
     .expect("create vendor");
     repo::create_account(
         &source,
-        "openrouter",
+        "customco",
         "OR",
         &encrypt_api_key("sk-or", secret).expect("encrypt"),
         None,
@@ -981,7 +989,7 @@ async fn import_creates_placeholder_vendor_for_unknown_custom_vendor() {
     .expect("create account");
 
     let exported = export_config(&source, secret).await.expect("export");
-    // 全新目标库：openrouter 厂商不存在，import 应补占位 vendor 而非 FK 违例
+    // 全新目标库：customco 厂商不存在，import 应补占位 vendor 而非 FK 违例
     let target = memory_db().await;
     let counts = import_config(&target, exported, secret)
         .await
@@ -992,9 +1000,9 @@ async fn import_creates_placeholder_vendor_for_unknown_custom_vendor() {
         .fetch_one(&target)
         .await
         .expect("account imported");
-    assert_eq!(or, "openrouter");
+    assert_eq!(or, "customco");
     let vendor_count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM vendors WHERE id = 'openrouter'")
+        sqlx::query_scalar("SELECT COUNT(*) FROM vendors WHERE id = 'customco'")
             .fetch_one(&target)
             .await
             .expect("vendor exists");
