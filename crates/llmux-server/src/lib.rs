@@ -1,4 +1,5 @@
 pub mod api_docs;
+pub mod api_schemas;
 pub mod app;
 pub mod error;
 pub mod middleware;

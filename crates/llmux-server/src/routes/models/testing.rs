@@ -15,7 +15,7 @@ use crate::app::AppState;
     get,
     path = "/api/models/test-queue/status",
     responses(
-        (status = 200, description = "模型批量测试队列状态（isRunning/total/current/progress）", body = serde_json::Value)
+        (status = 200, description = "模型批量测试队列状态（isRunning/total/current/progress）", body = crate::api_schemas::TestQueueStatus)
     )
 )]
 pub async fn get_test_queue_status(Extension(state): Extension<AppState>) -> Response {
@@ -34,8 +34,8 @@ pub async fn get_test_queue_status(Extension(state): Extension<AppState>) -> Res
     path = "/api/models/test-all",
     request_body = serde_json::Value,
     responses(
-        (status = 200, description = "启动全量模型批量测试队列", body = serde_json::Value),
-        (status = 400, description = "models 必须为数组")
+        (status = 200, description = "启动全量模型批量测试队列", body = crate::api_schemas::QueueStartResponse),
+        (status = 400, description = "models 必须为数组", body = crate::api_schemas::ErrorResponse)
     )
 )]
 pub async fn start_test_queue(
@@ -245,8 +245,8 @@ pub async fn start_test_queue(
     path = "/api/models/test",
     request_body = serde_json::Value,
     responses(
-        (status = 200, description = "单模型连通性测试结果", body = serde_json::Value),
-        (status = 400, description = "缺少 model")
+        (status = 200, description = "单模型连通性测试结果", body = crate::api_schemas::ModelTestResponse),
+        (status = 400, description = "缺少 model", body = crate::api_schemas::ErrorResponse)
     )
 )]
 pub async fn test_model(

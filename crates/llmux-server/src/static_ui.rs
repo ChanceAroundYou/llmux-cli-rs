@@ -7,7 +7,7 @@ use rust_embed::EmbeddedFile;
 use std::borrow::Cow;
 
 #[derive(rust_embed::RustEmbed)]
-#[folder = "../../ui/dist"]
+#[folder = "../../llmux_ui/dist"]
 struct UiAssets;
 
 const FALLBACK_INDEX: &str = r#"<!doctype html>

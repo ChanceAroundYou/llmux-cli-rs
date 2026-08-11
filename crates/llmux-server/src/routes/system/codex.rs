@@ -39,7 +39,7 @@ fn codex_backups_dir(data_dir: &std::path::Path) -> std::path::PathBuf {
     get,
     path = "/api/system/codex-settings",
     responses(
-        (status = 200, description = "读取 Codex 配置", body = serde_json::Value)
+        (status = 200, description = "读取 Codex 配置", body = crate::api_schemas::CodexSettingsView)
     )
 )]
 pub async fn get_codex_settings() -> Json<Value> {
@@ -64,7 +64,7 @@ pub async fn get_codex_settings() -> Json<Value> {
     path = "/api/system/codex-settings",
     request_body = serde_json::Value,
     responses(
-        (status = 200, description = "写入 Codex 配置（含备份）", body = serde_json::Value)
+        (status = 200, description = "写入 Codex 配置（含备份）", body = crate::api_schemas::CodexApplyResult)
     )
 )]
 pub async fn apply_codex_settings(
@@ -244,7 +244,7 @@ fn is_valid_codex_backup_name(name: &str) -> bool {
     get,
     path = "/api/system/codex-backups",
     responses(
-        (status = 200, description = "列出/读取 Codex 配置备份", body = serde_json::Value)
+        (status = 200, description = "列出/读取 Codex 配置备份（带 ?name= 时返回 {settings}）", body = [crate::api_schemas::BackupEntry])
     )
 )]
 pub async fn list_codex_backups(
@@ -311,7 +311,7 @@ pub async fn list_codex_backups(
     path = "/api/system/codex-backups",
     request_body = serde_json::Value,
     responses(
-        (status = 200, description = "从备份恢复 Codex 配置", body = serde_json::Value)
+        (status = 200, description = "从备份恢复 Codex 配置", body = crate::api_schemas::BackupRestoreResult)
     )
 )]
 pub async fn restore_codex_backup(
@@ -373,7 +373,7 @@ pub async fn restore_codex_backup(
     path = "/api/system/codex-backups",
     request_body = serde_json::Value,
     responses(
-        (status = 200, description = "删除 Codex 配置备份", body = serde_json::Value)
+        (status = 200, description = "删除 Codex 配置备份", body = crate::api_schemas::SuccessResponse)
     )
 )]
 pub async fn delete_codex_backup(

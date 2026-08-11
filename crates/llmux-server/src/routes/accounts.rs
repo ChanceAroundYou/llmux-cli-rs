@@ -33,8 +33,8 @@ pub async fn list_accounts(Extension(state): Extension<AppState>) -> Response {
     path = "/api/accounts",
     request_body = serde_json::Value,
     responses(
-        (status = 200, description = "创建账户成功（返回 id / modelCount / skippedValidation）", body = serde_json::Value),
-        (status = 400, description = "参数缺失或厂商未知/校验失败")
+        (status = 200, description = "创建账户成功（返回 id / modelCount / skippedValidation）", body = crate::api_schemas::AccountCreateResponse),
+        (status = 400, description = "参数缺失或厂商未知/校验失败", body = crate::api_schemas::ErrorResponse)
     )
 )]
 pub async fn create_account(
@@ -158,8 +158,8 @@ pub async fn create_account(
     params(("id" = i64, Path, description = "账户 ID")),
     request_body = serde_json::Value,
     responses(
-        (status = 200, description = "更新账户成功", body = serde_json::Value),
-        (status = 404, description = "账户不存在")
+        (status = 200, description = "更新账户成功", body = crate::api_schemas::MessageResponse),
+        (status = 404, description = "账户不存在", body = crate::api_schemas::ErrorResponse)
     )
 )]
 pub async fn update_account(
@@ -319,8 +319,8 @@ pub async fn update_account(
     path = "/api/accounts/{id}",
     params(("id" = i64, Path, description = "账户 ID")),
     responses(
-        (status = 200, description = "删除账户成功", body = serde_json::Value),
-        (status = 404, description = "账户不存在")
+        (status = 200, description = "删除账户成功", body = crate::api_schemas::MessageResponse),
+        (status = 404, description = "账户不存在", body = crate::api_schemas::ErrorResponse)
     )
 )]
 pub async fn delete_account(

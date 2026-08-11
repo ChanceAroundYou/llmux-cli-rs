@@ -21,7 +21,7 @@ pub struct ActivityQuery {
     get,
     path = "/api/activity",
     responses(
-        (status = 200, description = "最近活动列表（entries + totalRequests + successCount）")
+        (status = 200, description = "最近活动列表（entries + totalRequests + successCount）", body = crate::api_schemas::ActivityResponse)
     )
 )]
 pub async fn get_activity(

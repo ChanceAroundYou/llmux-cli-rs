@@ -29,7 +29,7 @@ pub async fn get_settings(Extension(state): Extension<AppState>) -> Response {
     path = "/api/settings",
     request_body = serde_json::Value,
     responses(
-        (status = 200, description = "批量更新设置成功", body = serde_json::Value)
+        (status = 200, description = "批量更新设置成功", body = crate::api_schemas::SuccessResponse)
     )
 )]
 pub async fn update_settings(
@@ -66,7 +66,7 @@ pub async fn update_settings(
     post,
     path = "/api/settings/reset",
     responses(
-        (status = 200, description = "清空运行数据（保留 vendors/dispatch_state/app_settings/gateway_key）", body = serde_json::Value)
+        (status = 200, description = "清空运行数据（保留 vendors/dispatch_state/app_settings/gateway_key）", body = crate::api_schemas::MessageResponse)
     )
 )]
 pub async fn purge_database(Extension(state): Extension<AppState>) -> Response {
@@ -128,7 +128,7 @@ pub async fn purge_database(Extension(state): Extension<AppState>) -> Response {
     get,
     path = "/api/export",
     responses(
-        (status = 200, description = "导出全量配置 JSON（application/json 附件下载）")
+        (status = 200, description = "导出全量配置 JSON（application/json 附件下载）", body = llmux_core::export_import::ConfigExport)
     )
 )]
 pub async fn export_config(Extension(state): Extension<AppState>) -> Response {
@@ -168,8 +168,8 @@ pub async fn export_config(Extension(state): Extension<AppState>) -> Response {
     path = "/api/import",
     request_body = serde_json::Value,
     responses(
-        (status = 200, description = "导入配置结果（imported 含 accounts/aliases/keys 计数）", body = serde_json::Value),
-        (status = 400, description = "配置格式无效")
+        (status = 200, description = "导入配置结果（imported 含 accounts/aliases/keys 计数）", body = crate::api_schemas::ImportResponse),
+        (status = 400, description = "配置格式无效", body = crate::api_schemas::ErrorResponse)
     )
 )]
 pub async fn import_config(

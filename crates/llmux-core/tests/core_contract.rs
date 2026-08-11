@@ -91,7 +91,6 @@ async fn init_db_creates_fresh_schema_and_seed_vendors() {
             "kimi",
             "longcat",
             "minimax",
-            "moonshot",
             "nvidia",
             "openai",
             "openrouter",

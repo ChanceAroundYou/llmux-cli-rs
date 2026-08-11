@@ -1,0 +1,303 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  /* ── 马卡龙多色板主题系统 ──────────────────────────────
+     明暗由 .dark 控制；色板由 data-theme 控制（默认 lavender）。
+     success/warning/destructive 语义色全局统一，各色板仅覆盖主色调。 */
+  :root {
+    /* 默认色板：lavender（紫）· 浅色 */
+    --background: 32 85% 97%;
+    --foreground: 260 15% 28%;
+    --card: 35 55% 98%;
+    --card-foreground: 260 15% 28%;
+    --primary: 258 90% 74%;
+    --primary-foreground: 258 60% 16%;
+    --secondary: 330 90% 94%;
+    --secondary-foreground: 330 55% 42%;
+    --accent: 200 95% 94%;
+    --accent-foreground: 200 65% 38%;
+    --muted: 32 45% 94%;
+    --muted-foreground: 260 10% 52%;
+    --border: 330 40% 91%;
+    --input: 330 40% 91%;
+    --ring: 258 85% 78%;
+    --shadow-soft: 258 40% 70% / 0.18;
+    /* 语义色（浅色） */
+    --success: 160 65% 55%;
+    --success-foreground: 160 55% 14%;
+    --warning: 45 92% 62%;
+    --warning-foreground: 40 60% 18%;
+    --destructive: 350 75% 72%;
+    --destructive-foreground: 350 60% 18%;
+    --radius: 1rem;
+  }
+
+  /* ── 色板：mint（薄荷） ─────────────────────────────── */
+  [data-theme="mint"] {
+    --background: 165 55% 96%;
+    --foreground: 175 35% 22%;
+    --card: 160 45% 98%;
+    --card-foreground: 175 35% 22%;
+    --primary: 160 65% 52%;
+    --primary-foreground: 160 60% 10%;
+    --secondary: 200 80% 93%;
+    --secondary-foreground: 200 55% 35%;
+    --accent: 140 60% 92%;
+    --accent-foreground: 150 55% 32%;
+    --muted: 165 40% 93%;
+    --muted-foreground: 175 20% 48%;
+    --border: 170 40% 90%;
+    --input: 170 40% 90%;
+    --ring: 160 70% 60%;
+    --shadow-soft: 160 50% 60% / 0.16;
+  }
+
+  /* ── 色板：peach（蜜桃） ─────────────────────────────── */
+  [data-theme="peach"] {
+    --background: 25 70% 96%;
+    --foreground: 25 35% 24%;
+    --card: 30 55% 98%;
+    --card-foreground: 25 35% 24%;
+    --primary: 22 85% 68%;
+    --primary-foreground: 22 70% 14%;
+    --secondary: 330 80% 94%;
+    --secondary-foreground: 330 50% 40%;
+    --accent: 40 85% 94%;
+    --accent-foreground: 40 65% 35%;
+    --muted: 25 45% 93%;
+    --muted-foreground: 25 25% 48%;
+    --border: 25 45% 90%;
+    --input: 25 45% 90%;
+    --ring: 22 80% 70%;
+    --shadow-soft: 25 55% 60% / 0.16;
+  }
+
+  /* ── 色板：ocean（奶油蓝） ───────────────────────────── */
+  [data-theme="ocean"] {
+    --background: 205 60% 96%;
+    --foreground: 220 35% 24%;
+    --card: 210 50% 98%;
+    --card-foreground: 220 35% 24%;
+    --primary: 215 80% 65%;
+    --primary-foreground: 215 70% 14%;
+    --secondary: 265 70% 94%;
+    --secondary-foreground: 265 50% 40%;
+    --accent: 190 70% 93%;
+    --accent-foreground: 190 60% 34%;
+    --muted: 210 40% 93%;
+    --muted-foreground: 220 25% 48%;
+    --border: 215 40% 90%;
+    --input: 215 40% 90%;
+    --ring: 215 80% 70%;
+    --shadow-soft: 215 55% 60% / 0.16;
+  }
+
+  /* ── 色板：azure（经典蓝，取自旧项目 shadcn 主题） ────── */
+  [data-theme="azure"] {
+    --background: 210 40% 96.1%;
+    --foreground: 222 47% 11%;
+    --card: 0 0% 100%;
+    --card-foreground: 222 47% 11%;
+    --primary: 221.2 83.2% 53.3%;
+    --primary-foreground: 210 40% 98%;
+    --secondary: 210 40% 96.1%;
+    --secondary-foreground: 222 47.4% 11.2%;
+    --accent: 210 40% 96.1%;
+    --accent-foreground: 222 47.4% 11.2%;
+    --muted: 210 40% 96.1%;
+    --muted-foreground: 215.4 16.3% 46.9%;
+    --border: 214.3 31.8% 91.4%;
+    --input: 214.3 31.8% 91.4%;
+    --ring: 221.2 83.2% 53.3%;
+    --shadow-soft: 221.2 60% 60% / 0.18;
+  }
+
+  /* ── 色板：rose（玫瑰） ──────────────────────────────── */
+  [data-theme="rose"] {
+    --background: 340 55% 96%;
+    --foreground: 340 30% 26%;
+    --card: 345 45% 98%;
+    --card-foreground: 340 30% 26%;
+    --primary: 340 75% 70%;
+    --primary-foreground: 340 65% 16%;
+    --secondary: 300 55% 94%;
+    --secondary-foreground: 300 45% 40%;
+    --accent: 20 80% 94%;
+    --accent-foreground: 20 65% 36%;
+    --muted: 340 40% 93%;
+    --muted-foreground: 340 20% 50%;
+    --border: 340 40% 90%;
+    --input: 340 40% 90%;
+    --ring: 340 75% 72%;
+    --shadow-soft: 340 50% 60% / 0.16;
+  }
+
+  /* ── 默认色板 lavender 深色 + 全局深色语义色 ─────────── */
+  .dark {
+    --background: 258 25% 13%;
+    --foreground: 258 22% 90%;
+    --card: 258 26% 17%;
+    --card-foreground: 258 22% 90%;
+    --primary: 258 92% 76%;
+    --primary-foreground: 258 70% 15%;
+    --secondary: 330 26% 25%;
+    --secondary-foreground: 330 70% 88%;
+    --accent: 200 26% 24%;
+    --accent-foreground: 200 60% 88%;
+    --muted: 258 20% 21%;
+    --muted-foreground: 258 12% 64%;
+    --border: 258 20% 27%;
+    --input: 258 20% 27%;
+    --ring: 258 60% 64%;
+    --shadow-soft: 258 60% 60% / 0.12;
+    --success: 160 65% 58%;
+    --success-foreground: 160 50% 10%;
+    --warning: 45 90% 66%;
+    --warning-foreground: 40 55% 12%;
+    --destructive: 350 68% 66%;
+    --destructive-foreground: 350 55% 12%;
+  }
+
+  [data-theme="mint"].dark {
+    --background: 170 30% 12%;
+    --foreground: 165 20% 88%;
+    --card: 168 26% 16%;
+    --card-foreground: 165 20% 88%;
+    --primary: 160 70% 55%;
+    --primary-foreground: 160 55% 10%;
+    --secondary: 200 24% 23%;
+    --secondary-foreground: 200 55% 88%;
+    --accent: 150 24% 22%;
+    --accent-foreground: 150 55% 88%;
+    --muted: 168 22% 20%;
+    --muted-foreground: 170 15% 62%;
+    --border: 168 22% 26%;
+    --input: 168 22% 26%;
+    --ring: 160 55% 55%;
+    --shadow-soft: 160 55% 55% / 0.12;
+  }
+
+  [data-theme="peach"].dark {
+    --background: 22 30% 12%;
+    --foreground: 25 25% 88%;
+    --card: 24 27% 16%;
+    --card-foreground: 25 25% 88%;
+    --primary: 22 90% 68%;
+    --primary-foreground: 22 65% 12%;
+    --secondary: 330 26% 24%;
+    --secondary-foreground: 330 55% 88%;
+    --accent: 40 28% 23%;
+    --accent-foreground: 40 60% 88%;
+    --muted: 24 24% 20%;
+    --muted-foreground: 25 18% 62%;
+    --border: 24 24% 26%;
+    --input: 24 24% 26%;
+    --ring: 22 75% 58%;
+    --shadow-soft: 22 55% 55% / 0.12;
+  }
+
+  [data-theme="ocean"].dark {
+    --background: 220 30% 12%;
+    --foreground: 215 22% 88%;
+    --card: 218 26% 16%;
+    --card-foreground: 215 22% 88%;
+    --primary: 215 82% 68%;
+    --primary-foreground: 215 60% 12%;
+    --secondary: 265 25% 24%;
+    --secondary-foreground: 265 55% 88%;
+    --accent: 190 24% 23%;
+    --accent-foreground: 190 55% 88%;
+    --muted: 218 22% 20%;
+    --muted-foreground: 215 18% 62%;
+    --border: 218 22% 26%;
+    --input: 218 22% 26%;
+    --ring: 215 60% 60%;
+    --shadow-soft: 215 55% 55% / 0.12;
+  }
+
+  [data-theme="azure"].dark {
+    --background: 240 10% 3.9%;
+    --foreground: 0 0% 98%;
+    --card: 240 10% 3.9%;
+    --card-foreground: 0 0% 98%;
+    --primary: 217.2 91.2% 59.8%;
+    --primary-foreground: 222.2 47.4% 11.2%;
+    --secondary: 240 3.7% 15.9%;
+    --secondary-foreground: 0 0% 98%;
+    --accent: 240 3.7% 15.9%;
+    --accent-foreground: 0 0% 98%;
+    --muted: 240 3.7% 15.9%;
+    --muted-foreground: 240 5% 64.9%;
+    --border: 240 3.7% 15.9%;
+    --input: 240 3.7% 15.9%;
+    --ring: 240 4.9% 83.9%;
+    --shadow-soft: 217 60% 60% / 0.12;
+  }
+
+  [data-theme="rose"].dark {
+    --background: 340 28% 13%;
+    --foreground: 340 20% 88%;
+    --card: 342 24% 17%;
+    --card-foreground: 340 20% 88%;
+    --primary: 340 80% 72%;
+    --primary-foreground: 340 60% 14%;
+    --secondary: 300 22% 24%;
+    --secondary-foreground: 300 50% 88%;
+    --accent: 20 26% 23%;
+    --accent-foreground: 20 55% 88%;
+    --muted: 342 22% 21%;
+    --muted-foreground: 340 15% 62%;
+    --border: 342 22% 27%;
+    --input: 342 22% 27%;
+    --ring: 340 60% 62%;
+    --shadow-soft: 340 55% 55% / 0.12;
+  }
+
+  /* 所有元素默认边框色用 token（避免 @apply 依赖 border-border 类的生成顺序） */
+  * {
+    border-color: hsl(var(--border));
+  }
+
+  html {
+    scroll-behavior: smooth;
+  }
+
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-feature-settings: "rlig" 1, "calt" 1;
+  }
+
+  ::selection {
+    background: hsl(var(--primary) / 0.25);
+  }
+
+  /* 柔和滚动条 */
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: hsl(var(--muted-foreground) / 0.25);
+    border-radius: 9999px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: hsl(var(--muted-foreground) / 0.4);
+  }
+}
+
+@layer components {
+  /* 马卡龙渐变卡片（主视觉用） */
+  .macaron-gradient {
+    background: linear-gradient(
+      135deg,
+      hsl(var(--primary) / 0.07),
+      hsl(var(--secondary) / 0.18),
+      hsl(var(--accent) / 0.14)
+    );
+  }
+}

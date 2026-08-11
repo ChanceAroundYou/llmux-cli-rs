@@ -55,8 +55,8 @@ fn parse_protocols(body: &Value, primary: &str) -> Vec<String> {
     path = "/api/vendors",
     request_body = serde_json::Value,
     responses(
-        (status = 200, description = "创建厂商成功", body = serde_json::Value),
-        (status = 400, description = "参数缺失或 protocol 非法")
+        (status = 200, description = "创建厂商成功", body = crate::api_schemas::MessageResponse),
+        (status = 400, description = "参数缺失或 protocol 非法", body = crate::api_schemas::ErrorResponse)
     )
 )]
 pub async fn create_vendor(
@@ -109,8 +109,8 @@ pub async fn create_vendor(
     params(("id" = String, Path, description = "厂商 ID")),
     request_body = serde_json::Value,
     responses(
-        (status = 200, description = "更新厂商成功", body = serde_json::Value),
-        (status = 404, description = "厂商不存在")
+        (status = 200, description = "更新厂商成功", body = crate::api_schemas::MessageResponse),
+        (status = 404, description = "厂商不存在", body = crate::api_schemas::ErrorResponse)
     )
 )]
 pub async fn update_vendor(
@@ -220,9 +220,9 @@ pub async fn update_vendor(
     path = "/api/vendors/{id}",
     params(("id" = String, Path, description = "厂商 ID")),
     responses(
-        (status = 200, description = "删除厂商成功", body = serde_json::Value),
-        (status = 404, description = "厂商不存在"),
-        (status = 409, description = "仍有账户引用该厂商")
+        (status = 200, description = "删除厂商成功", body = crate::api_schemas::MessageResponse),
+        (status = 404, description = "厂商不存在", body = crate::api_schemas::ErrorResponse),
+        (status = 409, description = "仍有账户引用该厂商", body = crate::api_schemas::ErrorResponse)
     )
 )]
 pub async fn delete_vendor(

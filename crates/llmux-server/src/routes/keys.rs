@@ -30,7 +30,7 @@ fn parse_allowed_models(value: &Value) -> Vec<String> {
     get,
     path = "/api/keys",
     responses(
-        (status = 200, description = "网关 key 列表（含 allowed_models 白名单）", body = [llmux_core::models::ApiKey])
+        (status = 200, description = "网关 key 列表（含 allowed_models 白名单）", body = [crate::api_schemas::ApiKeyView])
     )
 )]
 pub async fn list_api_keys(Extension(state): Extension<AppState>) -> Response {
@@ -73,7 +73,7 @@ pub async fn list_api_keys(Extension(state): Extension<AppState>) -> Response {
     path = "/api/keys",
     request_body = serde_json::Value,
     responses(
-        (status = 200, description = "创建网关 key 成功（返回明文 key）", body = serde_json::Value)
+        (status = 200, description = "创建网关 key 成功（返回明文 key）", body = crate::api_schemas::KeyCreateResponse)
     )
 )]
 pub async fn create_api_key(
@@ -122,7 +122,7 @@ pub async fn create_api_key(
     params(("id" = i64, Path, description = "网关 key ID")),
     request_body = serde_json::Value,
     responses(
-        (status = 200, description = "更新网关 key 成功", body = serde_json::Value)
+        (status = 200, description = "更新网关 key 成功", body = crate::api_schemas::SuccessResponse)
     )
 )]
 pub async fn update_api_key(
@@ -162,7 +162,7 @@ pub async fn update_api_key(
     path = "/api/keys/{id}",
     params(("id" = i64, Path, description = "网关 key ID")),
     responses(
-        (status = 200, description = "删除网关 key 成功", body = serde_json::Value)
+        (status = 200, description = "删除网关 key 成功", body = crate::api_schemas::SuccessResponse)
     )
 )]
 pub async fn delete_api_key(

@@ -101,7 +101,7 @@ pub async fn get_model_aliases(Extension(state): Extension<AppState>) -> Respons
     path = "/api/models/aliases",
     request_body = serde_json::Value,
     responses(
-        (status = 200, description = "设置（创建/更新）别名成功", body = serde_json::Value)
+        (status = 200, description = "设置（创建/更新）别名成功", body = crate::api_schemas::MessageResponse)
     )
 )]
 pub async fn set_model_alias(
@@ -172,8 +172,8 @@ pub async fn set_model_alias(
     path = "/api/models/aliases/{id}",
     params(("id" = i64, Path, description = "别名 ID")),
     responses(
-        (status = 200, description = "删除别名成功", body = serde_json::Value),
-        (status = 404, description = "别名不存在")
+        (status = 200, description = "删除别名成功", body = crate::api_schemas::MessageResponse),
+        (status = 404, description = "别名不存在", body = crate::api_schemas::ErrorResponse)
     )
 )]
 pub async fn delete_model_alias(

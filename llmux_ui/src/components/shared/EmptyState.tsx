@@ -1,0 +1,18 @@
+// 空态：马卡龙图标 + 标题 + 描述
+import React from "react";
+
+interface EmptyStateProps {
+  icon: React.ComponentType<{ className?: string }>;
+  title: string;
+  description?: string;
+}
+
+export const EmptyState: React.FC<EmptyStateProps> = ({ icon: Icon, title, description }) => (
+  <div className="flex flex-col items-center justify-center gap-2 py-10 text-center">
+    <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-muted text-muted-foreground">
+      <Icon className="h-6 w-6" />
+    </div>
+    <p className="text-sm font-medium text-muted-foreground">{title}</p>
+    {description && <p className="text-xs text-muted-foreground/70">{description}</p>}
+  </div>
+);

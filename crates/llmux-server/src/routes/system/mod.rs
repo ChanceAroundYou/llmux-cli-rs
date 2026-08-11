@@ -6,7 +6,7 @@ pub mod helpers;
 use axum::Json;
 use serde_json::{json, Value};
 
-use self::helpers::check_tool;
+use self::helpers::{check_tool, check_vscode};
 
 pub use claude::{
     apply_claude_settings, delete_claude_backup, get_claude_settings, list_claude_backups,
@@ -25,7 +25,7 @@ pub use gemini::{
     get,
     path = "/api/system/tools",
     responses(
-        (status = 200, description = "检测本机已安装的 CLI 工具（claude/codex/gemini/opencode/vscode）", body = serde_json::Value)
+        (status = 200, description = "检测本机已安装的 CLI 工具（claude/codex/gemini/opencode/vscode）", body = crate::api_schemas::InstalledTools)
     )
 )]
 pub async fn get_installed_tools() -> Json<Value> {
@@ -35,7 +35,8 @@ pub async fn get_installed_tools() -> Json<Value> {
     let vscode = check_tool("code");
 
     Json(json!({
-        "vscode": vscode,
+        "version": env!("CARGO_PKG_VERSION"),
+        "vscode": vscode || check_vscode(),
         "claude": claude,
         "gemini": gemini,
         "opencode": opencode,

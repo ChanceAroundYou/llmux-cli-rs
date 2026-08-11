@@ -23,6 +23,25 @@ pub fn check_tool(name: &str) -> bool {
     }
 }
 
+/// VSCode 可能只安装了 App、未把 `code` 命令加入 PATH（macOS 需手动安装 shell command），
+/// 因此补充常见安装路径检测。
+pub fn check_vscode() -> bool {
+    if cfg!(windows) {
+        let local = std::env::var("LOCALAPPDATA").unwrap_or_default();
+        std::path::Path::new(
+            &format!("{local}\\Programs\\Microsoft VS Code\\Code.exe"),
+        )
+        .exists()
+            || std::path::Path::new("C:\\Program Files\\Microsoft VS Code\\Code.exe")
+                .exists()
+    } else if cfg!(target_os = "macos") {
+        std::path::Path::new("/Applications/Visual Studio Code.app").exists()
+            || std::path::Path::new("/Applications/VSCodium.app").exists()
+    } else {
+        false // Linux 下 which code 即可覆盖
+    }
+}
+
 pub fn prune_backups(dir: &std::path::Path, keep: usize, prefixes: &[&str]) {
     for prefix in prefixes {
         let Ok(entries) = fs::read_dir(dir) else {

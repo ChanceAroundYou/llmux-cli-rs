@@ -10,7 +10,7 @@ use crate::app::AppState;
     get,
     path = "/api/health",
     responses(
-        (status = 200, description = "网关健康状态（账户/模型/上游在线情况）", body = serde_json::Value)
+        (status = 200, description = "网关健康状态（账户/模型/上游在线情况）", body = [crate::api_schemas::HealthItem])
     )
 )]
 pub async fn get_health_status(Extension(state): Extension<AppState>) -> Response {

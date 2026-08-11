@@ -62,7 +62,7 @@ fn set_env_key(env_content: &str, key: &str, value: &str) -> String {
     get,
     path = "/api/system/gemini-settings",
     responses(
-        (status = 200, description = "读取 Gemini 配置", body = serde_json::Value)
+        (status = 200, description = "读取 Gemini 配置", body = crate::api_schemas::GeminiSettingsView)
     )
 )]
 pub async fn get_gemini_settings() -> Json<Value> {
@@ -86,7 +86,7 @@ pub async fn get_gemini_settings() -> Json<Value> {
     path = "/api/system/gemini-settings",
     request_body = serde_json::Value,
     responses(
-        (status = 200, description = "写入 Gemini 配置（含备份）", body = serde_json::Value)
+        (status = 200, description = "写入 Gemini 配置（含备份）", body = crate::api_schemas::GeminiApplyResult)
     )
 )]
 pub async fn apply_gemini_settings(
@@ -215,7 +215,7 @@ fn is_valid_gemini_backup_name(name: &str) -> bool {
     get,
     path = "/api/system/gemini-backups",
     responses(
-        (status = 200, description = "列出/读取 Gemini 配置备份", body = serde_json::Value)
+        (status = 200, description = "列出/读取 Gemini 配置备份（带 ?name= 时返回 {settings}）", body = [crate::api_schemas::BackupEntry])
     )
 )]
 pub async fn list_gemini_backups(
@@ -282,7 +282,7 @@ pub async fn list_gemini_backups(
     path = "/api/system/gemini-backups",
     request_body = serde_json::Value,
     responses(
-        (status = 200, description = "从备份恢复 Gemini 配置", body = serde_json::Value)
+        (status = 200, description = "从备份恢复 Gemini 配置", body = crate::api_schemas::BackupRestoreResult)
     )
 )]
 pub async fn restore_gemini_backup(
@@ -341,7 +341,7 @@ pub async fn restore_gemini_backup(
     path = "/api/system/gemini-backups",
     request_body = serde_json::Value,
     responses(
-        (status = 200, description = "删除 Gemini 配置备份", body = serde_json::Value)
+        (status = 200, description = "删除 Gemini 配置备份", body = crate::api_schemas::SuccessResponse)
     )
 )]
 pub async fn delete_gemini_backup(

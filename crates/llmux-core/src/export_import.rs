@@ -4,8 +4,9 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqlitePool};
 use std::collections::HashMap;
+use utoipa::ToSchema;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
 pub struct ExportAccount {
     /// 源库账户 id，import 时用于把 alias 绑定重映射到目标库新 id。
     #[serde(default)]
@@ -29,7 +30,7 @@ pub struct ExportAccount {
     pub notes: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
 pub struct ExportAlias {
     pub alias: String,
     pub target_model: String,
@@ -42,7 +43,7 @@ pub struct ExportAlias {
 }
 
 /// 网关 key 明文存储，可直接导出/导入。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
 pub struct ExportApiKey {
     pub name: String,
     pub key: String,
@@ -50,7 +51,7 @@ pub struct ExportApiKey {
     pub allowed_models: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
 pub struct ConfigExport {
     #[serde(default)]
     pub version: i64,
@@ -64,7 +65,7 @@ pub struct ConfigExport {
     pub settings: Vec<SettingRow>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
 pub struct ImportCounts {
     pub accounts: usize,
     pub aliases: usize,

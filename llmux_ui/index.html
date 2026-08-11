@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>LLMux 网关</title>
+    <script>
+      // 防闪白：渲染前按存储偏好设置色板（data-theme）+ 明暗（.dark）
+      (function () {
+        var palettes = ["lavender", "mint", "peach", "ocean", "rose", "azure"];
+        var p = localStorage.getItem("llmux-palette");
+        if (palettes.indexOf(p) >= 0) {
+          document.documentElement.dataset.theme = p;
+        }
+        var t = localStorage.getItem("llmux-theme");
+        var dark =
+          t === "dark" || (!t && window.matchMedia("(prefers-color-scheme: dark)").matches);
+        document.documentElement.classList.toggle("dark", dark);
+        document.documentElement.style.colorScheme = dark ? "dark" : "light";
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

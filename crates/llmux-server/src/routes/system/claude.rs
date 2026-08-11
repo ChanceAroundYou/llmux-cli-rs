@@ -35,7 +35,7 @@ pub fn backups_dir(data_dir: &std::path::Path) -> std::path::PathBuf {
     get,
     path = "/api/system/claude-settings",
     responses(
-        (status = 200, description = "读取 Claude Code 配置", body = serde_json::Value)
+        (status = 200, description = "读取 Claude Code 配置", body = crate::api_schemas::ClaudeSettingsView)
     )
 )]
 pub async fn get_claude_settings() -> Json<Value> {
@@ -67,7 +67,7 @@ pub async fn get_claude_settings() -> Json<Value> {
     path = "/api/system/claude-settings",
     request_body = serde_json::Value,
     responses(
-        (status = 200, description = "写入 Claude Code 配置（含备份）", body = serde_json::Value)
+        (status = 200, description = "写入 Claude Code 配置（含备份）", body = crate::api_schemas::ClaudeApplyResult)
     )
 )]
 pub async fn apply_claude_settings(
@@ -254,7 +254,7 @@ pub async fn apply_claude_settings(
     get,
     path = "/api/system/claude-backups",
     responses(
-        (status = 200, description = "列出/读取 Claude Code 配置备份", body = serde_json::Value)
+        (status = 200, description = "列出/读取 Claude Code 配置备份（带 ?name= 时返回 {settings}）", body = [crate::api_schemas::BackupEntry])
     )
 )]
 pub async fn list_claude_backups(
@@ -335,7 +335,7 @@ pub async fn list_claude_backups(
     path = "/api/system/claude-backups",
     request_body = serde_json::Value,
     responses(
-        (status = 200, description = "从备份恢复 Claude Code 配置", body = serde_json::Value)
+        (status = 200, description = "从备份恢复 Claude Code 配置", body = crate::api_schemas::BackupRestoreResult)
     )
 )]
 pub async fn restore_claude_backup(
@@ -398,7 +398,7 @@ pub async fn restore_claude_backup(
     path = "/api/system/claude-backups",
     request_body = serde_json::Value,
     responses(
-        (status = 200, description = "删除 Claude Code 配置备份", body = serde_json::Value)
+        (status = 200, description = "删除 Claude Code 配置备份", body = crate::api_schemas::SuccessResponse)
     )
 )]
 pub async fn delete_claude_backup(

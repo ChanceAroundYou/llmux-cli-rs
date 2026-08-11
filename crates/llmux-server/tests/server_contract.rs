@@ -294,7 +294,8 @@ async fn system_tools_returns_expected_structure() {
         assert!(val.is_some(), "missing key {}", key);
         assert!(val.unwrap().is_boolean(), "key {} should be boolean", key);
     }
-    assert_eq!(body.as_object().unwrap().len(), 5);
+    assert!(body.get("version").unwrap().is_string(), "version should be string");
+    assert_eq!(body.as_object().unwrap().len(), 6);
 }
 
 #[tokio::test]

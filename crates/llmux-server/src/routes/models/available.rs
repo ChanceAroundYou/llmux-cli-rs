@@ -48,7 +48,7 @@ fn normalize_model(m: &mut Value) {
     get,
     path = "/api/models/available",
     responses(
-        (status = 200, description = "可用模型列表（返回 {data, stale, cached_at}，data 为异构模型对象数组）")
+        (status = 200, description = "可用模型列表（返回 {data, stale, cached_at}，data 为异构模型对象数组）", body = crate::api_schemas::AvailableModelsResponse)
     )
 )]
 pub async fn get_available_models(

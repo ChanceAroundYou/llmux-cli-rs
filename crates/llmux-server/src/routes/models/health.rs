@@ -12,7 +12,7 @@ use crate::app::AppState;
     get,
     path = "/api/models/health",
     responses(
-        (status = 200, description = "模型健康状态列表（含 limits_cache）")
+        (status = 200, description = "模型健康状态列表（含 limits_cache）", body = [crate::api_schemas::ModelHealthItem])
     )
 )]
 pub async fn get_models_health(Extension(state): Extension<AppState>) -> Response {
