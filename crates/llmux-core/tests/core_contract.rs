@@ -65,6 +65,7 @@ async fn init_db_creates_fresh_schema_and_seed_vendors() {
             "dispatch_state",
             "model_alias_accounts",
             "model_aliases",
+            "model_health",
             "usage_logs",
             "vendors",
         ]
@@ -1032,4 +1033,83 @@ async fn import_accepts_legacy_v1_export_field_names() {
         .await
         .expect("account imported");
     assert_eq!(name, "kimi-web");
+}
+
+#[tokio::test]
+async fn model_health_records_each_model_and_get_returns_all() {
+    let pool = memory_db().await;
+
+    // 一个账户，多个模型 —— 模拟批量拨测逐模型写入
+    let account_id = repo::create_account(&pool, "deepseek", "DS", "enc", None, None, 0, 1, 1, None)
+        .await
+        .expect("insert account");
+
+    repo::record_model_health(&pool, account_id, "deepseek-chat", true, 120, None)
+        .await
+        .expect("record chat");
+    repo::record_model_health(&pool, account_id, "deepseek-reasoner", false, 0, Some("timeout"))
+        .await
+        .expect("record reasoner");
+    // 同一模型再次拨测：应覆盖更新而非新增
+    repo::record_model_health(&pool, account_id, "deepseek-chat", true, 80, None)
+        .await
+        .expect("re-record chat");
+
+    let rows = repo::get_model_health(&pool).await.expect("get health");
+    assert_eq!(rows.len(), 2, "应为 2 个不同模型，实际 {}", rows.len());
+
+    let chat = rows.iter().find(|r| r.model.as_deref() == Some("deepseek-chat")).expect("chat row");
+    assert_eq!(chat.success, Some(1));
+    assert_eq!(chat.latency, Some(80), "第二次拨测应覆盖第一次的延迟");
+
+    let reasoner = rows.iter().find(|r| r.model.as_deref() == Some("deepseek-reasoner")).expect("reasoner row");
+    assert_eq!(reasoner.success, Some(0));
+    assert_eq!(reasoner.error.as_deref(), Some("timeout"));
+    // JOIN accounts 解析 account_name 与 vendor
+    assert_eq!(reasoner.account_name.as_deref(), Some("DS"));
+    assert_eq!(reasoner.vendor_id.as_deref(), Some("deepseek"));
+}
+
+#[tokio::test]
+async fn get_model_health_falls_back_to_usage_logs_for_unprobed_models() {
+    let pool = memory_db().await;
+    let account_id = repo::create_account(&pool, "openai", "OA", "enc", None, None, 0, 1, 1, None)
+        .await
+        .expect("insert account");
+
+    // 未拨测的模型走真实请求日志回退：log_usage 写入 gpt-4o
+    let usage = UsageService::new(pool.clone());
+    usage
+        .log_usage(UsageLogParams {
+            timestamp: Some(1_000),
+            account_id,
+            account_name: "OA".into(),
+            model: "gpt-4o".into(),
+            latency_ms: 50,
+            success: true,
+            error_message: None,
+            limit_cache: None,
+        })
+        .await
+        .expect("log usage");
+
+    let rows = repo::get_model_health(&pool).await.expect("get health");
+    let gpt = rows
+        .iter()
+        .find(|r| r.model.as_deref() == Some("gpt-4o"))
+        .expect("usage fallback row");
+    assert_eq!(gpt.success, Some(1));
+    assert_eq!(gpt.latency, Some(50));
+
+    // 拨测后同模型走 model_health（优先拨测结果），不再回退 usage_logs
+    repo::record_model_health(&pool, account_id, "gpt-4o", false, 0, Some("fail"))
+        .await
+        .expect("record");
+    let rows2 = repo::get_model_health(&pool).await.expect("get health 2");
+    let gpt2 = rows2
+        .iter()
+        .find(|r| r.model.as_deref() == Some("gpt-4o"))
+        .expect("probed row");
+    assert_eq!(gpt2.success, Some(0), "拨测结果应优先于 usage_logs 回退");
+    assert_eq!(rows2.len(), 1, "UNION 去重：同模型不应同时出现两条");
 }

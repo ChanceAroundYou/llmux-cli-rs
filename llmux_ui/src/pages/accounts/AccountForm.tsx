@@ -80,7 +80,7 @@ export const AccountFormModal: React.FC<Props> = ({
     }
   }, [account, open]);
 
-  // 选择厂商：内置按支持的协议开关字段 + 自动填默认 URL；自定义/未选全部打开
+  // 只计算字段可用性（vendor 变化时同步），不在此填 URL
   useEffect(() => {
     const v = vendors.find((x) => x.id === form.vendor_id);
     const isBuiltin = !!v && v.builtin === 1;
@@ -96,17 +96,31 @@ export const AccountFormModal: React.FC<Props> = ({
       anthEnabled: v ? (isBuiltin ? anthropic : true) : true,
       compatEnabled: v ? (isBuiltin ? base : true) : true,
     });
-
-    // 自动填默认 URL（仅当字段为空，避免覆盖编辑时已保存的自定义 URL）
-    if (v) {
-      setForm((f) => ({
-        ...f,
-        base_url: f.base_url || (v.default_base_url ?? ""),
-        anthropic_base_url:
-          f.anthropic_base_url || (v.default_anthropic_url ?? ""),
-      }));
-    }
   }, [form.vendor_id, vendors]);
+
+  // 选择厂商：同步填默认 URL；厂商不支持的协议字段禁用且清空（填了后端也不用）
+  const handleVendorChange = (vendorId: string) => {
+    setForm((f) => {
+      const v = vendors.find((x) => x.id === vendorId);
+      if (!v) return { ...f, vendor_id: vendorId };
+      const isBuiltin = v.builtin === 1;
+      const openai =
+        v.protocols.includes("openai") || v.protocol === "openai";
+      const anthropic = v.protocols.includes("anthropic");
+      // 与 urlFields effect 保持一致：内置按协议开关，自定义全开
+      const baseEnabled = isBuiltin
+        ? openai || v.protocol === "gemini"
+        : true;
+      const anthEnabled = isBuiltin ? anthropic : true;
+      // 数据驱动：anthropic 端点只取专用字段，不做厂商特判（数据由后端保证）
+      return {
+        ...f,
+        vendor_id: vendorId,
+        base_url: baseEnabled ? v.default_base_url ?? "" : "",
+        anthropic_base_url: anthEnabled ? v.default_anthropic_url ?? "" : "",
+      };
+    });
+  };
 
   const handleSubmit = async () => {
     setLoading(true);
@@ -159,7 +173,7 @@ export const AccountFormModal: React.FC<Props> = ({
             <label className={label}>{t("accounts.form.vendor")} *</label>
             <Select
               value={form.vendor_id}
-              onChange={(v) => setForm((f) => ({ ...f, vendor_id: v }))}
+              onChange={handleVendorChange}
               options={vendors.map((v) => ({ value: v.id, label: v.name }))}
               placeholder={t("accounts.form.selectVendor")}
             />

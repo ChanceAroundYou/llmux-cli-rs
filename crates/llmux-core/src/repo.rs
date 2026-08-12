@@ -8,6 +8,15 @@ use crate::models::{Account, AccountPublic, ApiKey, ModelAlias, Vendor};
 use anyhow::Result;
 use sqlx::{Row, SqlitePool};
 use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// unix 毫秒（与 usage_logs.ts 单位一致）。
+fn now_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
 
 // ---------------------------------------------------------------------------
 // vendors
@@ -608,7 +617,7 @@ pub async fn list_recent_activity(pool: &SqlitePool, limit: i64) -> Result<Vec<A
     .await?)
 }
 
-/// 模型健康检查一行（最新一条 usage_log 按 (account_id, model) 分组）。
+/// 模型健康检查一行（拨测结果或真实请求）。
 #[derive(Debug, sqlx::FromRow)]
 pub struct ModelHealthRow {
     pub account_id: Option<i64>,
@@ -623,10 +632,47 @@ pub struct ModelHealthRow {
     pub account_name: Option<String>,
 }
 
-/// 模型健康检查：分组取最新记录，JOIN vendors/accounts 解析厂商与缓存。
+/// 记录一次模型拨测结果（upsert）。(account_id, model) 唯一，最新覆盖。
+pub async fn record_model_health(
+    pool: &SqlitePool,
+    account_id: i64,
+    model: &str,
+    success: bool,
+    latency_ms: i64,
+    error_message: Option<&str>,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO model_health (account_id, model, success, latency_ms, error_message, checked_at) \
+         VALUES (?, ?, ?, ?, ?, ?) \
+         ON CONFLICT(account_id, model) DO UPDATE SET \
+           success = excluded.success, \
+           latency_ms = excluded.latency_ms, \
+           error_message = excluded.error_message, \
+           checked_at = excluded.checked_at",
+    )
+    .bind(account_id)
+    .bind(model)
+    .bind(if success { 1 } else { 0 })
+    .bind(latency_ms)
+    .bind(error_message)
+    .bind(now_millis())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// 模型健康检查：优先读拨测结果表 model_health；未拨测的 (account_id, model)
+/// 回退到 usage_logs 最新一条。JOIN vendors/accounts 解析厂商与缓存。
 pub async fn get_model_health(pool: &SqlitePool) -> Result<Vec<ModelHealthRow>> {
     Ok(sqlx::query_as::<_, ModelHealthRow>(
-        "SELECT u.account_id, v.id AS vendor_id, u.model, u.ts AS last_checked, \
+        "SELECT h.account_id, v.id AS vendor_id, h.model, h.checked_at AS last_checked, \
+                h.success, h.latency_ms AS latency, h.error_message AS error, \
+                a.limits_cache, a.limits_cache_updated_at, a.name AS account_name \
+         FROM model_health h \
+         LEFT JOIN accounts a ON h.account_id = a.id \
+         LEFT JOIN vendors v ON a.vendor_id = v.id \
+         UNION ALL \
+         SELECT u.account_id, v.id AS vendor_id, u.model, u.ts AS last_checked, \
                 u.success, u.latency_ms AS latency, u.error_message AS error, \
                 a.limits_cache, a.limits_cache_updated_at, u.account_name \
          FROM usage_logs u \
@@ -634,6 +680,10 @@ pub async fn get_model_health(pool: &SqlitePool) -> Result<Vec<ModelHealthRow>> 
          LEFT JOIN vendors v ON a.vendor_id = v.id \
          WHERE u.id IN ( \
            SELECT MAX(id) FROM usage_logs GROUP BY account_id, model \
+         ) \
+         AND NOT EXISTS ( \
+           SELECT 1 FROM model_health h2 \
+           WHERE h2.account_id = u.account_id AND h2.model = u.model \
          )",
     )
     .fetch_all(pool)

@@ -94,6 +94,19 @@ CREATE INDEX IF NOT EXISTS idx_usage_account  ON usage_logs(account_id);
 CREATE INDEX IF NOT EXISTS idx_usage_model    ON usage_logs(model);
 CREATE INDEX IF NOT EXISTS idx_usage_success  ON usage_logs(success);
 
+-- 健康域：模型拨测结果（区别于 usage_logs 只记真实请求）。
+-- 拨测 test / test-all 会把结果 upsert 到这里，(account_id, model) 唯一，最新覆盖。
+CREATE TABLE IF NOT EXISTS model_health (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  account_id    INTEGER REFERENCES accounts(id) ON DELETE SET NULL,
+  model         TEXT NOT NULL,
+  success       INTEGER NOT NULL DEFAULT 0,
+  latency_ms    INTEGER DEFAULT 0,
+  error_message TEXT,
+  checked_at    INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_model_health_account_model ON model_health(account_id, model);
+
 -- 运行时域：回退粘滞路由持久化
 CREATE TABLE IF NOT EXISTS dispatch_state (
   dispatch_key          TEXT PRIMARY KEY,
@@ -116,7 +129,7 @@ CREATE TABLE IF NOT EXISTS app_settings (
 -- openai_responses：官方 OpenAI=1；第三方 openai 兼容厂商保守标 0（多数仅实现 chat/completions，确认支持后可改 1）
 INSERT OR IGNORE INTO vendors (id, name, protocol, protocols, openai_responses, default_base_url, default_anthropic_url, coding_plan, coding_base_url, coding_anthropic_url, builtin) VALUES
 ('openai',     'OpenAI',             'openai',    '["openai"]',                  1, 'https://api.openai.com/v1',                              NULL, 0, NULL, NULL, 1),
-('anthropic',  'Anthropic',          'anthropic', '["anthropic"]',                 1, 'https://api.anthropic.com/v1',                           NULL, 0, NULL, NULL, 1),
+('anthropic',  'Anthropic',          'anthropic', '["anthropic"]',                 1, 'https://api.anthropic.com/v1',                           'https://api.anthropic.com/v1',   0, NULL, NULL, 1),
 ('gemini',     'Google Gemini',      'gemini',    '["gemini"]',                    1, 'https://generativelanguage.googleapis.com/v1beta',       NULL, 0, NULL, NULL, 1),
 ('deepseek',   'DeepSeek',           'openai',    '["openai","anthropic"]',        1, 'https://api.deepseek.com',                               'https://api.deepseek.com/anthropic',   0, NULL, NULL, 1),
 ('zhipu',      '智谱 GLM',           'openai',    '["openai","anthropic"]',        0, 'https://open.bigmodel.cn/api/paas/v4',                   'https://open.bigmodel.cn/api/anthropic', 0, 'https://open.bigmodel.cn/api/coding/paas/v4', 'https://open.bigmodel.cn/api/anthropic', 1),

@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 use llmux_core::dispatcher::{
     get_accounts_by_ids, get_active_accounts, resolve_model, ModelResolution,
 };
+use llmux_core::repo;
 
 use crate::app::AppState;
 
@@ -208,7 +209,19 @@ pub async fn start_test_queue(
                             false
                         };
                         let latency_ms = start.elapsed().as_millis() as i64;
-                        // 测试结果不入 usage_logs（监控域只记录真实请求）
+                        // 拨测结果持久化到 model_health（健康页/别名卡展示；不入 usage_logs 以免污染真实请求监控）
+                        if let Err(e) = repo::record_model_health(
+                            &pool,
+                            account.id,
+                            model_name,
+                            test_success,
+                            latency_ms,
+                            None,
+                        )
+                        .await
+                        {
+                            tracing::debug!("🧪 record_model_health failed: {e}");
+                        }
                         tracing::debug!(
                             "🧪 test {} via {}: success={} {}ms",
                             model_name,
@@ -418,6 +431,20 @@ pub async fn test_model(
             .map(String::from)
             .or_else(|| Some(body_text.clone()))
     };
+
+    // 拨测结果持久化到 model_health（健康页/别名卡展示；不入 usage_logs 以免污染真实请求监控）
+    if let Err(e) = repo::record_model_health(
+        &state.pool,
+        account.id,
+        model_name,
+        success,
+        latency_ms,
+        error_msg.as_deref(),
+    )
+    .await
+    {
+        tracing::debug!("🧪 record_model_health failed: {e}");
+    }
 
     if success {
         tracing::info!(

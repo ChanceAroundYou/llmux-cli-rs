@@ -126,16 +126,25 @@ export const ModelBrowser: React.FC = () => {
     fetchAll();
   }, [fetchAll]);
 
-  // 队列运行中轮询进度 + 顺带刷新健康
+  // 队列运行中轮询进度 + 每次轮询都刷新健康（含结束那次：isRunning 已变 false 时
+  // 最后一批结果同样需要带入，不能依赖 isRunning 判断）
   usePolling(
     async () => {
       const status = await modelApi.getTestQueueStatus();
       setQueueStatus(status);
-      if (status.isRunning) fetchHealth();
+      fetchHealth();
     },
     2000,
     queueStatus?.isRunning ?? false,
   );
+
+  // 兜底：队列极快完成（testAll 返回时已结束）时轮询可能从未 tick，
+  // 由 queueStatus 变为结束时再补一次最终健康刷新
+  useEffect(() => {
+    if (queueStatus && !queueStatus.isRunning) {
+      fetchHealth();
+    }
+  }, [queueStatus, fetchHealth]);
 
   const handleTest = async (m: AvailableModel) => {
     setTestResults((prev) => ({ ...prev, [m.id]: { loading: true } }));

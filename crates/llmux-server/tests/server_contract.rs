@@ -655,3 +655,66 @@ async fn swagger_ui_injects_request_snippets_config() {
         &text.chars().take(400).collect::<String>()
     );
 }
+
+#[tokio::test]
+async fn test_all_queue_writes_health_for_each_model() {
+    let state = llmux_server::test_state().await;
+    let pool = state.pool.clone();
+    let app = llmux_server::app(state);
+
+    // 建 deepseek 账户（目标厂商：内置种子 vendor，有协议/默认 URL）
+    let (status, body) = request_json_shared(
+        &app,
+        Method::POST,
+        "/api/accounts",
+        Some(json!({"vendor_id": "deepseek", "name": "DSHealth", "api_key": "sk-ds", "skip_validation": true})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let account_id = body["id"].as_i64().expect("account id");
+
+    // 启动批量拨测：两个模型走同一账户
+    let (status, body) = request_json_shared(
+        &app,
+        Method::POST,
+        "/api/models/test-all",
+        Some(json!({"models": [
+            {"model": "deepseek-chat", "vendorId": "deepseek"},
+            {"model": "deepseek-reasoner", "vendorId": "deepseek"}
+        ]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["success"], true);
+
+    // 轮询等待队列结束（批量拨测为异步 spawn）
+    let mut attempts = 0;
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let (_, q) = request_json_shared(&app, Method::GET, "/api/models/test-queue/status", None).await;
+        attempts += 1;
+        if q["isRunning"] == json!(false) || attempts > 100 {
+            break;
+        }
+    }
+
+    // 健康表应包含传入的两个模型（拨测请求无真实网络，结果为失败也算写入）
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM model_health WHERE account_id = ? AND model IN ('deepseek-chat','deepseek-reasoner')")
+            .bind(account_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count health rows");
+    assert_eq!(count, 2, "批量拨测应为每个模型写入健康记录，实际 {} 条", count);
+
+    // GET /api/models/health 聚合两个模型
+    let (_, health) = request_json_shared(&app, Method::GET, "/api/models/health", None).await;
+    let models: Vec<String> = health
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["model"].as_str().map_or(false, |m| m.starts_with("deepseek-")))
+        .map(|r| r["model"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(models.len(), 2, "health 接口应返回两个模型，实际 {:?}", models);
+}

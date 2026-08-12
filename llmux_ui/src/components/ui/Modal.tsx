@@ -1,5 +1,6 @@
 // 马卡龙弹窗：柔和遮罩 + 圆角卡片 + 淡入动效
 import React, { useEffect } from "react";
+import { createPortal } from "react-dom";
 import { cn } from "@/utils/helpers";
 import { X } from "lucide-react";
 
@@ -41,35 +42,45 @@ export const Modal: React.FC<ModalProps> = ({
 
   if (!open) return null;
 
-  return (
-    <div className="fixed inset-0 z-[60] flex items-center justify-center p-4">
-      <div className="absolute inset-0 bg-black/40 backdrop-blur-sm" onClick={onClose} aria-hidden="true" />
+  // 用 portal 挂到 body：脱离页面容器（避免容器 transform 使 fixed 遮罩相对容器定位而漏顶）
+  return createPortal(
+    <>
+      {/* 遮罩：独立 fixed 全屏，从视口顶边开始覆盖，避免顶部露缝 */}
       <div
-        role="dialog"
-        aria-modal="true"
-        className={cn(
-          "relative w-full animate-fade-in rounded-2xl border border-border bg-card shadow-card",
-          sizeMap[size],
-        )}
-      >
-        {title && (
-          <div className="flex items-center justify-between border-b border-border px-6 py-4">
-            <h2 className="text-lg font-semibold text-card-foreground">{title}</h2>
-            <button
-              onClick={onClose}
-              className="rounded-lg p-1 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-            >
-              <X className="h-5 w-5" />
-            </button>
-          </div>
-        )}
-        <div className="max-h-[70vh] overflow-y-auto px-6 py-4">{children}</div>
-        {footer && (
-          <div className="flex justify-end gap-3 border-t border-border px-6 py-4">
-            {footer}
-          </div>
-        )}
+        className="fixed inset-0 z-[60] bg-black/40 backdrop-blur-sm"
+        onClick={onClose}
+        aria-hidden="true"
+      />
+      {/* 弹窗层：独立 fixed 居中，容器指针穿透让点击落到遮罩 */}
+      <div className="pointer-events-none fixed inset-0 z-[61] flex items-center justify-center p-4">
+        <div
+          role="dialog"
+          aria-modal="true"
+          className={cn(
+            "pointer-events-auto relative w-full animate-fade-in rounded-2xl border border-border bg-card shadow-card",
+            sizeMap[size],
+          )}
+        >
+          {title && (
+            <div className="flex items-center justify-between border-b border-border px-6 py-4">
+              <h2 className="text-lg font-semibold text-card-foreground">{title}</h2>
+              <button
+                onClick={onClose}
+                className="rounded-lg p-1 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+              >
+                <X className="h-5 w-5" />
+              </button>
+            </div>
+          )}
+          <div className="max-h-[70vh] overflow-y-auto px-6 py-4">{children}</div>
+          {footer && (
+            <div className="flex justify-end gap-3 border-t border-border px-6 py-4">
+              {footer}
+            </div>
+          )}
+        </div>
       </div>
-    </div>
+    </>,
+    document.body,
   );
 };

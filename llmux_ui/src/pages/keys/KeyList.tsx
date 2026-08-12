@@ -1,20 +1,26 @@
 // 密钥管理：网关密钥 + 白名单 + 一次性明文展示
 import React, { useEffect, useState, useCallback } from "react";
 import { keyApi } from "@/api/keys";
+import { modelApi } from "@/api/models";
 import type { ApiKey } from "@/types/key";
+import type { AliasResponse } from "@/types/model";
 import { Button } from "@/components/ui/Button";
 import { Table } from "@/components/ui/Table";
 import { Badge } from "@/components/ui/Badge";
 import { Modal } from "@/components/ui/Modal";
 import { Input } from "@/components/ui/Input";
+import { Checkbox } from "@/components/ui/Checkbox";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { CopyButton } from "@/components/shared/CopyButton";
 import { useToast } from "@/hooks/useToast";
 import { useT } from "@/i18n";
 import { PageHeader } from "@/components/shared/PageHeader";
 import { EmptyState } from "@/components/shared/EmptyState";
+import { cn } from "@/utils/helpers";
 import { formatTimestamp } from "@/utils/format";
 import { KeyRound } from "lucide-react";
+
+type ModelScope = "all" | "specific";
 
 export const KeyList: React.FC = () => {
   const { t } = useT();
@@ -22,7 +28,9 @@ export const KeyList: React.FC = () => {
   const [loading, setLoading] = useState(true);
   const [createOpen, setCreateOpen] = useState(false);
   const [newKeyName, setNewKeyName] = useState("");
-  const [newKeyModels, setNewKeyModels] = useState("");
+  const [modelScope, setModelScope] = useState<ModelScope>("all");
+  const [selectedModels, setSelectedModels] = useState<string[]>([]);
+  const [aliases, setAliases] = useState<AliasResponse[]>([]);
   const [creating, setCreating] = useState(false);
   const [createdKey, setCreatedKey] = useState<string | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<ApiKey | null>(null);
@@ -42,15 +50,26 @@ export const KeyList: React.FC = () => {
 
   useEffect(() => {
     fetchKeys();
+    // 别名列表：创建密钥「指定模型」时从别名中勾选
+    modelApi.getAliases().then(setAliases).catch(() => {});
   }, [fetchKeys]);
+
+  const toggleModel = (alias: string) => {
+    setSelectedModels((prev) =>
+      prev.includes(alias)
+        ? prev.filter((m) => m !== alias)
+        : [...prev, alias],
+    );
+  };
 
   const handleCreate = async () => {
     setCreating(true);
     try {
       const payload: { name?: string; allowed_models?: string | string[] } = {};
       if (newKeyName.trim()) payload.name = newKeyName.trim();
-      if (newKeyModels.trim() && newKeyModels.trim() !== "*") {
-        payload.allowed_models = newKeyModels.split(",").map((s) => s.trim()).filter(Boolean);
+      // 「全部」不传 allowed_models → 后端默认 "*"；「指定模型」传选中的别名数组
+      if (modelScope === "specific" && selectedModels.length > 0) {
+        payload.allowed_models = selectedModels;
       }
       const res = await keyApi.create(payload);
       setCreatedKey(res.key);
@@ -174,7 +193,8 @@ export const KeyList: React.FC = () => {
           setCreateOpen(false);
           setCreatedKey(null);
           setNewKeyName("");
-          setNewKeyModels("");
+          setModelScope("all");
+          setSelectedModels([]);
         }}
         title={t("keys.create.title")}
         size="sm"
@@ -223,12 +243,55 @@ export const KeyList: React.FC = () => {
               <label className="mb-1 block text-sm font-medium text-card-foreground">
                 {t("keys.form.models")}
               </label>
-              <Input
-                value={newKeyModels}
-                onChange={setNewKeyModels}
-                placeholder={t("keys.form.modelsPlaceholder")}
-              />
-              <p className="mt-1 text-xs text-muted-foreground">{t("keys.form.modelsHint")}</p>
+
+              {/* 权限范围：全部 / 指定模型 */}
+              <div className="grid grid-cols-2 gap-1 rounded-xl bg-muted/60 p-1">
+                <button
+                  type="button"
+                  onClick={() => setModelScope("all")}
+                  className={cn(
+                    "rounded-lg py-2 text-sm font-semibold transition-all",
+                    modelScope === "all"
+                      ? "bg-card text-primary shadow-soft"
+                      : "text-muted-foreground hover:text-foreground",
+                  )}
+                >
+                  {t("keys.form.scopeAll")}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setModelScope("specific")}
+                  className={cn(
+                    "rounded-lg py-2 text-sm font-semibold transition-all",
+                    modelScope === "specific"
+                      ? "bg-card text-primary shadow-soft"
+                      : "text-muted-foreground hover:text-foreground",
+                  )}
+                >
+                  {t("keys.form.scopeSpecific")}
+                </button>
+              </div>
+
+              {modelScope === "all" ? (
+                <p className="mt-2 text-xs text-muted-foreground">
+                  {t("keys.form.allHint")}
+                </p>
+              ) : aliases.length === 0 ? (
+                <p className="mt-2 text-xs text-muted-foreground">
+                  {t("keys.form.noAliases")}
+                </p>
+              ) : (
+                <div className="mt-3 h-44 space-y-1.5 overflow-y-auto rounded-xl border border-border bg-muted/20 p-3">
+                  {aliases.map((a) => (
+                    <Checkbox
+                      key={a.id}
+                      checked={selectedModels.includes(a.alias)}
+                      onChange={() => toggleModel(a.alias)}
+                      label={a.alias}
+                    />
+                  ))}
+                </div>
+              )}
             </div>
           </div>
         )}
