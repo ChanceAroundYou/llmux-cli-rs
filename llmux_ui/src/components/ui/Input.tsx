@@ -19,7 +19,7 @@ export const Input: React.FC<InputProps> = ({
     value={value}
     onChange={(e) => onChange(e.target.value)}
     className={cn(
-      "w-full rounded-xl border border-input bg-card px-3 py-2 text-sm transition-colors",
+      "w-full rounded-xl border border-input bg-card px-3 py-2 text-sm transition-[color,border-color,box-shadow]",
       "placeholder:text-muted-foreground/60",
       "focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/30",
       "disabled:cursor-not-allowed disabled:bg-muted disabled:text-muted-foreground",

@@ -1,5 +1,6 @@
-// 马卡龙分段 Tabs：胶囊容器 + 浮起激活项
+// 马卡龙分段 Tabs：胶囊容器 + 浮起激活项（layoutId 在标签间平滑滑动）
 import React from "react";
+import { motion } from "framer-motion";
 import { cn } from "@/utils/helpers";
 
 interface TabsProps {
@@ -9,20 +10,28 @@ interface TabsProps {
 }
 
 export const Tabs: React.FC<TabsProps> = ({ active, onChange, items }) => (
-  <div className="flex flex-wrap gap-1 rounded-full bg-muted p-1">
-    {items.map((item) => (
-      <button
-        key={item.key}
-        onClick={() => onChange(item.key)}
-        className={cn(
-          "rounded-full px-4 py-1.5 text-sm font-medium transition-all duration-200",
-          active === item.key
-            ? "bg-card text-foreground shadow-soft"
-            : "text-muted-foreground hover:text-foreground",
-        )}
-      >
-        {item.label}
-      </button>
-    ))}
+  <div className="relative flex flex-wrap gap-1 rounded-full bg-muted p-1">
+    {items.map((item) => {
+      const isActive = active === item.key;
+      return (
+        <button
+          key={item.key}
+          onClick={() => onChange(item.key)}
+          className={cn(
+            "relative rounded-full px-4 py-1.5 text-sm font-medium transition-colors duration-200",
+            isActive ? "text-foreground" : "text-muted-foreground hover:text-foreground",
+          )}
+        >
+          {isActive && (
+            <motion.span
+              layoutId="tabs-active"
+              className="absolute inset-0 rounded-full bg-card shadow-soft"
+              transition={{ type: "spring", stiffness: 500, damping: 35 }}
+            />
+          )}
+          <span className="relative z-10">{item.label}</span>
+        </button>
+      );
+    })}
   </div>
 );

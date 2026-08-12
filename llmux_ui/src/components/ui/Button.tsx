@@ -39,7 +39,7 @@ export const Button: React.FC<ButtonProps> = ({
 }) => (
   <button
     className={cn(
-      "inline-flex items-center justify-center gap-2 rounded-full font-medium transition-all duration-200",
+      "inline-flex items-center justify-center gap-2 rounded-full font-medium transition-all duration-200 active:scale-[0.97]",
       "focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background",
       "disabled:cursor-not-allowed disabled:opacity-60",
       variantStyles[variant],

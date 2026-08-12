@@ -26,7 +26,7 @@ export const Select: React.FC<SelectProps> = ({
       onChange={(e) => onChange(e.target.value)}
       disabled={disabled}
       className={cn(
-        "w-full appearance-none rounded-xl border border-input bg-card py-2 pl-3 pr-9 text-sm transition-colors",
+        "w-full appearance-none rounded-xl border border-input bg-card py-2 pl-3 pr-9 text-sm transition-[color,border-color,box-shadow]",
         "focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/30",
         "disabled:cursor-not-allowed disabled:bg-muted disabled:text-muted-foreground",
       )}

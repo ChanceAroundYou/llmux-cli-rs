@@ -43,7 +43,7 @@ export function Table<T>({
 
   if (!data.length) {
     return (
-      <div className="flex h-40 items-center justify-center text-muted-foreground">
+      <div className="flex h-40 animate-fade-in items-center justify-center text-muted-foreground">
         {empty ?? t("common.noData")}
       </div>
     );
@@ -74,8 +74,8 @@ export function Table<T>({
             {data.map((row) => (
               <motion.tr
                 key={rowKey(row)}
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
+                initial={{ opacity: 0, y: 4 }}
+                animate={{ opacity: 1, y: 0 }}
                 exit={{ opacity: 0 }}
                 transition={{ duration: 0.15, ease: "easeOut" }}
                 className={cn(

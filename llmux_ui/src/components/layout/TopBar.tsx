@@ -1,5 +1,6 @@
 // 全局顶栏：网关连接状态 + 主题/语言切换 + 移动端菜单
 import React, { useEffect, useState } from "react";
+import { motion } from "framer-motion";
 import { cn } from "@/utils/helpers";
 import { useT } from "@/i18n";
 import { useThemeStore, getSystemTheme, applyThemeClass, type Scheme } from "@/stores/theme";
@@ -118,13 +119,19 @@ export const TopBar: React.FC<TopBarProps> = ({ onMenuClick }) => {
                   title={t(opt.labelKey)}
                   onClick={() => setScheme(opt.value)}
                   className={cn(
-                    "flex h-7 w-7 items-center justify-center rounded-full transition-all duration-200",
-                    active
-                      ? "bg-card text-primary shadow-soft"
-                      : "text-muted-foreground hover:text-foreground",
+                    "relative flex h-7 w-7 items-center justify-center rounded-full transition-colors duration-200",
+                    active ? "text-primary" : "text-muted-foreground hover:text-foreground",
                   )}
                 >
-                  <Icon className="h-4 w-4" />
+                  {/* 激活背景在主题选项间滑动 */}
+                  {active && (
+                    <motion.span
+                      layoutId="theme-active"
+                      className="absolute inset-0 rounded-full bg-card shadow-soft"
+                      transition={{ type: "spring", stiffness: 500, damping: 35 }}
+                    />
+                  )}
+                  <Icon className="relative h-4 w-4" />
                 </button>
               );
             })}
@@ -136,13 +143,19 @@ export const TopBar: React.FC<TopBarProps> = ({ onMenuClick }) => {
                 key={l}
                 onClick={() => setLang(l)}
                 className={cn(
-                  "rounded-full px-2.5 py-1 text-xs font-semibold transition-all duration-200",
-                  lang === l
-                    ? "bg-card text-primary shadow-soft"
-                    : "text-muted-foreground hover:text-foreground",
+                  "relative rounded-full px-2.5 py-1 text-xs font-semibold transition-colors duration-200",
+                  lang === l ? "text-primary" : "text-muted-foreground hover:text-foreground",
                 )}
               >
-                {l === "zh" ? "中" : "EN"}
+                {/* 激活背景在语言选项间滑动 */}
+                {lang === l && (
+                  <motion.span
+                    layoutId="lang-active"
+                    className="absolute inset-0 rounded-full bg-card shadow-soft"
+                    transition={{ type: "spring", stiffness: 500, damping: 35 }}
+                  />
+                )}
+                <span className="relative z-10">{l === "zh" ? "中" : "EN"}</span>
               </button>
             ))}
           </div>

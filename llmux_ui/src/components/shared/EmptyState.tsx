@@ -8,9 +8,10 @@ interface EmptyStateProps {
 }
 
 export const EmptyState: React.FC<EmptyStateProps> = ({ icon: Icon, title, description }) => (
-  <div className="flex flex-col items-center justify-center gap-2 py-10 text-center">
+  // 复用闲置的自定义动画：整体淡入 + 图标缓慢浮动，空态不再瞬间出现
+  <div className="flex animate-fade-in flex-col items-center justify-center gap-2 py-10 text-center">
     <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-muted text-muted-foreground">
-      <Icon className="h-6 w-6" />
+      <Icon className="h-6 w-6 animate-float" />
     </div>
     <p className="text-sm font-medium text-muted-foreground">{title}</p>
     {description && <p className="text-xs text-muted-foreground/70">{description}</p>}

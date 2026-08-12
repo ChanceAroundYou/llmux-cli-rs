@@ -15,7 +15,8 @@ export const StatusDot: React.FC<{ status: string; className?: string }> = ({
 }) => (
   <span
     className={cn(
-      "inline-block h-2.5 w-2.5 rounded-full",
+      // 颜色与发光阴影都做过渡，状态变化不再瞬间硬跳
+      "inline-block h-2.5 w-2.5 rounded-full transition-[background-color,box-shadow] duration-300",
       colorMap[status] ?? colorMap.unknown,
       className,
     )}

@@ -12,6 +12,7 @@ import type { ApiKey } from "@/types/key";
 import type { AliasResponse, ModelHealthEntry } from "@/types/model";
 import { Badge } from "@/components/ui/Badge";
 import { StatusDot } from "@/components/shared/StatusDot";
+import { AnimatedNumber } from "@/components/shared/AnimatedNumber";
 import { SearchInput } from "@/components/ui/SearchInput";
 import { Select } from "@/components/ui/Select";
 import { PageHeader } from "@/components/shared/PageHeader";
@@ -402,7 +403,10 @@ const StatCard: React.FC<{
       <Icon className="h-5 w-5" />
     </div>
     <p className="text-sm font-medium text-muted-foreground">{label}</p>
-    <p className="mt-1 text-3xl font-bold text-card-foreground">{value}</p>
+    <p className="mt-1 text-3xl font-bold text-card-foreground">
+      {/* 数值型统计卡用数字滚动动画，刷新数据时平滑变化 */}
+      {typeof value === "number" ? <AnimatedNumber value={value} /> : value}
+    </p>
     {sub && <p className="mt-0.5 text-xs text-muted-foreground">{sub}</p>}
   </div>
 );

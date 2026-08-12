@@ -1,5 +1,6 @@
 // 马卡龙悬浮侧边栏：玻璃卡片 + 圆润导航 + 明暗双主题
 import React, { useEffect, useState } from "react";
+import { AnimatePresence, motion } from "framer-motion";
 import { NavLink } from "react-router-dom";
 import { cn } from "@/utils/helpers";
 import { useT } from "@/i18n";
@@ -56,10 +57,20 @@ export const Sidebar: React.FC<SidebarProps> = ({ open, onClose }) => {
 
   return (
     <>
-      {/* 移动端遮罩 */}
-      {open && (
-        <div className="fixed inset-0 z-40 bg-black/30 backdrop-blur-sm lg:hidden" onClick={onClose} />
-      )}
+      {/* 移动端遮罩：淡入淡出 */}
+      <AnimatePresence>
+        {open && (
+          <motion.div
+            key="overlay"
+            className="fixed inset-0 z-40 bg-black/30 backdrop-blur-sm lg:hidden"
+            onClick={onClose}
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            transition={{ duration: 0.2 }}
+          />
+        )}
+      </AnimatePresence>
       <aside
         className={cn(
           "fixed left-0 top-0 z-50 h-screen w-64 p-2",

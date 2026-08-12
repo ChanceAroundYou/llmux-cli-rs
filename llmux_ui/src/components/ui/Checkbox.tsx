@@ -1,5 +1,6 @@
 // 马卡龙自定义复选框：圆角方框 + 主题色选中态 + 柔和阴影
 import React from "react";
+import { AnimatePresence, motion } from "framer-motion";
 import { Check } from "lucide-react";
 import { cn } from "@/utils/helpers";
 
@@ -38,7 +39,21 @@ export const Checkbox: React.FC<CheckboxProps> = ({
           : "border-border bg-card group-hover:border-primary/60",
       )}
     >
-      {checked && <Check size={11} strokeWidth={3.5} />}
+      {/* 勾选图标：scale + 旋转弹性出场 */}
+      <AnimatePresence initial={false}>
+        {checked && (
+          <motion.span
+            key="check"
+            initial={{ scale: 0, rotate: -45, opacity: 0 }}
+            animate={{ scale: 1, rotate: 0, opacity: 1 }}
+            exit={{ scale: 0, opacity: 0 }}
+            transition={{ type: "spring", stiffness: 600, damping: 20 }}
+            className="flex"
+          >
+            <Check size={11} strokeWidth={3.5} />
+          </motion.span>
+        )}
+      </AnimatePresence>
     </span>
     {label && (
       <span className="text-sm text-card-foreground">{label}</span>

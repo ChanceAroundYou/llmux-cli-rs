@@ -1,5 +1,6 @@
 // 复制按钮：点击后短暂显示对勾；剪贴板不可用时回退 execCommand
 import React, { useState } from "react";
+import { AnimatePresence, motion } from "framer-motion";
 import { Copy, Check } from "lucide-react";
 import { cn } from "@/utils/helpers";
 import { useT } from "@/i18n";
@@ -42,7 +43,32 @@ export const CopyButton: React.FC<{ text: string; className?: string }> = ({ tex
       title={t("common.copy")}
       aria-label={t("common.copy")}
     >
-      {copied ? <Check className="h-4 w-4 text-success" /> : <Copy className="h-4 w-4" />}
+      {/* 图标交叉切换：对勾以 scale + 旋转弹出，复制成功有奖励感 */}
+      <AnimatePresence mode="wait" initial={false}>
+        {copied ? (
+          <motion.span
+            key="check"
+            initial={{ scale: 0, rotate: -30, opacity: 0 }}
+            animate={{ scale: 1, rotate: 0, opacity: 1 }}
+            exit={{ scale: 0, opacity: 0 }}
+            transition={{ type: "spring", stiffness: 500, damping: 25 }}
+            className="flex"
+          >
+            <Check className="h-4 w-4 text-success" />
+          </motion.span>
+        ) : (
+          <motion.span
+            key="copy"
+            initial={{ scale: 0.6, opacity: 0 }}
+            animate={{ scale: 1, opacity: 1 }}
+            exit={{ scale: 0.6, opacity: 0 }}
+            transition={{ duration: 0.12 }}
+            className="flex"
+          >
+            <Copy className="h-4 w-4" />
+          </motion.span>
+        )}
+      </AnimatePresence>
     </button>
   );
 };
