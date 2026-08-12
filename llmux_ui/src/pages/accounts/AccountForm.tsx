@@ -193,6 +193,9 @@ export const AccountFormModal: React.FC<Props> = ({
     try {
       // 剔除内部暂存字段（_prev_*），只提交用户可见字段
       const { _prev_base_url: _pb, _prev_anthropic_url: _pa, ...payload } = form;
+      // 解构占位变量仅用于剔除字段，标记为有意忽略
+      void _pb;
+      void _pa;
       if (isEdit && account?.id) {
         await accountApi.update(account.id, {
           ...payload,

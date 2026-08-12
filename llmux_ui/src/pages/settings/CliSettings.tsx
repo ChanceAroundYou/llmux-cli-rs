@@ -153,7 +153,7 @@ export const CliSettings: React.FC = () => {
   };
 
   return (
-    <div className="animate-fade-in space-y-6">
+    <div className="space-y-6">
       <PageHeader
         icon={Wrench}
         iconClass="bg-warning/25 text-warning-foreground"

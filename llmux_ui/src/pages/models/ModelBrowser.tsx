@@ -23,6 +23,7 @@ import { StatusDot } from "@/components/shared/StatusDot";
 import { useToast } from "@/hooks/useToast";
 import { useT } from "@/i18n";
 import { usePolling } from "@/hooks/usePolling";
+import { useDelayedLoading } from "@/hooks/useDelayedLoading";
 import { cn } from "@/utils/helpers";
 import { formatTimestamp, formatLatency } from "@/utils/format";
 import {
@@ -59,6 +60,8 @@ export const ModelBrowser: React.FC = () => {
   const [healthMap, setHealthMap] = useState<Map<string, ModelHealthEntry>>(new Map());
   const [testResults, setTestResults] = useState<Record<string, TestState>>({});
   const [loading, setLoading] = useState(true);
+  // 模型网格骨架延迟显示：快速请求不闪
+  const showSkeleton = useDelayedLoading(loading, 200);
   const [search, setSearch] = useState("");
   const [vendorFilter, setVendorFilter] = useState<string>("all");
   const [page, setPage] = useState(1);
@@ -271,7 +274,7 @@ export const ModelBrowser: React.FC = () => {
   const pagedModels = filtered.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
 
   return (
-    <div className="animate-fade-in space-y-6">
+    <div className="space-y-6">
       <PageHeader
         icon={Boxes}
         iconClass="bg-primary/20 text-primary-foreground"
@@ -411,7 +414,7 @@ export const ModelBrowser: React.FC = () => {
       </div>
 
       {/* Model Grid */}
-      {loading ? (
+      {showSkeleton ? (
         <div className="grid grid-cols-1 gap-3 md:grid-cols-2 lg:grid-cols-3">
           {Array.from({ length: 6 }).map((_, i) => (
             <div key={i} className="h-28 animate-pulse rounded-2xl bg-muted" />

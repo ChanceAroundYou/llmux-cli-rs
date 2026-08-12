@@ -1,5 +1,5 @@
 // 密钥管理：网关密钥 + 白名单 + 一次性明文展示
-import React, { useEffect, useState, useCallback } from "react";
+import React, { useState } from "react";
 import { keyApi } from "@/api/keys";
 import { modelApi } from "@/api/models";
 import type { ApiKey } from "@/types/key";
@@ -13,6 +13,7 @@ import { Checkbox } from "@/components/ui/Checkbox";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { CopyButton } from "@/components/shared/CopyButton";
 import { useToast } from "@/hooks/useToast";
+import { useCachedData } from "@/hooks/useCachedData";
 import { useT } from "@/i18n";
 import { PageHeader } from "@/components/shared/PageHeader";
 import { EmptyState } from "@/components/shared/EmptyState";
@@ -24,35 +25,29 @@ type ModelScope = "all" | "specific";
 
 export const KeyList: React.FC = () => {
   const { t } = useT();
-  const [keys, setKeys] = useState<ApiKey[]>([]);
-  const [loading, setLoading] = useState(true);
+  const toast = useToast();
+  // 密钥列表缓存：切回本页直接展示旧数据，过期后后台刷新；快速请求不闪骨架
+  const { data, showSkeleton, refetch: fetchKeys } = useCachedData<ApiKey[]>(
+    "keys",
+    () => keyApi.list(),
+    { ttlMs: 60_000, onError: () => toast.error(t("keys.loadFailed")) },
+  );
+  const keys = data ?? [];
+  // 别名列表：创建密钥「指定模型」时从别名中勾选
+  const { data: aliasData } = useCachedData<AliasResponse[]>(
+    "aliases",
+    () => modelApi.getAliases(),
+    { ttlMs: 60_000 },
+  );
+  const aliases = aliasData ?? [];
   const [createOpen, setCreateOpen] = useState(false);
   const [newKeyName, setNewKeyName] = useState("");
   const [modelScope, setModelScope] = useState<ModelScope>("all");
   const [selectedModels, setSelectedModels] = useState<string[]>([]);
-  const [aliases, setAliases] = useState<AliasResponse[]>([]);
   const [creating, setCreating] = useState(false);
   const [createdKey, setCreatedKey] = useState<string | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<ApiKey | null>(null);
   const [deleting, setDeleting] = useState(false);
-  const toast = useToast();
-
-  const fetchKeys = useCallback(async () => {
-    setLoading(true);
-    try {
-      setKeys(await keyApi.list());
-    } catch {
-      toast.error(t("keys.loadFailed"));
-    } finally {
-      setLoading(false);
-    }
-  }, [t, toast]);
-
-  useEffect(() => {
-    fetchKeys();
-    // 别名列表：创建密钥「指定模型」时从别名中勾选
-    modelApi.getAliases().then(setAliases).catch(() => {});
-  }, [fetchKeys]);
 
   const toggleModel = (alias: string) => {
     setSelectedModels((prev) =>
@@ -169,7 +164,7 @@ export const KeyList: React.FC = () => {
   ];
 
   return (
-    <div className="animate-fade-in space-y-6">
+    <div className="space-y-6">
       <PageHeader
         icon={KeyRound}
         iconClass="bg-warning/25 text-warning-foreground"
@@ -182,7 +177,7 @@ export const KeyList: React.FC = () => {
         columns={columns}
         data={keys}
         rowKey={(r) => r.id ?? r.key}
-        loading={loading}
+        loading={showSkeleton}
         empty={<EmptyState icon={KeyRound} title={t("keys.title")} description={t("keys.create")} />}
       />
 

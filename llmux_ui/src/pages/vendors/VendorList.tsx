@@ -1,5 +1,5 @@
 // 厂商管理：内置 + 自定义，品牌色 Logo 卡片网格，编辑含 coding plan
-import React, { useEffect, useState, useCallback } from "react";
+import React, { useState } from "react";
 import { vendorApi } from "@/api/vendors";
 import type { Vendor, VendorCreatePayload } from "@/types/vendor";
 import { Button } from "@/components/ui/Button";
@@ -10,6 +10,7 @@ import { Select } from "@/components/ui/Select";
 import { Switch } from "@/components/ui/Switch";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { useToast } from "@/hooks/useToast";
+import { useCachedData } from "@/hooks/useCachedData";
 import { useT } from "@/i18n";
 import { PageHeader } from "@/components/shared/PageHeader";
 import { VendorLogo } from "@/components/vendors/VendorLogo";
@@ -19,8 +20,14 @@ const PROTOCOLS = ["openai", "anthropic", "gemini", "custom"];
 
 export const VendorList: React.FC = () => {
   const { t } = useT();
-  const [vendors, setVendors] = useState<Vendor[]>([]);
-  const [loading, setLoading] = useState(true);
+  const toast = useToast();
+  // 厂商列表缓存：切回本页直接展示旧数据，过期后后台刷新；快速请求不闪骨架
+  const { data, showSkeleton, refetch: fetchVendors } = useCachedData<Vendor[]>(
+    "vendors",
+    () => vendorApi.list(),
+    { ttlMs: 60_000, onError: () => toast.error(t("vendors.loadFailed")) },
+  );
+  const vendors = data ?? [];
   const [formOpen, setFormOpen] = useState(false);
   const [editing, setEditing] = useState<Vendor | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<Vendor | null>(null);
@@ -31,22 +38,6 @@ export const VendorList: React.FC = () => {
     protocol: "openai",
   });
   const [saving, setSaving] = useState(false);
-  const toast = useToast();
-
-  const fetchVendors = useCallback(async () => {
-    setLoading(true);
-    try {
-      setVendors(await vendorApi.list());
-    } catch {
-      toast.error(t("vendors.loadFailed"));
-    } finally {
-      setLoading(false);
-    }
-  }, [t, toast]);
-
-  useEffect(() => {
-    fetchVendors();
-  }, [fetchVendors]);
 
   const openCreate = () => {
     setEditing(null);
@@ -106,7 +97,7 @@ export const VendorList: React.FC = () => {
   };
 
   return (
-    <div className="animate-fade-in space-y-6">
+    <div className="space-y-6">
       <PageHeader
         icon={Building2}
         iconClass="bg-accent/50 text-accent-foreground"
@@ -115,7 +106,7 @@ export const VendorList: React.FC = () => {
         actions={<Button onClick={openCreate}>+ {t("vendors.add")}</Button>}
       />
 
-      {loading ? (
+      {showSkeleton ? (
         <div className="space-y-2 p-4">
           {Array.from({ length: 6 }).map((_, i) => (
             <div key={i} className="h-28 animate-pulse rounded-xl bg-muted" />

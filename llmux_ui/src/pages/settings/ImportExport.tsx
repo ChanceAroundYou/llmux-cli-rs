@@ -48,7 +48,7 @@ export const ImportExport: React.FC = () => {
   };
 
   return (
-    <div className="animate-fade-in grid grid-cols-1 gap-6 lg:grid-cols-2">
+    <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
       <Card title={t("ie.export.title")} description={t("ie.export.desc")}>
         <Button onClick={handleExport}>↓ {t("ie.export.button")}</Button>
         <p className="mt-3 text-xs text-warning-foreground">⚠️ {t("ie.export.warning")}</p>

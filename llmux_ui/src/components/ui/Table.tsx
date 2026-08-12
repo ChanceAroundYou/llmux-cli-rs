@@ -1,5 +1,6 @@
-// 马卡龙表格：卡片容器 + 骨架屏 loading
+// 马卡龙表格：卡片容器 + 骨架屏 loading + 行进出动画
 import React from "react";
+import { AnimatePresence, motion } from "framer-motion";
 import { cn } from "@/utils/helpers";
 import { useT } from "@/i18n";
 
@@ -69,24 +70,30 @@ export function Table<T>({
           </tr>
         </thead>
         <tbody>
-          {data.map((row) => (
-            <tr
-              key={rowKey(row)}
-              className={cn(
-                "border-b border-border/60 transition-colors last:border-0 hover:bg-muted/40",
-                onRowClick && "cursor-pointer",
-              )}
-              onClick={() => onRowClick?.(row)}
-            >
-              {columns.map((col) => (
-                <td key={col.key} className={cn("px-4 py-3 text-left", col.align === "right" && "text-right", col.align === "center" && "text-center")}>
-                  {col.render
-                    ? col.render(row)
-                    : ((row as Record<string, unknown>)[col.key] as React.ReactNode)}
-                </td>
-              ))}
-            </tr>
-          ))}
+          <AnimatePresence>
+            {data.map((row) => (
+              <motion.tr
+                key={rowKey(row)}
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                transition={{ duration: 0.15, ease: "easeOut" }}
+                className={cn(
+                  "border-b border-border/60 transition-colors last:border-0 hover:bg-muted/40",
+                  onRowClick && "cursor-pointer",
+                )}
+                onClick={() => onRowClick?.(row)}
+              >
+                {columns.map((col) => (
+                  <td key={col.key} className={cn("px-4 py-3 text-left", col.align === "right" && "text-right", col.align === "center" && "text-center")}>
+                    {col.render
+                      ? col.render(row)
+                      : ((row as Record<string, unknown>)[col.key] as React.ReactNode)}
+                  </td>
+                ))}
+              </motion.tr>
+            ))}
+          </AnimatePresence>
         </tbody>
       </table>
     </div>

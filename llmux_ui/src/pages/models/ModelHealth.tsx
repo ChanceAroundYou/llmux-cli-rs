@@ -1,5 +1,5 @@
 // 模型健康：各账户/模型组合最新测试结果
-import React, { useEffect, useState, useCallback } from "react";
+import React from "react";
 import { modelApi } from "@/api/models";
 import type { ModelHealthEntry } from "@/types/model";
 import { Badge } from "@/components/ui/Badge";
@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/Button";
 import { StatusDot } from "@/components/shared/StatusDot";
 import { formatTimestamp, formatLatency } from "@/utils/format";
 import { useToast } from "@/hooks/useToast";
+import { useCachedData } from "@/hooks/useCachedData";
 import { useT } from "@/i18n";
 import { PageHeader } from "@/components/shared/PageHeader";
 import { EmptyState } from "@/components/shared/EmptyState";
@@ -15,24 +16,14 @@ import { RefreshCw, HeartPulse } from "lucide-react";
 
 export const ModelHealth: React.FC = () => {
   const { t } = useT();
-  const [entries, setEntries] = useState<ModelHealthEntry[]>([]);
-  const [loading, setLoading] = useState(true);
   const toast = useToast();
-
-  const fetchHealth = useCallback(async () => {
-    setLoading(true);
-    try {
-      setEntries(await modelApi.getHealth());
-    } catch {
-      toast.error(t("health.loadFailed"));
-    } finally {
-      setLoading(false);
-    }
-  }, [t, toast]);
-
-  useEffect(() => {
-    fetchHealth();
-  }, [fetchHealth]);
+  // 健康数据缓存：切回本页直接展示旧数据，过期后后台刷新；快速请求不闪骨架
+  const { data, loading, showSkeleton, refetch: fetchHealth } = useCachedData<ModelHealthEntry[]>(
+    "modelHealth",
+    () => modelApi.getHealth(),
+    { ttlMs: 20_000, onError: () => toast.error(t("health.loadFailed")) },
+  );
+  const entries = data ?? [];
 
   const columns = [
     {
@@ -88,7 +79,7 @@ export const ModelHealth: React.FC = () => {
   ];
 
   return (
-    <div className="animate-fade-in space-y-6">
+    <div className="space-y-6">
       <PageHeader
         icon={HeartPulse}
         iconClass="bg-success/20 text-success-foreground"
@@ -105,7 +96,7 @@ export const ModelHealth: React.FC = () => {
         columns={columns}
         data={entries}
         rowKey={(r) => `${r.account_id}-${r.model}`}
-        loading={loading}
+        loading={showSkeleton}
         empty={<EmptyState icon={HeartPulse} title={t("health.empty")} />}
       />
     </div>

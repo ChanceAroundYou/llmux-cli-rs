@@ -47,7 +47,7 @@ export const GeneralSettings: React.FC = () => {
   };
 
   return (
-    <div className="animate-fade-in space-y-6">
+    <div className="space-y-6">
       {/* 外观：多色板 + 明暗 */}
       <Card title={t("settings.appearance.title")} description={t("settings.appearance.desc")}>
         <div className="space-y-6">

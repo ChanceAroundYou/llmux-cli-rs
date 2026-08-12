@@ -1,5 +1,5 @@
 // 账户列表：管理上游账户（含 CSV 导出）
-import React, { useEffect, useState, useCallback, useRef } from "react";
+import React, { useState, useRef } from "react";
 import { accountApi } from "@/api/accounts";
 import { vendorApi } from "@/api/vendors";
 import type { AccountPublic } from "@/types/account";
@@ -10,16 +10,38 @@ import { Badge } from "@/components/ui/Badge";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { AccountFormModal } from "./AccountForm";
 import { useToast } from "@/hooks/useToast";
+import { useCachedData } from "@/hooks/useCachedData";
 import { useT } from "@/i18n";
 import { PageHeader } from "@/components/shared/PageHeader";
 import { EmptyState } from "@/components/shared/EmptyState";
 import { Download, Pencil, Trash2, Plus, Users, Inbox, Power, PowerOff } from "lucide-react";
 
+// 账户页展示数据：账户列表 + 厂商列表（厂商用于渲染徽标名称）
+interface AccountListData {
+  accounts: AccountPublic[];
+  vendors: Vendor[];
+}
+
 export const AccountList: React.FC = () => {
   const { t } = useT();
-  const [accounts, setAccounts] = useState<AccountPublic[]>([]);
-  const [vendors, setVendors] = useState<Vendor[]>([]);
-  const [loading, setLoading] = useState(true);
+  const toast = useToast();
+  // 账户+厂商合并缓存：切回本页直接展示旧数据，过期后后台刷新；快速请求不闪骨架
+  const { data, showSkeleton, setData, refetch: fetchData } = useCachedData<AccountListData>(
+    "accountList",
+    async () => {
+      const [accs, vends] = await Promise.allSettled([accountApi.list(), vendorApi.list()]);
+      // 单项失败仍返回其余成功项，错误单独提示
+      if (accs.status === "rejected") toast.error(`Accounts: ${accs.reason?.message}`);
+      if (vends.status === "rejected") toast.error(`Vendors: ${vends.reason?.message}`);
+      return {
+        accounts: accs.status === "fulfilled" ? accs.value : [],
+        vendors: vends.status === "fulfilled" ? vends.value : [],
+      };
+    },
+    { ttlMs: 60_000 },
+  );
+  const accounts = data?.accounts ?? [];
+  const vendors = data?.vendors ?? [];
   const [formOpen, setFormOpen] = useState(false);
   const [editingAccount, setEditingAccount] = useState<AccountPublic | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<AccountPublic | null>(null);
@@ -27,26 +49,6 @@ export const AccountList: React.FC = () => {
   const [togglingId, setTogglingId] = useState<number | null>(null);
   // 同步守卫：跨渲染防重复点击（state 更新是异步的，同一帧两次点击会读到旧值）
   const togglingRef = useRef(false);
-  const toast = useToast();
-
-  const fetchData = useCallback(async () => {
-    setLoading(true);
-    try {
-      const [accs, vends] = await Promise.allSettled([accountApi.list(), vendorApi.list()]);
-      if (accs.status === "fulfilled") setAccounts(accs.value);
-      else toast.error(`Accounts: ${accs.reason?.message}`);
-      if (vends.status === "fulfilled") setVendors(vends.value);
-      else toast.error(`Vendors: ${vends.reason?.message}`);
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : t("accounts.loadFailed"));
-    } finally {
-      setLoading(false);
-    }
-  }, [t, toast]);
-
-  useEffect(() => {
-    fetchData();
-  }, [fetchData]);
 
   const handleDelete = async () => {
     if (!deleteTarget?.id) return;
@@ -73,9 +75,13 @@ export const AccountList: React.FC = () => {
     setTogglingId(id);
     try {
       await accountApi.update(id, { enabled: nextEnabled });
-      setAccounts((prev) =>
-        prev.map((a) => (a.id === id ? { ...a, enabled: nextEnabled } : a)),
-      );
+      // 本地更新该行并写回缓存，避免整表重拉导致闪屏
+      setData((prev) => ({
+        ...(prev ?? { accounts: [], vendors: [] }),
+        accounts: (prev?.accounts ?? []).map((a) =>
+          a.id === id ? { ...a, enabled: nextEnabled } : a,
+        ),
+      }));
       toast.success(nextEnabled ? t("accounts.enabledMsg") : t("accounts.disabledMsg"));
     } catch (err) {
       toast.error(err instanceof Error ? err.message : t("accounts.toggleFailed"));
@@ -183,7 +189,7 @@ export const AccountList: React.FC = () => {
   ];
 
   return (
-    <div className="animate-fade-in space-y-6">
+    <div className="space-y-6">
       <PageHeader
         icon={Users}
         iconClass="bg-primary/20 text-primary-foreground"
@@ -205,7 +211,7 @@ export const AccountList: React.FC = () => {
         columns={columns}
         data={accounts}
         rowKey={(row) => row.id ?? row.name}
-        loading={loading}
+        loading={showSkeleton}
         empty={<EmptyState icon={Inbox} title={t("accounts.empty")} />}
       />
 

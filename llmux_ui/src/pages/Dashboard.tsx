@@ -1,5 +1,5 @@
 // 仪表盘（参考老项目）：固定视口高度 → 两栏等高（别名健康 + 最近动态），列表内部滚动
-import React, { useEffect, useState, useMemo } from "react";
+import React, { useState, useMemo } from "react";
 import { healthApi } from "@/api/health";
 import { activityApi } from "@/api/activity";
 import { accountApi } from "@/api/accounts";
@@ -18,6 +18,7 @@ import { PageHeader } from "@/components/shared/PageHeader";
 import { Button } from "@/components/ui/Button";
 import { formatTimestamp, formatLatency } from "@/utils/format";
 import { useT } from "@/i18n";
+import { useCachedData } from "@/hooks/useCachedData";
 import { cn } from "@/utils/helpers";
 import {
   Tags,
@@ -33,51 +34,62 @@ import {
 } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 
+// 仪表盘展示数据：6 路请求聚合，含单项错误收集
+interface DashboardData {
+  accounts: AccountPublic[];
+  aliases: AliasResponse[];
+  keys: ApiKey[];
+  health: HealthEntry[];
+  modelHealth: ModelHealthEntry[];
+  activity: ActivityResponse | null;
+  errors: string[];
+}
+
 export const Dashboard: React.FC = () => {
   const { t } = useT();
   const navigate = useNavigate();
-  const [accounts, setAccounts] = useState<AccountPublic[]>([]);
-  const [aliases, setAliases] = useState<AliasResponse[]>([]);
-  const [keys, setKeys] = useState<ApiKey[]>([]);
-  const [health, setHealth] = useState<HealthEntry[]>([]);
-  const [modelHealth, setModelHealth] = useState<ModelHealthEntry[]>([]);
-  const [activity, setActivity] = useState<ActivityResponse | null>(null);
+  // 整包缓存：切回仪表盘直接展示旧数据，过期后后台刷新；快速请求不闪骨架
+  const { data, loading, showSkeleton, refetch: loadAll } = useCachedData<DashboardData>(
+    "dashboard",
+    async () => {
+      const errs: string[] = [];
+      const [a, al, k, h, mh, act] = await Promise.allSettled([
+        accountApi.list(),
+        modelApi.getAliases(),
+        keyApi.list(),
+        healthApi.list(),
+        modelApi.getHealth(),
+        activityApi.list(100),
+      ]);
+      if (a.status === "rejected") errs.push(`Accounts: ${a.reason?.message}`);
+      if (al.status === "rejected") errs.push(`Aliases: ${al.reason?.message}`);
+      if (k.status === "rejected") errs.push(`Keys: ${k.reason?.message}`);
+      if (h.status === "rejected") errs.push(`Health: ${h.reason?.message}`);
+      if (mh.status === "rejected") errs.push(`ModelHealth: ${mh.reason?.message}`);
+      if (act.status === "rejected") errs.push(`Activity: ${act.reason?.message}`);
+      return {
+        accounts: a.status === "fulfilled" ? a.value : [],
+        aliases: al.status === "fulfilled" ? al.value : [],
+        keys: k.status === "fulfilled" ? k.value : [],
+        health: h.status === "fulfilled" ? h.value : [],
+        modelHealth: mh.status === "fulfilled" ? mh.value : [],
+        activity: act.status === "fulfilled" ? act.value : null,
+        errors: errs,
+      };
+    },
+    { ttlMs: 30_000 },
+  );
+  // 解构默认值用 useMemo 稳定引用，避免每次渲染生成新数组导致下游 useMemo 失效
+  const accounts = useMemo(() => data?.accounts ?? [], [data]);
+  const aliases = useMemo(() => data?.aliases ?? [], [data]);
+  const keys = useMemo(() => data?.keys ?? [], [data]);
+  const health = useMemo(() => data?.health ?? [], [data]);
+  const modelHealth = useMemo(() => data?.modelHealth ?? [], [data]);
+  const activity = useMemo(() => data?.activity ?? null, [data]);
+  const errors = useMemo(() => data?.errors ?? [], [data]);
   const [aliasSearch, setAliasSearch] = useState("");
   const [aliasVendor, setAliasVendor] = useState("all");
   const [onlyShowErrors, setOnlyShowErrors] = useState(false);
-  const [errors, setErrors] = useState<string[]>([]);
-  const [loading, setLoading] = useState(true);
-
-  const loadAll = async () => {
-    setLoading(true);
-    const errs: string[] = [];
-    const [a, al, k, h, mh, act] = await Promise.allSettled([
-      accountApi.list(),
-      modelApi.getAliases(),
-      keyApi.list(),
-      healthApi.list(),
-      modelApi.getHealth(),
-      activityApi.list(100),
-    ]);
-    if (a.status === "fulfilled") setAccounts(a.value);
-    else errs.push(`Accounts: ${a.reason?.message}`);
-    if (al.status === "fulfilled") setAliases(al.value);
-    else errs.push(`Aliases: ${al.reason?.message}`);
-    if (k.status === "fulfilled") setKeys(k.value);
-    else errs.push(`Keys: ${k.reason?.message}`);
-    if (h.status === "fulfilled") setHealth(h.value);
-    else errs.push(`Health: ${h.reason?.message}`);
-    if (mh.status === "fulfilled") setModelHealth(mh.value);
-    else errs.push(`ModelHealth: ${mh.reason?.message}`);
-    if (act.status === "fulfilled") setActivity(act.value);
-    else errs.push(`Activity: ${act.reason?.message}`);
-    setErrors(errs);
-    setLoading(false);
-  };
-
-  useEffect(() => {
-    loadAll();
-  }, []);
 
   const healthyCount = health.filter((h) => h.status !== "down" && h.status !== "unknown").length;
 
@@ -129,7 +141,7 @@ export const Dashboard: React.FC = () => {
 
   return (
     <div
-      className="animate-fade-in flex flex-col gap-6"
+      className="flex flex-col gap-6"
       style={{ height: "calc(100dvh - 120px)", paddingBottom: "12px" }}
     >
       {/* Header */}
@@ -217,7 +229,7 @@ export const Dashboard: React.FC = () => {
           </div>
 
           <div className="flex-1 divide-y divide-border/50 overflow-y-auto">
-            {loading ? (
+            {showSkeleton ? (
               <div className="space-y-2 p-4">
                 {Array.from({ length: 5 }).map((_, i) => (
                   <div key={i} className="h-12 animate-pulse rounded-xl bg-muted" />
@@ -327,7 +339,7 @@ export const Dashboard: React.FC = () => {
 
           {/* 日志流（卡片式） */}
           <div className="flex-1 space-y-2 overflow-y-auto p-4">
-            {loading ? (
+            {showSkeleton ? (
               <div className="space-y-2">
                 {Array.from({ length: 4 }).map((_, i) => (
                   <div key={i} className="h-14 animate-pulse rounded-xl bg-muted" />
