@@ -13,7 +13,6 @@ import { useToast } from "@/hooks/useToast";
 import { useT } from "@/i18n";
 import { PageHeader } from "@/components/shared/PageHeader";
 import { VendorLogo } from "@/components/vendors/VendorLogo";
-import { cn } from "@/utils/helpers";
 import { Building2 } from "lucide-react";
 
 const PROTOCOLS = ["openai", "anthropic", "gemini", "custom"];
@@ -153,7 +152,9 @@ export const VendorList: React.FC = () => {
                   </Badge>
                 ))}
                 {v.openai_responses && <Badge variant="success">responses</Badge>}
-                {v.coding_plan === 1 && <Badge variant="warning">coding</Badge>}
+                {(v.coding_base_url || v.coding_anthropic_url) && (
+                  <Badge variant="warning">coding</Badge>
+                )}
               </div>
 
               <div className="truncate font-mono text-xs text-muted-foreground">
@@ -261,14 +262,15 @@ export const VendorList: React.FC = () => {
             </div>
           </div>
 
-          {/* Coding Plan */}
+          {/* Coding Plan：填写即声明支持（无开关，填了 coding URL 就生效） */}
           <div className="rounded-xl border border-border bg-muted/40 p-4">
-            <Switch
-              label={t("vendors.form.codingPlan")}
-              checked={form.coding_plan === 1}
-              onChange={(v) => setForm((f) => ({ ...f, coding_plan: v ? 1 : 0 }))}
-            />
-            <div className={cn("mt-3 grid grid-cols-2 gap-4 transition-opacity", form.coding_plan === 1 ? "opacity-100" : "pointer-events-none opacity-40")}>
+            <div className="text-xs font-semibold uppercase tracking-widest text-muted-foreground">
+              {t("vendors.form.codingPlan")}
+            </div>
+            <p className="mt-1 text-xs text-muted-foreground">
+              {t("vendors.form.codingPlanHint")}
+            </p>
+            <div className="mt-3 grid grid-cols-2 gap-4">
               <div>
                 <label className="mb-1 block text-sm font-medium text-card-foreground">
                   {t("vendors.form.codingUrl")}

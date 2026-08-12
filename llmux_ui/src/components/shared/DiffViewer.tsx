@@ -104,7 +104,7 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
   maxHeight = "360px",
   compareMethod,
   highlightLanguage,
-  showDiffOnly = true,
+  showDiffOnly = false,
 }) => {
   // 订阅主题：useDarkTheme 决定库用哪套 variables（明暗跟随切换）
   const scheme = useThemeStore((s) => s.scheme);

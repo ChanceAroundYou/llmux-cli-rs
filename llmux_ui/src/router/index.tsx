@@ -11,7 +11,6 @@ import { SettingsLayout } from "@/pages/settings/SettingsLayout";
 import { GeneralSettings } from "@/pages/settings/GeneralSettings";
 import { CliSettings } from "@/pages/settings/CliSettings";
 import { ImportExport } from "@/pages/settings/ImportExport";
-import { DiffDemo } from "@/pages/DiffDemo";
 
 export const router = createBrowserRouter([
   {
@@ -24,7 +23,6 @@ export const router = createBrowserRouter([
       { path: "/models/health", element: <ModelHealth /> },
       { path: "/vendors", element: <VendorList /> },
       { path: "/setup", element: <CliSettings /> },
-      { path: "/demo/diff", element: <DiffDemo /> },
       {
         path: "/settings",
         element: <SettingsLayout />,

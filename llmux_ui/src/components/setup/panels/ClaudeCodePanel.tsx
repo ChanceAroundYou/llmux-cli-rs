@@ -188,21 +188,25 @@ export const ClaudeCodePanel: React.FC<Props> = ({
   const previewSettings = useMemo(() => {
     if (!selectedKey) return null;
     const existing = currentSettings ?? {};
-    const newEnv: Record<string, string> = {
-      ...((existing.env ?? {}) as Record<string, string>),
-      ANTHROPIC_BASE_URL: `${gatewayUrl}/v1`,
-      ANTHROPIC_AUTH_TOKEN: selectedKey.key,
-    };
+    const existingEnv = (existing.env ?? {}) as Record<string, string>;
+    // 镜像后端 apply_claude_settings：先剔除旧 AUTH_TOKEN，再按固定顺序重设，
+    // 保证 env key 顺序与后端写入完全一致（否则 JSON diff 误判"一样却显示改了"）。
+    const baseEnv: Record<string, string> = {};
+    for (const [k, v] of Object.entries(existingEnv)) {
+      if (k !== "ANTHROPIC_AUTH_TOKEN") baseEnv[k] = v;
+    }
+    baseEnv.ANTHROPIC_BASE_URL = `${gatewayUrl}/v1`;
+    baseEnv.ANTHROPIC_AUTH_TOKEN = selectedKey.key;
     const opusVal = withLongContext(opusModel, opus1m);
     const sonnetVal = withLongContext(sonnetModel, sonnet1m);
     const haikuVal = withLongContext(haikuModel, haiku1m);
-    if (opusVal) newEnv.ANTHROPIC_DEFAULT_OPUS_MODEL = opusVal;
-    else delete newEnv.ANTHROPIC_DEFAULT_OPUS_MODEL;
-    if (sonnetVal) newEnv.ANTHROPIC_DEFAULT_SONNET_MODEL = sonnetVal;
-    else delete newEnv.ANTHROPIC_DEFAULT_SONNET_MODEL;
-    if (haikuVal) newEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL = haikuVal;
-    else delete newEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL;
-    return { ...existing, env: newEnv };
+    if (opusVal) baseEnv.ANTHROPIC_DEFAULT_OPUS_MODEL = opusVal;
+    else delete baseEnv.ANTHROPIC_DEFAULT_OPUS_MODEL;
+    if (sonnetVal) baseEnv.ANTHROPIC_DEFAULT_SONNET_MODEL = sonnetVal;
+    else delete baseEnv.ANTHROPIC_DEFAULT_SONNET_MODEL;
+    if (haikuVal) baseEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL = haikuVal;
+    else delete baseEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL;
+    return { ...existing, env: baseEnv };
   }, [selectedKey, currentSettings, gatewayUrl, opusModel, sonnetModel, haikuModel, opus1m, sonnet1m, haiku1m]);
 
   const handleApply = async () => {

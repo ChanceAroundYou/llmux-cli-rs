@@ -26,12 +26,12 @@ export const TOOLS: ToolDef[] = [
     installUrl: "https://docs.claude.com/en/docs/claude-code/quickstart",
   },
   {
-    id: "vscode",
-    detectKey: "vscode",
-    labelKey: "setup.tool.vscode",
-    descKey: "setup.tool.vscodeDesc",
-    icon: Code2,
-    installUrl: "https://code.visualstudio.com/",
+    id: "codex",
+    detectKey: "codex",
+    labelKey: "setup.tool.codex",
+    descKey: "setup.tool.codexDesc",
+    icon: Terminal,
+    installUrl: "https://github.com/openai/codex",
   },
   {
     id: "gemini",
@@ -42,6 +42,14 @@ export const TOOLS: ToolDef[] = [
     installUrl: "https://github.com/google-gemini/gemini-cli",
   },
   {
+    id: "vscode",
+    detectKey: "vscode",
+    labelKey: "setup.tool.vscode",
+    descKey: "setup.tool.vscodeDesc",
+    icon: Code2,
+    installUrl: "https://code.visualstudio.com/",
+  },
+  {
     id: "opencode",
     detectKey: "opencode",
     labelKey: "setup.tool.opencode",
@@ -49,13 +57,5 @@ export const TOOLS: ToolDef[] = [
     icon: Wrench,
     installUrl: "https://github.com/opencode-ai/opencode",
     comingSoon: true,
-  },
-  {
-    id: "codex",
-    detectKey: "codex",
-    labelKey: "setup.tool.codex",
-    descKey: "setup.tool.codexDesc",
-    icon: Terminal,
-    installUrl: "https://github.com/openai/codex",
   },
 ];

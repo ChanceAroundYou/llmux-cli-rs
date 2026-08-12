@@ -42,16 +42,29 @@ export const AccountFormModal: React.FC<Props> = ({
     openai_compatible: false,
     notes: "",
     skip_validation: false,
+    // 编辑态暂存：厂商协议不支持某字段被清空前的原值，切回时恢复
+    _prev_base_url: "",
+    _prev_anthropic_url: "",
   });
   // 按所选厂商控制字段可用性：内置按支持的协议开关，自定义/未选全部可用
   const [urlFields, setUrlFields] = useState({
     baseEnabled: true,
     anthEnabled: true,
     compatEnabled: true,
+    supportsCoding: false,
   });
+  // 是否使用厂商的 Coding Plan 端点（厂商提供 coding URL 时才可选）
+  const [useCodingPlan, setUseCodingPlan] = useState(false);
 
   useEffect(() => {
     if (account) {
+      // 编辑态：账户 base_url 等于厂商 coding URL → 默认视为使用 coding plan
+      const vendor = vendors.find((x) => x.id === account.vendor_id);
+      const usesCoding =
+        !!vendor &&
+        ((account.base_url ?? "") === (vendor.coding_base_url ?? "") ||
+          (account.base_url ?? "") === (vendor.coding_anthropic_url ?? ""));
+      setUseCodingPlan(usesCoding);
       setForm({
         vendor_id: account.vendor_id,
         name: account.name,
@@ -63,8 +76,11 @@ export const AccountFormModal: React.FC<Props> = ({
         openai_compatible: !!account.openai_compatible,
         notes: account.notes ?? "",
         skip_validation: false,
+        _prev_base_url: "",
+        _prev_anthropic_url: "",
       });
     } else {
+      setUseCodingPlan(false);
       setForm({
         vendor_id: "",
         name: "",
@@ -76,65 +92,117 @@ export const AccountFormModal: React.FC<Props> = ({
         openai_compatible: false,
         notes: "",
         skip_validation: false,
+        _prev_base_url: "",
+        _prev_anthropic_url: "",
       });
     }
-  }, [account, open]);
+  }, [account, open, vendors]);
+
+  // 厂商协议 → URL 字段可用性（内置按协议开关，自定义全开）。
+  // handleVendorChange / toggleCodingPlan / urlFields effect 共用，避免判断分叉。
+  const vendorUrlState = (v: Vendor | undefined) => {
+    if (!v)
+      return {
+        baseEnabled: true,
+        anthEnabled: true,
+        compatEnabled: true,
+        supportsCoding: false,
+      };
+    const isBuiltin = v.builtin === 1;
+    const openai = v.protocols.includes("openai") || v.protocol === "openai";
+    const anthropic = v.protocols.includes("anthropic");
+    // OpenAI 协议端点可用性：支持 openai 协议，或 gemini（走 OpenAI 兼容端点）
+    const base = openai || v.protocol === "gemini";
+    // Coding Plan：厂商提供 coding 端点（任一）即支持——无需开关，填了 URL 即生效
+    const supportsCoding = !!v.coding_base_url || !!v.coding_anthropic_url;
+    return {
+      baseEnabled: isBuiltin ? base : true,
+      anthEnabled: isBuiltin ? anthropic : true,
+      compatEnabled: isBuiltin ? base : true,
+      supportsCoding,
+    };
+  };
 
   // 只计算字段可用性（vendor 变化时同步），不在此填 URL
   useEffect(() => {
     const v = vendors.find((x) => x.id === form.vendor_id);
-    const isBuiltin = !!v && v.builtin === 1;
-    const openai = v
-      ? v.protocols.includes("openai") || v.protocol === "openai"
-      : true;
-    const anthropic = v ? v.protocols.includes("anthropic") : true;
-    // OpenAI 协议端点可用性：支持 openai 协议，或 gemini（走 OpenAI 兼容端点）
-    const base = v ? openai || v.protocol === "gemini" : true;
-
-    setUrlFields({
-      baseEnabled: v ? (isBuiltin ? base : true) : true,
-      anthEnabled: v ? (isBuiltin ? anthropic : true) : true,
-      compatEnabled: v ? (isBuiltin ? base : true) : true,
-    });
+    setUrlFields(vendorUrlState(v));
   }, [form.vendor_id, vendors]);
 
-  // 选择厂商：同步填默认 URL；厂商不支持的协议字段禁用且清空（填了后端也不用）
+  // 选择厂商：新建态自动填默认 URL（或 coding URL）；编辑态保留已保存值。
+  // 协议不支持的字段清空，但把原值暂存到 _prev_*；切回支持协议时恢复原值，避免数据丢失。
   const handleVendorChange = (vendorId: string) => {
+    const v = vendors.find((x) => x.id === vendorId);
+    const { baseEnabled, anthEnabled, supportsCoding } = vendorUrlState(v);
+    // 厂商支持 coding plan 时默认启用 coding 端点（在 setForm 外设置，保持 updater 纯函数）
+    setUseCodingPlan(supportsCoding);
     setForm((f) => {
-      const v = vendors.find((x) => x.id === vendorId);
       if (!v) return { ...f, vendor_id: vendorId };
-      const isBuiltin = v.builtin === 1;
-      const openai =
-        v.protocols.includes("openai") || v.protocol === "openai";
-      const anthropic = v.protocols.includes("anthropic");
-      // 与 urlFields effect 保持一致：内置按协议开关，自定义全开
-      const baseEnabled = isBuiltin
-        ? openai || v.protocol === "gemini"
-        : true;
-      const anthEnabled = isBuiltin ? anthropic : true;
-      // 数据驱动：anthropic 端点只取专用字段，不做厂商特判（数据由后端保证）
+      const coding = supportsCoding;
       return {
         ...f,
         vendor_id: vendorId,
-        base_url: baseEnabled ? v.default_base_url ?? "" : "",
-        anthropic_base_url: anthEnabled ? v.default_anthropic_url ?? "" : "",
+        base_url: !baseEnabled
+          ? ""
+          : isEdit
+            ? f.base_url || f._prev_base_url || v.default_base_url || ""
+            : coding
+              ? v.coding_base_url ?? v.default_base_url ?? ""
+              : v.default_base_url ?? "",
+        _prev_base_url:
+          !baseEnabled && f.base_url
+            ? f.base_url
+            : baseEnabled
+              ? ""
+              : f._prev_base_url,
+        anthropic_base_url: !anthEnabled
+          ? ""
+          : isEdit
+            ? f.anthropic_base_url || f._prev_anthropic_url || v.default_anthropic_url || ""
+            : coding
+              ? v.coding_anthropic_url ?? v.coding_base_url ?? v.default_anthropic_url ?? ""
+              : v.default_anthropic_url ?? "",
+        _prev_anthropic_url:
+          !anthEnabled && f.anthropic_base_url
+            ? f.anthropic_base_url
+            : anthEnabled
+              ? ""
+              : f._prev_anthropic_url,
       };
     });
+  };
+
+  // 切换 Coding Plan：开启 → URL 锁定为 coding 端点；关闭 → 恢复厂商默认 URL
+  const toggleCodingPlan = (enabled: boolean) => {
+    const v = vendors.find((x) => x.id === form.vendor_id);
+    if (!v) return;
+    setUseCodingPlan(enabled);
+    setForm((f) => ({
+      ...f,
+      base_url: enabled
+        ? v.coding_base_url ?? v.default_base_url ?? ""
+        : v.default_base_url ?? "",
+      anthropic_base_url: enabled
+        ? v.coding_anthropic_url ?? v.coding_base_url ?? v.default_anthropic_url ?? ""
+        : v.default_anthropic_url ?? "",
+    }));
   };
 
   const handleSubmit = async () => {
     setLoading(true);
     try {
+      // 剔除内部暂存字段（_prev_*），只提交用户可见字段
+      const { _prev_base_url: _pb, _prev_anthropic_url: _pa, ...payload } = form;
       if (isEdit && account?.id) {
         await accountApi.update(account.id, {
-          ...form,
+          ...payload,
           enabled: form.enabled ? 1 : 0,
           openai_compatible: form.openai_compatible ? 1 : 0,
         });
         toast.success(t("accounts.updated"));
       } else {
         const res = await accountApi.create({
-          ...form,
+          ...payload,
           enabled: form.enabled ? 1 : 0,
           openai_compatible: form.openai_compatible ? 1 : 0,
         } as AccountCreatePayload);
@@ -174,7 +242,14 @@ export const AccountFormModal: React.FC<Props> = ({
             <Select
               value={form.vendor_id}
               onChange={handleVendorChange}
-              options={vendors.map((v) => ({ value: v.id, label: v.name }))}
+              options={vendors.map((v) => ({
+                value: v.id,
+                // 提供 coding URL 的厂商加标记，便于选厂商时就看出
+                label:
+                  v.coding_base_url || v.coding_anthropic_url
+                    ? `${v.name} · Coding`
+                    : v.name,
+              }))}
               placeholder={t("accounts.form.selectVendor")}
             />
           </div>
@@ -209,7 +284,7 @@ export const AccountFormModal: React.FC<Props> = ({
               value={form.base_url}
               onChange={(v) => setForm((f) => ({ ...f, base_url: v }))}
               placeholder="https://api.openai.com/v1"
-              disabled={!urlFields.baseEnabled}
+              disabled={!urlFields.baseEnabled || useCodingPlan}
             />
           </div>
           <div>
@@ -218,10 +293,24 @@ export const AccountFormModal: React.FC<Props> = ({
               value={form.anthropic_base_url}
               onChange={(v) => setForm((f) => ({ ...f, anthropic_base_url: v }))}
               placeholder="https://api.anthropic.com"
-              disabled={!urlFields.anthEnabled}
+              disabled={!urlFields.anthEnabled || useCodingPlan}
             />
           </div>
         </div>
+
+        {/* Coding Plan：厂商支持时可选，开启后默认 URL 禁用，走 coding 端点 */}
+        {urlFields.supportsCoding && (
+          <div className="rounded-xl border border-primary/20 bg-primary/5 p-3">
+            <Switch
+              label={t("accounts.form.codingPlan")}
+              description={
+                useCodingPlan ? t("accounts.form.codingLocked") : t("accounts.form.codingPlanDesc")
+              }
+              checked={useCodingPlan}
+              onChange={toggleCodingPlan}
+            />
+          </div>
+        )}
 
         <div className="grid grid-cols-3 gap-4">
           <div>

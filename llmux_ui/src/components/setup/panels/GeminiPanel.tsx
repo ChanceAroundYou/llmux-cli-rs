@@ -40,6 +40,35 @@ function extractFromSettings(settingsStr: string | null | undefined): string {
   }
 }
 
+/**
+ * .env key 替换：镜像后端 set_env_key 语义——
+ * key 可出现在任意行（含首行），命中则替换该行；否则追加（trim_end + 换行）。
+ * 不 trim 尾部换行，保证保存后 current（后端写入）与 preview 逐字节一致。
+ */
+function setEnvKey(envContent: string, key: string, value: string): string {
+  // 首行匹配：key=...
+  if (envContent.startsWith(`${key}=`)) {
+    const lineEnd = envContent.indexOf("\n");
+    const end = lineEnd >= 0 ? lineEnd : envContent.length;
+    return `${key}=${value}${envContent.slice(end)}`;
+  }
+  // 非首行匹配：\nkey=...
+  const anchor = `\n${key}=`;
+  const anchorIdx = envContent.indexOf(anchor);
+  if (anchorIdx >= 0) {
+    const lineStart = anchorIdx + 1; // 跳过前导换行
+    const lineEndRel = envContent.slice(lineStart).indexOf("\n");
+    const lineEnd = lineEndRel >= 0 ? lineStart + lineEndRel : envContent.length;
+    return (
+      envContent.slice(0, lineStart) +
+      `${key}=${value}` +
+      envContent.slice(lineEnd)
+    );
+  }
+  // 追加
+  return `${envContent.trimEnd()}\n${key}=${value}\n`;
+}
+
 function isDirty(
   currentSettings: string | null,
   model: string,
@@ -121,25 +150,15 @@ export const GeminiPanel: React.FC<Props> = ({
     setApplyResult(null);
   }, [pendingFillContent, keys, selectedKeyId, t]);
 
-  // 预览 .env：更新 GEMINI_API_KEY 与 GOOGLE_GEMINI_BASE_URL
+  // 预览 .env：与后端 set_env_key 逻辑完全一致（key 可出现在任意行，追加补换行），
+  // 且不 trim 尾部换行——否则保存后 currentEnv（后端写入，保留尾换行）≠ previewEnv，diff 误判。
   const previewEnv = useMemo(() => {
     if (!selectedKey) return null;
-    let result = currentEnv ?? "";
-    result = result.replace(
-      /^GEMINI_API_KEY=.*$/m,
-      `GEMINI_API_KEY=${selectedKey.key}`,
+    return setEnvKey(
+      setEnvKey(currentEnv ?? "", "GEMINI_API_KEY", selectedKey.key),
+      "GOOGLE_GEMINI_BASE_URL",
+      gatewayUrl,
     );
-    if (!/^GEMINI_API_KEY=/m.test(result)) {
-      result = result.trimEnd() + `\nGEMINI_API_KEY=${selectedKey.key}`;
-    }
-    result = result.replace(
-      /^GOOGLE_GEMINI_BASE_URL=.*$/m,
-      `GOOGLE_GEMINI_BASE_URL=${gatewayUrl}`,
-    );
-    if (!/^GOOGLE_GEMINI_BASE_URL=/m.test(result)) {
-      result = result.trimEnd() + `\nGOOGLE_GEMINI_BASE_URL=${gatewayUrl}`;
-    }
-    return result.trim();
   }, [selectedKey, currentEnv, gatewayUrl]);
 
   // 预览 settings.json：更新 model.name

@@ -151,7 +151,15 @@ pub async fn get_vendor(pool: &SqlitePool, id: &str) -> Result<Option<(String, O
 /// 列出对外可见的账户视图（不含 api_key_enc），id 降序。
 pub async fn list_accounts_public(pool: &SqlitePool) -> Result<Vec<AccountPublic>> {
     Ok(sqlx::query_as::<_, AccountPublic>(
-        "SELECT id, vendor_id, name, base_url, anthropic_base_url, openai_compatible, CAST(enabled AS INTEGER) as enabled, weight, notes, created_at FROM accounts ORDER BY id DESC",
+        "SELECT a.id, a.vendor_id, a.name, a.base_url, a.anthropic_base_url, a.openai_compatible, \
+                CAST(a.enabled AS INTEGER) as enabled, a.weight, a.notes, a.created_at, \
+                CASE WHEN NULLIF(a.base_url, '') = v.coding_base_url \
+                       OR NULLIF(a.anthropic_base_url, '') = v.coding_anthropic_url \
+                       OR NULLIF(a.anthropic_base_url, '') = v.coding_base_url \
+                     THEN 1 ELSE 0 END AS uses_coding \
+         FROM accounts a \
+         JOIN vendors v ON a.vendor_id = v.id \
+         ORDER BY a.id DESC",
     )
     .fetch_all(pool)
     .await?)

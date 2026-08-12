@@ -1,5 +1,5 @@
 // 账户列表：管理上游账户（含 CSV 导出）
-import React, { useEffect, useState, useCallback } from "react";
+import React, { useEffect, useState, useCallback, useRef } from "react";
 import { accountApi } from "@/api/accounts";
 import { vendorApi } from "@/api/vendors";
 import type { AccountPublic } from "@/types/account";
@@ -13,7 +13,7 @@ import { useToast } from "@/hooks/useToast";
 import { useT } from "@/i18n";
 import { PageHeader } from "@/components/shared/PageHeader";
 import { EmptyState } from "@/components/shared/EmptyState";
-import { Download, Pencil, Trash2, Plus, Users, Inbox } from "lucide-react";
+import { Download, Pencil, Trash2, Plus, Users, Inbox, Power, PowerOff } from "lucide-react";
 
 export const AccountList: React.FC = () => {
   const { t } = useT();
@@ -24,6 +24,9 @@ export const AccountList: React.FC = () => {
   const [editingAccount, setEditingAccount] = useState<AccountPublic | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<AccountPublic | null>(null);
   const [deleting, setDeleting] = useState(false);
+  const [togglingId, setTogglingId] = useState<number | null>(null);
+  // 同步守卫：跨渲染防重复点击（state 更新是异步的，同一帧两次点击会读到旧值）
+  const togglingRef = useRef(false);
   const toast = useToast();
 
   const fetchData = useCallback(async () => {
@@ -57,6 +60,28 @@ export const AccountList: React.FC = () => {
       toast.error(err instanceof Error ? err.message : t("accounts.deleteFailed"));
     } finally {
       setDeleting(false);
+    }
+  };
+
+  // 快捷启用/停用：只传 enabled，后端 merge 保留其余字段。
+  // 成功后本地更新该行状态（行内刷新），避免整表重拉导致闪屏。
+  const handleToggle = async (row: AccountPublic) => {
+    const id = row.id;
+    if (id == null || togglingId != null || togglingRef.current) return;
+    const nextEnabled = row.enabled ? 0 : 1;
+    togglingRef.current = true;
+    setTogglingId(id);
+    try {
+      await accountApi.update(id, { enabled: nextEnabled });
+      setAccounts((prev) =>
+        prev.map((a) => (a.id === id ? { ...a, enabled: nextEnabled } : a)),
+      );
+      toast.success(nextEnabled ? t("accounts.enabledMsg") : t("accounts.disabledMsg"));
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : t("accounts.toggleFailed"));
+    } finally {
+      togglingRef.current = false;
+      setTogglingId(null);
     }
   };
 
@@ -97,9 +122,14 @@ export const AccountList: React.FC = () => {
       key: "enabled",
       title: t("accounts.col.status"),
       render: (row: AccountPublic) => (
-        <Badge variant={row.enabled ? "success" : "neutral"}>
-          {row.enabled ? t("accounts.status.enabled") : t("accounts.status.disabled")}
-        </Badge>
+        <div className="flex items-center gap-1.5">
+          <Badge variant={row.enabled ? "success" : "neutral"}>
+            {row.enabled ? t("accounts.status.enabled") : t("accounts.status.disabled")}
+          </Badge>
+          {row.uses_coding === 1 && (
+            <Badge variant="warning">{t("accounts.badge.coding")}</Badge>
+          )}
+        </div>
       ),
     },
     {
@@ -108,6 +138,20 @@ export const AccountList: React.FC = () => {
       align: "right" as const,
       render: (row: AccountPublic) => (
         <div className="flex items-center justify-end gap-1">
+          <Button
+            size="sm"
+            variant="ghost"
+            loading={togglingId === row.id}
+            icon={row.enabled ? <Power className="h-3.5 w-3.5" /> : <PowerOff className="h-3.5 w-3.5" />}
+            title={row.enabled ? t("accounts.status.disabled") : t("accounts.status.enabled")}
+            aria-label={row.enabled ? t("accounts.status.disabled") : t("accounts.status.enabled")}
+            className={
+              row.enabled
+                ? "text-destructive-foreground hover:text-destructive"
+                : "text-success hover:text-success-foreground"
+            }
+            onClick={() => handleToggle(row)}
+          />
           <Button size="sm" variant="ghost" title="CSV" aria-label="Export CSV" onClick={() => accountApi.exportCsv(row.id!)}>
             <Download className="h-3.5 w-3.5" />
           </Button>

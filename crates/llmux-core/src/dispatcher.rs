@@ -357,8 +357,8 @@ const ACCOUNT_SELECT: &str = "SELECT
     v.protocol, v.protocols, v.openai_responses,
     a.base_url AS custom_base_url_raw,
     a.anthropic_base_url AS custom_anthropic_base_url_raw,
-    COALESCE(NULLIF(a.base_url, ''), CASE WHEN v.coding_plan = 1 THEN v.coding_base_url ELSE v.default_base_url END) AS base_url,
-    COALESCE(NULLIF(a.anthropic_base_url, ''), CASE WHEN v.coding_plan = 1 THEN v.coding_anthropic_url ELSE v.default_anthropic_url END, CASE WHEN v.coding_plan = 1 THEN v.coding_base_url ELSE v.default_base_url END) AS anthropic_base_url
+    COALESCE(NULLIF(a.base_url, ''), NULLIF(v.coding_base_url, ''), v.default_base_url) AS base_url,
+    COALESCE(NULLIF(a.anthropic_base_url, ''), NULLIF(v.coding_anthropic_url, ''), NULLIF(v.coding_base_url, ''), v.default_anthropic_url, v.default_base_url) AS anthropic_base_url
   FROM accounts a
   JOIN vendors v ON a.vendor_id = v.id";
 

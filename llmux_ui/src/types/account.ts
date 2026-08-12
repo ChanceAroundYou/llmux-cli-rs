@@ -10,6 +10,8 @@ export interface AccountPublic {
   weight: number;
   notes?: string | null;
   created_at?: string | null;
+  /** 账户是否使用厂商的 Coding Plan 端点 */
+  uses_coding?: number; // 0 | 1
 }
 
 export interface AccountCreatePayload {

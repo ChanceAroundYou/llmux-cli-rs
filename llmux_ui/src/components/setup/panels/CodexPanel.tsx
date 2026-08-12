@@ -45,91 +45,11 @@ function extractFromToml(configToml: string): TomlFields {
   return { model, wireApi, contextWindow, autoCompactLimit };
 }
 
-function escapeRe(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-/** 顶层区域（第一个 [section] 之前）内的 key 替换；不存在则追加到顶层末尾。
- *  asNumber 为 true 时追加裸整数（如 model_context_window = 1000000），否则字符串带引号。 */
-function patchTopKey(
-  toml: string,
-  key: string,
-  value: string,
-  asNumber = false,
-): string {
-  const firstSection = /^\s*\[[^\]]+\]\s*$/m;
-  const match = firstSection.exec(toml);
-  const topEnd = match ? match.index : toml.length;
-  const top = toml.slice(0, topEnd);
-  const rest = toml.slice(topEnd);
-  const strRe = new RegExp(`^${key}\\s*=\\s*"[^"]*"`, "m");
-  const intRe = new RegExp(`^${key}\\s*=\\s*\\d+`, "m");
-  let newTop: string;
-  if (strRe.test(top)) newTop = top.replace(strRe, `${key} = "${value}"`);
-  else if (intRe.test(top)) newTop = top.replace(intRe, `${key} = ${value}`);
-  else {
-    newTop =
-      top.trimEnd() + `\n${key} = ${asNumber ? value : `"${value}"`}\n`;
-  }
-  return newTop + rest;
-}
-
-/** 定位 [section] 的 [start, end) 字符区间（不含 section 头） */
-function findSection(
-  toml: string,
-  section: string,
-): { start: number; end: number } | null {
-  const re = new RegExp(`^\\[${escapeRe(section)}\\]\\s*$`, "m");
-  const match = re.exec(toml);
-  if (!match) return null;
-  const start = match.index + match[0].length;
-  const after = toml.slice(start);
-  const nextSection = /^\s*\[[^\]]+\]\s*$/m;
-  const next = nextSection.exec(after);
-  const end = next ? start + next.index : toml.length;
-  return { start, end };
-}
-
-/** 在指定 section 内替换/追加字符串值 key（section 不存在则创建） */
-function patchSectionKey(
-  toml: string,
-  section: string,
-  key: string,
-  value: string,
-): string {
-  const seg = findSection(toml, section);
-  if (!seg) {
-    const spacer = toml.trimEnd() ? "\n\n" : "";
-    return toml.trimEnd() + spacer + `[${section}]\n${key} = "${value}"\n`;
-  }
-  const body = toml.slice(seg.start, seg.end);
-  const re = new RegExp(`^${key}\\s*=\\s*"[^"]*"`, "m");
-  const newBody = re.test(body)
-    ? body.replace(re, `${key} = "${value}"`)
-    : body.trimEnd() + `\n${key} = "${value}"\n`;
-  return toml.slice(0, seg.start) + newBody + toml.slice(seg.end);
-}
-
-/** 在指定 section 内替换/追加布尔值 key */
-function patchSectionBool(
-  toml: string,
-  section: string,
-  key: string,
-  value: boolean,
-): string {
-  const seg = findSection(toml, section);
-  if (!seg) {
-    const spacer = toml.trimEnd() ? "\n\n" : "";
-    return toml.trimEnd() + spacer + `[${section}]\n${key} = ${value}\n`;
-  }
-  const body = toml.slice(seg.start, seg.end);
-  const re = new RegExp(`^${key}\\s*=\\s*(?:true|false)`, "m");
-  const newBody = re.test(body)
-    ? body.replace(re, `${key} = ${value}`)
-    : body.trimEnd() + `\n${key} = ${value}\n`;
-  return toml.slice(0, seg.start) + newBody + toml.slice(seg.end);
-}
-
+/**
+ * 生成 config.toml 预览。逻辑必须与后端 patch_codex_toml 完全一致
+ * （model_provider/model/review_model/窗口参数 也写入 [model_providers.llmux] section），
+ * 否则保存后 currentToml（后端写入）≠ preview（前端生成），diff 永远显示全变。
+ */
 function patchToml(
   existing: string,
   model: string,
@@ -139,44 +59,63 @@ function patchToml(
   autoCompactLimit: number,
 ): string {
   let result = existing || "";
+  const baseUrl = `${gatewayUrl}/v1`;
 
-  // 顶层 keys：model_provider / model / review_model / 窗口参数（只在顶部区域操作）
-  result = patchTopKey(result, "model_provider", "llmux");
-  result = patchTopKey(result, "model", model || "(select a model)");
-  result = patchTopKey(result, "review_model", model || "(select a model)");
+  // 与后端一致：确保 section 存在后，section 内逐个 set key
+  // （set 用全局首个匹配替换，找不到则追加——与后端 set_toml_key 语义一致）
+  if (!result.includes("[model_providers.llmux]")) {
+    result = `${result.trimEnd()}\n\n[model_providers.llmux]\n`;
+  }
+  result = patchGlobalKey(result, "model_provider", "llmux");
+  result = patchGlobalKey(result, "model", model || "(select a model)");
+  result = patchGlobalKey(result, "review_model", model || "(select a model)");
   if (contextWindow > 0) {
-    result = patchTopKey(
-      result,
-      "model_context_window",
-      String(contextWindow),
-      true,
-    );
+    result = patchGlobalInt(result, "model_context_window", contextWindow);
   }
   if (autoCompactLimit > 0) {
-    result = patchTopKey(
-      result,
-      "model_auto_compact_token_limit",
-      String(autoCompactLimit),
-      true,
-    );
+    result = patchGlobalInt(result, "model_auto_compact_token_limit", autoCompactLimit);
   }
-
-  // [model_providers.llmux]：只在该 section 内更新 name/base_url/wire_api
-  result = patchSectionKey(result, "model_providers.llmux", "name", "llmux");
-  result = patchSectionKey(
-    result,
-    "model_providers.llmux",
-    "base_url",
-    `${gatewayUrl}/v1`,
-  );
-  result = patchSectionKey(result, "model_providers.llmux", "wire_api", wireApi);
-  result = patchSectionBool(
-    result,
-    "model_providers.llmux",
-    "requires_openai_auth",
-    true,
-  );
+  result = patchGlobalKey(result, "name", "llmux");
+  result = patchGlobalKey(result, "base_url", baseUrl);
+  result = patchGlobalKey(result, "wire_api", wireApi);
+  result = patchGlobalBool(result, "requires_openai_auth", true);
   return result;
+}
+
+/** 全局首个匹配 key = "value" 替换，找不到则追加（与后端 set_toml_key 一致） */
+function patchGlobalKey(toml: string, key: string, value: string): string {
+  const prefix = `${key} = "`;
+  const i = toml.indexOf(prefix);
+  if (i >= 0) {
+    const lineEndRel = toml.slice(i).indexOf("\n");
+    const lineEnd = lineEndRel >= 0 ? i + lineEndRel : toml.length;
+    return toml.slice(0, i) + `${key} = "${value}"` + toml.slice(lineEnd);
+  }
+  return `${toml.trimEnd()}\n${key} = "${value}"\n`;
+}
+
+/** 全局首个匹配 key = <int> 替换，找不到则追加 */
+function patchGlobalInt(toml: string, key: string, value: number): string {
+  const prefix = `${key} = `;
+  const i = toml.indexOf(prefix);
+  if (i >= 0) {
+    const lineEndRel = toml.slice(i).indexOf("\n");
+    const lineEnd = lineEndRel >= 0 ? i + lineEndRel : toml.length;
+    return toml.slice(0, i) + `${key} = ${value}` + toml.slice(lineEnd);
+  }
+  return `${toml.trimEnd()}\n${key} = ${value}\n`;
+}
+
+/** 全局首个匹配 key = true/false 替换，找不到则追加 */
+function patchGlobalBool(toml: string, key: string, value: boolean): string {
+  const prefix = `${key} = `;
+  const i = toml.indexOf(prefix);
+  if (i >= 0) {
+    const lineEndRel = toml.slice(i).indexOf("\n");
+    const lineEnd = lineEndRel >= 0 ? i + lineEndRel : toml.length;
+    return toml.slice(0, i) + `${key} = ${value}` + toml.slice(lineEnd);
+  }
+  return `${toml.trimEnd()}\n${key} = ${value}\n`;
 }
 
 function isDirty(

@@ -58,6 +58,8 @@ pub struct AccountPublic {
     pub weight: i64,
     pub notes: Option<String>,
     pub created_at: Option<String>,
+    /// 账户是否使用厂商的 Coding Plan 端点（base_url 命中厂商 coding URL）
+    pub uses_coding: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, PartialEq, ToSchema)]
