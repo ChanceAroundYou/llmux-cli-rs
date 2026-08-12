@@ -266,7 +266,7 @@ export const en: Dict = {
   "setup.keyReplaced": "The API key in the backup is no longer in your key list. Replaced with \"{name}\".",
   "setup.vscode.noAliases": "No aliases yet.",
   "setup.vscode.goModels": "Create one in Models",
-  "setup.vscode.hint": "Run \"Manage Language Models\" from the VS Code Command Palette ({shortcut}):\n1. Click \"Add Model\" → choose \"Custom Endpoint\"\n2. Fill in the group name and ApiKey (use your gateway key)\n3. Pick the apiType protocol (Chat Completions / Responses / Messages, by model support)\n4. Paste the generated models array below into the models field",
+  "setup.vscode.hint": "Run \"Manage Language Models\" from the VS Code Command Palette ({shortcut}):\n1. Click \"Add Model\" → choose \"Custom Endpoint\"\n2. Fill in the group name and ApiKey (use the ApiKey provided by LLMux)\n3. Pick the apiType protocol (Chat Completions / Responses / Messages, by model support)\n4. Paste the generated models array below into the models field",
   "setup.vscode.addModel": "Add Model",
   "setup.vscode.modelsList": "Models",
   "setup.vscode.selectModel": "Select model",

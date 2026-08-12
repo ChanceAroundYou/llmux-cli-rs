@@ -8,7 +8,10 @@ export const CopyButton: React.FC<{ text: string; className?: string }> = ({ tex
   const { t } = useT();
   const [copied, setCopied] = useState(false);
 
-  const handleCopy = async () => {
+  const handleCopy = async (e: React.MouseEvent<HTMLButtonElement>) => {
+    // 阻止冒泡：复制按钮嵌套在可点击卡片内时（如别名卡片 onClick 打开编辑），
+    // 点击复制不应触发父级动作
+    e.stopPropagation();
     try {
       await navigator.clipboard.writeText(text);
     } catch {

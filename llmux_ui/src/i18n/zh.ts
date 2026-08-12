@@ -270,7 +270,7 @@ export const zh: Dict = {
   "setup.keyReplaced": "备份中的 API Key 不在当前密钥列表，已自动替换为「{name}」。",
   "setup.vscode.noAliases": "暂无可用别名，",
   "setup.vscode.goModels": "去模型页创建",
-  "setup.vscode.hint": "在 VS Code 命令面板（{shortcut}）运行「Manage Language Models」：\n1. 点击「添加模型」→ 选择「Custom Endpoint」\n2. 填写组名与 ApiKey（用你的网关密钥）\n3. 选择协议 apiType（Chat Completions / Responses / Messages，按模型支持选）\n4. 将下方生成的 models 数组粘贴到 models 字段",
+  "setup.vscode.hint": "在 VS Code 命令面板（{shortcut}）运行「Manage Language Models」：\n1. 点击「添加模型」→ 选择「Custom Endpoint」\n2. 填写组名与 ApiKey（使用 LLMux 提供的 ApiKey 即可）\n3. 选择协议 apiType（Chat Completions / Responses / Messages，按模型支持选）\n4. 将下方生成的 models 数组粘贴到 models 字段",
   "setup.vscode.addModel": "添加模型",
   "setup.vscode.modelsList": "模型列表",
   "setup.vscode.selectModel": "选择模型",

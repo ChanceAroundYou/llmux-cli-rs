@@ -1,46 +1,15 @@
 // 快速配置：单文件预览卡（行级 diff 或纯文本，右上角复制）
-import React, { useMemo } from "react";
-import { useT } from "@/i18n";
-import { cn } from "@/utils/helpers";
-import { computeLineDiff, type DiffLine } from "./utils";
+import React from "react";
 import { CopyButton } from "@/components/shared/CopyButton";
-
-export const DiffLines: React.FC<{ lines: DiffLine[] }> = ({ lines }) => {
-  const { t } = useT();
-  const hasChanges = lines.some((l) => l.type !== "unchanged");
-  return (
-    <div className="space-y-px overflow-x-auto font-mono text-xs leading-relaxed">
-      {!hasChanges && (
-        <div className="mb-1 italic text-muted-foreground/50">
-          {t("setup.noChanges")}
-        </div>
-      )}
-      {lines.map((l, i) => (
-        <div
-          key={i}
-          className={cn(
-            "flex items-start gap-2 whitespace-nowrap rounded px-2",
-            l.type === "removed" && "bg-destructive/10 text-destructive",
-            l.type === "added" && "bg-success/10 text-success",
-            l.type === "unchanged" && "text-muted-foreground/80",
-          )}
-        >
-          <span className="w-3 shrink-0 select-none">
-            {l.type === "removed" ? "−" : l.type === "added" ? "+" : " "}
-          </span>
-          <span>{l.line}</span>
-        </div>
-      ))}
-    </div>
-  );
-};
+import { DiffViewer } from "@/components/shared/DiffViewer";
 
 interface FileCardProps {
   title: string;
   currentContent: string | null;
   previewContent: string | null;
   isDiff: boolean;
-  emptyText?: string;
+  /** 语法高亮语言（如 "json"、"toml"、"ini"）——传给 DiffViewer / 纯展示 */
+  language?: string;
 }
 
 export const FileCard: React.FC<FileCardProps> = ({
@@ -48,13 +17,9 @@ export const FileCard: React.FC<FileCardProps> = ({
   currentContent,
   previewContent,
   isDiff,
-  emptyText = "— —",
+  language,
 }) => {
-  const diffLines = useMemo(() => {
-    if (!isDiff || !currentContent || !previewContent) return null;
-    return computeLineDiff(currentContent, previewContent);
-  }, [isDiff, currentContent, previewContent]);
-
+  const showDiff = isDiff && currentContent != null && previewContent != null;
   const displayContent = isDiff && previewContent ? previewContent : currentContent;
 
   return (
@@ -73,12 +38,22 @@ export const FileCard: React.FC<FileCardProps> = ({
         <CopyButton text={displayContent ?? ""} />
       </div>
       <div className="max-h-[360px] overflow-y-auto p-3">
-        {diffLines ? (
-          <DiffLines lines={diffLines} />
+        {showDiff ? (
+          <DiffViewer
+            oldValue={currentContent}
+            newValue={previewContent}
+            maxHeight="320px"
+            highlightLanguage={language}
+          />
         ) : (
-          <pre className="whitespace-pre overflow-x-auto font-mono text-[10px] leading-relaxed text-foreground/70">
-            {displayContent ?? emptyText}
-          </pre>
+          // 纯展示：走库的高亮渲染（旧值同新值 → 全 unchanged，非新增），保留语法色
+          <DiffViewer
+            oldValue={displayContent ?? ""}
+            newValue={displayContent ?? ""}
+            maxHeight="320px"
+            highlightLanguage={language}
+            showDiffOnly={false}
+          />
         )}
       </div>
     </div>

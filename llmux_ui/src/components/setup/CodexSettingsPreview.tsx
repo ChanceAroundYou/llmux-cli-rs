@@ -97,14 +97,14 @@ export const CodexSettingsPreview: React.FC<Props> = ({
             currentContent={authCurrent}
             previewContent={authPreview}
             isDiff={isDiff}
-            emptyText={t("setup.emptyFile")}
+            language="json"
           />
           <FileCard
             title="config.toml"
             currentContent={tomlCurrent}
             previewContent={tomlPreview}
             isDiff={isDiff}
-            emptyText={t("setup.emptyFile")}
+            language="toml"
           />
         </div>
       )}

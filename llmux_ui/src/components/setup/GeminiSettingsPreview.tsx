@@ -92,14 +92,14 @@ export const GeminiSettingsPreview: React.FC<Props> = ({
             currentContent={currentEnv}
             previewContent={previewEnv}
             isDiff={isDiff}
-            emptyText={t("setup.emptyFile")}
+            language="ini"
           />
           <FileCard
             title="settings.json"
             currentContent={currentSettings}
             previewContent={previewSettings}
             isDiff={isDiff}
-            emptyText={t("setup.emptyFile")}
+            language="json"
           />
         </div>
       )}

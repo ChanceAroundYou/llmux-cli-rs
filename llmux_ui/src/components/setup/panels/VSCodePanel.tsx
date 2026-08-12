@@ -283,7 +283,7 @@ export const VSCodePanel: React.FC<Props> = ({ aliases, gatewayUrl }) => {
             currentContent={json}
             previewContent={null}
             isDiff={false}
-            emptyText=""
+            language="json"
           />
           <p className="px-1 text-xs text-muted-foreground">
             {t("setup.vscode.note")}

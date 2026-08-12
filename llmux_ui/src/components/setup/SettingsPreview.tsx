@@ -1,60 +1,11 @@
-// 快速配置：Claude settings 预览（Diff/当前 双 tab，按扁平 key 对比高亮）
+// 快速配置：Claude settings 预览（Diff/当前 双 tab，用统一 DiffViewer 库做 JSON 结构 diff）
 import React, { useEffect, useMemo, useState } from "react";
 import { FileJson, RotateCcw } from "lucide-react";
 import { useT } from "@/i18n";
 import { cn } from "@/utils/helpers";
-import { buildKeyDiff, type DiffLine } from "./utils";
 import { CopyButton } from "@/components/shared/CopyButton";
-
-// 高亮展示写入网关的关键字段
-const HIGHLIGHT_KEYS = new Set([
-  "ANTHROPIC_BASE_URL",
-  "ANTHROPIC_AUTH_TOKEN",
-  "ANTHROPIC_DEFAULT_OPUS_MODEL",
-  "ANTHROPIC_DEFAULT_SONNET_MODEL",
-  "ANTHROPIC_DEFAULT_HAIKU_MODEL",
-]);
-
-function DiffView({
-  lines,
-}: {
-  lines: DiffLine[];
-}) {
-  const { t } = useT();
-  const hasChanges = lines.some((l) => l.type !== "unchanged");
-  return (
-    <div className="space-y-px overflow-x-auto font-mono text-xs leading-relaxed">
-      {!hasChanges && (
-        <div className="mb-1 italic text-muted-foreground/50">
-          {t("setup.noChanges")}
-        </div>
-      )}
-      {lines.map((l, i) => {
-        const leafKey = l.key?.split(".").pop() ?? "";
-        const highlighted = HIGHLIGHT_KEYS.has(leafKey);
-        return (
-          <div
-            key={i}
-            className={cn(
-              "flex items-start gap-2 whitespace-nowrap rounded px-2",
-              l.type === "removed" && "bg-destructive/10 text-destructive",
-              l.type === "added" && "bg-success/10 text-success",
-              l.type === "unchanged" &&
-                (highlighted ? "text-foreground/70" : "text-muted-foreground/80"),
-            )}
-          >
-            <span className="w-3 shrink-0 select-none">
-              {l.type === "removed" ? "−" : l.type === "added" ? "+" : " "}
-            </span>
-            <span className={cn(highlighted && l.type !== "unchanged" && "font-semibold")}>
-              {l.line}
-            </span>
-          </div>
-        );
-      })}
-    </div>
-  );
-}
+import { DiffViewer } from "@/components/shared/DiffViewer";
+import { DiffMethod } from "react-diff-viewer-continued";
 
 interface Props {
   /** 当前文件内容（settings.json 对象） */
@@ -81,9 +32,13 @@ export const SettingsPreview: React.FC<Props> = ({
     setTab(preview ? "diff" : "current");
   }, [preview]);
 
-  const diffLines = useMemo(() => {
+  // JSON 结构 diff：settings（旧）与 preview（新）序列化后交给库对比
+  const diffPair = useMemo(() => {
     if (!preview) return null;
-    return buildKeyDiff(settings, preview);
+    return {
+      old: settings ? JSON.stringify(settings, null, 2) : "",
+      new: JSON.stringify(preview, null, 2),
+    };
   }, [settings, preview]);
 
   const showContent = tab === "current" ? (settings ?? preview) : preview;
@@ -157,8 +112,14 @@ export const SettingsPreview: React.FC<Props> = ({
             <div className="font-mono text-xs text-muted-foreground">
               {t("setup.loading")}
             </div>
-          ) : tab === "diff" && diffLines ? (
-            <DiffView lines={diffLines} />
+          ) : tab === "diff" && diffPair ? (
+            <DiffViewer
+              oldValue={diffPair.old}
+              newValue={diffPair.new}
+              compareMethod={DiffMethod.JSON}
+              highlightLanguage="json"
+              maxHeight="360px"
+            />
           ) : showContent ? (
             <pre className="whitespace-pre overflow-x-auto font-mono text-xs leading-relaxed text-foreground/80">
               {JSON.stringify(showContent, null, 2)}
