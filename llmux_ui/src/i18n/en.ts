@@ -31,6 +31,7 @@ export const en: Dict = {
   "common.next": "Next",
   "common.show": "Show",
   "common.hide": "Hide",
+  "common.retry": "Retry",
 
   // ── Time ──────────────────────────────────────────────
   "time.justNow": "just now",

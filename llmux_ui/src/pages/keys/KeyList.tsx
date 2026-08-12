@@ -19,7 +19,7 @@ import { PageHeader } from "@/components/shared/PageHeader";
 import { EmptyState } from "@/components/shared/EmptyState";
 import { cn } from "@/utils/helpers";
 import { formatTimestamp } from "@/utils/format";
-import { KeyRound } from "lucide-react";
+import { KeyRound, AlertTriangle } from "lucide-react";
 
 type ModelScope = "all" | "specific";
 
@@ -27,7 +27,7 @@ export const KeyList: React.FC = () => {
   const { t } = useT();
   const toast = useToast();
   // 密钥列表缓存：切回本页直接展示旧数据，过期后后台刷新；快速请求不闪骨架
-  const { data, showSkeleton, refetch: fetchKeys } = useCachedData<ApiKey[]>(
+  const { data, showSkeleton, error, refetch: fetchKeys } = useCachedData<ApiKey[]>(
     "keys",
     () => keyApi.list(),
     { ttlMs: 60_000, onError: () => toast.error(t("keys.loadFailed")) },
@@ -173,13 +173,26 @@ export const KeyList: React.FC = () => {
         actions={<Button onClick={() => setCreateOpen(true)}>+ {t("keys.create")}</Button>}
       />
 
-      <Table
-        columns={columns}
-        data={keys}
-        rowKey={(r) => r.id ?? r.key}
-        loading={showSkeleton}
-        empty={<EmptyState icon={KeyRound} title={t("keys.title")} description={t("keys.create")} />}
-      />
+      {error && data === null ? (
+        // 加载失败且无缓存数据可展示：失败空态 + 重试
+        <EmptyState
+          icon={AlertTriangle}
+          title={t("keys.loadFailed")}
+          action={
+            <Button size="sm" onClick={() => fetchKeys()}>
+              {t("common.retry")}
+            </Button>
+          }
+        />
+      ) : (
+        <Table
+          columns={columns}
+          data={keys}
+          rowKey={(r) => r.id ?? r.key}
+          loading={showSkeleton}
+          empty={<EmptyState icon={KeyRound} title={t("keys.title")} description={t("keys.create")} />}
+        />
+      )}
 
       {/* Create Modal */}
       <Modal

@@ -63,9 +63,9 @@ export const Modal: React.FC<ModalProps> = ({
               key="dialog"
               role="dialog"
               aria-modal="true"
-              initial={{ opacity: 0, scale: 0.97 }}
-              animate={{ opacity: 1, scale: 1 }}
-              exit={{ opacity: 0, scale: 0.98 }}
+              initial={{ opacity: 0, y: 8, scale: 0.97 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, y: 8, scale: 0.98 }}
               transition={{ duration: 0.18, ease: "easeOut" }}
               className={cn(
                 "pointer-events-auto relative w-full rounded-2xl border border-border bg-card shadow-card",

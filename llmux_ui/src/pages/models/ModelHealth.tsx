@@ -12,13 +12,13 @@ import { useCachedData } from "@/hooks/useCachedData";
 import { useT } from "@/i18n";
 import { PageHeader } from "@/components/shared/PageHeader";
 import { EmptyState } from "@/components/shared/EmptyState";
-import { RefreshCw, HeartPulse } from "lucide-react";
+import { RefreshCw, HeartPulse, AlertTriangle } from "lucide-react";
 
 export const ModelHealth: React.FC = () => {
   const { t } = useT();
   const toast = useToast();
   // 健康数据缓存：切回本页直接展示旧数据，过期后后台刷新；快速请求不闪骨架
-  const { data, loading, showSkeleton, refetch: fetchHealth } = useCachedData<ModelHealthEntry[]>(
+  const { data, loading, showSkeleton, error, refetch: fetchHealth } = useCachedData<ModelHealthEntry[]>(
     "modelHealth",
     () => modelApi.getHealth(),
     { ttlMs: 20_000, onError: () => toast.error(t("health.loadFailed")) },
@@ -92,13 +92,26 @@ export const ModelHealth: React.FC = () => {
         }
       />
 
-      <Table
-        columns={columns}
-        data={entries}
-        rowKey={(r) => `${r.account_id}-${r.model}`}
-        loading={showSkeleton}
-        empty={<EmptyState icon={HeartPulse} title={t("health.empty")} />}
-      />
+      {error && data === null ? (
+        // 加载失败且无缓存数据可展示：失败空态 + 重试
+        <EmptyState
+          icon={AlertTriangle}
+          title={t("health.loadFailed")}
+          action={
+            <Button size="sm" onClick={() => fetchHealth()}>
+              {t("common.retry")}
+            </Button>
+          }
+        />
+      ) : (
+        <Table
+          columns={columns}
+          data={entries}
+          rowKey={(r) => `${r.account_id}-${r.model}`}
+          loading={showSkeleton}
+          empty={<EmptyState icon={HeartPulse} title={t("health.empty")} />}
+        />
+      )}
     </div>
   );
 };

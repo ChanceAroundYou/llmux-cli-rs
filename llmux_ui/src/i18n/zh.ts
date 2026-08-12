@@ -31,6 +31,7 @@ export const zh: Dict = {
   "common.next": "下一页",
   "common.show": "显示",
   "common.hide": "隐藏",
+  "common.retry": "重试",
 
   // ── 时间 ──────────────────────────────────────────────
   "time.justNow": "刚刚",

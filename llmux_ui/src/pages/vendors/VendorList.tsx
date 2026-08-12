@@ -13,8 +13,9 @@ import { useToast } from "@/hooks/useToast";
 import { useCachedData } from "@/hooks/useCachedData";
 import { useT } from "@/i18n";
 import { PageHeader } from "@/components/shared/PageHeader";
+import { EmptyState } from "@/components/shared/EmptyState";
 import { VendorLogo } from "@/components/vendors/VendorLogo";
-import { Building2 } from "lucide-react";
+import { Building2, AlertTriangle } from "lucide-react";
 
 const PROTOCOLS = ["openai", "anthropic", "gemini", "custom"];
 
@@ -22,7 +23,7 @@ export const VendorList: React.FC = () => {
   const { t } = useT();
   const toast = useToast();
   // 厂商列表缓存：切回本页直接展示旧数据，过期后后台刷新；快速请求不闪骨架
-  const { data, showSkeleton, refetch: fetchVendors } = useCachedData<Vendor[]>(
+  const { data, showSkeleton, error, refetch: fetchVendors } = useCachedData<Vendor[]>(
     "vendors",
     () => vendorApi.list(),
     { ttlMs: 60_000, onError: () => toast.error(t("vendors.loadFailed")) },
@@ -112,12 +113,23 @@ export const VendorList: React.FC = () => {
             <div key={i} className="h-28 animate-pulse rounded-xl bg-muted" />
           ))}
         </div>
+      ) : error && data === null ? (
+        // 加载失败且无缓存数据可展示：失败空态 + 重试
+        <EmptyState
+          icon={AlertTriangle}
+          title={t("vendors.loadFailed")}
+          action={
+            <Button size="sm" onClick={() => fetchVendors()}>
+              {t("common.retry")}
+            </Button>
+          }
+        />
       ) : (
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
           {vendors.map((v) => (
             <div
               key={v.id}
-              className="flex flex-col gap-3 rounded-xl border border-border bg-card p-4 transition-all hover:border-primary/30 hover:shadow-soft"
+              className="flex flex-col gap-3 rounded-xl border border-border bg-card p-4 transition-all duration-200 hover:-translate-y-1 hover:border-primary/30 hover:shadow-card"
             >
               <div className="flex items-start gap-3">
                 <VendorLogo id={v.id} name={v.name} size={44} />

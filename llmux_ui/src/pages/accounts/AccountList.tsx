@@ -14,7 +14,7 @@ import { useCachedData } from "@/hooks/useCachedData";
 import { useT } from "@/i18n";
 import { PageHeader } from "@/components/shared/PageHeader";
 import { EmptyState } from "@/components/shared/EmptyState";
-import { Download, Pencil, Trash2, Plus, Users, Inbox, Power, PowerOff } from "lucide-react";
+import { Download, Pencil, Trash2, Plus, Users, Inbox, Power, PowerOff, AlertTriangle } from "lucide-react";
 
 // 账户页展示数据：账户列表 + 厂商列表（厂商用于渲染徽标名称）
 interface AccountListData {
@@ -26,7 +26,7 @@ export const AccountList: React.FC = () => {
   const { t } = useT();
   const toast = useToast();
   // 账户+厂商合并缓存：切回本页直接展示旧数据，过期后后台刷新；快速请求不闪骨架
-  const { data, showSkeleton, setData, refetch: fetchData } = useCachedData<AccountListData>(
+  const { data, showSkeleton, error, setData, refetch: fetchData } = useCachedData<AccountListData>(
     "accountList",
     async () => {
       const [accs, vends] = await Promise.allSettled([accountApi.list(), vendorApi.list()]);
@@ -207,13 +207,26 @@ export const AccountList: React.FC = () => {
         }
       />
 
-      <Table
-        columns={columns}
-        data={accounts}
-        rowKey={(row) => row.id ?? row.name}
-        loading={showSkeleton}
-        empty={<EmptyState icon={Inbox} title={t("accounts.empty")} />}
-      />
+      {error && data === null ? (
+        // 加载失败且无缓存数据可展示：失败空态 + 重试
+        <EmptyState
+          icon={AlertTriangle}
+          title={t("accounts.loadFailed")}
+          action={
+            <Button size="sm" onClick={() => fetchData()}>
+              {t("common.retry")}
+            </Button>
+          }
+        />
+      ) : (
+        <Table
+          columns={columns}
+          data={accounts}
+          rowKey={(row) => row.id ?? row.name}
+          loading={showSkeleton}
+          empty={<EmptyState icon={Inbox} title={t("accounts.empty")} />}
+        />
+      )}
 
       <AccountFormModal
         open={formOpen}

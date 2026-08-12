@@ -20,7 +20,7 @@ export const Select: React.FC<SelectProps> = ({
   disabled,
   className,
 }) => (
-  <div className={cn("relative w-full", className)}>
+  <div className={cn("group relative w-full", className)}>
     <select
       value={value}
       onChange={(e) => onChange(e.target.value)}
@@ -38,7 +38,7 @@ export const Select: React.FC<SelectProps> = ({
         </option>
       ))}
     </select>
-    {/* 自定义箭头：pointer-events-none 避免遮挡点击；right-3 距右缘 12px */}
-    <ChevronDown className="pointer-events-none absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+    {/* 自定义箭头：pointer-events-none 避免遮挡点击；right-3 距右缘 12px；聚焦时旋转 */}
+    <ChevronDown className="pointer-events-none absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground transition-transform duration-200 group-focus-within:rotate-180" />
   </div>
 );

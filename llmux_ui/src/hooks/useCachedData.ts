@@ -51,6 +51,8 @@ export function useCachedData<T>(
 
   const [data, setData] = useState<T | null>(() => readCache<T>(key));
   const [loading, setLoading] = useState(() => data === null);
+  // 最近一次请求是否失败：用于"无数据可展示时渲染失败空态"
+  const [error, setError] = useState(false);
 
   const refetch = useCallback(async () => {
     setLoading(true);
@@ -58,8 +60,10 @@ export function useCachedData<T>(
       const next = await fetcherRef.current();
       writeCache(key, next);
       setData(next);
+      setError(false);
     } catch (err) {
-      // 失败保留旧数据；错误交由调用方展示
+      // 失败保留旧数据；错误交由调用方展示（toast），同时标记失败态
+      setError(true);
       onErrorRef.current?.(err);
     } finally {
       setLoading(false);
@@ -91,5 +95,5 @@ export function useCachedData<T>(
   // 骨架显示条件：没有任何可展示数据且请求较慢（延迟阈值内完成则不闪）
   const showSkeleton = useDelayedLoading(loading && data === null, 200);
 
-  return { data, loading, showSkeleton, setData: update, refetch };
+  return { data, loading, showSkeleton, error, setData: update, refetch };
 }

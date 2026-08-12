@@ -105,15 +105,27 @@ export const Sidebar: React.FC<SidebarProps> = ({ open, onClose }) => {
                       onClick={onClose}
                       className={({ isActive }) =>
                         cn(
-                          "flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-medium transition-all duration-200",
+                          "relative flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-medium transition-colors duration-200",
                           isActive
-                            ? "bg-primary text-primary-foreground shadow-soft"
+                            ? "text-primary-foreground"
                             : "text-muted-foreground hover:bg-muted hover:text-foreground",
                         )
                       }
                     >
-                      <item.icon className="h-[18px] w-[18px] shrink-0" />
-                      {t(item.labelKey)}
+                      {/* 激活高亮在导航项间滑动（layoutId 跨菜单共享） */}
+                      {({ isActive }) => (
+                        <>
+                          {isActive && (
+                            <motion.span
+                              layoutId="sidebar-active"
+                              className="absolute inset-0 rounded-xl bg-primary shadow-soft"
+                              transition={{ type: "spring", stiffness: 400, damping: 32 }}
+                            />
+                          )}
+                          <item.icon className="relative z-10 h-[18px] w-[18px] shrink-0" />
+                          <span className="relative z-10">{t(item.labelKey)}</span>
+                        </>
+                      )}
                     </NavLink>
                   ))}
                 </div>

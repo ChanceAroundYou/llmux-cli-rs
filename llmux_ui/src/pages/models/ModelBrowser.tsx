@@ -583,7 +583,7 @@ const ModelCard: React.FC<{
   return (
     <div
       className={cn(
-        "rounded-2xl border p-4 shadow-soft transition-all duration-200 hover:shadow-card",
+        "rounded-2xl border p-4 shadow-soft transition-all duration-200 hover:-translate-y-1 hover:shadow-card",
         isPlaceholder
           ? "border-dashed border-warning/40 bg-warning/5"
           : linked
