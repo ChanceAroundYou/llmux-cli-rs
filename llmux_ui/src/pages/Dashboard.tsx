@@ -189,11 +189,11 @@ export const Dashboard: React.FC = () => {
         description="LLMux · AI Gateway"
         actions={
           <>
-            <Button variant="outline" size="sm" onClick={() => loadAll()}>
+            <Button variant="outline" onClick={() => loadAll()}>
               <RefreshCw className={cn("h-4 w-4", refreshing && "animate-spin text-primary")} />
               {t("common.refresh")}
             </Button>
-            <Button size="sm" onClick={() => navigate("/accounts")}>
+            <Button onClick={() => navigate("/accounts")}>
               <Plus className="h-4 w-4" /> {t("accounts.add")}
             </Button>
           </>
