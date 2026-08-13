@@ -1,5 +1,5 @@
 // 仪表盘（参考老项目）：固定视口高度 → 两栏等高（别名健康 + 最近动态），列表内部滚动
-import React, { useState, useMemo } from "react";
+import React, { useState, useMemo, useEffect } from "react";
 import { healthApi } from "@/api/health";
 import { activityApi } from "@/api/activity";
 import { accountApi } from "@/api/accounts";
@@ -88,6 +88,41 @@ export const Dashboard: React.FC = () => {
   const modelHealth = useMemo(() => data?.modelHealth ?? [], [data]);
   const activity = useMemo(() => data?.activity ?? null, [data]);
   const errors = useMemo(() => data?.errors ?? [], [data]);
+
+  // 最近动态：初始来自缓存数据，之后由 SSE 实时追加（按 id 去重，上限 100 条）
+  const [liveEntries, setLiveEntries] = useState<ActivityEntry[]>([]);
+  // SSE 连接状态：断开时面板给出非实时提示（浏览器会自动重连）
+  const [sseOk, setSseOk] = useState(true);
+
+  // 初始/刷新数据同步进 liveEntries（以 SSE 为准，这里只在缓存数据到达时合并一次）
+  useEffect(() => {
+    if (activity) {
+      setLiveEntries((prev) => mergeActivityById(prev, activity.entries));
+    }
+  }, [activity]);
+
+  // SSE：只有本页打开（有连接）才推送；关闭/切走即断开，后端无连接则不轮询
+  useEffect(() => {
+    const es = new EventSource("/api/activity/stream");
+    es.onopen = () => setSseOk(true);
+    es.onerror = () => {
+      // 连接失败：EventSource 会自动重连，标记非实时供 UI 提示
+      setSseOk(false);
+    };
+    es.onmessage = (ev) => {
+      try {
+        const parsed = JSON.parse(ev.data) as { entries?: ActivityEntry[] };
+        const incoming = parsed.entries;
+        if (incoming && incoming.length > 0) {
+          setLiveEntries((prev) => mergeActivityById(prev, incoming));
+        }
+      } catch {
+        /* 忽略异常数据 */
+      }
+    };
+    return () => es.close();
+  }, []);
+
   const [aliasSearch, setAliasSearch] = useState("");
   const [aliasVendor, setAliasVendor] = useState("all");
   const [onlyShowErrors, setOnlyShowErrors] = useState(false);
@@ -125,8 +160,8 @@ export const Dashboard: React.FC = () => {
     return [...new Set(aliasHealthList.map((a) => a.provider).filter(Boolean))];
   }, [aliasHealthList]);
 
-  // 最近动态（useMemo 保证引用稳定，避免下游 useMemo deps 每次变化）
-  const entries = useMemo(() => activity?.entries ?? [], [activity]);
+  // 最近动态（SSE 实时更新）
+  const entries = liveEntries;
   const filteredLogs = useMemo(() => {
     const src = onlyShowErrors ? entries.filter((l) => l.success !== 1) : entries;
     return src.slice(0, 100);
@@ -292,6 +327,11 @@ export const Dashboard: React.FC = () => {
               <div className="flex items-center gap-2">
                 <Activity className="h-4 w-4 text-muted-foreground" />
                 <h2 className="text-base font-semibold text-card-foreground">{t("dash.logs.title")}</h2>
+                {!sseOk && (
+                  <span className="rounded-full bg-warning/15 px-2 py-0.5 text-[10px] font-medium text-warning-foreground">
+                    {t("dash.logs.sseOffline")}
+                  </span>
+                )}
               </div>
               <Button
                 size="sm"
@@ -434,4 +474,14 @@ const PulseChart: React.FC<{ entries: ActivityEntry[] }> = ({ entries }) => {
 
 function timeText(ts: number): string {
   return new Date(ts * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
+}
+
+// 合并最近动态：新条目优先（同 id 覆盖），按时间倒序，上限 100 条
+function mergeActivityById(prev: ActivityEntry[], incoming: ActivityEntry[]): ActivityEntry[] {
+  const map = new Map<number, ActivityEntry>();
+  for (const e of incoming) map.set(e.id, e);
+  for (const e of prev) if (!map.has(e.id)) map.set(e.id, e);
+  return Array.from(map.values())
+    .sort((a, b) => b.timestamp - a.timestamp)
+    .slice(0, 100);
 }

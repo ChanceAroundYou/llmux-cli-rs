@@ -625,6 +625,34 @@ pub async fn list_recent_activity(pool: &SqlitePool, limit: i64) -> Result<Vec<A
     .await?)
 }
 
+/// 当前最大活动 id：SSE 连接时用它初始化游标——历史由 /api/activity 接口提供，流只推真新增
+pub async fn max_activity_id(pool: &SqlitePool) -> Result<i64> {
+    Ok(sqlx::query_scalar::<_, i64>("SELECT COALESCE(MAX(id), 0) FROM usage_logs")
+        .fetch_one(pool)
+        .await?)
+}
+
+/// 活动增量流：取 id > since_id 的条目，按 id 升序。
+/// 配合游标逐批消费：突发新增超过 limit 时，下个 tick 从游标继续取，不丢条。
+pub async fn list_activity_since(
+    pool: &SqlitePool,
+    since_id: i64,
+    limit: i64,
+) -> Result<Vec<ActivityEntry>> {
+    Ok(sqlx::query_as::<_, ActivityEntry>(
+        "SELECT l.id, l.ts, l.model, l.success, l.latency_ms,
+                l.error_message, l.account_name
+         FROM usage_logs l
+         WHERE l.id > ?
+         ORDER BY l.id ASC
+         LIMIT ?",
+    )
+    .bind(since_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?)
+}
+
 /// 模型健康检查一行（拨测结果或真实请求）。
 #[derive(Debug, sqlx::FromRow)]
 pub struct ModelHealthRow {

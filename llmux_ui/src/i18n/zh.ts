@@ -82,6 +82,7 @@ export const zh: Dict = {
   "dash.logs.showAll": "显示全部",
   "dash.logs.latencyPulse": "延迟脉搏",
   "dash.logs.noErrors": "暂无错误",
+  "dash.logs.sseOffline": "实时连接已断开",
 
   // ── 活动 ──────────────────────────────────────────────
 

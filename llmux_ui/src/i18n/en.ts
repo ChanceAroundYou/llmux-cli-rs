@@ -82,6 +82,7 @@ export const en: Dict = {
   "dash.logs.showAll": "Show all",
   "dash.logs.latencyPulse": "Latency pulse",
   "dash.logs.noErrors": "No errors",
+  "dash.logs.sseOffline": "Live connection lost",
 
   // ── Activity ──────────────────────────────────────────
 
