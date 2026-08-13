@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use axum::{
-    extract::OriginalUri,
+    extract::{DefaultBodyLimit, OriginalUri},
     http::{Method, StatusCode, Uri},
     middleware,
     response::{IntoResponse, Response},
@@ -264,6 +264,7 @@ pub fn app(state: AppState) -> AppRouter {
         .route("/api/export", get(settings::export_config))
         .route("/api/import", post(settings::import_config))
         .layer(Extension(state))
+        .layer(DefaultBodyLimit::max(128 * 1024 * 1024))
         .fallback(fallback)
         .layer(cors_layer())
         .layer(TraceLayer::new_for_http())

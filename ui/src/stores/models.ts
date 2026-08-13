@@ -7,6 +7,7 @@ export interface AvailableModel {
   created: number;
   owned_by: string;
   error?: string;
+  context_length?: number;
 }
 
 export interface ModelAlias {

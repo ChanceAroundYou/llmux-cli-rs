@@ -30,11 +30,21 @@ yarn-error.log*
 tmp/
 temp/
 cache/
+data/
+*.db
+*.db-shm
+*.db-wal
+master.key
+secrets/
 
 # OS
 Thumbs.db
 .AppleDouble
 .LSOverride
+
+# Ops artifacts (session state, notes, metrics)
+.omc/
+.claude/
 
 # Rust
 /target/

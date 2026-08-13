@@ -1,3 +1,6 @@
+pub mod anthropic_openai;
+pub mod openai_anthropic;
+
 use crate::adapters::{Account, ProviderRequest};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;

@@ -6,6 +6,8 @@ use axum::{
 };
 use serde_json::Value;
 
+use llmux_core::context::lookup_context_length;
+
 use crate::app::AppState;
 use crate::middleware;
 
@@ -20,8 +22,8 @@ pub async fn models(Extension(state): Extension<AppState>, headers: HeaderMap) -
     let is_anthropic =
         headers.contains_key("x-api-key") || headers.contains_key("anthropic-version");
 
-    let alias_names: Vec<String> = match sqlx::query_scalar::<_, String>(
-        "SELECT alias FROM model_aliases",
+    let alias_rows: Vec<(String, Option<String>)> = match sqlx::query_as::<_, (String, Option<String>)>(
+        "SELECT alias, target_model FROM model_aliases",
     )
     .fetch_all(&state.pool)
     .await
@@ -39,15 +41,19 @@ pub async fn models(Extension(state): Extension<AppState>, headers: HeaderMap) -
 
     if is_anthropic {
         let created_at = iso8601_now();
-        let data: Vec<Value> = alias_names
+        let data: Vec<Value> = alias_rows
             .iter()
-            .map(|alias| {
-                serde_json::json!({
+            .map(|(alias, target)| {
+                let mut obj = serde_json::json!({
                     "type": "model",
                     "id": alias,
                     "display_name": alias,
                     "created_at": created_at,
-                })
+                });
+                if let Some(ctx) = resolve_alias_context(&state, target.as_deref()) {
+                    obj["context_length"] = serde_json::json!(ctx);
+                }
+                obj
             })
             .collect();
         let first_id = data
@@ -69,15 +75,19 @@ pub async fn models(Extension(state): Extension<AppState>, headers: HeaderMap) -
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let data: Vec<Value> = alias_names
+    let data: Vec<Value> = alias_rows
         .into_iter()
-        .map(|alias| {
-            serde_json::json!({
+        .map(|(alias, target)| {
+            let mut obj = serde_json::json!({
                 "id": alias,
                 "object": "model",
                 "created": created,
                 "owned_by": "llmux",
-            })
+            });
+            if let Some(ctx) = resolve_alias_context(&state, target.as_deref()) {
+                obj["context_length"] = serde_json::json!(ctx);
+            }
+            obj
         })
         .collect();
 
@@ -86,4 +96,23 @@ pub async fn models(Extension(state): Extension<AppState>, headers: HeaderMap) -
         "data": data
     }))
     .into_response()
+}
+
+/// Resolve an alias's context length: match its target model against the
+/// cached upstream model list first, then fall back to the built-in table.
+fn resolve_alias_context(state: &AppState, target_model: Option<&str>) -> Option<u64> {
+    let target = target_model?;
+    if target.is_empty() {
+        return None;
+    }
+    if let Some(cache) = state.models_cache.lock().unwrap().as_ref() {
+        for m in &cache.data {
+            if m.get("id").and_then(Value::as_str) == Some(target) {
+                if let Some(ctx) = m.get("context_length").and_then(Value::as_u64) {
+                    return Some(ctx);
+                }
+            }
+        }
+    }
+    lookup_context_length(target)
 }

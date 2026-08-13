@@ -5,6 +5,7 @@ use axum::{
 use serde_json::{json, Value};
 use sqlx::Row;
 
+use llmux_core::context::lookup_context_length;
 use llmux_core::dispatcher::{get_active_accounts, resolve_provider_type};
 
 use crate::app::{AppState, ModelsCache};
@@ -42,6 +43,54 @@ fn normalize_model(m: &mut Value) {
     obj.insert("name".to_string(), json!(display_name));
     obj.entry("object".to_string()).or_insert(json!("model"));
     obj.entry("created".to_string()).or_insert(json!(0));
+
+    // Resolve context length: upstream-specific fields first, built-in table as fallback.
+    let context_length = extract_context_length(obj).or_else(|| {
+        if id.is_empty() {
+            None
+        } else {
+            lookup_context_length(&id)
+        }
+    });
+    if let Some(ctx) = context_length {
+        obj.insert("context_length".to_string(), json!(ctx));
+    }
+}
+
+/// Coerce a JSON number (or numeric string) to u64.
+fn as_u64_val(v: &Value) -> Option<u64> {
+    v.as_u64()
+        .or_else(|| v.as_i64().and_then(|i| u64::try_from(i).ok()))
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+}
+
+/// Extract a canonical context length from upstream-specific fields.
+fn extract_context_length(obj: &serde_json::Map<String, Value>) -> Option<u64> {
+    // GitHub Copilot models: capabilities.limits.max_context_window_tokens
+    if let Some(v) = obj
+        .get("capabilities")
+        .and_then(|c| c.get("limits"))
+        .and_then(|l| l.get("max_context_window_tokens"))
+        .and_then(as_u64_val)
+    {
+        return Some(v);
+    }
+    // Gemini: inputTokenLimit
+    if let Some(v) = obj.get("inputTokenLimit").and_then(as_u64_val) {
+        return Some(v);
+    }
+    // OpenAI-compatible variants (OpenRouter `context_length`, vLLM `max_model_len`, …)
+    for key in [
+        "context_length",
+        "max_model_len",
+        "max_context_length",
+        "context_window",
+    ] {
+        if let Some(v) = obj.get(key).and_then(as_u64_val) {
+            return Some(v);
+        }
+    }
+    None
 }
 
 pub async fn get_available_models(

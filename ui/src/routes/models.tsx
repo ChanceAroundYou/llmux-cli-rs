@@ -28,6 +28,18 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 
+function formatContextLength(n: number): string {
+  if (n >= 1_000_000) {
+    const m = n / 1_000_000;
+    return Number.isInteger(m) ? `${m}M` : `${m.toFixed(1)}M`;
+  }
+  if (n >= 1_000) {
+    const k = n / 1_000;
+    return Number.isInteger(k) ? `${k}K` : `${k.toFixed(1)}K`;
+  }
+  return `${n}`;
+}
+
 export default function Models() {
   const { t, i18n } = useTranslation();
   const { availableModels, cachedAt, aliases, accounts, isLoading, fetchModels, fetchAliases, fetchAccounts, addAlias, deleteAlias, testModel } = useModelsStore();
@@ -418,6 +430,14 @@ export default function Models() {
                 />
               </div>
               <div className="flex items-center gap-2">
+                {model.context_length != null && model.context_length > 0 && (
+                  <span
+                    className="text-[10px] font-bold text-muted-foreground/60 bg-muted/50 border border-border/50 rounded px-1.5 py-0.5"
+                    title={`${t('models.contextLength')}: ${model.context_length.toLocaleString()}`}
+                  >
+                    {formatContextLength(model.context_length)}
+                  </span>
+                )}
                 {testResults[model.id]?.latency != null && (
                   <span className="text-xs text-success font-bold">{(testResults[model.id]!.latency! / 1000).toFixed(1)}s</span>
                 )}

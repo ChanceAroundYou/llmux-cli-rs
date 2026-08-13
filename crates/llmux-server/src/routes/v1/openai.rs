@@ -8,11 +8,19 @@ use axum::{
     response::{IntoResponse, Response},
     Extension, Json,
 };
+use bytes::Bytes;
 use futures_util::StreamExt;
 use serde_json::Value;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 
 use llmux_core::adapters::{self, execute_provider_request, ProviderRequest};
 use llmux_core::dispatcher::{self, get_accounts_by_ids, get_active_accounts, is_retryable_status};
+use llmux_core::proxy::openai_anthropic::{
+    anthropic_to_openai_response, is_unsupported_api_for_model, openai_to_anthropic_request,
+    AnthropicSseConverter,
+};
+use llmux_core::proxy::{build_anthropic_target_url, anthropic_openai::{parse_sse_chunks, sse_data_payload}};
 
 use crate::app::{AppState, TuiEvent};
 use crate::middleware::{self, AuthContext};
@@ -273,6 +281,48 @@ async fn openai_dispatch(
                 }
                 continue;
             }
+            // Some provider gateways (GitHub Copilot) serve GPT-5.x models only
+            // via the Anthropic Messages endpoint and reject /chat/completions
+            // with `unsupported_api_for_model`. When that happens and the
+            // account has a valid anthropic_base_url, retry the request
+            // through its /v1/messages endpoint (OpenAI → Anthropic conversion).
+            if endpoint == "chat/completions"
+                && is_unsupported_api_for_model(&error_body)
+                && account
+                    .anthropic_base_url
+                    .as_deref()
+                    .map(str::trim)
+                    .is_some_and(|u| !u.is_empty())
+            {
+                tracing::info!(
+                    "↩️ {} rejected /chat/completions — retrying via /v1/messages",
+                    account.alias
+                );
+                if let Some(resp) = anthropic_fallback_response(
+                    &patched_body,
+                    account,
+                    &model_resolution.target_model,
+                    streaming,
+                    state.pool.clone(),
+                    start,
+                )
+                .await
+                {
+                    {
+                        let mut router = state.dispatch_router.lock().await;
+                        router.record_result(&dispatch_key, &dispatch_meta, Some(account.id), true);
+                    }
+                    send_tui_request(
+                        &state.tui_tx,
+                        normalized_uri.path(),
+                        200,
+                        start,
+                        &model_resolution.target_model,
+                    );
+                    return resp;
+                }
+            }
+
             let latency_ms = start.elapsed().as_millis() as i64;
             let _ = log_usage(
                 &state.pool,
@@ -431,6 +481,210 @@ async fn openai_streaming_passthrough(
     });
 
     let body = Body::from_stream(stream);
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .header("connection", "keep-alive")
+        .body(body)
+        .unwrap()
+        .into_response()
+}
+
+/// Retry an OpenAI chat/completions request through the account's Anthropic
+/// `/v1/messages` endpoint. Used when the upstream rejects `/chat/completions`
+/// for a model that IS served on `/v1/messages` (GitHub Copilot GPT-5.x).
+/// Returns `None` when the account has no usable anthropic_base_url or the
+/// Anthropic attempt fails (the caller keeps the original error).
+async fn anthropic_fallback_response(
+    openai_body: &Value,
+    account: &adapters::Account,
+    model: &str,
+    streaming: bool,
+    pool: sqlx::SqlitePool,
+    start: Instant,
+) -> Option<Response> {
+    let anthropic_base = account
+        .anthropic_base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|u| !u.is_empty())?;
+
+    let anthropic_body = match openai_to_anthropic_request(openai_body, model) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!("↩️ OpenAI→Anthropic conversion failed: {e}");
+            return None;
+        }
+    };
+
+    let mut headers = BTreeMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    headers.insert("x-api-key".to_string(), account.api_key.clone());
+    headers.insert("anthropic-version".to_string(), "2023-06-01".to_string());
+
+    let provider_request = ProviderRequest {
+        method: "POST".to_string(),
+        url: build_anthropic_target_url(anthropic_base),
+        headers,
+        body: anthropic_body,
+    };
+
+    let response = match execute_provider_request(&provider_request).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("↩️ Anthropic fallback request failed: {e}");
+            return None;
+        }
+    };
+
+    if !response.status().is_success() {
+        tracing::warn!(
+            "↩️ Anthropic fallback returned {}",
+            response.status()
+        );
+        return None;
+    }
+
+    if streaming {
+        Some(anthropic_fallback_streaming(response, model, account, pool, start).await)
+    } else {
+        let bytes = match response.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!("↩️ Anthropic fallback read failed: {e}");
+                return None;
+            }
+        };
+        let data: Value = match serde_json::from_slice(&bytes) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("↩️ Anthropic fallback parse failed: {e}");
+                return None;
+            }
+        };
+        let openai_resp = anthropic_to_openai_response(&data, model);
+        let usage = &data["usage"];
+        let _ = log_usage(
+            &pool,
+            account,
+            model,
+            &account.provider_id,
+            usage["input_tokens"].as_i64().unwrap_or(0),
+            usage["output_tokens"].as_i64().unwrap_or(0),
+            0,
+            0,
+            start.elapsed().as_millis() as i64,
+            true,
+            &None,
+        )
+        .await;
+        Some(Json(openai_resp).into_response())
+    }
+}
+
+/// Stream an Anthropic `/v1/messages` SSE response, translating each event to
+/// OpenAI chat.completion.chunk SSE frames.
+async fn anthropic_fallback_streaming(
+    response: reqwest::Response,
+    model: &str,
+    account: &adapters::Account,
+    pool: sqlx::SqlitePool,
+    start: Instant,
+) -> Response {
+    let model = model.to_string();
+    let account = account.clone();
+
+    let (tx, rx) = mpsc::channel::<Result<Bytes, axum::Error>>(64);
+    tokio::spawn(async move {
+        let mut buffer: Vec<u8> = Vec::with_capacity(4096);
+        let mut converter = AnthropicSseConverter::new(&model);
+        let mut sse = response.bytes_stream();
+        let mut usage: Option<Value> = None;
+
+        while let Some(chunk) = sse.next().await {
+            let chunk = match chunk {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!("↩️ upstream stream read error: {e}");
+                    break;
+                }
+            };
+            buffer.extend_from_slice(&chunk);
+            for event_text in parse_sse_chunks(&mut buffer, 128) {
+                let Some(payload) = sse_data_payload(&event_text) else {
+                    continue;
+                };
+                let Ok(parsed) = serde_json::from_str::<Value>(payload) else {
+                    continue;
+                };
+                match parsed.get("type").and_then(Value::as_str) {
+                    Some("message_start") => {
+                        usage = parsed
+                            .get("message")
+                            .and_then(|m| m.get("usage"))
+                            .cloned();
+                    }
+                    Some("message_delta") => {
+                        // Merge output_tokens into the running usage.
+                        if let Some(out) = parsed
+                            .get("usage")
+                            .and_then(|u| u.get("output_tokens"))
+                            .and_then(Value::as_i64)
+                        {
+                            let u = usage.get_or_insert_with(|| serde_json::json!({}));
+                            u["output_tokens"] = serde_json::json!(out);
+                        }
+                    }
+                    Some("message_stop") => {
+                        // End of the Anthropic stream.
+                        for line in converter.finish(usage.as_ref()) {
+                            if tx.send(Ok(Bytes::from(format!("{line}\n\n")))).await.is_err() {
+                                return;
+                            }
+                        }
+                        let (prompt, completion) = {
+                            let u = usage.unwrap_or_default();
+                            (
+                                u.get("input_tokens").and_then(Value::as_i64).unwrap_or(0),
+                                u.get("output_tokens").and_then(Value::as_i64).unwrap_or(0),
+                            )
+                        };
+                        let _ = log_usage(
+                            &pool,
+                            &account,
+                            &model,
+                            &account.provider_id,
+                            prompt,
+                            completion,
+                            0,
+                            0,
+                            start.elapsed().as_millis() as i64,
+                            true,
+                            &None,
+                        )
+                        .await;
+                        return;
+                    }
+                    _ => {}
+                }
+                for line in converter.feed(&parsed) {
+                    if tx.send(Ok(Bytes::from(format!("{line}\n\n")))).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+
+        // Stream ended without message_stop (upstream error / truncation).
+        for line in converter.finish(usage.as_ref()) {
+            if tx.send(Ok(Bytes::from(format!("{line}\n\n")))).await.is_err() {
+                return;
+            }
+        }
+    });
+
+    let body = Body::from_stream(ReceiverStream::new(rx));
     Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "text/event-stream")

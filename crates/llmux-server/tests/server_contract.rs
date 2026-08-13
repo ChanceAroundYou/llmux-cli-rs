@@ -157,6 +157,78 @@ async fn v1_routes_are_authenticated_placeholders_with_legacy_error_shape() {
 }
 
 #[tokio::test]
+async fn v1_models_reports_context_length_from_table_cache_and_unknown() {
+    let state = llmux_server::test_state().await;
+
+    // Unlock the gateway with an API key
+    sqlx::query("INSERT INTO api_keys (name, key, allowed_models) VALUES ('test', 'sk-test', '')")
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+    // Alias resolved via built-in table
+    sqlx::query(
+        "INSERT INTO model_aliases (alias, target_model, provider_id) VALUES ('g', 'gpt-4o', 'openai')",
+    )
+    .execute(&state.pool)
+    .await
+    .unwrap();
+    // Alias resolved via cached upstream model list
+    sqlx::query(
+        "INSERT INTO model_aliases (alias, target_model, provider_id) VALUES ('x', 'custom-100k', 'acme')",
+    )
+    .execute(&state.pool)
+    .await
+    .unwrap();
+    // Alias with no known context
+    sqlx::query(
+        "INSERT INTO model_aliases (alias, target_model, provider_id) VALUES ('u', 'mystery-model', 'acme')",
+    )
+    .execute(&state.pool)
+    .await
+    .unwrap();
+
+    {
+        let mut cache = state.models_cache.lock().unwrap();
+        *cache = Some(llmux_server::app::ModelsCache {
+            data: vec![serde_json::json!({
+                "id": "custom-100k",
+                "object": "model",
+                "created": 0,
+                "owned_by": "acme",
+                "context_length": 100_000,
+            })],
+            created_at: 0,
+            refreshing: false,
+        });
+    }
+
+    let app = llmux_server::app(state);
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/v1/models")
+        .header(header::AUTHORIZATION, "Bearer sk-test")
+        .body(Body::empty())
+        .unwrap();
+    let response = llmux_server::test_request(app, request).await;
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+
+    assert_eq!(status, StatusCode::OK);
+    let models = body["data"].as_array().unwrap();
+    let by_id: std::collections::HashMap<&str, &Value> = models
+        .iter()
+        .map(|m| (m["id"].as_str().unwrap(), m))
+        .collect();
+    assert_eq!(by_id["g"]["context_length"], json!(128_000), "{body}");
+    assert_eq!(by_id["x"]["context_length"], json!(100_000), "{body}");
+    assert!(by_id["u"].get("context_length").is_none(), "{body}");
+}
+
+#[tokio::test]
 async fn unknown_api_routes_return_gateway_not_found_error_without_spa_fallback() {
     let (status, body) = request_json(Method::GET, "/api/does-not-exist", None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);

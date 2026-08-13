@@ -309,9 +309,6 @@ export default function Accounts() {
               </label>
               <p className="text-xs text-muted-foreground ml-6">{t('accounts.skipValidationHint')}</p>
             </div>
-            <div className="p-3 bg-primary/5 border border-primary/10 rounded-lg">
-              <p className="text-xs text-primary/80 leading-relaxed">{t('accounts.passthroughNote')}</p>
-            </div>
             <div className="pt-4 flex gap-3">
                <Button
                  type="button"
@@ -466,9 +463,6 @@ export default function Accounts() {
                 <span className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.skipValidation')}</span>
               </label>
               <p className="text-xs text-muted-foreground ml-6">{t('accounts.skipValidationHint')}</p>
-            </div>
-            <div className="p-3 bg-primary/5 border border-primary/10 rounded-lg">
-              <p className="text-xs text-primary/80 leading-relaxed">{t('accounts.passthroughNote')}</p>
             </div>
             <div className="pt-4 flex gap-3">
                <Button

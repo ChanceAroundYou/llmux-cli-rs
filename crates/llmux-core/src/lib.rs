@@ -1,5 +1,6 @@
 pub mod adapters;
 pub mod config;
+pub mod context;
 pub mod crypto;
 pub mod db;
 pub mod dispatcher;

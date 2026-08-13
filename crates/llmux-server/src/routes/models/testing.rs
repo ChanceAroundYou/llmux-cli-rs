@@ -8,6 +8,7 @@ use sqlx::Row;
 
 use llmux_core::crypto::decrypt_api_key;
 use llmux_core::dispatcher::{get_active_accounts, resolve_model, resolve_provider_type, ModelResolution};
+use llmux_core::proxy::build_anthropic_target_url;
 
 use crate::app::AppState;
 
@@ -106,7 +107,7 @@ pub async fn start_test_queue(
                                         .as_deref()
                                         .unwrap_or("https://api.anthropic.com/v1"),
                                 );
-                                let url = format!("{}/messages", base.trim_end_matches('/'));
+                                let url = build_anthropic_target_url(base);
                                 let mut headers = std::collections::BTreeMap::new();
                                 headers.insert(
                                     "x-api-key".to_string(),
@@ -153,28 +154,61 @@ pub async fn start_test_queue(
                                 (url, headers, body)
                             }
                             _ => {
-                                // OpenAI and custom
-                                let base = account
-                                    .base_url
+                                // OpenAI and custom. Accounts with a valid
+                                // anthropic_base_url are served via the Anthropic
+                                // Messages endpoint in real traffic (mirrors the
+                                // /v1/messages passthrough routing) — e.g. GitHub
+                                // Copilot's gateway rejects GPT-5.x models on
+                                // /chat/completions but serves them on /v1/messages.
+                                if let Some(anthropic_base) = account
+                                    .anthropic_base_url
                                     .as_deref()
-                                    .unwrap_or("https://api.openai.com/v1");
-                                let url =
-                                    format!("{}/chat/completions", base.trim_end_matches('/'));
-                                let mut headers = std::collections::BTreeMap::new();
-                                headers.insert(
-                                    "authorization".to_string(),
-                                    format!("Bearer {}", account.api_key),
-                                );
-                                headers.insert(
-                                    "content-type".to_string(),
-                                    "application/json".to_string(),
-                                );
-                                let body = json!({
-                                    "model": model_name,
-                                    "messages": [{"role": "user", "content": "Say OK and nothing else."}],
-                                    "max_tokens": 10
-                                });
-                                (url, headers, body)
+                                    .map(str::trim)
+                                    .filter(|u| !u.is_empty())
+                                {
+                                    let url = build_anthropic_target_url(anthropic_base);
+                                    let mut headers = std::collections::BTreeMap::new();
+                                    headers.insert(
+                                        "x-api-key".to_string(),
+                                        account.api_key.clone(),
+                                    );
+                                    headers.insert(
+                                        "anthropic-version".to_string(),
+                                        "2023-06-01".to_string(),
+                                    );
+                                    headers.insert(
+                                        "content-type".to_string(),
+                                        "application/json".to_string(),
+                                    );
+                                    let body = json!({
+                                        "model": model_name,
+                                        "max_tokens": 10,
+                                        "messages": [{"role": "user", "content": "Say OK and nothing else."}]
+                                    });
+                                    (url, headers, body)
+                                } else {
+                                    let base = account
+                                        .base_url
+                                        .as_deref()
+                                        .unwrap_or("https://api.openai.com/v1");
+                                    let url =
+                                        format!("{}/chat/completions", base.trim_end_matches('/'));
+                                    let mut headers = std::collections::BTreeMap::new();
+                                    headers.insert(
+                                        "authorization".to_string(),
+                                        format!("Bearer {}", account.api_key),
+                                    );
+                                    headers.insert(
+                                        "content-type".to_string(),
+                                        "application/json".to_string(),
+                                    );
+                                    let body = json!({
+                                        "model": model_name,
+                                        "messages": [{"role": "user", "content": "Say OK and nothing else."}],
+                                        "max_tokens": 10
+                                    });
+                                    (url, headers, body)
+                                }
                             }
                         };
 
@@ -354,7 +388,7 @@ pub async fn test_model(
                     .as_deref()
                     .unwrap_or("https://api.anthropic.com/v1"),
             );
-            let url = format!("{}/messages", base.trim_end_matches('/'));
+            let url = build_anthropic_target_url(base);
             let mut headers = std::collections::BTreeMap::new();
             headers.insert("x-api-key".to_string(), account.api_key.clone());
             headers.insert("anthropic-version".to_string(), "2023-06-01".to_string());
@@ -389,24 +423,47 @@ pub async fn test_model(
             (url, headers, body)
         }
         _ => {
-            // OpenAI and custom providers
-            let base = account
-                .base_url
+            // OpenAI and custom providers. Accounts with a valid
+            // anthropic_base_url are probed via the Anthropic Messages endpoint
+            // (mirrors the /v1/messages passthrough routing) — GitHub Copilot's
+            // gateway rejects GPT-5.x models on /chat/completions but serves
+            // them on /v1/messages.
+            if let Some(anthropic_base) = account
+                .anthropic_base_url
                 .as_deref()
-                .unwrap_or("https://api.openai.com/v1");
-            let url = format!("{}/chat/completions", base.trim_end_matches('/'));
-            let mut headers = std::collections::BTreeMap::new();
-            headers.insert(
-                "authorization".to_string(),
-                format!("Bearer {}", account.api_key),
-            );
-            headers.insert("content-type".to_string(), "application/json".to_string());
-            let body = json!({
-                "model": model_name,
-                "messages": [{"role": "user", "content": "Say exactly: OK"}],
-                "max_tokens": 50
-            });
-            (url, headers, body)
+                .map(str::trim)
+                .filter(|u| !u.is_empty())
+            {
+                let url = build_anthropic_target_url(anthropic_base);
+                let mut headers = std::collections::BTreeMap::new();
+                headers.insert("x-api-key".to_string(), account.api_key.clone());
+                headers.insert("anthropic-version".to_string(), "2023-06-01".to_string());
+                headers.insert("content-type".to_string(), "application/json".to_string());
+                let body = json!({
+                    "model": model_name,
+                    "max_tokens": 50,
+                    "messages": [{"role": "user", "content": "Say exactly: OK"}]
+                });
+                (url, headers, body)
+            } else {
+                let base = account
+                    .base_url
+                    .as_deref()
+                    .unwrap_or("https://api.openai.com/v1");
+                let url = format!("{}/chat/completions", base.trim_end_matches('/'));
+                let mut headers = std::collections::BTreeMap::new();
+                headers.insert(
+                    "authorization".to_string(),
+                    format!("Bearer {}", account.api_key),
+                );
+                headers.insert("content-type".to_string(), "application/json".to_string());
+                let body = json!({
+                    "model": model_name,
+                    "messages": [{"role": "user", "content": "Say exactly: OK"}],
+                    "max_tokens": 50
+                });
+                (url, headers, body)
+            }
         }
     };
 
