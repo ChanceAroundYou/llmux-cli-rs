@@ -15,10 +15,21 @@ interface ToastStore {
   remove: (id: string) => void;
 }
 
+// 生成 toast 唯一 id：crypto.randomUUID 仅在安全上下文（HTTPS/localhost）可用，
+// 局域网 IP 走普通 HTTP 时回退到时间戳 + 随机串
+function makeId(): string {
+  try {
+    if (typeof crypto.randomUUID === "function") return crypto.randomUUID();
+  } catch {
+    // 忽略并走 fallback
+  }
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
 export const useToastStore = create<ToastStore>((set) => ({
   toasts: [],
   add: (toast) => {
-    const id = crypto.randomUUID();
+    const id = makeId();
     set((s) => ({ toasts: [...s.toasts, { ...toast, id }] }));
     setTimeout(() => {
       set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) }));

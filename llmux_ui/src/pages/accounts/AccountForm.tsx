@@ -134,8 +134,11 @@ export const AccountFormModal: React.FC<Props> = ({
   const handleVendorChange = (vendorId: string) => {
     const v = vendors.find((x) => x.id === vendorId);
     const { baseEnabled, anthEnabled, supportsCoding } = vendorUrlState(v);
-    // 厂商支持 coding plan 时默认启用 coding 端点（在 setForm 外设置，保持 updater 纯函数）
-    setUseCodingPlan(supportsCoding);
+    // 仅新建态默认启用 coding 端点；编辑态保持用户当前选择，
+    // 否则开关被强制打开而 base_url 仍是旧值，界面与后端（按 URL 推断 uses_coding）矛盾
+    if (!isEdit) {
+      setUseCodingPlan(supportsCoding);
+    }
     setForm((f) => {
       if (!v) return { ...f, vendor_id: vendorId };
       const coding = supportsCoding;

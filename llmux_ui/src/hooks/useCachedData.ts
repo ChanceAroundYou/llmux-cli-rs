@@ -28,11 +28,6 @@ function writeCache(key: string, data: unknown) {
   store.set(key, { data, ts: Date.now() });
 }
 
-// 手动失效指定缓存 key（数据变更类操作需要强制刷新时使用；当前页面未直接使用，预留）
-export function invalidateCache(...keys: string[]) {
-  keys.forEach((k) => store.delete(k));
-}
-
 interface UseCachedDataOptions {
   ttlMs?: number;
   onError?: (err: unknown) => void;
@@ -53,8 +48,13 @@ export function useCachedData<T>(
   const [loading, setLoading] = useState(() => data === null);
   // 最近一次请求是否失败：用于"无数据可展示时渲染失败空态"
   const [error, setError] = useState(false);
+  // 手动刷新中：仅用户显式触发时置 true，避免后台自动刷新让"刷新"按钮空转圈
+  const [refreshing, setRefreshing] = useState(false);
 
-  const refetch = useCallback(async () => {
+  // silent=true 表示后台静默刷新（缓存过期/缺缓存时自动触发），不点亮 refreshing
+  const refetch = useCallback(async (opts?: { silent?: boolean }) => {
+    const silent = opts?.silent ?? false;
+    if (!silent) setRefreshing(true);
     setLoading(true);
     try {
       const next = await fetcherRef.current();
@@ -67,6 +67,7 @@ export function useCachedData<T>(
       onErrorRef.current?.(err);
     } finally {
       setLoading(false);
+      if (!silent) setRefreshing(false);
     }
   }, [key]);
 
@@ -75,11 +76,12 @@ export function useCachedData<T>(
 
   useEffect(() => {
     if (needsFetch) {
-      refetch();
+      refetch({ silent: true });
     }
   }, [needsFetch, refetch]);
 
-  // 更新数据并写回缓存；支持函数式更新以兼容 setState 语义
+  // 更新数据并写回缓存；支持函数式更新以兼容 setState 语义。
+  // 注：StrictMode 下 updater 会被调用两次，writeCache 幂等，重复写无害
   const update = useCallback(
     (updater: T | ((prev: T | null) => T)) => {
       setData((prev) => {
@@ -95,5 +97,5 @@ export function useCachedData<T>(
   // 骨架显示条件：没有任何可展示数据且请求较慢（延迟阈值内完成则不闪）
   const showSkeleton = useDelayedLoading(loading && data === null, 200);
 
-  return { data, loading, showSkeleton, error, setData: update, refetch };
+  return { data, loading, refreshing, showSkeleton, error, setData: update, refetch };
 }

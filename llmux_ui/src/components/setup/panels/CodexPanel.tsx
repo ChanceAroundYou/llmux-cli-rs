@@ -1,5 +1,5 @@
 // 快速配置：Codex 配置面板（密钥选择 + 模型/wireApi/窗口 + auth.json 与 config.toml 预览）
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { Globe } from "lucide-react";
 import { useT } from "@/i18n";
 import { systemApi } from "@/api/system";
@@ -43,79 +43,6 @@ function extractFromToml(configToml: string): TomlFields {
   const compactMatch = configToml.match(/model_auto_compact_token_limit\s*=\s*(\d+)/);
   const autoCompactLimit = compactMatch ? parseInt(compactMatch[1], 10) : 0;
   return { model, wireApi, contextWindow, autoCompactLimit };
-}
-
-/**
- * 生成 config.toml 预览。逻辑必须与后端 patch_codex_toml 完全一致
- * （model_provider/model/review_model/窗口参数 也写入 [model_providers.llmux] section），
- * 否则保存后 currentToml（后端写入）≠ preview（前端生成），diff 永远显示全变。
- */
-function patchToml(
-  existing: string,
-  model: string,
-  wireApi: string,
-  gatewayUrl: string,
-  contextWindow: number,
-  autoCompactLimit: number,
-): string {
-  let result = existing || "";
-  const baseUrl = `${gatewayUrl}/v1`;
-
-  // 与后端一致：确保 section 存在后，section 内逐个 set key
-  // （set 用全局首个匹配替换，找不到则追加——与后端 set_toml_key 语义一致）
-  if (!result.includes("[model_providers.llmux]")) {
-    result = `${result.trimEnd()}\n\n[model_providers.llmux]\n`;
-  }
-  result = patchGlobalKey(result, "model_provider", "llmux");
-  result = patchGlobalKey(result, "model", model || "(select a model)");
-  result = patchGlobalKey(result, "review_model", model || "(select a model)");
-  if (contextWindow > 0) {
-    result = patchGlobalInt(result, "model_context_window", contextWindow);
-  }
-  if (autoCompactLimit > 0) {
-    result = patchGlobalInt(result, "model_auto_compact_token_limit", autoCompactLimit);
-  }
-  result = patchGlobalKey(result, "name", "llmux");
-  result = patchGlobalKey(result, "base_url", baseUrl);
-  result = patchGlobalKey(result, "wire_api", wireApi);
-  result = patchGlobalBool(result, "requires_openai_auth", true);
-  return result;
-}
-
-/** 全局首个匹配 key = "value" 替换，找不到则追加（与后端 set_toml_key 一致） */
-function patchGlobalKey(toml: string, key: string, value: string): string {
-  const prefix = `${key} = "`;
-  const i = toml.indexOf(prefix);
-  if (i >= 0) {
-    const lineEndRel = toml.slice(i).indexOf("\n");
-    const lineEnd = lineEndRel >= 0 ? i + lineEndRel : toml.length;
-    return toml.slice(0, i) + `${key} = "${value}"` + toml.slice(lineEnd);
-  }
-  return `${toml.trimEnd()}\n${key} = "${value}"\n`;
-}
-
-/** 全局首个匹配 key = <int> 替换，找不到则追加 */
-function patchGlobalInt(toml: string, key: string, value: number): string {
-  const prefix = `${key} = `;
-  const i = toml.indexOf(prefix);
-  if (i >= 0) {
-    const lineEndRel = toml.slice(i).indexOf("\n");
-    const lineEnd = lineEndRel >= 0 ? i + lineEndRel : toml.length;
-    return toml.slice(0, i) + `${key} = ${value}` + toml.slice(lineEnd);
-  }
-  return `${toml.trimEnd()}\n${key} = ${value}\n`;
-}
-
-/** 全局首个匹配 key = true/false 替换，找不到则追加 */
-function patchGlobalBool(toml: string, key: string, value: boolean): string {
-  const prefix = `${key} = `;
-  const i = toml.indexOf(prefix);
-  if (i >= 0) {
-    const lineEndRel = toml.slice(i).indexOf("\n");
-    const lineEnd = lineEndRel >= 0 ? i + lineEndRel : toml.length;
-    return toml.slice(0, i) + `${key} = ${value}` + toml.slice(lineEnd);
-  }
-  return `${toml.trimEnd()}\n${key} = ${value}\n`;
 }
 
 function isDirty(
@@ -221,21 +148,42 @@ export const CodexPanel: React.FC<Props> = ({
     setApplyResult(null);
   }, [pendingFillContent, keys, selectedKeyId, t]);
 
-  const previewSettings = useMemo(() => {
-    if (!selectedKey) return null;
-    const existing = currentAuth ?? {};
-    const newAuth = { ...existing, OPENAI_API_KEY: selectedKey.key };
-    const existingToml = currentToml ?? "";
-    const newConfigToml = patchToml(
-      existingToml,
-      model,
-      wireApi,
-      gatewayUrl,
-      contextWindow,
-      autoCompactLimit,
-    );
-    return { auth: newAuth, configToml: newConfigToml };
-  }, [selectedKey, currentAuth, currentToml, gatewayUrl, model, wireApi, contextWindow, autoCompactLimit]);
+  // 预览由后端生成：与 apply 共用同一套 patch 逻辑，只算不写，天然一致
+  const [preview, setPreview] = useState<{
+    auth: Record<string, unknown> | null;
+    configToml: string;
+  } | null>(null);
+
+  useEffect(() => {
+    if (!selectedKey) {
+      setPreview(null);
+      return;
+    }
+    let cancelled = false;
+    // 防抖 300ms：数字输入框连续改动时只发最后一次预览请求，避免每敲一键都请求
+    const timer = setTimeout(() => {
+      systemApi
+        .previewCodexSettings({
+          apiBaseUrl: `${gatewayUrl}/v1`,
+          apiKey: selectedKey.key,
+          model: model || undefined,
+          reviewModel: model || undefined,
+          wireApi,
+          contextWindow: contextWindow || undefined,
+          autoCompactLimit: autoCompactLimit || undefined,
+        })
+        .then((res) => {
+          if (!cancelled) setPreview(res);
+        })
+        .catch(() => {
+          // 预览失败静默：保留上一次结果，diff 不误判
+        });
+    }, 300);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [selectedKey, gatewayUrl, model, wireApi, contextWindow, autoCompactLimit]);
 
   const handleApply = async () => {
     if (!selectedKey) return;
@@ -397,9 +345,9 @@ export const CodexPanel: React.FC<Props> = ({
         <div className="space-y-3">
           <CodexSettingsPreview
             currentAuth={currentAuth}
-            previewAuth={previewSettings?.auth ?? null}
+            previewAuth={preview?.auth ?? null}
             currentToml={currentToml}
-            previewToml={previewSettings?.configToml ?? null}
+            previewToml={preview?.configToml ?? null}
             exists={settingsExists}
             loading={settingsLoading}
             onRefresh={onRefreshSettings}

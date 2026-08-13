@@ -18,7 +18,7 @@ export const ModelHealth: React.FC = () => {
   const { t } = useT();
   const toast = useToast();
   // 健康数据缓存：切回本页直接展示旧数据，过期后后台刷新；快速请求不闪骨架
-  const { data, loading, showSkeleton, error, refetch: fetchHealth } = useCachedData<ModelHealthEntry[]>(
+  const { data, refreshing, showSkeleton, error, refetch: fetchHealth } = useCachedData<ModelHealthEntry[]>(
     "modelHealth",
     () => modelApi.getHealth(),
     { ttlMs: 20_000, onError: () => toast.error(t("health.loadFailed")) },
@@ -86,7 +86,7 @@ export const ModelHealth: React.FC = () => {
         title={t("health.title")}
         description={t("health.desc")}
         actions={
-          <Button variant="outline" onClick={fetchHealth} loading={loading}>
+          <Button variant="outline" onClick={() => fetchHealth()} loading={refreshing}>
             <RefreshCw className="h-4 w-4" /> {t("common.refresh")}
           </Button>
         }

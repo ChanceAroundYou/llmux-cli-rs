@@ -50,7 +50,7 @@ export const Dashboard: React.FC = () => {
   const { t } = useT();
   const navigate = useNavigate();
   // 整包缓存：切回仪表盘直接展示旧数据，过期后后台刷新；快速请求不闪骨架
-  const { data, loading, showSkeleton, refetch: loadAll } = useCachedData<DashboardData>(
+  const { data, refreshing, showSkeleton, refetch: loadAll } = useCachedData<DashboardData>(
     "dashboard",
     async () => {
       const errs: string[] = [];
@@ -62,12 +62,12 @@ export const Dashboard: React.FC = () => {
         modelApi.getHealth(),
         activityApi.list(100),
       ]);
-      if (a.status === "rejected") errs.push(`Accounts: ${a.reason?.message}`);
-      if (al.status === "rejected") errs.push(`Aliases: ${al.reason?.message}`);
-      if (k.status === "rejected") errs.push(`Keys: ${k.reason?.message}`);
-      if (h.status === "rejected") errs.push(`Health: ${h.reason?.message}`);
-      if (mh.status === "rejected") errs.push(`ModelHealth: ${mh.reason?.message}`);
-      if (act.status === "rejected") errs.push(`Activity: ${act.reason?.message}`);
+      if (a.status === "rejected") errs.push(`${t("dash.error.accounts")}: ${a.reason?.message}`);
+      if (al.status === "rejected") errs.push(`${t("dash.error.aliases")}: ${al.reason?.message}`);
+      if (k.status === "rejected") errs.push(`${t("dash.error.keys")}: ${k.reason?.message}`);
+      if (h.status === "rejected") errs.push(`${t("dash.error.health")}: ${h.reason?.message}`);
+      if (mh.status === "rejected") errs.push(`${t("dash.error.modelHealth")}: ${mh.reason?.message}`);
+      if (act.status === "rejected") errs.push(`${t("dash.error.activity")}: ${act.reason?.message}`);
       return {
         accounts: a.status === "fulfilled" ? a.value : [],
         aliases: al.status === "fulfilled" ? al.value : [],
@@ -153,8 +153,8 @@ export const Dashboard: React.FC = () => {
         description="LLMux · AI Gateway"
         actions={
           <>
-            <Button variant="outline" size="sm" onClick={loadAll}>
-              <RefreshCw className={cn("h-4 w-4", loading && "animate-spin text-primary")} />
+            <Button variant="outline" size="sm" onClick={() => loadAll()}>
+              <RefreshCw className={cn("h-4 w-4", refreshing && "animate-spin text-primary")} />
               {t("common.refresh")}
             </Button>
             <Button size="sm" onClick={() => navigate("/accounts")}>
@@ -314,7 +314,7 @@ export const Dashboard: React.FC = () => {
                 <span className="block text-xs font-medium uppercase tracking-wider text-muted-foreground">
                   {t("dash.logs.avgLatency")}
                 </span>
-                <span className="mt-1 block text-xl font-bold text-card-foreground">{avgText(logMetrics.avg)}</span>
+                <span className="mt-1 block text-xl font-bold text-card-foreground">{formatLatency(logMetrics.avg)}</span>
               </div>
             </div>
 
@@ -431,11 +431,6 @@ const PulseChart: React.FC<{ entries: ActivityEntry[] }> = ({ entries }) => {
     </div>
   );
 };
-
-function avgText(ms: number): string {
-  if (ms < 1000) return `${ms}ms`;
-  return `${(ms / 1000).toFixed(1)}s`;
-}
 
 function timeText(ts: number): string {
   return new Date(ts * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });

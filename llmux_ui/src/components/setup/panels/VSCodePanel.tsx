@@ -1,5 +1,5 @@
 // 快速配置：VSCode Copilot 模型配置（可视化编辑 models，可增删，实时 JSON 预览）
-import React, { useCallback, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { Bot, Globe, Info, Plus, Trash2 } from "lucide-react";
 import { Link } from "react-router-dom";
 import { useT } from "@/i18n";
@@ -20,12 +20,9 @@ interface VscodeModel {
   thinking: boolean;
 }
 
-// 初始从网关别名生成：id 为目标模型名、name 为别名、url 指向本网关
-function buildVscodeModels(
-  aliases: AliasResponse[],
-  gatewayUrl: string,
-): VscodeModel[] {
-  return aliases.map((a) => ({
+// 单个别名 → VSCode 模型：id 为目标模型名、name 为别名、url 指向本网关
+function buildOne(a: AliasResponse, gatewayUrl: string): VscodeModel {
+  return {
     id: a.target_model,
     name: a.alias,
     url: `${gatewayUrl}/v1`,
@@ -34,7 +31,15 @@ function buildVscodeModels(
     maxInputTokens: 1000000,
     maxOutputTokens: 16000,
     thinking: true,
-  }));
+  };
+}
+
+// 初始从网关别名生成
+function buildVscodeModels(
+  aliases: AliasResponse[],
+  gatewayUrl: string,
+): VscodeModel[] {
+  return aliases.map((a) => buildOne(a, gatewayUrl));
 }
 
 function emptyModel(gatewayUrl: string): VscodeModel {
@@ -96,6 +101,17 @@ export const VSCodePanel: React.FC<Props> = ({ aliases, gatewayUrl }) => {
   const [models, setModels] = useState<VscodeModel[]>(() =>
     buildVscodeModels(aliases, gatewayUrl),
   );
+
+  // 别名变化时把新增别名追加到模型列表（保留用户已编辑项）。
+  // 也覆盖"挂载后 aliases 才异步到达"的场景：首帧 models 为空，到达后补齐。
+  useEffect(() => {
+    setModels((prev) => {
+      const existing = new Set(prev.map((m) => m.name));
+      const added = aliases.filter((a) => !existing.has(a.alias));
+      if (added.length === 0) return prev;
+      return [...prev, ...added.map((a) => buildOne(a, gatewayUrl))];
+    });
+  }, [aliases, gatewayUrl]);
 
   const updateField = useCallback(
     (index: number, patch: Partial<VscodeModel>) => {

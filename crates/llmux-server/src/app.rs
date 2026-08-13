@@ -251,6 +251,7 @@ pub fn app(state: AppState) -> AppRouter {
             "/api/system/codex-settings",
             get(system::get_codex_settings).post(system::apply_codex_settings),
         )
+        .route("/api/system/codex-preview", post(system::preview_codex_settings))
         .route(
             "/api/system/codex-backups",
             get(system::list_codex_backups)
@@ -261,6 +262,7 @@ pub fn app(state: AppState) -> AppRouter {
             "/api/system/gemini-settings",
             get(system::get_gemini_settings).post(system::apply_gemini_settings),
         )
+        .route("/api/system/gemini-preview", post(system::preview_gemini_settings))
         .route(
             "/api/system/gemini-backups",
             get(system::list_gemini_backups)

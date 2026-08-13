@@ -1,5 +1,5 @@
 // 快速配置：CLI 工具一键接入网关（工具检测 + 密钥选择 + diff 预览 + 备份历史）
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { RotateCcw, Wrench } from "lucide-react";
 import { useT } from "@/i18n";
 import { useToast } from "@/hooks/useToast";
@@ -42,6 +42,14 @@ export const CliSettings: React.FC = () => {
   const [keys, setKeys] = useState<ApiKey[]>([]);
   const [aliases, setAliases] = useState<AliasResponse[]>([]);
   const [loaded, setLoaded] = useState(false); // 首载完成（keys/aliases/各 settings）
+  // 卸载守卫：异步回调（fetchClaude/Codex/Gemini）卸载后不再 setState
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   const [claudeData, setClaudeData] = useState<ClaudeData>({
     exists: false,
@@ -63,12 +71,14 @@ export const CliSettings: React.FC = () => {
     setSettingsLoading(true);
     try {
       const d = await systemApi.getClaudeSettings();
-      setClaudeData({
-        exists: d.exists,
-        settings: (d.settings as Record<string, unknown> | null) ?? null,
-      });
+      if (mountedRef.current) {
+        setClaudeData({
+          exists: d.exists,
+          settings: (d.settings as Record<string, unknown> | null) ?? null,
+        });
+      }
     } finally {
-      setSettingsLoading(false);
+      if (mountedRef.current) setSettingsLoading(false);
     }
   }, []);
 
@@ -76,9 +86,9 @@ export const CliSettings: React.FC = () => {
     setSettingsLoading(true);
     try {
       const d = await systemApi.getCodexSettings();
-      setCodexData({ exists: d.exists, auth: d.auth, configToml: d.configToml });
+      if (mountedRef.current) setCodexData({ exists: d.exists, auth: d.auth, configToml: d.configToml });
     } finally {
-      setSettingsLoading(false);
+      if (mountedRef.current) setSettingsLoading(false);
     }
   }, []);
 
@@ -86,9 +96,9 @@ export const CliSettings: React.FC = () => {
     setSettingsLoading(true);
     try {
       const d = await systemApi.getGeminiSettings();
-      setGeminiData({ exists: d.exists, env: d.env, settings: d.settings });
+      if (mountedRef.current) setGeminiData({ exists: d.exists, env: d.env, settings: d.settings });
     } finally {
-      setSettingsLoading(false);
+      if (mountedRef.current) setSettingsLoading(false);
     }
   }, []);
 
@@ -115,7 +125,8 @@ export const CliSettings: React.FC = () => {
         fetchCodex(),
         fetchGemini(),
       ]);
-      if (settingsRes.some((r) => r.status === "rejected")) {
+      // 三个 settings 接口全部失败才提示整体加载失败；部分失败静默（对应工具面板自行处理）
+      if (settingsRes.every((r) => r.status === "rejected")) {
         toast.error(t("setup.loadFailed"));
       }
       if (!cancelled) setLoaded(true);

@@ -1,5 +1,5 @@
 // 快速配置：Gemini CLI 配置面板（密钥选择 + 默认模型 + .env 与 settings.json 预览）
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { Globe } from "lucide-react";
 import { useT } from "@/i18n";
 import { systemApi } from "@/api/system";
@@ -38,35 +38,6 @@ function extractFromSettings(settingsStr: string | null | undefined): string {
   } catch {
     return "";
   }
-}
-
-/**
- * .env key 替换：镜像后端 set_env_key 语义——
- * key 可出现在任意行（含首行），命中则替换该行；否则追加（trim_end + 换行）。
- * 不 trim 尾部换行，保证保存后 current（后端写入）与 preview 逐字节一致。
- */
-function setEnvKey(envContent: string, key: string, value: string): string {
-  // 首行匹配：key=...
-  if (envContent.startsWith(`${key}=`)) {
-    const lineEnd = envContent.indexOf("\n");
-    const end = lineEnd >= 0 ? lineEnd : envContent.length;
-    return `${key}=${value}${envContent.slice(end)}`;
-  }
-  // 非首行匹配：\nkey=...
-  const anchor = `\n${key}=`;
-  const anchorIdx = envContent.indexOf(anchor);
-  if (anchorIdx >= 0) {
-    const lineStart = anchorIdx + 1; // 跳过前导换行
-    const lineEndRel = envContent.slice(lineStart).indexOf("\n");
-    const lineEnd = lineEndRel >= 0 ? lineStart + lineEndRel : envContent.length;
-    return (
-      envContent.slice(0, lineStart) +
-      `${key}=${value}` +
-      envContent.slice(lineEnd)
-    );
-  }
-  // 追加
-  return `${envContent.trimEnd()}\n${key}=${value}\n`;
 }
 
 function isDirty(
@@ -150,30 +121,32 @@ export const GeminiPanel: React.FC<Props> = ({
     setApplyResult(null);
   }, [pendingFillContent, keys, selectedKeyId, t]);
 
-  // 预览 .env：与后端 set_env_key 逻辑完全一致（key 可出现在任意行，追加补换行），
-  // 且不 trim 尾部换行——否则保存后 currentEnv（后端写入，保留尾换行）≠ previewEnv，diff 误判。
-  const previewEnv = useMemo(() => {
-    if (!selectedKey) return null;
-    return setEnvKey(
-      setEnvKey(currentEnv ?? "", "GEMINI_API_KEY", selectedKey.key),
-      "GOOGLE_GEMINI_BASE_URL",
-      gatewayUrl,
-    );
-  }, [selectedKey, currentEnv, gatewayUrl]);
+  // 预览由后端生成：与 apply 共用同一套逻辑（.env 的 set_env_key + settings.json 的 model.name），
+  // 只算不写，天然一致
+  const [preview, setPreview] = useState<{ env: string; settings: string } | null>(null);
 
-  // 预览 settings.json：更新 model.name
-  const previewSettings = useMemo(() => {
-    if (!model) return null;
-    const existingStr = currentSettings ?? "";
-    let parsed: Record<string, unknown> = {};
-    try {
-      parsed = existingStr ? (JSON.parse(existingStr) as Record<string, unknown>) : {};
-    } catch {
-      /* 忽略解析错误，按空对象处理 */
+  useEffect(() => {
+    if (!selectedKey) {
+      setPreview(null);
+      return;
     }
-    parsed.model = { ...((parsed.model as Record<string, unknown>) ?? {}), name: model };
-    return JSON.stringify(parsed, null, 2);
-  }, [model, currentSettings]);
+    let cancelled = false;
+    systemApi
+      .previewGeminiSettings({
+        apiKey: selectedKey.key,
+        gatewayUrl,
+        model: model || undefined,
+      })
+      .then((res) => {
+        if (!cancelled) setPreview(res);
+      })
+      .catch(() => {
+        // 预览失败静默：保留上一次结果，diff 不误判
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedKey, gatewayUrl, model]);
 
   const handleApply = async () => {
     if (!selectedKey) return;
@@ -265,9 +238,9 @@ export const GeminiPanel: React.FC<Props> = ({
         <div className="space-y-3">
           <GeminiSettingsPreview
             currentEnv={currentEnv}
-            previewEnv={previewEnv}
+            previewEnv={preview?.env ?? null}
             currentSettings={currentSettings}
-            previewSettings={previewSettings}
+            previewSettings={preview?.settings ?? null}
             exists={settingsExists}
             loading={settingsLoading}
             onRefresh={onRefreshSettings}

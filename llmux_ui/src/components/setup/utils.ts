@@ -1,8 +1,4 @@
 // 快速配置：工具函数（白名单解析、diff 生成）
-import { cn } from "@/utils/helpers";
-
-export { cn };
-
 /** 解析密钥允许的模型：可能是 "*"、逗号串或 JSON 数组 */
 export function parseAllowedModels(raw: string | string[]): string[] {
   if (!raw) return [];

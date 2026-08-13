@@ -133,9 +133,14 @@ export const ModelBrowser: React.FC = () => {
   // 最后一批结果同样需要带入，不能依赖 isRunning 判断）
   usePolling(
     async () => {
-      const status = await modelApi.getTestQueueStatus();
-      setQueueStatus(status);
-      fetchHealth();
+      try {
+        const status = await modelApi.getTestQueueStatus();
+        setQueueStatus(status);
+        fetchHealth();
+      } catch {
+        // 轮询失败：立即停止（isRunning 置 false），避免每 2s 抛未捕获异常且永远停不下来
+        setQueueStatus({ isRunning: false, total: 0, current: 0, progress: 0 });
+      }
     },
     2000,
     queueStatus?.isRunning ?? false,

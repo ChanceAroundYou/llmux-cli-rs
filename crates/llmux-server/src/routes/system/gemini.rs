@@ -207,6 +207,63 @@ pub async fn apply_gemini_settings(
     })).into_response()
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/system/gemini-preview",
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "预览 Gemini 配置（只算不写，与 apply 输出一致）")
+    )
+)]
+pub async fn preview_gemini_settings(Json(body): Json<Value>) -> Response {
+    let api_key = match body.get("apiKey").and_then(Value::as_str) {
+        Some(v) => v.to_string(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "Missing required field: apiKey" })),
+            ).into_response();
+        }
+    };
+
+    let gateway_url = match body.get("gatewayUrl").and_then(Value::as_str) {
+        Some(v) => v.to_string(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "Missing required field: gatewayUrl" })),
+            ).into_response();
+        }
+    };
+
+    let model = body.get("model").and_then(Value::as_str).unwrap_or("gemini-3-pro-preview");
+
+    // 与 apply 共用同一逻辑：读现有 .env / settings.json 合并，只算不写
+    let existing_env = gemini_env_path()
+        .and_then(|p| if p.exists() { fs::read_to_string(&p).ok() } else { None })
+        .unwrap_or_default();
+    let mut new_env = set_env_key(&existing_env, "GEMINI_API_KEY", &api_key);
+    new_env = set_env_key(&new_env, "GOOGLE_GEMINI_BASE_URL", &gateway_url);
+
+    let existing_settings = gemini_settings_path()
+        .and_then(|p| if p.exists() { fs::read_to_string(&p).ok() } else { None })
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .unwrap_or(Value::Object(Default::default()));
+    let mut new_settings = existing_settings.clone();
+    if let Some(obj) = new_settings.as_object_mut() {
+        let model_obj = obj.entry("model").or_insert_with(|| json!({}));
+        if let Some(m) = model_obj.as_object_mut() {
+            m.insert("name".to_string(), json!(model));
+        }
+    }
+    let settings_str = serde_json::to_string_pretty(&new_settings).unwrap_or_default();
+
+    Json(json!({
+        "env": new_env,
+        "settings": settings_str,
+    })).into_response()
+}
+
 fn is_valid_gemini_backup_name(name: &str) -> bool {
     name.starts_with("gemini.") && !name.contains('/') && !name.contains("..")
 }

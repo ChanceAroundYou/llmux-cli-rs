@@ -175,6 +175,58 @@ pub async fn apply_codex_settings(
     })).into_response()
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/system/codex-preview",
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "预览 Codex 配置（只算不写，与 apply 输出逐字节一致）")
+    )
+)]
+pub async fn preview_codex_settings(Json(body): Json<Value>) -> Response {
+    let api_base_url = match body.get("apiBaseUrl").and_then(Value::as_str) {
+        Some(v) => v.to_string(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "Missing required field: apiBaseUrl" })),
+            ).into_response();
+        }
+    };
+
+    let api_key = match body.get("apiKey").and_then(Value::as_str) {
+        Some(v) => v.to_string(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "Missing required field: apiKey" })),
+            ).into_response();
+        }
+    };
+
+    let model = body.get("model").and_then(Value::as_str).unwrap_or("gpt-5.4");
+    let review_model = body.get("reviewModel").and_then(Value::as_str).unwrap_or(model);
+    let wire_api = body.get("wireApi").and_then(Value::as_str).unwrap_or("responses");
+    let context_window = body.get("contextWindow").and_then(Value::as_u64);
+    let auto_compact_limit = body.get("autoCompactLimit").and_then(Value::as_u64);
+
+    // 与 apply 共用同一 patch 逻辑：读现有 config.toml 合并，只算不写
+    let existing_toml = codex_config_path()
+        .and_then(|p| if p.exists() { fs::read_to_string(&p).ok() } else { None })
+        .unwrap_or_default();
+    let config_toml = patch_codex_toml(
+        &existing_toml, model, review_model, &api_base_url, wire_api, context_window,
+        auto_compact_limit,
+    );
+    // auth.json 结构与 apply 一致（只含 OPENAI_API_KEY）
+    let auth_content = json!({ "OPENAI_API_KEY": api_key });
+
+    Json(json!({
+        "auth": auth_content,
+        "configToml": config_toml,
+    })).into_response()
+}
+
 fn set_toml_key(toml: &str, key: &str, value: &str) -> String {
     let prefix = format!("{key} = \"");
     if let Some(line_start) = toml.find(&prefix) {
