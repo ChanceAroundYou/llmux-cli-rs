@@ -96,7 +96,7 @@ pub struct AvailableModelsResponse {
     pub data: Vec<AvailableModel>,
     /// 缓存是否过期
     pub stale: bool,
-    /// unix 秒
+    /// unix 毫秒
     pub cached_at: i64,
 }
 
@@ -123,7 +123,7 @@ pub struct ModelHealthItem {
     pub account_id: i64,
     pub vendor_id: Option<String>,
     pub model: String,
-    /// unix 秒
+    /// unix 毫秒
     pub last_checked: i64,
     pub success: i64,
     /// 毫秒
@@ -176,7 +176,7 @@ pub struct TestQueueStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ActivityEntry {
     pub id: i64,
-    /// unix 秒
+    /// unix 毫秒
     pub timestamp: i64,
     pub model: String,
     pub success: i64,

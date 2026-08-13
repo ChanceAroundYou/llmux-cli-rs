@@ -63,7 +63,7 @@ pub async fn get_health_status(Extension(state): Extension<AppState>) -> Respons
             "id": format!("acc_{acc_id}"),
             "name": alias,
             "status": status,
-            "lastSuccess": success_count,
+            "successCount": success_count,
             "totalChecks": total,
         }));
     }

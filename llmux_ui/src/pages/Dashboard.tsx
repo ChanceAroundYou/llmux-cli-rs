@@ -1,5 +1,6 @@
 // 仪表盘（参考老项目）：固定视口高度 → 两栏等高（别名健康 + 最近动态），列表内部滚动
 import React, { useState, useMemo, useEffect } from "react";
+import { AnimatePresence, motion } from "framer-motion";
 import { healthApi } from "@/api/health";
 import { activityApi } from "@/api/activity";
 import { accountApi } from "@/api/accounts";
@@ -391,14 +392,21 @@ export const Dashboard: React.FC = () => {
                 {onlyShowErrors ? t("dash.logs.noErrors") : t("dash.logs.empty")}
               </p>
             ) : (
-              filteredLogs.map((log) => (
-                <div
-                  key={log.id}
-                  className={cn(
-                    "rounded-xl border p-3 text-xs transition-colors",
-                    log.success === 1 ? "border-border/50 bg-muted/40 hover:bg-muted/70" : "border-destructive/10 bg-destructive/5 hover:bg-destructive/10",
-                  )}
-                >
+              // 日志卡入场动画：SSE 推入的新日志从上方滑入淡入，其余条目平滑重排
+              <AnimatePresence initial={false}>
+                {filteredLogs.map((log) => (
+                  <motion.div
+                    key={log.id}
+                    layout
+                    initial={{ opacity: 0, y: -10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, scale: 0.98 }}
+                    transition={{ duration: 0.2, ease: "easeOut" }}
+                    className={cn(
+                      "rounded-xl border p-3 text-xs transition-colors",
+                      log.success === 1 ? "border-border/50 bg-muted/40 hover:bg-muted/70" : "border-destructive/10 bg-destructive/5 hover:bg-destructive/10",
+                    )}
+                  >
                   <div className="flex flex-wrap items-start justify-between gap-2">
                     <div className="flex min-w-0 items-center gap-2">
                       <span className="shrink-0 text-muted-foreground/60">{timeText(log.timestamp)}</span>
@@ -414,14 +422,15 @@ export const Dashboard: React.FC = () => {
                       </Badge>
                     </div>
                   </div>
-                  {log.account_name && <div className="mt-1 text-muted-foreground/60">{log.account_name}</div>}
-                  {log.success !== 1 && log.error_message && (
-                    <div className="mt-2 rounded-lg border border-destructive/20 bg-destructive/10 p-2 leading-relaxed text-destructive-foreground">
-                      {log.error_message}
-                    </div>
-                  )}
-                </div>
-              ))
+                    {log.account_name && <div className="mt-1 text-muted-foreground/60">{log.account_name}</div>}
+                    {log.success !== 1 && log.error_message && (
+                      <div className="mt-2 rounded-lg border border-destructive/20 bg-destructive/10 p-2 leading-relaxed text-destructive-foreground">
+                        {log.error_message}
+                      </div>
+                    )}
+                  </motion.div>
+                ))}
+              </AnimatePresence>
             )}
           </div>
         </section>
@@ -472,8 +481,9 @@ const PulseChart: React.FC<{ entries: ActivityEntry[] }> = ({ entries }) => {
   );
 };
 
+// ts 为 Unix 毫秒（后端统一毫秒），直接 new Date
 function timeText(ts: number): string {
-  return new Date(ts * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
+  return new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
 }
 
 // 合并最近动态：新条目优先（同 id 覆盖），按时间倒序，上限 100 条

@@ -142,7 +142,7 @@ export const KeyList: React.FC = () => {
       title: t("keys.col.lastUsed"),
       render: (row: ApiKey) => (
         <span className="text-xs text-muted-foreground">
-          {row.last_used_at ? formatTimestamp(new Date(row.last_used_at).getTime() / 1000) : t("keys.never")}
+          {row.last_used_at ? formatTimestamp(new Date(row.last_used_at).getTime()) : t("keys.never")}
         </span>
       ),
     },

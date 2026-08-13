@@ -381,7 +381,8 @@ pub async fn export_account_usage(
         }
     };
 
-    let mut csv = String::from("Timestamp,Model,Latency (ms),Status,Error\n");
+    // ts 为 Unix 毫秒，表头注明单位，避免用户拿到裸 epoch 值误读
+    let mut csv = String::from("Timestamp (epoch ms),Model,Latency (ms),Status,Error\n");
     for (ts, model, latency, success, error) in &rows {
         let status = if *success != 0 { "Success" } else { "Failed" };
         let model = model.as_deref().unwrap_or("unknown");

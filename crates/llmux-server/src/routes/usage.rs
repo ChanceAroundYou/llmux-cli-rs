@@ -74,7 +74,8 @@ pub async fn get_activity(
     .into_response()
 }
 
-/// 活动条目 → JSON（字段形状与 /api/activity 一致）
+/// 活动条目 → JSON（字段形状与 /api/activity 一致）。
+/// usage_logs.ts 为 Unix 毫秒，前端 formatTimestamp/timeText 按毫秒处理，这里原样透出。
 fn activity_entry_json(log: &ActivityEntry) -> Value {
     json!({
         "id": log.id,

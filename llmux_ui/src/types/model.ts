@@ -78,7 +78,7 @@ export interface ModelHealthEntry {
   account_id: number;
   vendor_id?: string | null;
   model: string;
-  last_checked: number;
+  last_checked: number; // unix 毫秒
   success: number; // 0 | 1
   latency: number;
   error?: string | null;

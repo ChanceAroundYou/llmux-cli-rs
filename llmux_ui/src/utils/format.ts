@@ -1,8 +1,8 @@
-// 格式化工具：时间相对化文案走 i18n
+// 格式化工具：时间相对化文案走 i18n；输入为 Unix 毫秒（与后端时间字段统一）
 import { useI18n } from "@/i18n";
 
-export function formatTimestamp(unixSeconds: number): string {
-  const date = new Date(unixSeconds * 1000);
+export function formatTimestamp(unixMillis: number): string {
+  const date = new Date(unixMillis);
   const now = new Date();
   const diff = now.getTime() - date.getTime();
   const { t, lang } = useI18n.getState();

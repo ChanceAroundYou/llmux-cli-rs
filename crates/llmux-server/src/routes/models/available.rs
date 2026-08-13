@@ -55,12 +55,13 @@ pub async fn get_available_models(
     Extension(state): Extension<AppState>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response {
-    const CACHE_TTL: i64 = 24 * 60 * 60;
+    // 时间统一为 Unix 毫秒（与 usage_logs.ts / model_health.checked_at 一致）
+    const CACHE_TTL: i64 = 24 * 60 * 60 * 1000;
     let force = params.get("force").map(|v| v == "true").unwrap_or(false);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs() as i64;
+        .as_millis() as i64;
 
     if force {
         tracing::info!("🤖 Force refresh requested, bypassing cache");
@@ -101,7 +102,7 @@ pub async fn get_available_models(
                 let now_bg = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
-                    .as_secs() as i64;
+                    .as_millis() as i64;
                 let mut c = cache_bg.lock().unwrap();
                 if let Some(e) = c.as_mut() {
                     e.data = new_data;
@@ -113,7 +114,7 @@ pub async fn get_available_models(
         tracing::debug!(
             "🤖 Returning {} cached models (age: {}s{})",
             data.len(),
-            age,
+            age / 1000,
             if stale { ", refreshing in background" } else { "" }
         );
         return Json(json!({ "data": data, "stale": stale, "cached_at": cached_at })).into_response();
