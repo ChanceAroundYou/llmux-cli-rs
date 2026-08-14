@@ -677,9 +677,13 @@ impl OpenAISseConverter {
             .unwrap_or_else(|| "end_turn".to_string());
 
         let mut delta_usage = Map::new();
-        if let Some(usage) = &self.last_usage {
-            let output = usage.get("completion_tokens").and_then(Value::as_i64).unwrap_or(0);
+        if self.last_usage.is_some() {
+            // Full usage so downstream (mindfs etc.) can read input tokens.
+            let (input, output, cache_read, cache_create) = self.usage_tokens();
             delta_usage.insert("output_tokens".to_string(), json!(output));
+            delta_usage.insert("input_tokens".to_string(), json!(input));
+            delta_usage.insert("cache_read_input_tokens".to_string(), json!(cache_read));
+            delta_usage.insert("cache_creation_input_tokens".to_string(), json!(cache_create));
         }
         events.push(sse_event(
             "message_delta",

@@ -562,6 +562,9 @@ fn sse_state_machine_usage_capture() {
     let evs = conv.finish();
     let delta = evs.iter().find(|s| s.starts_with("event: message_delta")).unwrap();
     assert!(delta.contains("\"output_tokens\":3"), "real usage in message_delta: {delta}");
+    assert!(delta.contains("\"input_tokens\":12"), "real input usage in message_delta: {delta}");
+    assert!(delta.contains("\"cache_read_input_tokens\":5"), "real cache usage in message_delta: {delta}");
+    assert!(delta.contains("\"cache_creation_input_tokens\":7"), "real cache usage in message_delta: {delta}");
 }
 
 // ---------------------------------------------------------------------------
