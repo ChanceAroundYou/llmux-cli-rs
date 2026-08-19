@@ -554,7 +554,7 @@ async fn anthropic_to_openai_streaming(
             };
             buffer.extend_from_slice(&chunk);
 
-            for event_text in parse_sse_chunks(&mut buffer, 128) {
+            for event_text in parse_sse_chunks(&mut buffer, 0) {
                 let Some(payload) = sse_data_payload(&event_text) else {
                     continue;
                 };
@@ -571,9 +571,44 @@ async fn anthropic_to_openai_streaming(
                     }
                 }
             }
+
+            if done {
+                break;
+            }
         }
 
-        // Drain any trailing data that lacked a blank-line terminator.
+        // Drain any complete SSE events still buffered (e.g. more than one read
+        // worth arrived, or `[DONE]` trailed content in the same TCP read). Every
+        // frame here may carry a tool_use arg delta / finish_reason — dropping it
+        // would truncate the assistant turn right before a tool call.
+        loop {
+            let events = parse_sse_chunks(&mut buffer, 0);
+            if events.is_empty() {
+                break;
+            }
+            for event_text in events {
+                let Some(payload) = sse_data_payload(&event_text) else {
+                    continue;
+                };
+                if payload.trim() == "[DONE]" {
+                    done = true;
+                    continue;
+                }
+                let Ok(parsed) = serde_json::from_str::<Value>(payload) else {
+                    continue;
+                };
+                for ev in converter.feed(&parsed) {
+                    if tx.send(Ok(Bytes::from(ev))).await.is_err() {
+                        return;
+                    }
+                }
+            }
+            if done {
+                break;
+            }
+        }
+
+        // Handle one trailing partial event that lacked a blank-line terminator.
         if !buffer.is_empty() {
             let text = String::from_utf8_lossy(&buffer).to_string();
             if let Some(payload) = sse_data_payload(&text) {

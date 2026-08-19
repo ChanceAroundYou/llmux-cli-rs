@@ -723,11 +723,12 @@ fn sse_event(event_type: &str, data: Value) -> String {
 /// Split complete SSE events out of a byte buffer. Handles chunk boundaries:
 /// the buffer accumulates until a blank-line terminator (`\n\n`) is found, then
 /// that event is drained. `max_events` bounds the number of events returned per
-/// call. Incomplete trailing data stays in `buffer`.
+/// call; `0` means no limit (drain everything). Incomplete trailing data stays
+/// in `buffer`.
 pub fn parse_sse_chunks(buffer: &mut Vec<u8>, max_events: usize) -> Vec<String> {
     let mut events = Vec::new();
     loop {
-        if events.len() >= max_events {
+        if max_events > 0 && events.len() >= max_events {
             break;
         }
         // Find first "\n\n" (or "\r\n\r\n").

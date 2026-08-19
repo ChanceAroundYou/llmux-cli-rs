@@ -611,7 +611,7 @@ async fn anthropic_fallback_streaming(
                 }
             };
             buffer.extend_from_slice(&chunk);
-            for event_text in parse_sse_chunks(&mut buffer, 128) {
+            for event_text in parse_sse_chunks(&mut buffer, 0) {
                 let Some(payload) = sse_data_payload(&event_text) else {
                     continue;
                 };
@@ -677,6 +677,28 @@ async fn anthropic_fallback_streaming(
         }
 
         // Stream ended without message_stop (upstream error / truncation).
+        // Drain any complete SSE events still buffered first — otherwise a burst
+        // of trailing tool_use/finish_reason frames can be dropped, truncating
+        // the turn right before a tool call.
+        loop {
+            let events = parse_sse_chunks(&mut buffer, 0);
+            if events.is_empty() {
+                break;
+            }
+            for event_text in events {
+                let Some(payload) = sse_data_payload(&event_text) else {
+                    continue;
+                };
+                let Ok(parsed) = serde_json::from_str::<Value>(payload) else {
+                    continue;
+                };
+                for line in converter.feed(&parsed) {
+                    if tx.send(Ok(Bytes::from(format!("{line}\n\n")))).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
         for line in converter.finish(usage.as_ref()) {
             if tx.send(Ok(Bytes::from(format!("{line}\n\n")))).await.is_err() {
                 return;

@@ -589,6 +589,20 @@ fn parse_sse_chunks_handles_chunk_boundaries() {
 }
 
 #[test]
+fn parse_sse_chunks_zero_limit_drains_all_events() {
+    // max_events=0 must mean "no limit" (drain every complete event), not
+    // "return nothing". A burst of tool_use arg-delta frames landing in one
+    // upstream read must not be dropped at EOF.
+    let mut buffer = Vec::new();
+    for i in 0..300 {
+        buffer.extend_from_slice(format!("data: {{\"i\":{i}}}\n\n").as_bytes());
+    }
+    let evs = parse_sse_chunks(&mut buffer, 0);
+    assert_eq!(evs.len(), 300, "0-limit must return all complete events");
+    assert!(buffer.is_empty(), "buffer must be fully drained");
+}
+
+#[test]
 fn sse_data_payload_extraction() {
     assert_eq!(
         sse_data_payload("event: message_start\ndata: {\"type\":\"message_start\"}\n\n"),
