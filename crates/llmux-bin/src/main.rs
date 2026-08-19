@@ -47,13 +47,9 @@ async fn main() -> anyhow::Result<()> {
                 std::path::PathBuf::from(home).join(".config").join("llmux")
             });
         std::fs::create_dir_all(&data_dir).ok();
-        let log_file = data_dir.join("llmux.log");
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_file)
-            .expect("failed to open llmux.log");
-        let file_writer = Mutex::new(file);
+        // Rolling daily appender writes `<data_dir>/llmux.log.YYYY-MM-DD`; survives
+        // container recreate (data dir is a persistent mount) and never grows unbounded.
+        let file_writer = tracing_appender::rolling::daily(&data_dir, "llmux.log");
 
         use tracing_subscriber::layer::SubscriberExt;
         use tracing_subscriber::util::SubscriberInitExt;
