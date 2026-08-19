@@ -476,6 +476,30 @@ impl OpenAISseConverter {
     pub fn feed(&mut self, chunk: &Value) -> Vec<String> {
         let mut events = Vec::new();
 
+        // Diagnostic: log every upstream chunk to trace truncation.
+        if let Some(choices) = chunk.get("choices").and_then(Value::as_array) {
+            if let Some(first) = choices.first() {
+                let finish = first.get("finish_reason").and_then(Value::as_str).unwrap_or("");
+                let has_content = first.get("delta").and_then(|d| d.get("content")).is_some();
+                let has_tool = first.get("delta").and_then(|d| d.get("tool_calls")).is_some();
+                let tool_calls = first.get("delta").and_then(|d| d.get("tool_calls"));
+                if has_tool {
+                    let json_str = tool_calls.map(|v| v.to_string()).unwrap_or_default();
+                    let snippet: String = json_str.chars().take(200).collect();
+                    tracing::debug!(
+                        "converter.feed: finish_reason={finish}, has_tool=true, tool_calls~{snippet}"
+                    );
+                } else {
+                    tracing::debug!(
+                        "converter.feed: finish_reason={finish}, has_content={has_content}, has_tool={has_tool}, finished={}",
+                        self.finished
+                    );
+                }
+            }
+        } else if chunk.get("usage").is_some() {
+            tracing::debug!("converter.feed: usage chunk (no choices)");
+        }
+
         if !self.message_started {
             self.message_started = true;
             events.push(sse_event(
@@ -640,9 +664,20 @@ impl OpenAISseConverter {
     /// available), and terminate with `message_stop`. Idempotent.
     pub fn finish(&mut self) -> Vec<String> {
         if self.finished {
+            tracing::debug!("converter.finish: already finished, returning empty");
             return Vec::new();
         }
         self.finished = true;
+
+        let stop_reason = self
+            .pending_stop_reason
+            .clone()
+            .unwrap_or_else(|| "end_turn".to_string());
+        tracing::debug!(
+            "converter.finish: text_block={}, thinking={}, tools={}, stop_reason={}",
+            self.text_block_started, self.thinking_started,
+            self.tool_indices.len(), stop_reason
+        );
 
         let mut events = Vec::new();
 
@@ -670,11 +705,6 @@ impl OpenAISseConverter {
                 json!({ "type": "content_block_stop", "index": block_index }),
             ));
         }
-
-        let stop_reason = self
-            .pending_stop_reason
-            .clone()
-            .unwrap_or_else(|| "end_turn".to_string());
 
         let mut delta_usage = Map::new();
         if self.last_usage.is_some() {

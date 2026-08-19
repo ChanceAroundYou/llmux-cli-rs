@@ -542,16 +542,23 @@ async fn anthropic_to_openai_streaming(
         let mut buffer: Vec<u8> = Vec::with_capacity(4096);
         let mut sse = response.bytes_stream();
         let mut done = false;
+        let mut chunks_received: u64 = 0;
+
+        tracing::debug!("[stream:{model}] upstream stream started");
 
         while !done {
             let chunk = match sse.next().await {
                 Some(Ok(c)) => c,
                 Some(Err(e)) => {
-                    tracing::warn!("upstream stream read error: {e}");
+                    tracing::warn!("[stream:{model}] upstream stream read error: {e}");
                     break;
                 }
-                None => break,
+                None => {
+                    tracing::debug!("[stream:{model}] upstream EOF after {chunks_received} chunks, buffer={} bytes", buffer.len());
+                    break;
+                }
             };
+            chunks_received += 1;
             buffer.extend_from_slice(&chunk);
 
             for event_text in parse_sse_chunks(&mut buffer, 0) {
@@ -559,6 +566,7 @@ async fn anthropic_to_openai_streaming(
                     continue;
                 };
                 if payload.trim() == "[DONE]" {
+                    tracing::debug!("[stream:{model}] received [DONE] in main loop");
                     done = true;
                     break;
                 }
@@ -610,6 +618,7 @@ async fn anthropic_to_openai_streaming(
 
         // Handle one trailing partial event that lacked a blank-line terminator.
         if !buffer.is_empty() {
+            tracing::debug!("[stream:{model}] partial event handler: {} bytes remaining", buffer.len());
             let text = String::from_utf8_lossy(&buffer).to_string();
             if let Some(payload) = sse_data_payload(&text) {
                 if payload.trim() != "[DONE]" {
@@ -625,11 +634,14 @@ async fn anthropic_to_openai_streaming(
         }
 
         for ev in converter.finish() {
+            tracing::debug!("[stream:{model}] finish event: {}", &ev[..ev.len().min(120)]);
             if tx.send(Ok(Bytes::from(ev))).await.is_err() {
+                tracing::debug!("[stream:{model}] client gone during finish send");
                 return;
             }
         }
 
+        tracing::debug!("[stream:{model}] stream complete: done={done}, chunks={chunks_received}, buffer_remaining={}", buffer.len());
         let (input_tokens, output_tokens, cache_read, cache_create) = converter.usage_tokens();
         let latency_ms = start.elapsed().as_millis() as i64;
         let _ = log_usage(

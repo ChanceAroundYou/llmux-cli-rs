@@ -5,6 +5,17 @@
 
 ## [Unreleased]
 
+### Added
+
+- **流式转换诊断日志（排查截断用）**：`anthropic_to_openai_streaming` 增加流级
+  debug 日志（upstream 启停、是否收到 `[DONE]`、EOF 剩余 buffer、每条 finish 事件、
+  是否 `client gone`）；`OpenAISseConverter::feed` 打印每条上游 chunk 的
+  `finish_reason`/是否有 content/tool_calls 及其 JSON 片段，`finish()` 打印结束后
+  的 text/thinking/tool 块数与 stop_reason。
+- **持久化日志输出**：`llmux-bin` 无 TUI 模式下日志同时写 stdout（供 `docker
+  logs`）与 `<DATA_DIR>/llmux.log`（持久挂载卷，容器重建/重启不丢失），便于在
+  截断发生后回溯原始流，不依赖 `docker logs` 的生命周期。
+
 ### Fixed
 
 - **SSE 流式转换尾部事件丢失（第三类"卡死"根因）**：`anthropic_to_openai_streaming`

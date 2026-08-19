@@ -40,15 +40,46 @@ async fn main() -> anyhow::Result<()> {
     let use_tui = !matches!(&cli.command, Some(Command::Start { no_tui: true, .. }));
 
     if !use_tui {
-        tracing_subscriber::fmt()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| "llmux=info,tower_http=info".into()),
-            )
+        let data_dir = std::env::var("DATA_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+                std::path::PathBuf::from(home).join(".config").join("llmux")
+            });
+        std::fs::create_dir_all(&data_dir).ok();
+        let log_file = data_dir.join("llmux.log");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_file)
+            .expect("failed to open llmux.log");
+        let file_writer = Mutex::new(file);
+
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+
+        let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| "llmux=info,tower_http=info".into());
+
+        // Tee writer: stdout (for `docker logs`) + persistent file (survives
+        // container recreate). EnvFilter as a registry layer applies to both.
+        let timer =
+            tracing_subscriber::fmt::time::LocalTime::new(time::macros::format_description!(
+                "[month]-[day] [hour]:[minute]:[second]"
+            ));
+        let stdout_layer = tracing_subscriber::fmt::layer()
+            .with_writer(std::io::stdout)
             .with_target(false)
-            .with_timer(tracing_subscriber::fmt::time::LocalTime::new(
-                time::macros::format_description!("[month]-[day] [hour]:[minute]:[second]"),
-            ))
+            .with_timer(timer.clone());
+        let file_layer = tracing_subscriber::fmt::layer()
+            .with_writer(file_writer)
+            .with_ansi(false)
+            .with_target(false)
+            .with_timer(timer);
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(stdout_layer)
+            .with(file_layer)
             .init();
     }
 
