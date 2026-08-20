@@ -151,7 +151,7 @@ fn now_secs() -> i64 {
 }
 
 async fn load_snapshot(pool: &sqlx::SqlitePool) -> (Vec<Value>, Vec<Value>) {
-    let rows = sqlx::query("SELECT account_id, alias, models_json, error, updated_at FROM account_model_cache ORDER BY updated_at DESC")
+    let rows = sqlx::query("SELECT c.account_id, c.alias, c.models_json, c.error, c.updated_at FROM account_model_cache c JOIN accounts a ON a.id = c.account_id AND a.is_active = 1 ORDER BY c.updated_at DESC")
         .fetch_all(pool).await.unwrap_or_default();
     let mut all: Vec<Value> = Vec::new();
     let mut seen = std::collections::HashSet::new();

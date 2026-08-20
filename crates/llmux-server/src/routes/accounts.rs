@@ -266,7 +266,7 @@ pub async fn update_account(
         existing.api_key
     };
 
-    match sqlx::query(
+    let update_res = sqlx::query(
         "UPDATE accounts SET alias = ?, provider_id = ?, api_key = ?, base_url = ?, anthropic_base_url = ?, is_active = ?, weight = ?, notes = ?, openai_compatible = ? WHERE id = ?",
     )
     .bind(&alias)
@@ -280,10 +280,17 @@ pub async fn update_account(
     .bind(openai_compatible)
     .bind(id)
     .execute(&state.pool)
-    .await
-    {
-        Ok(_) => Json(json!({ "success": true, "message": "Account updated successfully" }))
-            .into_response(),
+    .await;
+    match update_res {
+        Ok(_) => {
+            if is_active == 0 {
+                let _ = sqlx::query("DELETE FROM account_model_cache WHERE account_id = ?")
+                    .bind(id)
+                    .execute(&state.pool)
+                    .await;
+            }
+            Json(json!({ "success": true, "message": "Account updated successfully" })).into_response()
+        }
         Err(e) => crate::error::simple_error(
             format!("Failed to update account: {e}"),
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -305,7 +312,7 @@ pub async fn delete_account(
         }
     };
 
-    // Delete usage_logs for this account first to maintain referential integrity.
+    // Delete usage_logs and model cache for this account first.
     if let Err(e) = sqlx::query("DELETE FROM usage_logs WHERE account_id = ?")
         .bind(id)
         .execute(&mut *tx)
@@ -316,6 +323,10 @@ pub async fn delete_account(
             StatusCode::INTERNAL_SERVER_ERROR,
         );
     }
+    let _ = sqlx::query("DELETE FROM account_model_cache WHERE account_id = ?")
+        .bind(id)
+        .execute(&mut *tx)
+        .await;
 
     let result = sqlx::query("DELETE FROM accounts WHERE id = ?")
         .bind(id)
