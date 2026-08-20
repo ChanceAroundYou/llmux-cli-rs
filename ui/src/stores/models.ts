@@ -40,7 +40,7 @@ interface ModelsState {
   addAlias: (alias: string, targetModel: string, providerId?: string, accountIds?: number[], preferredAccountId?: number) => Promise<void>;
   deleteAlias: (id: number) => Promise<void>;
   testModel: (modelId: string, providerId?: string, accountId?: number) => Promise<{ success: boolean; error?: string; latency?: number }>;
-  startTestQueue: (models: { model: string, providerId: string }[]) => Promise<{ success: boolean; error?: string }>;
+  startTestQueue: (models: { model: string, providerId: string, accountId?: number }[]) => Promise<{ success: boolean; error?: string }>;
   fetchTestQueueStatus: () => Promise<{ isRunning: boolean; current: number; total: number; progress: number }>;
 }
 

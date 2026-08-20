@@ -58,10 +58,42 @@ pub async fn start_test_queue(
                 .get("model")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown");
+            let account_id_override = model_entry.get("accountId").and_then(|v| v.as_i64());
             let provider_id_override = model_entry
                 .get("providerId")
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty());
+
+            // 若前端已指定 accountId，直接定向到该账户，避免同名模型串到 provider 的首账户
+            let targeted_accounts: Option<Vec<llmux_core::adapters::Account>> = if let Some(acc_id) = account_id_override {
+                match sqlx::query(
+                    "SELECT id, alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight, openai_compatible FROM accounts WHERE id = ? AND is_active = 1",
+                )
+                .bind(acc_id)
+                .fetch_optional(&pool)
+                .await
+                {
+                    Ok(Some(row)) => {
+                        let enc: String = row.try_get("api_key").unwrap_or_default();
+                        match decrypt_api_key(&enc, &master_key) {
+                            Ok(api_key) => Some(vec![llmux_core::adapters::Account {
+                                id: row.try_get("id").unwrap_or_default(),
+                                alias: row.try_get("alias").unwrap_or_default(),
+                                provider_id: row.try_get("provider_id").unwrap_or_default(),
+                                api_key,
+                                base_url: row.try_get("base_url").ok(),
+                                anthropic_base_url: row.try_get("anthropic_base_url").ok(),
+                                is_active: row.try_get::<i64, _>("is_active").unwrap_or(1),
+                                weight: row.try_get("weight").unwrap_or(1),
+                                openai_compatible: row.try_get("openai_compatible").unwrap_or(0),
+                            }]),
+                            Err(_) => Some(vec![]),
+                        }
+                    }
+                    Ok(None) => Some(vec![]),
+                    Err(_) => Some(vec![]),
+                }
+            } else { None };
 
             // Resolve provider and get accounts
             // Try resolve_model first (by alias), fall back to providerId, then prefix guess
@@ -82,10 +114,12 @@ pub async fn start_test_queue(
                 &resolution.provider_id
             };
 
-            if let Ok(accounts) =
-                get_active_accounts(&pool, Some(effective_provider), &master_key).await
-            {
-                if let Some(account) = accounts.first() {
+            let accounts_for_test: Vec<llmux_core::adapters::Account> = if let Some(v) = targeted_accounts {
+                v
+            } else if let Ok(acs) = get_active_accounts(&pool, Some(effective_provider), &master_key).await {
+                acs
+            } else { vec![] };
+            if let Some(account) = accounts_for_test.first() {
                         let provider_type = {
                             let pt = sqlx::query_scalar::<_, Option<String>>(
                                 "SELECT type FROM providers WHERE id = ?",
@@ -253,7 +287,6 @@ pub async fn start_test_queue(
                         .execute(&pool)
                         .await;
                     }
-                }
 
             {
                 let mut queue = queue_state.lock().unwrap();

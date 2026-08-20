@@ -49,6 +49,22 @@ export default function Models() {
   const [activeProvider, setActiveProvider] = useState<string>('');
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [aliasForm, setAliasForm] = useState({ alias: '', target: '', provider: '', selectedAccountIds: [] as number[], preferredAccountId: null as number | null });
+  // 测速/健康按账户隔离：key = accountId:modelId（避免同名模型互串）
+  const healthKey = (accountId: number | null | undefined, modelId: string) => `${accountId ?? 'na'}:${modelId}`;
+  const modelAccountId = (owned_by: string, modelId: string): number | null => {
+    const m = safeModels.find(x => x.owned_by === owned_by && x.id === modelId);
+    if (!m) return null;
+    const acc = safeAccounts.find(a => a.alias === owned_by);
+    return acc ? Number(acc.id) : null;
+  };
+  // 别名下拉使用复合值，避免同名模型回显串台：value = "owned_by:modelId"
+  const optionValue = (owned_by: string, id: string) => `${owned_by}:${id}`;
+  const parseOptionValue = (v: string): { owner: string; id: string } => {
+    const idx = v.indexOf(':');
+    if (idx === -1) return { owner: '', id: v };
+    return { owner: v.slice(0, idx), id: v.slice(idx + 1) };
+  };
+
   const [testResults, setTestResults] = useState<Record<string, { success: boolean; latency?: number; error?: string; loading?: boolean; lastChecked?: string; limitsCache?: any; limitsUpdatedAt?: string }>>({});
   const [queueStatus, setQueueStatus] = useState<{ isRunning: boolean; current: number; total: number; progress: number }>({ isRunning: false, current: 0, total: 0, progress: 0 });
   const { startTestQueue, fetchTestQueueStatus } = useModelsStore();
@@ -60,54 +76,37 @@ export default function Models() {
   const [isVerifying, setIsVerifying] = useState(false);
   const [verifyResult, setVerifyResult] = useState<{ success: boolean; error?: string; latency?: number } | null>(null);
 
-  const handleTest = async (modelId: string, providerId: string) => {
-    setTestResults(prev => ({ ...prev, [modelId]: { success: false, loading: true } }));
-    const result = await testModel(modelId, providerId);
+  const handleTest = async (modelId: string, providerId: string, accountId?: number) => {
+    let resolvedAccountId = accountId ?? null;
+    if (resolvedAccountId == null) {
+      resolvedAccountId = modelAccountId(providerId, modelId);
+    }
+    const key = healthKey(resolvedAccountId, modelId);
+    setTestResults(prev => ({ ...prev, [key]: { success: false, loading: true } }));
+    const result = await testModel(modelId, providerId, resolvedAccountId ?? undefined);
     // @ts-ignore
-    setTestResults(prev => ({ ...prev, [modelId]: { ...result, loading: false } }));
+    setTestResults(prev => ({ ...prev, [key]: { ...result, loading: false } }));
   };
 
   const fetchHealth = async () => {
     try {
       const res = await fetch('/api/models/health');
       if (res.ok) {
-        const data = await res.json();
+        const data: any[] = await res.json();
         setTestResults(prev => {
           const next = { ...prev };
-
-          // 按模型聚合，如果同一模型有多个账号，优先显示配额最低的
-          const modelMap = new Map<string, any>();
+          // 按 (account_id, model) 隔离写入，不再按裸 model 合并
           data.forEach((row: any) => {
-            const existing = modelMap.get(row.model);
-            if (!existing) {
-              modelMap.set(row.model, row);
-            } else {
-              // 如果两个都有 limits_cache，比较剩余配额
-              if (row.limits_cache && existing.limits_cache) {
-                const rowRemaining = parseInt(row.limits_cache['x-ratelimit-remaining-tokens'] ?? row.limits_cache['x-quota-remaining'] ?? -1);
-                const existingRemaining = parseInt(existing.limits_cache['x-ratelimit-remaining-tokens'] ?? existing.limits_cache['x-quota-remaining'] ?? -1);
-                if (rowRemaining >= 0 && (existingRemaining < 0 || rowRemaining < existingRemaining)) {
-                  modelMap.set(row.model, row);
-                }
-              } else if (row.limits_cache && !existing.limits_cache) {
-                // 优先显示有配额数据的
-                modelMap.set(row.model, row);
-              }
-            }
-          });
-
-          modelMap.forEach((row, model) => {
-            // Don't overwrite if it's currently loading
-            if (!next[model]?.loading) {
-              next[model] = {
-                success: Boolean(row.success),
-                latency: row.latency,
-                error: row.error,
-                lastChecked: row.last_checked,
-                limitsCache: row.limits_cache,
-                limitsUpdatedAt: row.limits_cache_updated_at
-              };
-            }
+            const key = healthKey(row.account_id, row.model);
+            if (next[key]?.loading) return;
+            next[key] = {
+              success: Boolean(row.success),
+              latency: row.latency,
+              error: row.error,
+              lastChecked: row.last_checked,
+              limitsCache: row.limits_cache,
+              limitsUpdatedAt: row.limits_cache_updated_at
+            };
           });
           return next;
         });
@@ -171,11 +170,19 @@ export default function Models() {
   };
 
   const executeTestAll = async () => {
-    // 仅测试已配置别名的模型，避免测试成百上千个未使用的原始模型
-    const modelsToTest = aliases.map(a => ({ 
-      model: a.target_model, 
-      providerId: a.provider_id || '' 
-    })).filter(m => m.model);
+    // 仅测试已配置别名的模型，并携带 accountId 以隔离同名模型
+    const modelsToTest = aliases.map(a => {
+      let accountId: number | undefined = undefined;
+      if (a.account_ids) {
+        try { const ids: number[] = JSON.parse(a.account_ids); if (ids.length) accountId = Number(ids[0]); } catch {}
+      }
+      if (accountId == null && a.preferred_account_id != null) accountId = Number(a.preferred_account_id);
+      if (accountId == null && a.provider_id) {
+        const acc = safeAccounts.find(x => x.alias === a.provider_id);
+        if (acc) accountId = Number(acc.id);
+      }
+      return { model: a.target_model, providerId: a.provider_id || '', ...(accountId != null ? { accountId } : {}) };
+    }).filter(m => m.model);
 
     if (modelsToTest.length === 0) {
       setTestAllConfirm(false);
@@ -313,7 +320,11 @@ export default function Models() {
            </h2>
            <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3">
               {aliases.map(a => {
-                const result = testResults[a.target_model];
+                let aliasAccountId: number | null = null;
+                if (a.account_ids) { try { const ids: number[] = JSON.parse(a.account_ids); if (ids.length) aliasAccountId = Number(ids[0]); } catch {} }
+                if (aliasAccountId == null && a.preferred_account_id != null) aliasAccountId = Number(a.preferred_account_id);
+                if (aliasAccountId == null && a.provider_id) { const acc = safeAccounts.find(x => x.alias === a.provider_id); if (acc) aliasAccountId = Number(acc.id); }
+                const result = testResults[aliasAccountId != null ? healthKey(aliasAccountId, a.target_model) : a.target_model] ?? testResults[a.target_model];
                 return (
                   <div
                     key={a.id}
@@ -399,23 +410,26 @@ export default function Models() {
         </div>
       </div>
 
-      {/* Models Grid */}
+      {/* Models Grid — key by owned_by:modelId so 同名模型在不同账户各有一张卡 */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5 gap-4">
         {filteredModels.map((model) => {
           const isPlaceholder = model.id?.endsWith('-models-unavailable');
+          const cardAccountId = modelAccountId(model.owned_by, model.id);
+          const cardKey = healthKey(cardAccountId, model.id);
+          const cardResult = (!isPlaceholder ? (testResults[cardKey] ?? testResults[model.id]) : undefined);
           return (
-          <div key={model.id} className={cn("p-4 rounded-xl border bg-card hover:border-primary/40 transition-all group flex flex-col justify-between min-h-[160px]", isPlaceholder ? "border-dashed border-warning/30 bg-warning/5" : "border-border")}>
+          <div key={`${model.owned_by}:${model.id}`} className={cn("p-4 rounded-xl border bg-card hover:border-primary/40 transition-all group flex flex-col justify-between min-h-[160px]", isPlaceholder ? "border-dashed border-warning/30 bg-warning/5" : "border-border")}>
             <div className="space-y-1">
               <div className="flex items-center justify-between">
                 <span className="text-xs font-bold text-primary uppercase tracking-widest">{model.owned_by}</span>
                 <div className="flex items-center gap-1.5">
-                   {!isPlaceholder && testResults[model.id]?.loading ? (
+                   {!isPlaceholder && cardResult?.loading ? (
                      <RefreshCcw size={10} className="animate-spin text-muted-foreground" />
-                   ) : !isPlaceholder && testResults[model.id] ? (
+                   ) : !isPlaceholder && cardResult ? (
                      <div className={cn(
                        "w-1.5 h-1.5 rounded-full",
-                       testResults[model.id]?.success ? "bg-success shadow-[0_0_8px_rgba(34,197,94,0.6)]" : "bg-destructive shadow-[0_0_8px_rgba(239,68,68,0.6)]"
-                     )} title={testResults[model.id]?.error} />
+                       cardResult?.success ? "bg-success shadow-[0_0_8px_rgba(34,197,94,0.6)]" : "bg-destructive shadow-[0_0_8px_rgba(239,68,68,0.6)]"
+                     )} title={cardResult?.error} />
                    ) : null}
                    <LayoutGrid size={12} className="text-muted-foreground/30" />
                 </div>
@@ -438,24 +452,24 @@ export default function Models() {
                     {formatContextLength(model.context_length)}
                   </span>
                 )}
-                {testResults[model.id]?.latency != null && (
-                  <span className="text-xs text-success font-bold">{(testResults[model.id]!.latency! / 1000).toFixed(1)}s</span>
+                {cardResult?.latency != null && (
+                  <span className="text-xs text-success font-bold">{(cardResult!.latency! / 1000).toFixed(1)}s</span>
                 )}
-                {testResults[model.id]?.lastChecked && (
+                {cardResult?.lastChecked && (
                   <span className="text-xs text-muted-foreground/60 font-medium">
-                    {parseServerDate(testResults[model.id]!.lastChecked!).toLocaleString(i18n.language, { 
-                      month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' 
+                    {parseServerDate(cardResult!.lastChecked!).toLocaleString(i18n.language, {
+                      month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'
                     })}
                   </span>
                 )}
               </div>
-              {testResults[model.id]?.error && (
-                <p className="text-xs text-destructive font-medium line-clamp-1 opacity-80" title={testResults[model.id]?.error}>{testResults[model.id]?.error}</p>
+              {cardResult?.error && (
+                <p className="text-xs text-destructive font-medium line-clamp-1 opacity-80" title={cardResult?.error}>{cardResult?.error}</p>
               )}
               {/* 限额进度条：只有厂商返回了 ratelimit 数据才显示 */}
               {(() => {
-                const limits = testResults[model.id]?.limitsCache;
-                const limitsUpdatedAt = testResults[model.id]?.limitsUpdatedAt;
+                const limits = cardResult?.limitsCache;
+                const limitsUpdatedAt = cardResult?.limitsUpdatedAt;
                 if (!limits) return null;
                 const remaining = parseInt(limits['x-ratelimit-remaining-tokens'] ?? limits['x-quota-remaining'] ?? -1);
                 const total = parseInt(limits['x-ratelimit-limit-tokens'] ?? limits['x-quota-total'] ?? -1);
@@ -491,12 +505,12 @@ export default function Models() {
                  <p className="text-xs text-warning font-normal normal-case truncate" title={(model as any).error}>{(model as any).error || t('models.apiUnavailable')}</p>
                ) : (
                  <button
-                   onClick={() => handleTest(model.id, model.owned_by)}
-                   disabled={testResults[model.id]?.loading || queueStatus.isRunning}
+                   onClick={() => handleTest(model.id, model.owned_by, cardAccountId ?? undefined)}
+                   disabled={cardResult?.loading || queueStatus.isRunning}
                    className="flex items-center gap-1 hover:text-foreground transition-colors disabled:opacity-50"
                  >
-                   <Zap size={12} className={cn(testResults[model.id]?.success && "text-warning")} />
-                   {testResults[model.id]?.loading ? t('models.testing') : t('models.testBtn')}
+                   <Zap size={12} className={cn(cardResult?.success && "text-warning")} />
+                   {cardResult?.loading ? t('models.testing') : t('models.testBtn')}
                  </button>
                )}
                {!isPlaceholder && (
@@ -542,17 +556,19 @@ export default function Models() {
           <div className="space-y-1.5">
             <label className="text-xs font-bold text-muted-foreground uppercase">{t('models.targetModel')}</label>
             <select
-              value={aliasForm.target}
+              value={aliasForm.target ? optionValue(aliasForm.provider || safeModels.find(m => m.id === aliasForm.target)?.owned_by || '', aliasForm.target) : ''}
               onChange={e => {
-                const modelId = e.target.value;
-                const models = safeModels;
+                const parsed = parseOptionValue(e.target.value);
                 const accts = safeAccounts;
-                const matchingAliases = [...new Set(models.filter(x => x.id === modelId).map(x => x.owned_by))];
-                const matchingAccounts = accts.filter(a => matchingAliases.includes(a.alias) && a.is_active === 1);
+                if (!parsed.id) {
+                  setAliasForm({ ...aliasForm, target: '', provider: '', selectedAccountIds: [] });
+                  return;
+                }
+                const matchingAccounts = accts.filter(a => a.alias === parsed.owner && a.is_active === 1);
                 setAliasForm({
                   ...aliasForm,
-                  target: modelId,
-                  provider: matchingAliases[0] || '',
+                  target: parsed.id,
+                  provider: parsed.owner,
                   selectedAccountIds: matchingAccounts.map(a => a.id),
                 });
               }}
@@ -560,16 +576,16 @@ export default function Models() {
             >
               <option value="">{t('common.default')}</option>
               {safeModels.map(mod => (
-                <option key={`${mod.owned_by}:${mod.id}`} value={mod.id}>[{mod.owned_by}] {mod.id}</option>
+                <option key={`${mod.owned_by}:${mod.id}`} value={optionValue(mod.owned_by, mod.id)}>[{mod.owned_by}] {mod.id}</option>
               ))}
             </select>
           </div>
           {(() => {
-            const models = safeModels;
             const accts = safeAccounts;
-            const matchingAliases = aliasForm.target ? [...new Set(models.filter(x => x.id === aliasForm.target).map(x => x.owned_by))] : [];
-            const matchingAccounts = accts.filter(a => matchingAliases.includes(a.alias) && a.is_active === 1);
-            const otherAccounts = accts.filter(a => !matchingAliases.includes(a.alias) && a.is_active === 1);
+            const matchingAccounts = aliasForm.target && aliasForm.provider
+              ? accts.filter(a => a.alias === aliasForm.provider && a.is_active === 1)
+              : [];
+            const otherAccounts = accts.filter(a => !matchingAccounts.some(m => m.id === a.id) && a.is_active === 1);
             if (!aliasForm.target) return null;
             return (
               <div className="space-y-1.5 border-t border-border pt-3">
