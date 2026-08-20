@@ -18,7 +18,7 @@ use tower_http::{
     trace::TraceLayer,
 };
 
-use crate::routes::{accounts, auth, health, keys, models, settings, system, usage, v1};
+use crate::routes::{accounts, auth, health, keys, models, settings, stats, system, usage, v1};
 use crate::routes::models::TestQueueState;
 
 #[derive(Clone)]
@@ -224,6 +224,8 @@ pub fn app(state: AppState) -> AppRouter {
         .route("/api/models/test-all", post(models::start_test_queue))
         .route("/api/models/test", post(models::test_model))
         .route("/api/activity", get(usage::get_activity))
+        .route("/api/stats", get(stats::get_stats))
+        .route("/api/stats/logs", get(stats::get_stats_logs))
         .route("/api/health", get(health::get_health_status))
         .route("/api/system/tools", get(system::get_installed_tools))
         .route(

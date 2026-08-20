@@ -15,6 +15,7 @@ pub struct UsageSummary {
     pub total_output: i64,
     pub total_cache_read: i64,
     pub total_cache_create: i64,
+    pub cache_hit_rate: f64,
     pub avg_latency: f64,
     pub total_requests: i64,
     pub success_requests: i64,
@@ -44,6 +45,9 @@ pub struct ProviderBreakdown {
     pub id: Option<String>,
     pub input: i64,
     pub output: i64,
+    pub cache_read: i64,
+    pub cache_create: i64,
+    pub cache_hit_rate: f64,
     pub total_tokens: i64,
     pub requests: i64,
     pub success_count: i64,
@@ -56,6 +60,9 @@ pub struct ModelBreakdown {
     pub model: Option<String>,
     pub input: i64,
     pub output: i64,
+    pub cache_read: i64,
+    pub cache_create: i64,
+    pub cache_hit_rate: f64,
     pub requests: i64,
     pub success_count: i64,
     pub avg_latency: f64,
@@ -69,6 +76,9 @@ pub struct AccountBreakdown {
     pub provider: String,
     pub input: i64,
     pub output: i64,
+    pub cache_read: i64,
+    pub cache_create: i64,
+    pub cache_hit_rate: f64,
     pub total_tokens: i64,
     pub requests: i64,
     pub success_count: i64,
@@ -177,11 +187,21 @@ impl UsageService {
         let mut query = sqlx::query(&sql);
         query = bind_time_filter(query, start_time, end_time);
         let row = query.fetch_one(&self.pool).await?;
+        let total_input: i64 = row.try_get("total_input")?;
+        let total_cache_read: i64 = row.try_get("total_cache_read")?;
+        let total_cache_create: i64 = row.try_get("total_cache_create")?;
+        let denom = (total_input + total_cache_read + total_cache_create) as f64;
+        let cache_hit_rate = if denom > 0.0 {
+            (total_cache_read as f64 / denom) * 100.0
+        } else {
+            0.0
+        };
         Ok(UsageSummary {
-            total_input: row.try_get("total_input")?,
+            total_input,
             total_output: row.try_get("total_output")?,
-            total_cache_read: row.try_get("total_cache_read")?,
-            total_cache_create: row.try_get("total_cache_create")?,
+            total_cache_read,
+            total_cache_create,
+            cache_hit_rate,
             avg_latency: row.try_get("avg_latency")?,
             total_requests: row.try_get("total_requests")?,
             success_requests: row.try_get("success_requests")?,
@@ -231,6 +251,8 @@ impl UsageService {
             "SELECT provider_id AS id,
                     IFNULL(SUM(input_tokens), 0) AS input,
                     IFNULL(SUM(output_tokens), 0) AS output,
+                    IFNULL(SUM(cache_read_input_tokens), 0) AS cache_read,
+                    IFNULL(SUM(cache_creation_input_tokens), 0) AS cache_create,
                     IFNULL(SUM(input_tokens + output_tokens), 0) AS total_tokens,
                     COUNT(*) AS requests,
                     IFNULL(SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END), 0) AS success_count,
@@ -245,10 +267,18 @@ impl UsageService {
         let rows = query.fetch_all(&self.pool).await?;
         rows.into_iter()
             .map(|row| {
+                let input: i64 = row.try_get("input")?;
+                let cache_read: i64 = row.try_get("cache_read")?;
+                let cache_create: i64 = row.try_get("cache_create")?;
+                let denom = (input + cache_read + cache_create) as f64;
+                let cache_hit_rate = if denom > 0.0 { (cache_read as f64 / denom) * 100.0 } else { 0.0 };
                 Ok(ProviderBreakdown {
                     id: row.try_get("id")?,
-                    input: row.try_get("input")?,
+                    input,
                     output: row.try_get("output")?,
+                    cache_read,
+                    cache_create,
+                    cache_hit_rate,
                     total_tokens: row.try_get("total_tokens")?,
                     requests: row.try_get("requests")?,
                     success_count: row.try_get("success_count")?,
@@ -267,6 +297,8 @@ impl UsageService {
             "SELECT model,
                     IFNULL(SUM(input_tokens), 0) AS input,
                     IFNULL(SUM(output_tokens), 0) AS output,
+                    IFNULL(SUM(cache_read_input_tokens), 0) AS cache_read,
+                    IFNULL(SUM(cache_creation_input_tokens), 0) AS cache_create,
                     COUNT(*) AS requests,
                     IFNULL(SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END), 0) AS success_count,
                     CAST(IFNULL(AVG(latency_ms), 0) AS REAL) AS avg_latency
@@ -280,10 +312,18 @@ impl UsageService {
         let rows = query.fetch_all(&self.pool).await?;
         rows.into_iter()
             .map(|row| {
+                let input: i64 = row.try_get("input")?;
+                let cache_read: i64 = row.try_get("cache_read")?;
+                let cache_create: i64 = row.try_get("cache_create")?;
+                let denom = (input + cache_read + cache_create) as f64;
+                let cache_hit_rate = if denom > 0.0 { (cache_read as f64 / denom) * 100.0 } else { 0.0 };
                 Ok(ModelBreakdown {
                     model: row.try_get("model")?,
-                    input: row.try_get("input")?,
+                    input,
                     output: row.try_get("output")?,
+                    cache_read,
+                    cache_create,
+                    cache_hit_rate,
                     requests: row.try_get("requests")?,
                     success_count: row.try_get("success_count")?,
                     avg_latency: row.try_get("avg_latency")?,
@@ -303,6 +343,8 @@ impl UsageService {
                     a.provider_id AS provider,
                     IFNULL(SUM(l.input_tokens), 0) AS input,
                     IFNULL(SUM(l.output_tokens), 0) AS output,
+                    IFNULL(SUM(l.cache_read_input_tokens), 0) AS cache_read,
+                    IFNULL(SUM(l.cache_creation_input_tokens), 0) AS cache_create,
                     IFNULL(SUM(l.input_tokens + l.output_tokens), 0) AS total_tokens,
                     COUNT(*) AS requests,
                     IFNULL(SUM(CASE WHEN l.success = 1 THEN 1 ELSE 0 END), 0) AS success_count,
@@ -318,12 +360,20 @@ impl UsageService {
         let rows = query.fetch_all(&self.pool).await?;
         rows.into_iter()
             .map(|row| {
+                let input: i64 = row.try_get("input")?;
+                let cache_read: i64 = row.try_get("cache_read")?;
+                let cache_create: i64 = row.try_get("cache_create")?;
+                let denom = (input + cache_read + cache_create) as f64;
+                let cache_hit_rate = if denom > 0.0 { (cache_read as f64 / denom) * 100.0 } else { 0.0 };
                 Ok(AccountBreakdown {
                     id: row.try_get("id")?,
                     name: row.try_get("name")?,
                     provider: row.try_get("provider")?,
-                    input: row.try_get("input")?,
+                    input,
                     output: row.try_get("output")?,
+                    cache_read,
+                    cache_create,
+                    cache_hit_rate,
                     total_tokens: row.try_get("total_tokens")?,
                     requests: row.try_get("requests")?,
                     success_count: row.try_get("success_count")?,

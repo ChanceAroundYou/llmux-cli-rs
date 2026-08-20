@@ -4,6 +4,7 @@ pub mod health;
 pub mod keys;
 pub mod models;
 pub mod settings;
+pub mod stats;
 pub mod system;
 pub mod usage;
 pub mod v1;

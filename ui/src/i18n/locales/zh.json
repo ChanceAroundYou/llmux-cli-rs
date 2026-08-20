@@ -119,6 +119,56 @@
     "searchLogs": "搜索日志...",
     "success": "成功",
     "failed": "失败",
+    "presets": {
+      "1h": "近 1 小时",
+      "24h": "近 24 小时",
+      "7d": "近 7 天",
+      "30d": "近 30 天"
+    },
+    "custom": {
+      "start": "开始",
+      "end": "结束",
+      "apply": "应用自定义"
+    },
+    "statsCards": {
+      "totalTokens": "总 Token",
+      "cacheHit": "缓存命中",
+      "effectiveTokens": "有效 Token",
+      "requests": "请求",
+      "cacheDetail": "读 {{read}} · 写 {{write}} — 读/总输入(含缓存)",
+      "effectiveHint": "输入+命中+创建的总输入面",
+      "inputOutput": "输入 {{input}} / 输出 {{output}}"
+    },
+    "charts": {
+      "byModelTop": "按模型 Top",
+      "byAccountTop": "按账号 Top"
+    },
+    "tables": {
+      "byModel": "按模型",
+      "byAccount": "按账号",
+      "headers": {
+        "model": "模型",
+        "input": "输入",
+        "output": "输出",
+        "total": "合计",
+        "cacheHit": "命中",
+        "hitRate": "命中率",
+        "requests": "请求",
+        "successRate": "成功率",
+        "avgLatency": "均延",
+        "account": "账号",
+        "provider": "厂商"
+      }
+    },
+    "filter": {
+      "model": "筛选模型",
+      "account": "筛选账号/厂商"
+    },
+    "legend": {
+      "cache": "缓存",
+      "input": "输入",
+      "output": "输出"
+    },
     "page": "第 {{page}} 页",
     "provisioned": "已调配资源",
     "noPriceData": "未配置价格",

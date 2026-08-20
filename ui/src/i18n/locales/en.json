@@ -117,6 +117,56 @@
     "searchLogs": "Search logs...",
     "success": "Success",
     "failed": "Failed",
+    "presets": {
+      "1h": "Last 1 hour",
+      "24h": "Last 24 hours",
+      "7d": "Last 7 days",
+      "30d": "Last 30 days"
+    },
+    "custom": {
+      "start": "Start",
+      "end": "End",
+      "apply": "Apply Custom"
+    },
+    "statsCards": {
+      "totalTokens": "Total Tokens",
+      "cacheHit": "Cache Hit",
+      "effectiveTokens": "Effective Tokens",
+      "requests": "Requests",
+      "cacheDetail": "read {{read}} · write {{write}} — read / total input (incl. cache)",
+      "effectiveHint": "input + cache read + cache create",
+      "inputOutput": "input {{input}} / output {{output}}"
+    },
+    "charts": {
+      "byModelTop": "Top by Model",
+      "byAccountTop": "Top by Account"
+    },
+    "tables": {
+      "byModel": "By Model",
+      "byAccount": "By Account",
+      "headers": {
+        "model": "Model",
+        "input": "Input",
+        "output": "Output",
+        "total": "Total",
+        "cacheHit": "Cache Hit",
+        "hitRate": "Hit Rate",
+        "requests": "Requests",
+        "successRate": "Success",
+        "avgLatency": "Avg Latency",
+        "account": "Account",
+        "provider": "Provider"
+      }
+    },
+    "filter": {
+      "model": "Filter models",
+      "account": "Filter accounts/providers"
+    },
+    "legend": {
+      "cache": "Cache",
+      "input": "Input",
+      "output": "Output"
+    },
     "page": "Page {{page}}",
     "provisioned": "Provisioned Resource",
     "noPriceData": "No Price Data",

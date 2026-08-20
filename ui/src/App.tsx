@@ -12,6 +12,7 @@ import {
   Menu,
   X,
   MonitorSmartphone,
+  BarChart3,
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import Accounts from './routes/accounts';
@@ -21,6 +22,7 @@ import SettingsPage from './routes/settings';
 import About from './routes/about';
 import KeysPage from './routes/keys';
 import SetupPage from './routes/setup';
+import StatsPage from './routes/stats';
 import { useSettingsStore } from './stores/settings';
 import { cn } from './lib/utils'
 import { StatusDot } from './components/shared/StatusDot'
@@ -137,6 +139,7 @@ function App() {
           <NavItem to="/accounts" icon={Users} labelKey="common.accounts" />
           <NavItem to="/models" icon={Box} labelKey="common.models" />
           <NavItem to="/keys" icon={KeyIcon} labelKey="common.keys" />
+          <NavItem to="/stats" icon={BarChart3} labelKey="common.usage" />
           <NavItem to="/setup" icon={MonitorSmartphone} labelKey="common.setup" />
 
           <div className="pt-6 text-xs font-bold text-muted-foreground/50 uppercase tracking-wider px-3 mb-2">{t('common.menuPref')}</div>
@@ -178,6 +181,7 @@ function App() {
               <Route path="/accounts" element={<Accounts />} />
               <Route path="/models" element={<Models />} />
               <Route path="/keys" element={<KeysPage />} />
+              <Route path="/stats" element={<StatsPage />} />
               <Route path="/setup" element={<SetupPage />} />
               <Route path="/settings" element={<SettingsPage />} />
               <Route path="/about" element={<About />} />

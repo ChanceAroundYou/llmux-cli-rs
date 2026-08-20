@@ -1,0 +1,339 @@
+import React, { useEffect, useState, useMemo, useCallback } from 'react';
+import { useTranslation } from 'react-i18next';
+import { BarChart3, RefreshCw, Search, Inbox } from 'lucide-react';
+import { PageHeader } from '../components/shared/PageHeader';
+import { StatCard } from '../components/shared/StatCard';
+import { EmptyState } from '../components/shared/EmptyState';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Badge } from '@/components/ui/badge';
+import {
+  Chart as ChartJS,
+  CategoryScale,
+  LinearScale,
+  BarElement,
+  Tooltip,
+  Legend,
+  type ChartData,
+  type ChartOptions,
+} from 'chart.js';
+import { Bar } from 'react-chartjs-2';
+
+ChartJS.register(CategoryScale, LinearScale, BarElement, Tooltip, Legend);
+
+type Preset = '1h' | '24h' | '7d' | '30d' | 'custom';
+
+interface Summary {
+  total_input: number;
+  total_output: number;
+  total_cache_read: number;
+  total_cache_create: number;
+  cache_hit_rate: number;
+  avg_latency: number;
+  total_requests: number;
+  success_requests: number;
+}
+interface ModelBreakdown {
+  model: string | null;
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheCreate: number;
+  cacheHitRate: number;
+  requests: number;
+  successCount: number;
+  avgLatency: number;
+}
+interface AccountBreakdown {
+  id: number;
+  name: string;
+  provider: string;
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheCreate: number;
+  cacheHitRate: number;
+  totalTokens: number;
+  requests: number;
+  successCount: number;
+  avgLatency: number;
+}
+
+const PRESET_MS: Record<Exclude<Preset, 'custom'>, number> = {
+  '1h': 60 * 60 * 1000,
+  '24h': 24 * 60 * 60 * 1000,
+  '7d': 7 * 24 * 60 * 60 * 1000,
+  '30d': 30 * 24 * 60 * 60 * 1000,
+};
+
+function toLocalInput(ms: number): string {
+  const d = new Date(ms);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+function fromLocalInput(v: string): number {
+  return new Date(v).getTime();
+}
+
+export default function StatsPage() {
+  const { t } = useTranslation();
+  const [preset, setPreset] = useState<Preset>('24h');
+  const [customStart, setCustomStart] = useState(() => toLocalInput(Date.now() - PRESET_MS['24h']));
+  const [customEnd, setCustomEnd] = useState(() => toLocalInput(Date.now()));
+  const [range, setRange] = useState(() => {
+    const end = Date.now();
+    return { start: end - PRESET_MS['24h'], end };
+  });
+
+  const [summary, setSummary] = useState<Summary | null>(null);
+  const [byModel, setByModel] = useState<ModelBreakdown[]>([]);
+  const [byAccount, setByAccount] = useState<AccountBreakdown[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [modelFilter, setModelFilter] = useState('');
+  const [accountFilter, setAccountFilter] = useState('');
+
+  const applyPreset = (p: Exclude<Preset, 'custom'>) => {
+    setPreset(p);
+    const end = Date.now();
+    setRange({ start: end - PRESET_MS[p], end });
+  };
+  const applyCustom = () => {
+    const s = fromLocalInput(customStart);
+    const e = fromLocalInput(customEnd);
+    if (!isNaN(s) && !isNaN(e) && s <= e) {
+      setPreset('custom');
+      setRange({ start: s, end: e });
+    }
+  };
+
+  const fetchStats = useCallback(async () => {
+    setLoading(true);
+    try {
+      const res = await fetch(`/api/stats?start=${range.start}&end=${range.end}`);
+      if (!res.ok) throw new Error(await res.text());
+      const data = await res.json();
+      setSummary(data.summary ?? null);
+      setByModel(data.byModel ?? []);
+      setByAccount(data.byAccount ?? []);
+    } catch (e) {
+      console.error('stats fetch failed', e);
+    } finally {
+      setLoading(false);
+    }
+  }, [range.start, range.end]);
+
+  useEffect(() => { fetchStats(); }, [fetchStats]);
+
+  const filteredModels = useMemo(() => {
+    if (!modelFilter) return byModel;
+    const q = modelFilter.toLowerCase();
+    return byModel.filter(m => (m.model ?? '').toLowerCase().includes(q));
+  }, [byModel, modelFilter]);
+  const filteredAccounts = useMemo(() => {
+    if (!accountFilter) return byAccount;
+    const q = accountFilter.toLowerCase();
+    return byAccount.filter(a => a.name.toLowerCase().includes(q) || a.provider.toLowerCase().includes(q));
+  }, [byAccount, accountFilter]);
+
+  // 6 色系循环，每系内 3 阶：缓存(深, 底部) → 输入(中) → 输出(浅, 顶部)
+  const HUE_FAMILIES: Array<{ cache: string; input: string; output: string }> = [
+    { cache: '#1d4ed8', input: '#3b82f6', output: '#93c5fd' }, // blue
+    { cache: '#15803d', input: '#22c55e', output: '#86efac' }, // green
+    { cache: '#6d28d9', input: '#8b5cf6', output: '#c4b5fd' }, // violet
+    { cache: '#b45309', input: '#f59e0b', output: '#fde68a' }, // amber
+    { cache: '#0e7490', input: '#06b6d4', output: '#67e8f9' }, // cyan
+    { cache: '#be123c', input: '#ec4899', output: '#f9a8d4' }, // rose
+  ];
+
+  const modelChartData: ChartData<'bar'> = useMemo(() => {
+    const top = [...byModel].slice(0, 8);
+    return {
+      labels: top.map(m => (m.model ?? 'unknown').slice(0, 28)),
+      datasets: [
+        { label: t('usage.legend.cache', { defaultValue: '缓存' }), data: top.map(m => (m.cacheRead ?? 0) + (m.cacheCreate ?? 0)), backgroundColor: top.map((_, i) => HUE_FAMILIES[i % HUE_FAMILIES.length].cache), stack: 'tokens' },
+        { label: t('usage.legend.input', { defaultValue: '输入' }), data: top.map(m => m.input), backgroundColor: top.map((_, i) => HUE_FAMILIES[i % HUE_FAMILIES.length].input), stack: 'tokens' },
+        { label: t('usage.legend.output', { defaultValue: '输出' }), data: top.map(m => m.output), backgroundColor: top.map((_, i) => HUE_FAMILIES[i % HUE_FAMILIES.length].output), stack: 'tokens' },
+      ],
+    };
+  }, [byModel, t]);
+
+  const accountChartData: ChartData<'bar'> = useMemo(() => {
+    const top = [...byAccount].slice(0, 8);
+    return {
+      labels: top.map(a => a.name.slice(0, 20)),
+      datasets: [
+        { label: t('usage.legend.cache', { defaultValue: '缓存' }), data: top.map(a => (a.cacheRead ?? 0) + (a.cacheCreate ?? 0)), backgroundColor: top.map((_, i) => HUE_FAMILIES[i % HUE_FAMILIES.length].cache), stack: 'tokens' },
+        { label: t('usage.legend.input', { defaultValue: '输入' }), data: top.map(a => a.input), backgroundColor: top.map((_, i) => HUE_FAMILIES[i % HUE_FAMILIES.length].input), stack: 'tokens' },
+        { label: t('usage.legend.output', { defaultValue: '输出' }), data: top.map(a => a.output), backgroundColor: top.map((_, i) => HUE_FAMILIES[i % HUE_FAMILIES.length].output), stack: 'tokens' },
+      ],
+    };
+  }, [byAccount, t]);
+
+  const barOpts: ChartOptions<'bar'> = useMemo(() => ({
+    responsive: true, maintainAspectRatio: false, animation: false,
+    interaction: { mode: 'index', intersect: false } as const,
+    plugins: {
+      legend: { display: true, position: 'bottom' as const, labels: { boxWidth: 10, font: { size: 10 }, padding: 12 } },
+      tooltip: { backgroundColor: '#1e293b', titleFont: { size: 10 }, bodyFont: { size: 10 } },
+    },
+    scales: { x: { stacked: true, ticks: { maxRotation: 0, font: { size: 9 } } }, y: { stacked: true, beginAtZero: true } },
+  }), []);
+
+  const totalTokens = (summary?.total_input ?? 0) + (summary?.total_output ?? 0);
+  const successRate = summary?.total_requests ? Math.round((summary.success_requests / summary.total_requests) * 100) : 0;
+
+  return (
+    <div className="flex flex-col gap-6 animate-fadeIn pb-8">
+      <PageHeader
+        icon={<BarChart3 size={24} />}
+        title={t('common.usage', { defaultValue: '用量统计' })}
+        subtitle={t('usage.subtitle', { defaultValue: '按时间与维度查看 token 消耗' })}
+        action={
+          <Button variant="outline" size="sm" onClick={fetchStats} disabled={loading}>
+            <RefreshCw size={14} className={loading ? 'animate-spin' : ''} />
+            <span>{loading ? '...' : t('models.actions.refresh', { defaultValue: '刷新' })}</span>
+          </Button>
+        }
+      />
+
+      {/* Time range */}
+      <div className="bg-card border border-border rounded-xl p-4 flex flex-col gap-3">
+        <div className="flex flex-wrap gap-2">
+          {(['1h', '24h', '7d', '30d'] as const).map(p => (
+            <Button key={p} variant={preset === p ? 'default' : 'outline'} size="sm" onClick={() => applyPreset(p)} className="h-7 px-3 text-xs">
+              {t(`usage.presets.${p}`, { defaultValue: p === '1h' ? '近 1 小时' : p === '24h' ? '近 24 小时' : p === '7d' ? '近 7 天' : '近 30 天' })}
+            </Button>
+          ))}
+        </div>
+        <div className="flex flex-wrap items-end gap-2">
+          <div className="flex flex-col gap-1">
+            <span className="text-xs text-muted-foreground">{t('usage.custom.start', { defaultValue: '开始' })}</span>
+            <Input type="datetime-local" value={customStart} onChange={e => setCustomStart(e.target.value)} className="h-8 text-xs" />
+          </div>
+          <div className="flex flex-col gap-1">
+            <span className="text-xs text-muted-foreground">{t('usage.custom.end', { defaultValue: '结束' })}</span>
+            <Input type="datetime-local" value={customEnd} onChange={e => setCustomEnd(e.target.value)} className="h-8 text-xs" />
+          </div>
+          <Button size="sm" onClick={applyCustom} className="h-8">{t('usage.custom.apply', { defaultValue: '应用自定义' })}</Button>
+          <span className="text-xs text-muted-foreground ml-2">
+            {new Date(range.start).toLocaleString()} — {new Date(range.end).toLocaleString()}
+          </span>
+        </div>
+      </div>
+
+      {/* Summary — cache_hit_rate = cache_read / (input+cache_read+cache_create) */}
+      <section className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+        <StatCard label={t('usage.statsCards.totalTokens', { defaultValue: '总 Token' })} value={totalTokens.toLocaleString()} subtitle={t('usage.statsCards.inputOutput', { defaultValue: `输入 ${summary?.total_input ?? 0} / 输出 ${summary?.total_output ?? 0}`, input: summary?.total_input ?? 0, output: summary?.total_output ?? 0 })} icon={BarChart3} />
+        <StatCard label={t('usage.statsCards.cacheHit', { defaultValue: '缓存命中' })} value={`${(summary?.cache_hit_rate ?? 0).toFixed(1)}%`} subtitle={t('usage.statsCards.cacheDetail', { defaultValue: `读 ${summary?.total_cache_read ?? 0} · 写 ${summary?.total_cache_create ?? 0} — 读/总输入(含缓存)`, read: summary?.total_cache_read ?? 0, write: summary?.total_cache_create ?? 0 })} icon={BarChart3} />
+        <StatCard label={t('usage.statsCards.effectiveTokens', { defaultValue: '有效 Token' })} value={(totalTokens + (summary?.total_cache_read ?? 0) + (summary?.total_cache_create ?? 0)).toLocaleString()} subtitle={t('usage.statsCards.effectiveHint', { defaultValue: '输入+命中+创建的总输入面' })} icon={BarChart3} />
+        <StatCard label={t('usage.statsCards.requests', { defaultValue: '请求' })} value={summary?.total_requests ?? 0} subtitle={`${t('usage.success', { defaultValue: '成功' })} ${successRate}% · ${t('usage.latency', { defaultValue: '耗时' })} ${(summary?.avg_latency ?? 0).toFixed(0)}ms`} icon={BarChart3} />
+      </section>
+
+      {/* Charts */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <div className="bg-card border border-border rounded-xl p-4">
+          <h3 className="text-sm font-bold mb-3">{t('usage.charts.byModelTop', { defaultValue: '按模型 Top' })}</h3>
+          <div className="h-64">
+            {byModel.length ? <Bar data={modelChartData} options={barOpts} /> : <EmptyState icon={Inbox} title={t('usage.noData', { defaultValue: '暂无数据' })} />}
+          </div>
+        </div>
+        <div className="bg-card border border-border rounded-xl p-4">
+          <h3 className="text-sm font-bold mb-3">{t('usage.charts.byAccountTop', { defaultValue: '按账号 Top' })}</h3>
+          <div className="h-64">
+            {byAccount.length ? <Bar data={accountChartData} options={barOpts} /> : <EmptyState icon={Inbox} title={t('usage.noData', { defaultValue: '暂无数据' })} />}
+          </div>
+        </div>
+      </div>
+
+      {/* By model table */}
+      <div className="bg-card border border-border rounded-xl overflow-hidden">
+        <div className="p-4 border-b border-border/50 flex flex-wrap justify-between gap-3">
+          <h3 className="text-sm font-bold">{t('usage.tables.byModel', { defaultValue: '按模型' })}</h3>
+          <div className="relative">
+            <Search size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-muted-foreground" />
+            <Input placeholder={t('usage.filter.model', { defaultValue: '筛选模型' })} value={modelFilter} onChange={e => setModelFilter(e.target.value)} className="h-8 pl-8 w-56 text-xs" />
+          </div>
+        </div>
+        <div className="overflow-x-auto">
+          <table className="w-full text-xs">
+            <thead className="bg-muted/50 text-muted-foreground">
+              <tr>
+                <th className="text-left px-4 py-2">{t('usage.tables.headers.model', { defaultValue: '模型' })}</th>
+                <th className="text-right px-3 py-2">{t('usage.input', { defaultValue: '输入' })}</th>
+                <th className="text-right px-3 py-2">{t('usage.output', { defaultValue: '输出' })}</th>
+                <th className="text-right px-3 py-2">{t('usage.tables.headers.total', { defaultValue: '合计' })}</th>
+                <th className="text-right px-3 py-2">{t('usage.cacheHit', { defaultValue: '命中' })}</th>
+                <th className="text-right px-3 py-2">{t('usage.tables.headers.hitRate', { defaultValue: '命中率' })}</th>
+                <th className="text-right px-3 py-2">{t('usage.tables.headers.requests', { defaultValue: '请求' })}</th>
+                <th className="text-right px-3 py-2">{t('usage.tables.headers.successRate', { defaultValue: '成功率' })}</th>
+                <th className="text-right px-3 py-2">{t('usage.tables.headers.avgLatency', { defaultValue: '均延' })}</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-border/50">
+              {filteredModels.length === 0 ? (
+                <tr><td colSpan={9} className="py-8"><EmptyState icon={Inbox} title={t('usage.noData', { defaultValue: '暂无数据' })} /></td></tr>
+              ) : filteredModels.map((m, i) => (
+                <tr key={i} className="hover:bg-muted/30">
+                  <td className="px-4 py-2 font-mono truncate max-w-[260px]">{m.model ?? '—'}</td>
+                  <td className="text-right px-3 py-2">{m.input.toLocaleString()}</td>
+                  <td className="text-right px-3 py-2">{m.output.toLocaleString()}</td>
+                  <td className="text-right px-3 py-2 font-semibold">{(m.input + m.output).toLocaleString()}</td>
+                  <td className="text-right px-3 py-2">{m.cacheRead.toLocaleString()}</td>
+                  <td className="text-right px-3 py-2">{m.cacheHitRate.toFixed(1)}%</td>
+                  <td className="text-right px-3 py-2">{m.requests}</td>
+                  <td className="text-right px-3 py-2">{m.requests ? Math.round(m.successCount / m.requests * 100) : 0}%</td>
+                  <td className="text-right px-3 py-2">{m.avgLatency.toFixed(0)}ms</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* By account table */}
+      <div className="bg-card border border-border rounded-xl overflow-hidden">
+        <div className="p-4 border-b border-border/50 flex flex-wrap justify-between gap-3">
+          <h3 className="text-sm font-bold">{t('usage.tables.byAccount', { defaultValue: '按账号' })}</h3>
+          <div className="relative">
+            <Search size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-muted-foreground" />
+            <Input placeholder={t('usage.filter.account', { defaultValue: '筛选账号/厂商' })} value={accountFilter} onChange={e => setAccountFilter(e.target.value)} className="h-8 pl-8 w-56 text-xs" />
+          </div>
+        </div>
+        <div className="overflow-x-auto">
+          <table className="w-full text-xs">
+            <thead className="bg-muted/50 text-muted-foreground">
+              <tr>
+                <th className="text-left px-4 py-2">{t('usage.tables.headers.account', { defaultValue: '账号' })}</th>
+                <th className="text-left px-3 py-2">{t('usage.tables.headers.provider', { defaultValue: '厂商' })}</th>
+                <th className="text-right px-3 py-2">{t('usage.input', { defaultValue: '输入' })}</th>
+                <th className="text-right px-3 py-2">{t('usage.output', { defaultValue: '输出' })}</th>
+                <th className="text-right px-3 py-2">{t('usage.tables.headers.total', { defaultValue: '合计' })}</th>
+                <th className="text-right px-3 py-2">{t('usage.cacheHit', { defaultValue: '命中' })}</th>
+                <th className="text-right px-3 py-2">{t('usage.tables.headers.hitRate', { defaultValue: '命中率' })}</th>
+                <th className="text-right px-3 py-2">{t('usage.tables.headers.requests', { defaultValue: '请求' })}</th>
+                <th className="text-right px-3 py-2">{t('usage.tables.headers.successRate', { defaultValue: '成功率' })}</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-border/50">
+              {filteredAccounts.length === 0 ? (
+                <tr><td colSpan={9} className="py-8"><EmptyState icon={Inbox} title={t('usage.noData', { defaultValue: '暂无数据' })} /></td></tr>
+              ) : filteredAccounts.map(a => (
+                <tr key={a.id} className="hover:bg-muted/30">
+                  <td className="px-4 py-2 font-medium">{a.name}</td>
+                  <td className="px-3 py-2"><Badge variant="secondary" className="text-xs">{a.provider || '—'}</Badge></td>
+                  <td className="text-right px-3 py-2">{a.input.toLocaleString()}</td>
+                  <td className="text-right px-3 py-2">{a.output.toLocaleString()}</td>
+                  <td className="text-right px-3 py-2 font-semibold">{a.totalTokens.toLocaleString()}</td>
+                  <td className="text-right px-3 py-2">{a.cacheRead.toLocaleString()}</td>
+                  <td className="text-right px-3 py-2">{a.cacheHitRate.toFixed(1)}%</td>
+                  <td className="text-right px-3 py-2">{a.requests}</td>
+                  <td className="text-right px-3 py-2">{a.requests ? Math.round(a.successCount / a.requests * 100) : 0}%</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  );
+}

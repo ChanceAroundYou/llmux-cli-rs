@@ -170,7 +170,7 @@ export default function Dashboard() {
   }, [filteredAliases, selectedProvider]);
 
   return (
-    <div className="flex flex-col gap-6 animate-fadeIn" style={{ height: 'calc(100vh - 126px)', paddingBottom: '20px' }}>
+    <div className="flex flex-col gap-6 animate-fadeIn pb-5 lg:h-[calc(100vh-126px)] lg:flex-1 lg:min-h-0">
 
       {/* Header */}
       <PageHeader
@@ -207,10 +207,10 @@ export default function Dashboard() {
       </section>
 
       {/* Two-Column Panel */}
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-stretch flex-1 min-h-0">
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 lg:gap-8 lg:items-stretch lg:flex-1 lg:min-h-0">
 
         {/* Left: Alias Health — 7 cols */}
-        <section className="lg:col-span-7 bg-card border border-border rounded-xl shadow-sm overflow-hidden flex flex-col">
+        <section className="lg:col-span-7 bg-card border border-border rounded-xl shadow-sm lg:overflow-hidden lg:flex lg:flex-col">
           <div className="p-6 border-b border-border/50">
             <div className="flex justify-between items-center flex-wrap gap-2">
               <div className="flex items-center gap-2">
@@ -247,7 +247,7 @@ export default function Dashboard() {
             </div>
           </div>
 
-          <div className="divide-y divide-border/50 flex-1 overflow-y-auto">
+          <div className="divide-y divide-border/50 lg:flex-1 lg:overflow-y-auto">
             {displayAliases.length === 0 ? (
               <EmptyState icon={Database} title={t('dashboard.noAliases')} />
             ) : displayAliases.map((a, i) => (
@@ -293,7 +293,7 @@ export default function Dashboard() {
         </section>
 
         {/* Right: Activity Log — 5 cols */}
-        <section className="lg:col-span-5 bg-card border border-border rounded-xl shadow-sm overflow-hidden flex flex-col">
+        <section className="lg:col-span-5 bg-card border border-border rounded-xl shadow-sm lg:overflow-hidden lg:flex lg:flex-col">
           <div className="p-6 border-b border-border/50">
             <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3">
               <div className="flex items-center gap-2">
@@ -341,7 +341,7 @@ export default function Dashboard() {
             </div>
           </div>
 
-          <div className="flex-1 p-6 overflow-y-auto space-y-3">
+          <div className="p-6 space-y-3 lg:flex-1 lg:overflow-y-auto">
             {filteredLogs.length === 0 ? (
               <EmptyState icon={AlertTriangle} title={onlyShowErrors ? t('dashboard.noErrors') : t('dashboard.noActivity')} />
             ) : filteredLogs.map(log => (
