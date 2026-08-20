@@ -91,6 +91,8 @@ export default function StatsPage() {
   const [loading, setLoading] = useState(false);
   const [modelFilter, setModelFilter] = useState('');
   const [accountFilter, setAccountFilter] = useState('');
+  const [modelSort, setModelSort] = useState<{ key: string; dir: 'asc' | 'desc' }>({ key: 'total', dir: 'desc' });
+  const [accountSort, setAccountSort] = useState<{ key: string; dir: 'asc' | 'desc' }>({ key: 'total', dir: 'desc' });
 
   const applyPreset = (p: Exclude<Preset, 'custom'>) => {
     setPreset(p);
@@ -135,6 +137,59 @@ export default function StatsPage() {
     return byAccount.filter(a => a.name.toLowerCase().includes(q) || a.provider.toLowerCase().includes(q));
   }, [byAccount, accountFilter]);
 
+  const toggleModelSort = (k: string) => setModelSort(prev => prev.key === k ? { key: k, dir: prev.dir === 'asc' ? 'desc' : 'asc' } : { key: k, dir: 'desc' });
+  const toggleAccountSort = (k: string) => setAccountSort(prev => prev.key === k ? { key: k, dir: prev.dir === 'asc' ? 'desc' : 'asc' } : { key: k, dir: 'desc' });
+  const sortIndicator = (cur: {key:string, dir:string}, k: string) => cur.key !== k ? ' ↕' : cur.dir === 'asc' ? ' ▲' : ' ▼';
+
+  const sortedModels = useMemo(() => {
+    const arr = [...filteredModels];
+    const dir = modelSort.dir === 'asc' ? 1 : -1;
+    const getVal = (m: any) => {
+      switch(modelSort.key) {
+        case 'model': return (m.model ?? '').toLowerCase();
+        case 'input': return m.input;
+        case 'output': return m.output;
+        case 'total': return (m.input + m.output);
+        case 'cacheHit': return m.cacheRead;
+        case 'hitRate': return m.cacheHitRate;
+        case 'requests': return m.requests;
+        case 'successRate': return m.requests ? m.successCount / m.requests : 0;
+        case 'avgLatency': return m.avgLatency;
+        default: return 0;
+      }
+    };
+    arr.sort((a,b) => {
+      const av=getVal(a), bv=getVal(b);
+      if (typeof av === 'string') return (av as string).localeCompare(bv as string) * dir;
+      return ((av as number) - (bv as number)) * dir;
+    });
+    return arr;
+  }, [filteredModels, modelSort]);
+
+  const sortedAccounts = useMemo(() => {
+    const arr = [...filteredAccounts];
+    const dir = accountSort.dir === 'asc' ? 1 : -1;
+    const getVal = (a: any) => {
+      switch(accountSort.key) {
+        case 'name': return (a.name ?? '').toLowerCase();
+        case 'input': return a.input;
+        case 'output': return a.output;
+        case 'total': return a.totalTokens;
+        case 'cacheHit': return a.cacheRead;
+        case 'hitRate': return a.cacheHitRate;
+        case 'requests': return a.requests;
+        case 'successRate': return a.requests ? a.successCount / a.requests : 0;
+        default: return 0;
+      }
+    };
+    arr.sort((a,b) => {
+      const av=getVal(a), bv=getVal(b);
+      if (typeof av === 'string') return (av as string).localeCompare(bv as string) * dir;
+      return ((av as number) - (bv as number)) * dir;
+    });
+    return arr;
+  }, [filteredAccounts, accountSort]);
+
   // 6 色系循环，每系内 3 阶：缓存(深, 底部) → 输入(中) → 输出(浅, 顶部)
   const HUE_FAMILIES: Array<{ cache: string; input: string; output: string }> = [
     { cache: '#1d4ed8', input: '#3b82f6', output: '#93c5fd' }, // blue
@@ -174,7 +229,7 @@ export default function StatsPage() {
     interaction: { mode: 'index', intersect: false } as const,
     plugins: {
       legend: { display: true, position: 'bottom' as const, labels: { boxWidth: 10, font: { size: 10 }, padding: 12 } },
-      tooltip: { backgroundColor: '#1e293b', titleFont: { size: 10 }, bodyFont: { size: 10 } },
+      tooltip: { backgroundColor: '#1e293b', titleFont: { size: 10 }, bodyFont: { size: 10 }, itemSort: (a: any, b: any) => a.datasetIndex - b.datasetIndex },
     },
     scales: { x: { stacked: true, ticks: { maxRotation: 0, font: { size: 9 } } }, y: { stacked: true, beginAtZero: true } },
   }), []);
@@ -258,21 +313,21 @@ export default function StatsPage() {
           <table className="w-full text-xs">
             <thead className="bg-muted/50 text-muted-foreground">
               <tr>
-                <th className="text-left px-4 py-2">{t('usage.tables.headers.model', { defaultValue: '模型' })}</th>
-                <th className="text-right px-3 py-2">{t('usage.input', { defaultValue: '输入' })}</th>
-                <th className="text-right px-3 py-2">{t('usage.output', { defaultValue: '输出' })}</th>
-                <th className="text-right px-3 py-2">{t('usage.tables.headers.total', { defaultValue: '合计' })}</th>
-                <th className="text-right px-3 py-2">{t('usage.cacheHit', { defaultValue: '命中' })}</th>
-                <th className="text-right px-3 py-2">{t('usage.tables.headers.hitRate', { defaultValue: '命中率' })}</th>
-                <th className="text-right px-3 py-2">{t('usage.tables.headers.requests', { defaultValue: '请求' })}</th>
-                <th className="text-right px-3 py-2">{t('usage.tables.headers.successRate', { defaultValue: '成功率' })}</th>
-                <th className="text-right px-3 py-2">{t('usage.tables.headers.avgLatency', { defaultValue: '均延' })}</th>
+                <th className="text-left px-4 py-2 cursor-pointer select-none" onClick={() => toggleModelSort('model')}>{t('usage.tables.headers.model', { defaultValue: '模型' })}{sortIndicator(modelSort,'model')}</th>
+                <th className="text-right px-3 py-2 cursor-pointer select-none" onClick={() => toggleModelSort('input')}>{t('usage.input', { defaultValue: '输入' })}{sortIndicator(modelSort,'input')}</th>
+                <th className="text-right px-3 py-2 cursor-pointer select-none" onClick={() => toggleModelSort('output')}>{t('usage.output', { defaultValue: '输出' })}{sortIndicator(modelSort,'output')}</th>
+                <th className="text-right px-3 py-2 cursor-pointer select-none" onClick={() => toggleModelSort('total')}>{t('usage.tables.headers.total', { defaultValue: '合计' })}{sortIndicator(modelSort,'total')}</th>
+                <th className="text-right px-3 py-2 cursor-pointer select-none" onClick={() => toggleModelSort('cacheHit')}>{t('usage.cacheHit', { defaultValue: '命中' })}{sortIndicator(modelSort,'cacheHit')}</th>
+                <th className="text-right px-3 py-2 cursor-pointer select-none" onClick={() => toggleModelSort('hitRate')}>{t('usage.tables.headers.hitRate', { defaultValue: '命中率' })}{sortIndicator(modelSort,'hitRate')}</th>
+                <th className="text-right px-3 py-2 cursor-pointer select-none" onClick={() => toggleModelSort('requests')}>{t('usage.tables.headers.requests', { defaultValue: '请求' })}{sortIndicator(modelSort,'requests')}</th>
+                <th className="text-right px-3 py-2 cursor-pointer select-none" onClick={() => toggleModelSort('successRate')}>{t('usage.tables.headers.successRate', { defaultValue: '成功率' })}{sortIndicator(modelSort,'successRate')}</th>
+                <th className="text-right px-3 py-2 cursor-pointer select-none" onClick={() => toggleModelSort('avgLatency')}>{t('usage.tables.headers.avgLatency', { defaultValue: '均延' })}{sortIndicator(modelSort,'avgLatency')}</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-border/50">
-              {filteredModels.length === 0 ? (
+              {sortedModels.length === 0 ? (
                 <tr><td colSpan={9} className="py-8"><EmptyState icon={Inbox} title={t('usage.noData', { defaultValue: '暂无数据' })} /></td></tr>
-              ) : filteredModels.map((m, i) => (
+              ) : sortedModels.map((m, i) => (
                 <tr key={i} className="hover:bg-muted/30">
                   <td className="px-4 py-2 font-mono truncate max-w-[260px]">{m.model ?? '—'}</td>
                   <td className="text-right px-3 py-2">{m.input.toLocaleString()}</td>
@@ -303,24 +358,22 @@ export default function StatsPage() {
           <table className="w-full text-xs">
             <thead className="bg-muted/50 text-muted-foreground">
               <tr>
-                <th className="text-left px-4 py-2">{t('usage.tables.headers.account', { defaultValue: '账号' })}</th>
-                <th className="text-left px-3 py-2">{t('usage.tables.headers.provider', { defaultValue: '厂商' })}</th>
-                <th className="text-right px-3 py-2">{t('usage.input', { defaultValue: '输入' })}</th>
-                <th className="text-right px-3 py-2">{t('usage.output', { defaultValue: '输出' })}</th>
-                <th className="text-right px-3 py-2">{t('usage.tables.headers.total', { defaultValue: '合计' })}</th>
-                <th className="text-right px-3 py-2">{t('usage.cacheHit', { defaultValue: '命中' })}</th>
-                <th className="text-right px-3 py-2">{t('usage.tables.headers.hitRate', { defaultValue: '命中率' })}</th>
-                <th className="text-right px-3 py-2">{t('usage.tables.headers.requests', { defaultValue: '请求' })}</th>
-                <th className="text-right px-3 py-2">{t('usage.tables.headers.successRate', { defaultValue: '成功率' })}</th>
+                <th className="text-left px-4 py-2 cursor-pointer select-none" onClick={() => toggleAccountSort('name')}>{t('usage.tables.headers.account', { defaultValue: '账号' })}{sortIndicator(accountSort,'name')}</th>
+                <th className="text-right px-3 py-2 cursor-pointer select-none" onClick={() => toggleAccountSort('input')}>{t('usage.input', { defaultValue: '输入' })}{sortIndicator(accountSort,'input')}</th>
+                <th className="text-right px-3 py-2 cursor-pointer select-none" onClick={() => toggleAccountSort('output')}>{t('usage.output', { defaultValue: '输出' })}{sortIndicator(accountSort,'output')}</th>
+                <th className="text-right px-3 py-2 cursor-pointer select-none" onClick={() => toggleAccountSort('total')}>{t('usage.tables.headers.total', { defaultValue: '合计' })}{sortIndicator(accountSort,'total')}</th>
+                <th className="text-right px-3 py-2 cursor-pointer select-none" onClick={() => toggleAccountSort('cacheHit')}>{t('usage.cacheHit', { defaultValue: '命中' })}{sortIndicator(accountSort,'cacheHit')}</th>
+                <th className="text-right px-3 py-2 cursor-pointer select-none" onClick={() => toggleAccountSort('hitRate')}>{t('usage.tables.headers.hitRate', { defaultValue: '命中率' })}{sortIndicator(accountSort,'hitRate')}</th>
+                <th className="text-right px-3 py-2 cursor-pointer select-none" onClick={() => toggleAccountSort('requests')}>{t('usage.tables.headers.requests', { defaultValue: '请求' })}{sortIndicator(accountSort,'requests')}</th>
+                <th className="text-right px-3 py-2 cursor-pointer select-none" onClick={() => toggleAccountSort('successRate')}>{t('usage.tables.headers.successRate', { defaultValue: '成功率' })}{sortIndicator(accountSort,'successRate')}</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-border/50">
-              {filteredAccounts.length === 0 ? (
-                <tr><td colSpan={9} className="py-8"><EmptyState icon={Inbox} title={t('usage.noData', { defaultValue: '暂无数据' })} /></td></tr>
-              ) : filteredAccounts.map(a => (
+              {sortedAccounts.length === 0 ? (
+                <tr><td colSpan={8} className="py-8"><EmptyState icon={Inbox} title={t('usage.noData', { defaultValue: '暂无数据' })} /></td></tr>
+              ) : sortedAccounts.map(a => (
                 <tr key={a.id} className="hover:bg-muted/30">
                   <td className="px-4 py-2 font-medium">{a.name}</td>
-                  <td className="px-3 py-2"><Badge variant="secondary" className="text-xs">{a.provider || '—'}</Badge></td>
                   <td className="text-right px-3 py-2">{a.input.toLocaleString()}</td>
                   <td className="text-right px-3 py-2">{a.output.toLocaleString()}</td>
                   <td className="text-right px-3 py-2 font-semibold">{a.totalTokens.toLocaleString()}</td>
