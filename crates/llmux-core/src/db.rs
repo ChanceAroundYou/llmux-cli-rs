@@ -7,6 +7,7 @@ pub const INIT_SQL: &str = include_str!("migrations/0001_init.sql");
 pub const MIGRATION_002: &str = include_str!("migrations/0002_add_account_ids.sql");
 pub const MIGRATION_003: &str = include_str!("migrations/0003_add_openai_compatible.sql");
 pub const MIGRATION_004: &str = include_str!("migrations/0004_add_preferred_account_id.sql");
+pub const MIGRATION_005: &str = include_str!("migrations/0005_add_account_model_cache.sql");
 
 pub async fn connect_sqlite(database_url: &str) -> Result<SqlitePool> {
     let options = SqliteConnectOptions::from_str(database_url)?.create_if_missing(true);
@@ -29,6 +30,7 @@ pub async fn init_db(pool: &SqlitePool) -> Result<()> {
         ("0002", MIGRATION_002),
         ("0003", MIGRATION_003),
         ("0004", MIGRATION_004),
+        ("0005", MIGRATION_005),
     ];
     for (name, sql) in &migrations {
         for statement in sql.split(';') {

@@ -208,6 +208,7 @@ pub fn app(state: AppState) -> AppRouter {
             get(accounts::export_account_usage),
         )
         .route("/api/models/available", get(models::get_available_models))
+        .route("/api/models/available/stream", get(models::stream_available_models))
         .route(
             "/api/models/aliases",
             get(models::get_model_aliases).post(models::set_model_alias),

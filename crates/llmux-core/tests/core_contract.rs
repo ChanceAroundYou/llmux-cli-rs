@@ -54,6 +54,7 @@ async fn init_db_creates_fresh_schema_and_seed_providers() {
     assert_eq!(
         tables,
         vec![
+            "account_model_cache",
             "accounts",
             "api_keys",
             "model_aliases",

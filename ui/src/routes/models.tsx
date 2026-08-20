@@ -42,7 +42,7 @@ function formatContextLength(n: number): string {
 
 export default function Models() {
   const { t, i18n } = useTranslation();
-  const { availableModels, cachedAt, aliases, accounts, isLoading, fetchModels, fetchAliases, fetchAccounts, addAlias, deleteAlias, testModel } = useModelsStore();
+  const { availableModels, cachedAt, aliases, accounts, isLoading, streaming, fetchModels, streamModels, fetchAliases, fetchAccounts, addAlias, deleteAlias, testModel } = useModelsStore();
   const safeModels = availableModels || [];
   const safeAccounts = accounts || [];
   const [search, setSearch] = useState('');
@@ -116,13 +116,12 @@ export default function Models() {
     }
   };
 
-  // 1. 初始加载数据
+  // 1. 初始加载数据：秒开用缓存快照，随后自动开流增量刷新
   useEffect(() => {
-    fetchModels();
+    fetchModels().then(() => streamModels(false));
     fetchAliases();
     fetchAccounts();
     fetchHealth();
-    // 进入页面时仅检查一次队列状态
     fetchTestQueueStatus().then(setQueueStatus);
   }, []);
 
@@ -287,11 +286,11 @@ export default function Models() {
            <Button
              variant="ghost"
              size="icon"
-             onClick={() => { fetchModels(true); fetchHealth(); }}
+             onClick={() => { streamModels(true); fetchHealth(); }}
              className="text-muted-foreground"
              title={t('models.actions.refresh')}
            >
-             <RefreshCcw size={18} className={cn(isLoading && "animate-spin")} />
+             <RefreshCcw size={18} className={cn((isLoading || streaming) && "animate-spin")} />
            </Button>
            <Button
              size="sm"

@@ -104,9 +104,22 @@ pub async fn get_available_models(
         .unwrap_or_default()
         .as_secs() as i64;
 
+    // Try persistent cache first (survives restarts)
+    if let Some((data, per_account, cached_at, stale)) = load_persistent_snapshot(&state.pool).await {
+        if !force {
+            // keep in-memory cache in sync for v1/models
+            if let Ok(mut c) = state.models_cache.lock() {
+                *c = Some(ModelsCache { data: data.clone(), created_at: cached_at, refreshing: false });
+            }
+            tracing::debug!("🤖 Returning {} models from persistent cache (stale={})", data.len(), stale);
+            return Json(json!({ "data": data, "stale": stale, "cached_at": cached_at, "per_account": per_account })).into_response();
+        }
+    }
+
     if force {
         tracing::info!("🤖 Force refresh requested, bypassing cache");
         let data = do_fetch_models(&state).await;
+        persist_snapshot(&state.pool, &data).await;
         {
             let mut cache = state.models_cache.lock().unwrap();
             *cache = Some(ModelsCache {
@@ -118,7 +131,7 @@ pub async fn get_available_models(
         return Json(json!({ "data": data, "stale": false, "cached_at": now })).into_response();
     }
 
-    // stale-while-revalidate: return cached data, background refresh only when cache expired
+    // fallback: memory cache with stale-while-revalidate
     let (cached_data, need_refresh) = {
         let mut c = state.models_cache.lock().unwrap();
         match c.as_mut() {
@@ -140,6 +153,7 @@ pub async fn get_available_models(
             let cache_bg = state.models_cache.clone();
             tokio::spawn(async move {
                 let new_data = do_fetch_models(&state_bg).await;
+                persist_snapshot(&state_bg.pool, &new_data).await;
                 let now_bg = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -162,6 +176,7 @@ pub async fn get_available_models(
     }
 
     let data = do_fetch_models(&state).await;
+    persist_snapshot(&state.pool, &data).await;
     {
         let mut cache = state.models_cache.lock().unwrap();
         *cache = Some(ModelsCache {
@@ -171,6 +186,52 @@ pub async fn get_available_models(
         });
     }
     Json(json!({ "data": data, "stale": false, "cached_at": now })).into_response()
+}
+
+async fn load_persistent_snapshot(pool: &sqlx::SqlitePool) -> Option<(Vec<Value>, Vec<Value>, i64, bool)> {
+    let rows = sqlx::query("SELECT account_id, alias, models_json, error, updated_at FROM account_model_cache ORDER BY updated_at DESC")
+        .fetch_all(pool).await.ok()?;
+    if rows.is_empty() { return None; }
+    let mut all: Vec<Value> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut per_account: Vec<Value> = Vec::new();
+    let mut max_ts: i64 = 0;
+    for r in &rows {
+        let alias: String = r.try_get("alias").unwrap_or_default();
+        let j: String = r.try_get("models_json").unwrap_or_else(|_| "[]".into());
+        let err: Option<String> = r.try_get("error").unwrap_or(None);
+        let updated_at: i64 = r.try_get("updated_at").unwrap_or(0);
+        let account_id: i64 = r.try_get("account_id").unwrap_or(0);
+        max_ts = max_ts.max(updated_at);
+        let models: Vec<Value> = serde_json::from_str(&j).unwrap_or_default();
+        for m in &models { let id = m.get("id").and_then(Value::as_str).unwrap_or(""); let key = format!("{}:{}", alias, id); if seen.insert(key) { all.push(m.clone()); } }
+        per_account.push(json!({"account_id": account_id, "alias": alias, "updated_at": updated_at, "error": err, "count": models.len()}));
+    }
+    // merge alias custom models
+    let alias_rows = sqlx::query("SELECT DISTINCT target_model, provider_id FROM model_aliases WHERE target_model IS NOT NULL AND target_model != ''")
+        .fetch_all(pool).await.unwrap_or_default();
+    for r in alias_rows { let model_id: String = r.try_get("target_model").unwrap_or_default(); let provider: String = r.try_get("provider_id").unwrap_or_default(); if model_id.is_empty() { continue; } let owned_by = if provider.is_empty() { "custom".to_string() } else { provider.clone() }; let key = format!("{}:{}", owned_by, model_id); if seen.insert(key) { all.push(json!({"id": model_id, "object": "model", "created": 0, "owned_by": owned_by})); } }
+    const TTL: i64 = 24*60*60;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+    let stale = per_account.iter().any(|p| now - p.get("updated_at").and_then(Value::as_i64).unwrap_or(0) >= TTL);
+    Some((all, per_account, max_ts, stale))
+}
+
+async fn persist_snapshot(pool: &sqlx::SqlitePool, all_models: &[Value]) {
+    // group by owned_by (alias)
+    let mut by_alias: std::collections::HashMap<String, Vec<Value>> = std::collections::HashMap::new();
+    for m in all_models { if let Some(alias) = m.get("owned_by").and_then(Value::as_str) { by_alias.entry(alias.to_string()).or_default().push(m.clone()); } }
+    if by_alias.is_empty() { return; }
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+    // need account_id for each alias
+    for (alias, models) in by_alias {
+        let row = sqlx::query("SELECT id FROM accounts WHERE alias = ? LIMIT 1").bind(&alias).fetch_optional(pool).await.ok().flatten();
+        let account_id: Option<i64> = row.and_then(|r| r.try_get::<i64,_>("id").ok());
+        let Some(aid) = account_id else { continue; };
+        let j = serde_json::to_string(&models).unwrap_or_else(|_| "[]".into());
+        let _ = sqlx::query("INSERT OR REPLACE INTO account_model_cache (account_id, alias, models_json, error, updated_at) VALUES (?, ?, ?, NULL, ?)")
+            .bind(aid).bind(&alias).bind(&j).bind(now).execute(pool).await;
+    }
 }
 
 /// Fetch and merge models from all accounts. Extracted so it can be called
