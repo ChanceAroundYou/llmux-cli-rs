@@ -564,7 +564,8 @@ export default function Models() {
                   setAliasForm({ ...aliasForm, target: '', provider: '', selectedAccountIds: [] });
                   return;
                 }
-                const matchingAccounts = accts.filter(a => a.alias === parsed.owner && a.is_active === 1);
+                // 按模型 id 匹配所有拥有该模型的账户，不只所选 owner，避免同名模型在多账户间被隐藏
+                const matchingAccounts = accts.filter(a => a.is_active === 1 && safeModels.some(m => m.id === parsed.id && m.owned_by === a.alias));
                 setAliasForm({
                   ...aliasForm,
                   target: parsed.id,
@@ -582,8 +583,8 @@ export default function Models() {
           </div>
           {(() => {
             const accts = safeAccounts;
-            const matchingAccounts = aliasForm.target && aliasForm.provider
-              ? accts.filter(a => a.alias === aliasForm.provider && a.is_active === 1)
+            const matchingAccounts = aliasForm.target
+              ? accts.filter(a => a.is_active === 1 && safeModels.some(m => m.id === aliasForm.target && m.owned_by === a.alias))
               : [];
             const otherAccounts = accts.filter(a => !matchingAccounts.some(m => m.id === a.id) && a.is_active === 1);
             if (!aliasForm.target) return null;
