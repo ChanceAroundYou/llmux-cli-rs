@@ -211,7 +211,8 @@ async fn load_persistent_snapshot(pool: &sqlx::SqlitePool) -> Option<(Vec<Value>
         let updated_at: i64 = r.try_get("updated_at").unwrap_or(0);
         let account_id: i64 = r.try_get("account_id").unwrap_or(0);
         max_ts = max_ts.max(updated_at);
-        let models: Vec<Value> = serde_json::from_str(&j).unwrap_or_default();
+        let mut models: Vec<Value> = serde_json::from_str(&j).unwrap_or_default();
+        for m in &mut models { normalize_model(m); }
         for m in &models { let id = m.get("id").and_then(Value::as_str).unwrap_or(""); let key = format!("{}:{}", alias, id); if seen.insert(key) { all.push(m.clone()); } }
         per_account.push(json!({"account_id": account_id, "alias": alias, "updated_at": updated_at, "error": err, "count": models.len()}));
     }
