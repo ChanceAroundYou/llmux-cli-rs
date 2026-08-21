@@ -476,28 +476,21 @@ impl OpenAISseConverter {
     pub fn feed(&mut self, chunk: &Value) -> Vec<String> {
         let mut events = Vec::new();
 
-        // Diagnostic: log every upstream chunk to trace truncation.
-        if let Some(choices) = chunk.get("choices").and_then(Value::as_array) {
-            if let Some(first) = choices.first() {
-                let finish = first.get("finish_reason").and_then(Value::as_str).unwrap_or("");
-                let has_content = first.get("delta").and_then(|d| d.get("content")).is_some();
-                let has_tool = first.get("delta").and_then(|d| d.get("tool_calls")).is_some();
-                let tool_calls = first.get("delta").and_then(|d| d.get("tool_calls"));
-                if has_tool {
-                    let json_str = tool_calls.map(|v| v.to_string()).unwrap_or_default();
-                    let snippet: String = json_str.chars().take(200).collect();
-                    tracing::debug!(
-                        "converter.feed: finish_reason={finish}, has_tool=true, tool_calls~{snippet}"
-                    );
-                } else {
-                    tracing::debug!(
-                        "converter.feed: finish_reason={finish}, has_content={has_content}, has_tool={has_tool}, finished={}",
-                        self.finished
+        if tracing::enabled!(tracing::Level::TRACE) {
+            if let Some(choices) = chunk.get("choices").and_then(Value::as_array) {
+                if let Some(first) = choices.first() {
+                    let finish = first.get("finish_reason").and_then(Value::as_str).unwrap_or("");
+                    let has_content = first.get("delta").and_then(|d| d.get("content")).is_some();
+                    let has_tool = first.get("delta").and_then(|d| d.get("tool_calls")).is_some();
+                    tracing::trace!(
+                        finish_reason = finish,
+                        has_content, has_tool, finished = self.finished,
+                        "converter.feed"
                     );
                 }
+            } else if chunk.get("usage").is_some() {
+                tracing::trace!("converter.feed: usage chunk");
             }
-        } else if chunk.get("usage").is_some() {
-            tracing::debug!("converter.feed: usage chunk (no choices)");
         }
 
         if !self.message_started {
@@ -664,7 +657,7 @@ impl OpenAISseConverter {
     /// available), and terminate with `message_stop`. Idempotent.
     pub fn finish(&mut self) -> Vec<String> {
         if self.finished {
-            tracing::debug!("converter.finish: already finished, returning empty");
+            tracing::trace!("converter.finish: already finished");
             return Vec::new();
         }
         self.finished = true;
@@ -673,10 +666,12 @@ impl OpenAISseConverter {
             .pending_stop_reason
             .clone()
             .unwrap_or_else(|| "end_turn".to_string());
-        tracing::debug!(
-            "converter.finish: text_block={}, thinking={}, tools={}, stop_reason={}",
-            self.text_block_started, self.thinking_started,
-            self.tool_indices.len(), stop_reason
+        tracing::trace!(
+            text_block = self.text_block_started,
+            thinking = self.thinking_started,
+            tools = self.tool_indices.len(),
+            stop_reason,
+            "converter.finish"
         );
 
         let mut events = Vec::new();
@@ -743,7 +738,14 @@ impl OpenAISseConverter {
 
 /// Build a single Anthropic SSE frame: `event: <type>\ndata: <json>\n\n`.
 fn sse_event(event_type: &str, data: Value) -> String {
-    format!("event: {event_type}\ndata: {data}\n\n")
+    let data_str = data.to_string();
+    let mut s = String::with_capacity(16 + event_type.len() + data_str.len());
+    s.push_str("event: ");
+    s.push_str(event_type);
+    s.push_str("\ndata: ");
+    s.push_str(&data_str);
+    s.push_str("\n\n");
+    s
 }
 
 // ---------------------------------------------------------------------------
@@ -757,24 +759,29 @@ fn sse_event(event_type: &str, data: Value) -> String {
 /// in `buffer`.
 pub fn parse_sse_chunks(buffer: &mut Vec<u8>, max_events: usize) -> Vec<String> {
     let mut events = Vec::new();
-    loop {
+    let mut start = 0usize;
+    let len = buffer.len();
+    while start + 1 < len {
         if max_events > 0 && events.len() >= max_events {
             break;
         }
-        // Find first "\n\n" (or "\r\n\r\n").
-        let mut end = None;
-        let n = buffer.len();
-        let mut i = 0;
-        while i + 1 < n {
+        // scan for \n\n from start
+        let mut found = None;
+        let mut i = start;
+        while i + 1 < len {
             if buffer[i] == b'\n' && buffer[i + 1] == b'\n' {
-                end = Some(i + 2);
+                found = Some(i + 2);
                 break;
             }
             i += 1;
         }
-        let Some(end) = end else { break };
-        let chunk: Vec<u8> = buffer.drain(..end).collect();
-        events.push(String::from_utf8_lossy(&chunk).to_string());
+        let Some(end) = found else { break };
+        // slice is &buffer[start..end], no per-event drain
+        events.push(String::from_utf8_lossy(&buffer[start..end]).into_owned());
+        start = end;
+    }
+    if start > 0 {
+        buffer.drain(..start);
     }
     events
 }

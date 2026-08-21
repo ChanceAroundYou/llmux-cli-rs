@@ -407,22 +407,18 @@ pub async fn get_active_accounts(
     encryption_secret: &str,
 ) -> anyhow::Result<Vec<Account>> {
     let rows = if let Some(provider) = provider_or_alias {
-        let provider_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(1) FROM accounts WHERE provider_id = ? AND is_active = 1",
-        )
-        .bind(provider)
-        .fetch_one(pool)
-        .await?;
-        if provider_count > 0 {
-            sqlx::query("SELECT id, alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight, openai_compatible FROM accounts WHERE provider_id = ? AND is_active = 1 ORDER BY weight DESC, id ASC")
+        // ponytail: single query path — try provider_id first, alias fallback only if empty (saves one COUNT(*) RTT)
+        let rows = sqlx::query("SELECT id, alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight, openai_compatible FROM accounts WHERE provider_id = ? AND is_active = 1 ORDER BY weight DESC, id ASC")
                 .bind(provider)
                 .fetch_all(pool)
-                .await?
-        } else {
+                .await?;
+        if rows.is_empty() {
             sqlx::query("SELECT id, alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight, openai_compatible FROM accounts WHERE alias = ? AND is_active = 1 ORDER BY weight DESC, id ASC")
                 .bind(provider)
                 .fetch_all(pool)
                 .await?
+        } else {
+            rows
         }
     } else {
         sqlx::query("SELECT id, alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight, openai_compatible FROM accounts WHERE is_active = 1 ORDER BY weight DESC, id ASC")

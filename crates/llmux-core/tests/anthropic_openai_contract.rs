@@ -508,9 +508,11 @@ fn sse_state_machine_full_sequence() {
 
     let text: Vec<&str> = all.iter().map(|s| s.as_str()).collect();
     // message_start
-    assert!(text[0].starts_with("event: message_start\ndata: {\"type\":\"message_start\""));
+    // (field order is not guaranteed since serde_json dropped preserve_order —
+    // assert on event name + key presence, not on JSON key order)
+    assert!(text[0].starts_with("event: message_start\n") && text[0].contains("\"type\":\"message_start\""), "bad message_start: {text:?}");
     // thinking block opens
-    assert!(text.iter().any(|s| s.starts_with("event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\"")), "missing thinking start: {text:?}");
+    assert!(text.iter().any(|s| s.contains("content_block_start") && s.contains("\"type\":\"content_block_start\"") && s.contains("\"index\":0") && s.contains("\"type\":\"thinking\"")), "missing thinking start: {text:?}");
     assert!(text.iter().any(|s| s.contains("\"type\":\"thinking_delta\"")), "missing thinking delta: {text:?}");
     // thinking closes before text
     let think_stop = text.iter().position(|s| s.contains("\"index\":0") && s.contains("content_block_stop"));

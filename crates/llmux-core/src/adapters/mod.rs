@@ -10,7 +10,16 @@ fn get_client() -> &'static reqwest::Client {
     CLIENT.get_or_init(|| {
         reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(10))
-            .timeout(std::time::Duration::from_secs(600))
+            // ponytail: NO global `.timeout()`. reqwest's `.timeout()` bounds the
+            // whole request including streaming reads, so any non-huge value
+            // (e.g. 60s) kills long SSE responses mid-stream (long hy3 carries
+            // exceeded it → `error decoding response body` + done=false). This
+            // is a streaming gateway 1st and foremost; dead connections are
+            // reaped by pool_idle_timeout / tcp_keepalive instead. Per-request
+            // timeouts for non-streaming callers live at their call sites.
+            .pool_idle_timeout(std::time::Duration::from_secs(90))
+            .pool_max_idle_per_host(20)
+            .tcp_keepalive(std::time::Duration::from_secs(30))
             .build()
             .expect("failed to build reqwest client")
     })
@@ -22,6 +31,10 @@ pub async fn execute_provider_request(
     let client = get_client();
     let method = reqwest::Method::from_bytes(request.method.as_bytes())?;
     let mut builder = client.request(method, &request.url);
+    // ponytail: force identity encoding. Upstream SSE streams that get truncated
+    // mid-gzip make reqwest abort the whole stream ("error decoding response
+    // body"); with identity we receive plaintext and emit partial events instead.
+    builder = builder.header("accept-encoding", "identity");
     for (key, value) in &request.headers {
         builder = builder.header(key.as_str(), value.as_str());
     }

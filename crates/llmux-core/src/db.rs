@@ -8,11 +8,20 @@ pub const MIGRATION_002: &str = include_str!("migrations/0002_add_account_ids.sq
 pub const MIGRATION_003: &str = include_str!("migrations/0003_add_openai_compatible.sql");
 pub const MIGRATION_004: &str = include_str!("migrations/0004_add_preferred_account_id.sql");
 pub const MIGRATION_005: &str = include_str!("migrations/0005_add_account_model_cache.sql");
+pub const MIGRATION_006: &str = include_str!("migrations/0006_perf_indexes.sql");
 
 pub async fn connect_sqlite(database_url: &str) -> Result<SqlitePool> {
-    let options = SqliteConnectOptions::from_str(database_url)?.create_if_missing(true);
+    let options = SqliteConnectOptions::from_str(database_url)?
+        .create_if_missing(true)
+        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+        .synchronous(sqlx::sqlite::SqliteSynchronous::Normal)
+        .busy_timeout(std::time::Duration::from_secs(5))
+        .foreign_keys(true)
+        .optimize_on_close(true, None);
     let pool = SqlitePoolOptions::new()
-        .max_connections(5)
+        .max_connections(8)
+        .min_connections(1)
+        .acquire_timeout(std::time::Duration::from_secs(3))
         .connect_with(options)
         .await?;
     Ok(pool)
@@ -31,6 +40,7 @@ pub async fn init_db(pool: &SqlitePool) -> Result<()> {
         ("0003", MIGRATION_003),
         ("0004", MIGRATION_004),
         ("0005", MIGRATION_005),
+        ("0006", MIGRATION_006),
     ];
     for (name, sql) in &migrations {
         for statement in sql.split(';') {

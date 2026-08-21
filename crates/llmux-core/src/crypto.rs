@@ -6,9 +6,13 @@ use base64::Engine;
 use rand::rngs::OsRng;
 use rand::RngCore;
 use scrypt::{scrypt, Params};
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
 use zeroize::Zeroize;
+
+static KEY_CACHE: OnceLock<Mutex<HashMap<String, [u8; 32]>>> = OnceLock::new();
 
 const VERSION_PREFIX: &str = "v1";
 const SALT_LEN: usize = 16;
@@ -86,9 +90,34 @@ fn decode_part(part: Option<&str>, name: &str) -> Result<Vec<u8>> {
 }
 
 fn derive_key(secret: &str, salt: &[u8]) -> Result<[u8; KEY_LEN]> {
+    // ponytail: cache by (salt_hex, secret_hash) — same account decrypted every request; hash avoids retaining secret plaintext in cache key
+    let salt_hex = hex::encode(salt);
+    let secret_hash = {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        secret.hash(&mut h);
+        // mix length to reduce collision
+        secret.len().hash(&mut h);
+        format!("{:016x}", h.finish())
+    };
+    let cache_key = format!("{salt_hex}:{secret_hash}");
+    if let Some(cache) = KEY_CACHE.get() {
+        if let Ok(guard) = cache.lock() {
+            if let Some(cached) = guard.get(&cache_key) {
+                return Ok(*cached);
+            }
+        }
+    }
     let params = Params::recommended();
     let mut key = [0u8; KEY_LEN];
     scrypt(secret.as_bytes(), salt, &params, &mut key).context("derive encryption key")?;
+    let cache = KEY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(mut guard) = cache.lock() {
+        if guard.len() < 1024 {
+            guard.insert(cache_key, key);
+        }
+    }
     Ok(key)
 }
 
