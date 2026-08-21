@@ -85,9 +85,21 @@ const CONTEXT_TABLE: &[(&str, u64)] = &[
     ("moonshot", 131_072),
     ("command-r", 131_072),
     ("yi-lightning", 16_384),
-    // ── opencode / custom ─────────────────────────────────────
+    // ── opencode / custom (verified 2026-08 via upstream /v1/models) ──
     ("muse-spark", 128_000),
     ("hy3", 200_000),
+    ("agnes", 200_000),
+    ("sensenova", 262_144),
+    ("minimax-m3", 196_608),
+    ("minimax-m2", 131_072),
+    ("mimo-v2", 131_072),
+    ("glm-5", 200_000),
+    ("step-3", 65_536),
+    ("stepfun", 65_536),
+    ("auto", 1_048_576),
+    ("gpt-5", 400_000),
+    ("gemini-3", 1_048_576),
+    ("qwen", 131_072),
 ];
 
 /// Resolve a model's context length from the built-in table.
@@ -207,9 +219,9 @@ mod tests {
 
     #[test]
     fn unknown_models_return_none() {
-        assert_eq!(lookup_context_length("sensenova-6.8-flash-lite"), None);
+        assert_eq!(lookup_context_length("sensenova-6.8-flash-lite"), Some(262_144));
         assert_eq!(lookup_context_length("Ternary-Bonsai-27B-Q2_0.gguf"), None);
-        assert_eq!(lookup_context_length("auto"), None);
+        assert_eq!(lookup_context_length("auto"), Some(1_048_576));
         assert_eq!(lookup_context_length(""), None);
     }
 
