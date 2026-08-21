@@ -582,9 +582,6 @@ async fn openai_streaming_passthrough(
             }
         }
 
-        // ponytail: truncation = no [DONE] and no non-null finish_reason
-        let done = saw_done || last_finish.as_deref().is_some_and(|s| !s.is_empty());
-        let truncated = !done;
         let (prompt_tokens, completion_tokens) = match &last_usage {
             Some(u) => (
                 u.get("prompt_tokens").and_then(Value::as_i64).unwrap_or(0),
@@ -592,16 +589,23 @@ async fn openai_streaming_passthrough(
             ),
             None => (0, 0),
         };
+        // ponytail: truncation = no [DONE]/finish_reason; empty stream with 0 tokens also truncated
+        let done = saw_done || last_finish.as_deref().is_some_and(|s| !s.is_empty());
+        let truncated = !done;
+        let empty_content = !truncated && completion_tokens == 0 && chunks <= 4;
+        let final_truncated = truncated || empty_content;
+        let overflow = llmux_core::context::lookup_context_length(&model)
+            .is_some_and(|limit| (prompt_tokens as u64) > limit);
         let latency_ms = start.elapsed().as_millis() as i64;
 
         tracing::debug!(
-            "[openai:{model}] stream complete: done={done} saw_done={saw_done} finish={:?} chunks={chunks} buffer_remaining={} truncated={truncated} usage=({prompt_tokens},{completion_tokens})",
+            "[openai:{model}] stream complete: done={done} saw_done={saw_done} finish={:?} chunks={chunks} buffer_remaining={} truncated={final_truncated} overflow={overflow} usage=({prompt_tokens},{completion_tokens})",
             last_finish,
             buffer.len()
         );
-        if truncated {
+        if final_truncated {
             tracing::warn!(
-                "[openai:{model}] stream truncated: account={} finish_reason=null chunks={} saw_done={}",
+                "[openai:{model}] stream truncated: account={} finish_reason=null chunks={} saw_done={} empty={empty_content} overflow={overflow}",
                 account.alias,
                 chunks,
                 saw_done
@@ -618,9 +622,11 @@ async fn openai_streaming_passthrough(
             0,
             0,
             latency_ms,
-            !truncated,
-            if truncated {
-                Some(format!("truncated: finish_reason=null chunks={chunks} saw_done={saw_done}"))
+            !final_truncated,
+            if final_truncated {
+                Some(format!(
+                    "truncated: finish_reason=null chunks={chunks} saw_done={saw_done} empty={empty_content} overflow={overflow}"
+                ))
             } else {
                 None
             },

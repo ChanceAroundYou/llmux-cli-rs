@@ -638,12 +638,16 @@ async fn anthropic_to_openai_streaming(
         }
 
         tracing::debug!("[stream:{model}] stream complete: done={done}, chunks={chunks_received}, buffer_remaining={}", buffer.len());
-        // ponytail: truncation = no [DONE] and buffered as success=0 (mirrors openai passthrough)
-        let truncated = !done;
-        if truncated {
-            tracing::warn!("[stream:{model}] stream truncated: account={} chunks={chunks_received}", account.alias);
-        }
         let (input_tokens, output_tokens, cache_read, cache_create) = converter.usage_tokens();
+        // ponytail: no [DONE] => truncated; 0 output with few chunks (empty model response) also truncated; overflow when prompt > built-in window
+        let empty_content = done && output_tokens == 0 && chunks_received <= 4;
+        let raw_truncated = !done;
+        let truncated = raw_truncated || empty_content;
+        let overflow = llmux_core::context::lookup_context_length(&model)
+            .is_some_and(|limit| (input_tokens as u64) > limit);
+        if truncated {
+            tracing::warn!("[stream:{model}] stream truncated: account={} chunks={chunks_received} empty={empty_content} overflow={overflow}", account.alias);
+        }
         let latency_ms = start.elapsed().as_millis() as i64;
         spawn_log_usage(
             pool.clone(),
@@ -657,7 +661,7 @@ async fn anthropic_to_openai_streaming(
             latency_ms,
             !truncated,
             if truncated {
-                Some(format!("truncated: done=false chunks={chunks_received}"))
+                Some(format!("truncated: done={done} empty={empty_content} overflow={overflow} chunks={chunks_received}"))
             } else {
                 None
             },
