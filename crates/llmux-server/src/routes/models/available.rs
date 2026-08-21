@@ -44,14 +44,22 @@ fn normalize_model(m: &mut Value) {
     obj.entry("object".to_string()).or_insert(json!("model"));
     obj.entry("created".to_string()).or_insert(json!(0));
 
-    // Resolve context length: upstream-specific fields first, built-in table as fallback.
-    let context_length = extract_context_length(obj).or_else(|| {
-        if id.is_empty() {
-            None
-        } else {
-            lookup_context_length(&id)
-        }
-    });
+    // Resolve context length: upstream first, built-in table as fallback,
+    // but take the larger of the two. Agnes /v1/models is stale (200k) while
+    // the real window is 512k/1M (verified via wiki + 524288 probe); max()
+    // fixes stale upstream without regressing providers that report larger.
+    let upstream = extract_context_length(obj);
+    let table = if id.is_empty() {
+        None
+    } else {
+        lookup_context_length(&id)
+    };
+    let context_length = match (upstream, table) {
+        (Some(u), Some(t)) => Some(u.max(t)),
+        (Some(u), None) => Some(u),
+        (None, Some(t)) => Some(t),
+        (None, None) => None,
+    };
     if let Some(ctx) = context_length {
         obj.insert("context_length".to_string(), json!(ctx));
     }

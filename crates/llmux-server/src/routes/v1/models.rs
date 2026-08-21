@@ -100,19 +100,29 @@ pub async fn models(Extension(state): Extension<AppState>, headers: HeaderMap) -
 
 /// Resolve an alias's context length: match its target model against the
 /// cached upstream model list first, then fall back to the built-in table.
+/// Takes the larger of upstream vs table to survive stale upstream data
+/// (e.g. Agnes reports 200k while the real window is 512k/1M).
 fn resolve_alias_context(state: &AppState, target_model: Option<&str>) -> Option<u64> {
     let target = target_model?;
     if target.is_empty() {
         return None;
     }
+    let mut upstream: Option<u64> = None;
     if let Some(cache) = state.models_cache.lock().unwrap().as_ref() {
         for m in &cache.data {
             if m.get("id").and_then(Value::as_str) == Some(target) {
                 if let Some(ctx) = m.get("context_length").and_then(Value::as_u64) {
-                    return Some(ctx);
+                    upstream = Some(ctx);
+                    break;
                 }
             }
         }
     }
-    lookup_context_length(target)
+    let table = lookup_context_length(target);
+    match (upstream, table) {
+        (Some(u), Some(t)) => Some(u.max(t)),
+        (Some(u), None) => Some(u),
+        (None, Some(t)) => Some(t),
+        (None, None) => None,
+    }
 }
