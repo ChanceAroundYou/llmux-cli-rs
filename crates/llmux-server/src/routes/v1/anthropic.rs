@@ -638,6 +638,11 @@ async fn anthropic_to_openai_streaming(
         }
 
         tracing::debug!("[stream:{model}] stream complete: done={done}, chunks={chunks_received}, buffer_remaining={}", buffer.len());
+        // ponytail: truncation = no [DONE] and buffered as success=0 (mirrors openai passthrough)
+        let truncated = !done;
+        if truncated {
+            tracing::warn!("[stream:{model}] stream truncated: account={} chunks={chunks_received}", account.alias);
+        }
         let (input_tokens, output_tokens, cache_read, cache_create) = converter.usage_tokens();
         let latency_ms = start.elapsed().as_millis() as i64;
         spawn_log_usage(
@@ -650,8 +655,12 @@ async fn anthropic_to_openai_streaming(
             cache_read,
             cache_create,
             latency_ms,
-            true,
-            None,
+            !truncated,
+            if truncated {
+                Some(format!("truncated: done=false chunks={chunks_received}"))
+            } else {
+                None
+            },
         );
     });
 

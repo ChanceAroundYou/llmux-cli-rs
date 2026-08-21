@@ -85,6 +85,9 @@ const CONTEXT_TABLE: &[(&str, u64)] = &[
     ("moonshot", 131_072),
     ("command-r", 131_072),
     ("yi-lightning", 16_384),
+    // ── opencode / custom ─────────────────────────────────────
+    ("muse-spark", 128_000),
+    ("hy3", 200_000),
 ];
 
 /// Resolve a model's context length from the built-in table.
