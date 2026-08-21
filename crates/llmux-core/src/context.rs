@@ -125,7 +125,10 @@ const CONTEXT_TABLE: &[(&str, u64)] = &[
     ("nemotron-3-ultra", ONE_M),
     ("ox-alpha", ONE_M),
     // ── other custom / fallback ──
-    ("agnes", 512_000),  // wiki.agnes-ai.cn 512K
+    ("agnes-2.5-pro", ONE_M),  // wiki.agnes-ai.cn 1M
+    ("agnes-2.5", 512_000),  // wiki.agnes-ai.cn 512K (flash)
+    ("agnes-2.0", 512_000),  // wiki.agnes-ai.cn 512K
+    ("agnes", 512_000),  // fallback for any agnes-* text model
     ("sensenova", 262_144),
     ("stepfun", 65_536),
     ("auto", 1_048_576),
