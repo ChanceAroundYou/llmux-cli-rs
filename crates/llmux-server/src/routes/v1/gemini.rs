@@ -20,7 +20,7 @@ use llmux_core::dispatcher::{self, get_accounts_by_ids, get_active_accounts, is_
 use crate::app::{AppState, TuiEvent};
 use crate::middleware::{self, AuthContext};
 
-use super::helpers::{log_usage, spawn_log_usage, normalize_base_url, send_tui_request};
+use super::helpers::{spawn_log_usage, normalize_base_url, send_tui_request};
 
 // ---------------------------------------------------------------------------
 // /v1beta/models/{model}:{action}  — Gemini native protocol passthrough

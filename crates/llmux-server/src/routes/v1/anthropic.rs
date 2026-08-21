@@ -27,7 +27,7 @@ use llmux_core::proxy::{build_anthropic_passthrough_request, extract_anthropic_u
 use crate::app::{AppState, TuiEvent};
 use crate::middleware::{self, AuthContext};
 
-use super::helpers::{log_usage, spawn_log_usage, send_tui_request};
+use super::helpers::{spawn_log_usage, send_tui_request};
 
 // ---------------------------------------------------------------------------
 // /v1/messages  (Anthropic Messages API)

@@ -28,7 +28,7 @@ use llmux_core::proxy::{build_anthropic_target_url, anthropic_openai::{parse_sse
 use crate::app::{AppState, TuiEvent};
 use crate::middleware::{self, AuthContext};
 
-use super::helpers::{log_usage, spawn_log_usage, normalize_base_url, send_tui_request};
+use super::helpers::{spawn_log_usage, normalize_base_url, send_tui_request};
 
 // ---------------------------------------------------------------------------
 // /v1/chat/completions  — pure OpenAI-compatible passthrough
@@ -437,8 +437,10 @@ async fn openai_dispatch(
 // ---------------------------------------------------------------------------
 
 /// Passthrough streaming for OpenAI-compatible responses.
-/// Bytes are forwarded as-is (SSE). Usage is logged asynchronously with
-/// estimated tokens since we don't parse the stream.
+/// Bytes are forwarded as-is (SSE) but the stream is also parsed for
+/// observability: `finish_reason`, `usage`, and truncation (`[DONE]` / null
+/// finish_reason without tail usage) are extracted so `ag` (agnes-2.5-flash)
+/// truncations are no longer invisible (`output_tokens` 0 + `success=1`).
 async fn openai_streaming_passthrough(
     response: reqwest::Response,
     model: &str,
@@ -449,34 +451,183 @@ async fn openai_streaming_passthrough(
     let model = model.to_string();
     let account = account.clone();
 
-    let stream = response.bytes_stream().map(move |chunk| {
-        chunk.map_err(|err| {
-            tracing::warn!("upstream stream read error: {err}");
-            axum::Error::new(err)
-        })
-    });
-
-    let pool_clone = pool.clone();
-    let model_clone = model.clone();
+    let (tx, rx) = mpsc::channel::<Result<Bytes, axum::Error>>(64);
     tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let mut buffer: Vec<u8> = Vec::with_capacity(4096);
+        let mut sse = response.bytes_stream();
+        let mut chunks: u64 = 0;
+        let mut saw_done = false;
+        let mut last_finish: Option<String> = None;
+        let mut last_usage: Option<Value> = None;
+
+        tracing::debug!("[openai:{model}] upstream stream started (account={})", account.alias);
+
+        while let Some(chunk) = sse.next().await {
+            match chunk {
+                Ok(c) => {
+                    chunks += 1;
+                    // forward raw bytes to client before parsing
+                    if tx.send(Ok(Bytes::from(c.to_vec()))).await.is_err() {
+                        return;
+                    }
+                    buffer.extend_from_slice(&c);
+                    for event_text in parse_sse_chunks(&mut buffer, 0) {
+                        let Some(payload) = sse_data_payload(&event_text) else {
+                            continue;
+                        };
+                        if payload.trim() == "[DONE]" {
+                            saw_done = true;
+                            continue;
+                        }
+                        let Ok(parsed) = serde_json::from_str::<Value>(payload) else {
+                            continue;
+                        };
+                        if let Some(u) = parsed.get("usage") {
+                            if u.is_object() {
+                                last_usage = Some(u.clone());
+                            }
+                        }
+                        if let Some(choice) = parsed
+                            .get("choices")
+                            .and_then(Value::as_array)
+                            .and_then(|a| a.first())
+                        {
+                            if let Some(fr) = choice.get("finish_reason") {
+                                if fr.is_null() {
+                                    last_finish = None;
+                                } else if let Some(s) = fr.as_str() {
+                                    if !s.is_empty() {
+                                        last_finish = Some(s.to_string());
+                                    }
+                                }
+                            }
+                            // some gateways emit usage alongside the last choice
+                            if let Some(u) = parsed.get("usage") {
+                                last_usage = Some(u.clone());
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "[openai:{model}] upstream stream read error: {e} (account={}, chunks={})",
+                        account.alias,
+                        chunks
+                    );
+                    break;
+                }
+            }
+        }
+
+        // drain any complete events still buffered
+        loop {
+            let events = parse_sse_chunks(&mut buffer, 0);
+            if events.is_empty() {
+                break;
+            }
+            for event_text in events {
+                let Some(payload) = sse_data_payload(&event_text) else {
+                    continue;
+                };
+                if payload.trim() == "[DONE]" {
+                    saw_done = true;
+                    continue;
+                }
+                let Ok(parsed) = serde_json::from_str::<Value>(payload) else {
+                    continue;
+                };
+                if let Some(u) = parsed.get("usage") {
+                    last_usage = Some(u.clone());
+                }
+                if let Some(choice) = parsed
+                    .get("choices")
+                    .and_then(Value::as_array)
+                    .and_then(|a| a.first())
+                {
+                    if let Some(fr) = choice.get("finish_reason") {
+                        if fr.is_null() {
+                            last_finish = None;
+                        } else if let Some(s) = fr.as_str() {
+                            if !s.is_empty() {
+                                last_finish = Some(s.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // trailing partial without blank-line terminator
+        if !buffer.is_empty() {
+            let text = String::from_utf8_lossy(&buffer).to_string();
+            if let Some(payload) = sse_data_payload(&text) {
+                if payload.trim() == "[DONE]" {
+                    saw_done = true;
+                } else if let Ok(parsed) = serde_json::from_str::<Value>(payload) {
+                    if let Some(choice) = parsed
+                        .get("choices")
+                        .and_then(Value::as_array)
+                        .and_then(|a| a.first())
+                    {
+                        if let Some(fr) = choice.get("finish_reason").and_then(Value::as_str) {
+                            if !fr.is_empty() {
+                                last_finish = Some(fr.to_string());
+                            }
+                        }
+                    }
+                    if let Some(u) = parsed.get("usage") {
+                        last_usage = Some(u.clone());
+                    }
+                }
+            }
+        }
+
+        // ponytail: truncation = no [DONE] and no non-null finish_reason
+        let done = saw_done || last_finish.as_deref().is_some_and(|s| !s.is_empty());
+        let truncated = !done;
+        let (prompt_tokens, completion_tokens) = match &last_usage {
+            Some(u) => (
+                u.get("prompt_tokens").and_then(Value::as_i64).unwrap_or(0),
+                u.get("completion_tokens").and_then(Value::as_i64).unwrap_or(0),
+            ),
+            None => (0, 0),
+        };
         let latency_ms = start.elapsed().as_millis() as i64;
+
+        tracing::debug!(
+            "[openai:{model}] stream complete: done={done} saw_done={saw_done} finish={:?} chunks={chunks} buffer_remaining={} truncated={truncated} usage=({prompt_tokens},{completion_tokens})",
+            last_finish,
+            buffer.len()
+        );
+        if truncated {
+            tracing::warn!(
+                "[openai:{model}] stream truncated: account={} finish_reason=null chunks={} saw_done={}",
+                account.alias,
+                chunks,
+                saw_done
+            );
+        }
+
         spawn_log_usage(
-            pool_clone.clone(),
+            pool.clone(),
             account.clone(),
-            model_clone.clone(),
+            model.clone(),
             account.provider_id.clone(),
-            0,
-            0,
+            prompt_tokens,
+            completion_tokens,
             0,
             0,
             latency_ms,
-            true,
-            None,
+            !truncated,
+            if truncated {
+                Some(format!("truncated: finish_reason=null chunks={chunks} saw_done={saw_done}"))
+            } else {
+                None
+            },
         );
     });
 
-    let body = Body::from_stream(stream);
+    let body = Body::from_stream(ReceiverStream::new(rx));
     Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "text/event-stream")
