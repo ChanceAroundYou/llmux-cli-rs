@@ -1,3 +1,4 @@
+import { apiFetch } from "@/lib/api";
 import React, { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { ExternalLink, Check, X, Loader2, Code2 } from 'lucide-react';
@@ -34,7 +35,7 @@ export default function WebLoginWizard({ isOpen, onClose, provider }: Props) {
 
   if (provider === 'openai') {
     try {
-      const res = await fetch('/api/auth/session');
+      const res = await apiFetch('/api/auth/session');
       const data = await res.json();
       token = data.accessToken;
       if (token) console.log('${t('auth.script.tokenFound', { provider: 'OpenAI' })}');

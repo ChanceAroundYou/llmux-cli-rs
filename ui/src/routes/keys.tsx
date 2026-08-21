@@ -50,8 +50,8 @@ export default function KeysPage() {
   const [warningKeyNames, setWarningKeyNames] = useState<string[]>([]);
 
   const baseUrl = typeof window !== 'undefined'
-    ? (() => { const p = window.location.pathname.startsWith('/llmux') ? '/llmux' : ''; return `${window.location.origin}${p}/v1`; })()
-    : 'http://localhost:25976/llmux/v1';
+    ? `${window.location.origin}${(import.meta.env.BASE_URL as string).replace(/\/$/, '')}/v1`
+    : `http://localhost:25976${(import.meta.env.BASE_URL as string).replace(/\/$/, '')}/v1`;
 
   useEffect(() => {
     fetchKeys();

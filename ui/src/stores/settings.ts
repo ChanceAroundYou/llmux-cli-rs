@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { apiFetch } from "@/lib/api";
 
 interface SettingsState {
   config: Record<string, any>;
@@ -17,7 +18,7 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
     if (get().isLoading) return;
     set({ isLoading: true });
     try {
-      const res = await fetch('/api/settings');
+      const res = await apiFetch('/api/settings');
       const data = await res.json();
       set({ config: data, isInitialized: true });
       
@@ -40,7 +41,7 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
   updateSettings: async (newConfig) => {
     set({ isLoading: true });
     try {
-      await fetch('/api/settings', {
+      await apiFetch('/api/settings', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(newConfig),

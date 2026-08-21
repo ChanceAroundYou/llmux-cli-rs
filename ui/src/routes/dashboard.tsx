@@ -1,4 +1,5 @@
 import React, { useEffect, useState, useMemo } from 'react';
+import { apiFetch } from "@/lib/api";
 import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router-dom';
 import { RefreshCw, Plus, Search, AlertTriangle, Database, Users, Zap, Key, Shield, Activity, LayoutDashboard } from 'lucide-react';
@@ -48,8 +49,8 @@ export default function Dashboard() {
     setIsLoading(true);
     try {
       const [accRes, aliasRes, keyRes, healthRes, mhRes, actRes] = await Promise.all([
-        fetch('/api/accounts'), fetch('/api/models/aliases'), fetch('/api/keys'),
-        fetch('/api/health'), fetch('/api/models/health'), fetch('/api/activity?limit=200'),
+        apiFetch('/api/accounts'), apiFetch('/api/models/aliases'), apiFetch('/api/keys'),
+        apiFetch('/api/health'), apiFetch('/api/models/health'), apiFetch('/api/activity?limit=200'),
       ]);
       const accounts = accRes.ok ? await accRes.json() : [];
       const aliasData: ModelAlias[] = aliasRes.ok ? await aliasRes.json() : [];

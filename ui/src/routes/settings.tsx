@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
+import { apiFetch } from "@/lib/api";
 import { useTranslation } from 'react-i18next';
 import { useSettingsStore } from '../stores/settings';
 import {
@@ -101,7 +102,7 @@ export default function Settings() {
   const handleExport = async () => {
     setIsExporting(true);
     try {
-      const res = await fetch('/api/export');
+      const res = await apiFetch('/api/export');
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
@@ -122,7 +123,7 @@ export default function Settings() {
     try {
       const text = await file.text();
       const json = JSON.parse(text);
-      const res = await fetch('/api/import', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(json) });
+      const res = await apiFetch('/api/import', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(json) });
       const data = await res.json();
       if (data.success) {
         const { accounts, aliases, keys } = data.imported;
@@ -139,9 +140,9 @@ export default function Settings() {
   const handlePurge = async () => {    setIsConfirmOpen(false);
     setIsPurging(true);
     try {
-      const res = await fetch('/api/settings/reset', { method: 'POST' });
+      const res = await apiFetch('/api/settings/reset', { method: 'POST' });
       if (res.ok) {
-        window.location.href = '/'; 
+        window.location.href = import.meta.env.BASE_URL; 
       }
     } catch (err) {
       console.error('Purge failed:', err);

@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { apiFetch } from "@/lib/api";
 
 export interface ApiKey {
   id: number;
@@ -23,7 +24,7 @@ export const useKeysStore = create<KeysState>((set, get) => ({
   fetchKeys: async () => {
     set({ isLoading: true });
     try {
-      const res = await fetch('/api/keys');
+      const res = await apiFetch('/api/keys');
       if (res.ok) {
         const data = await res.json();
         set({ keys: data });
@@ -33,7 +34,7 @@ export const useKeysStore = create<KeysState>((set, get) => ({
     }
   },
   createKey: async (name, allowedModels) => {
-    const res = await fetch('/api/keys', {
+    const res = await apiFetch('/api/keys', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name, allowed_models: allowedModels }),
@@ -45,12 +46,12 @@ export const useKeysStore = create<KeysState>((set, get) => ({
     return data.key;
   },
   deleteKey: async (id) => {
-    const res = await fetch(`/api/keys/${id}`, { method: 'DELETE' });
+    const res = await apiFetch(`/api/keys/${id}`, { method: 'DELETE' });
     if (!res.ok) throw new Error('Failed to delete API key');
     await get().fetchKeys();
   },
   updateKey: async (id, name, allowedModels) => {
-    const res = await fetch(`/api/keys/${id}`, {
+    const res = await apiFetch(`/api/keys/${id}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name, allowed_models: allowedModels }),

@@ -1,4 +1,5 @@
 import React, { useEffect, useState, useMemo } from 'react';
+import { apiFetch } from "@/lib/api";
 import { useModelsStore } from '../stores/models';
 import {
   Box,
@@ -90,7 +91,7 @@ export default function Models() {
 
   const fetchHealth = async () => {
     try {
-      const res = await fetch('/api/models/health');
+      const res = await apiFetch('/api/models/health');
       if (res.ok) {
         const data: any[] = await res.json();
         setTestResults(prev => {
@@ -784,4 +785,3 @@ export default function Models() {
     </div>
   );
 }
-

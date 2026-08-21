@@ -1,4 +1,5 @@
 import React, { useEffect, useState, useMemo, useCallback } from 'react';
+import { apiFetch } from "@/lib/api";
 import { useTranslation } from 'react-i18next';
 import { BarChart3, RefreshCw, Search, Inbox } from 'lucide-react';
 import { PageHeader } from '../components/shared/PageHeader';
@@ -111,7 +112,7 @@ export default function StatsPage() {
   const fetchStats = useCallback(async () => {
     setLoading(true);
     try {
-      const res = await fetch(`/api/stats?start=${range.start}&end=${range.end}`);
+      const res = await apiFetch(`/api/stats?start=${range.start}&end=${range.end}`);
       if (!res.ok) throw new Error(await res.text());
       const data = await res.json();
       setSummary(data.summary ?? null);
@@ -229,7 +230,7 @@ export default function StatsPage() {
     interaction: { mode: 'index', intersect: false } as const,
     plugins: {
       legend: { display: true, position: 'bottom' as const, labels: { boxWidth: 10, font: { size: 10 }, padding: 12 } },
-      tooltip: { backgroundColor: '#1e293b', titleFont: { size: 10 }, bodyFont: { size: 10 }, itemSort: (a: any, b: any) => a.datasetIndex - b.datasetIndex },
+      tooltip: { backgroundColor: '#1e293b', titleFont: { size: 10 }, bodyFont: { size: 10 }, itemSort: (a: any, b: any) => b.datasetIndex - a.datasetIndex /* stack bottom->top: cache(0)->input(1)->output(2), so top->down = output(2), input(1), cache(0) */ },
     },
     scales: { x: { stacked: true, ticks: { maxRotation: 0, font: { size: 9 } } }, y: { stacked: true, beginAtZero: true } },
   }), []);

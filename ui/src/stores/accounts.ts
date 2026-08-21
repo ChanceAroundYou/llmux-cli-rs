@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { apiFetch } from "@/lib/api";
 
 export interface Account {
   id: number;
@@ -31,7 +32,7 @@ export const useAccountsStore = create<AccountsState>((set, get) => ({
   fetchAccounts: async () => {
     set({ isLoading: true, error: null });
     try {
-      const res = await fetch('/api/accounts');
+      const res = await apiFetch('/api/accounts');
       if (!res.ok) throw new Error('Failed to fetch accounts');
       const data = await res.json();
       set({ accounts: data, isLoading: false });
@@ -42,7 +43,7 @@ export const useAccountsStore = create<AccountsState>((set, get) => ({
 
   addAccount: async (account) => {
     try {
-      const res = await fetch('/api/accounts', {
+      const res = await apiFetch('/api/accounts', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(account),
@@ -60,7 +61,7 @@ export const useAccountsStore = create<AccountsState>((set, get) => ({
 
   updateAccount: async (id, account) => {
     try {
-      const res = await fetch(`/api/accounts/${id}`, {
+      const res = await apiFetch(`/api/accounts/${id}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(account),
@@ -78,7 +79,7 @@ export const useAccountsStore = create<AccountsState>((set, get) => ({
 
   deleteAccount: async (id) => {
     try {
-      const res = await fetch(`/api/accounts/${id}`, { method: 'DELETE' });
+      const res = await apiFetch(`/api/accounts/${id}`, { method: 'DELETE' });
       if (!res.ok) throw new Error('Failed to delete account');
       await get().fetchAccounts();
     } catch (err: any) {
@@ -89,7 +90,7 @@ export const useAccountsStore = create<AccountsState>((set, get) => ({
 
   toggleActive: async (id, currentStatus) => {
     try {
-      const res = await fetch(`/api/accounts/${id}`, {
+      const res = await apiFetch(`/api/accounts/${id}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ is_active: currentStatus === 1 ? 0 : 1 }),

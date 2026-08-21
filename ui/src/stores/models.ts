@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { apiFetch } from "@/lib/api";
 
 export interface AvailableModel {
   id: string;
@@ -74,7 +75,7 @@ export const useModelsStore = create<ModelsState>((set, get) => ({
     set({ isLoading: true, error: null });
     try {
       const url = force ? '/api/models/available?force=true' : '/api/models/available';
-      const res = await fetch(url);
+      const res = await apiFetch(url);
       if (!res.ok) throw new Error('Failed to fetch available models');
       const json = await res.json();
       const models = Array.isArray(json) ? json : (json.data || []);
@@ -99,7 +100,7 @@ export const useModelsStore = create<ModelsState>((set, get) => ({
     set({ streaming: true, error: null });
     try {
       const url = force ? '/api/models/available/stream?force=true' : '/api/models/available/stream';
-      const res = await fetch(url, { headers: { Accept: 'text/event-stream' }, signal: ac.signal });
+      const res = await apiFetch(url, { headers: { Accept: 'text/event-stream' }, signal: ac.signal });
       if (!res.ok || !res.body) throw new Error(`Stream failed: ${res.status}`);
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
@@ -163,7 +164,7 @@ export const useModelsStore = create<ModelsState>((set, get) => ({
   fetchAliases: async () => {
     set({ error: null });
     try {
-      const res = await fetch('/api/models/aliases');
+      const res = await apiFetch('/api/models/aliases');
       if (!res.ok) throw new Error('Failed to fetch aliases');
       const data = await res.json();
       set({ aliases: data });
@@ -174,7 +175,7 @@ export const useModelsStore = create<ModelsState>((set, get) => ({
 
   fetchAccounts: async () => {
     try {
-      const res = await fetch('/api/accounts');
+      const res = await apiFetch('/api/accounts');
       if (!res.ok) throw new Error('Failed to fetch accounts');
       const data = await res.json();
       set({ accounts: data });
@@ -192,7 +193,7 @@ export const useModelsStore = create<ModelsState>((set, get) => ({
       if (preferredAccountId != null) {
         body.preferred_account_id = preferredAccountId;
       }
-      const res = await fetch('/api/models/aliases', {
+      const res = await apiFetch('/api/models/aliases', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
@@ -210,7 +211,7 @@ export const useModelsStore = create<ModelsState>((set, get) => ({
 
   deleteAlias: async (id) => {
     try {
-      const res = await fetch(`/api/models/aliases/${id}`, { method: 'DELETE' });
+      const res = await apiFetch(`/api/models/aliases/${id}`, { method: 'DELETE' });
       if (!res.ok) throw new Error('Failed to delete alias');
       await get().fetchAliases();
     } catch (err: any) {
@@ -221,7 +222,7 @@ export const useModelsStore = create<ModelsState>((set, get) => ({
 
   testModel: async (modelId, providerId, accountId) => {
     try {
-      const res = await fetch('/api/models/test', {
+      const res = await apiFetch('/api/models/test', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ model: modelId, providerId, accountId }),
@@ -234,7 +235,7 @@ export const useModelsStore = create<ModelsState>((set, get) => ({
 
   startTestQueue: async (models) => {
     try {
-      const res = await fetch('/api/models/test-all', {
+      const res = await apiFetch('/api/models/test-all', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ models }),
@@ -247,7 +248,7 @@ export const useModelsStore = create<ModelsState>((set, get) => ({
 
   fetchTestQueueStatus: async () => {
     try {
-      const res = await fetch('/api/models/test-queue/status');
+      const res = await apiFetch('/api/models/test-queue/status');
       return await res.json();
     } catch (err: any) {
       return { isRunning: false, progress: 0, current: 0, total: 0 };

@@ -191,7 +191,7 @@ function App() {
 
 export default function Root() {
   return (
-    <Router>
+    <Router basename={import.meta.env.BASE_URL}>
       <App />
     </Router>
   );

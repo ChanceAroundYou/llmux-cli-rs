@@ -3,7 +3,12 @@ import react from '@vitejs/plugin-react'
 import path from 'path'
 
 // https://vitejs.dev/config/
+const rawBase = process.env.VITE_BASE_PATH ?? "";
+const vBase = rawBase.trim().replace(/^\/+|\/+$/g, "");
+const base = vBase ? `/${vBase}/` : "/";
+
 export default defineConfig({
+  base,
   plugins: [
     react(),
     {
@@ -42,7 +47,8 @@ export default defineConfig({
       '/v1': {
         target: 'http://localhost:25976',
         changeOrigin: true,
-      }
+      },
+      ...(vBase ? { [`/${vBase}/api`]: { target: 'http://localhost:25976', changeOrigin: true, rewrite: (path: string) => path.replace(`/${vBase}`, '') }, [`/${vBase}/v1`]: { target: 'http://localhost:25976', changeOrigin: true, rewrite: (path: string) => path.replace(`/${vBase}`, '') } } : {}),
     }
   },
   build: {
