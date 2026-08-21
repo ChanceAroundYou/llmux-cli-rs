@@ -18,12 +18,17 @@ const FALLBACK_INDEX: &str = r#"<!doctype html>
 "#;
 
 pub async fn serve_spa(path: &str) -> Response {
-    let normalized = normalize_path(path);
+    serve_spa_with_base(path, "").await
+}
+
+pub async fn serve_spa_with_base(path: &str, base: &str) -> Response {
+    let eff = strip_base(path, base);
+    let normalized = normalize_path(eff);
     if let Some(response) = serve_asset(&normalized) {
         return response;
     }
 
-    if normalized == "/" || normalized == "/index.html" || is_spa_path(path) {
+    if normalized == "/" || normalized == "/index.html" || is_spa_path(eff) {
         if let Some(response) = serve_asset("/index.html") {
             return response;
         }
@@ -31,6 +36,14 @@ pub async fn serve_spa(path: &str) -> Response {
     }
 
     crate::error::not_found()
+}
+
+fn strip_base<'a>(path: &'a str, base: &str) -> &'a str {
+    if base.is_empty() { return path; }
+    if path == base { return "/"; }
+    if let Some(s) = path.strip_prefix(base) {
+        if s.is_empty() { "/" } else { s }
+    } else { path }
 }
 
 fn normalize_path(path: &str) -> String {

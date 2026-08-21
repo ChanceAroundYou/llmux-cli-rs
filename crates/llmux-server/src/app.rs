@@ -1,4 +1,6 @@
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use axum::{
     extract::{DefaultBodyLimit, OriginalUri},
@@ -10,15 +12,33 @@ use axum::{
 };
 use std::task::{Context, Poll};
 use tower::{Layer, Service};
-use llmux_core::dispatcher::DispatchRouter;
+use llmux_core::dispatcher::{DispatchRouter, ModelResolution};
 use serde_json::Value;
 use sqlx::SqlitePool;
+use crate::middleware::AuthContext;
+
+pub const HOT_CACHE_TTL: Duration = Duration::from_secs(60);
+// ponytail: simple TTL caches for hot-path SQL — avoid 2 RTT per request (auth + alias)
+
+#[derive(Debug, Clone)]
+pub struct CachedAuth {
+    pub ctx: AuthContext,
+    pub expires: Instant,
+}
+#[derive(Debug, Clone)]
+pub struct CachedModel {
+    pub resolution: ModelResolution,
+    pub expires: Instant,
+}
 use tower_http::{
     cors::{Any, CorsLayer},
     trace::TraceLayer,
 };
 
 use crate::routes::{accounts, auth, health, keys, models, settings, stats, system, usage, v1};
+
+static TIME_FMT: LazyLock<Vec<time::format_description::BorrowedFormatItem<'static>>> =
+    LazyLock::new(|| time::format_description::parse_borrowed::<1>("[hour]:[minute]:[second]").unwrap());
 use crate::routes::models::TestQueueState;
 
 #[derive(Clone)]
@@ -57,10 +77,13 @@ pub struct AppState {
     pub pool: SqlitePool,
     pub master_key: String,
     pub data_dir: std::path::PathBuf,
+    pub base_path: String,
     pub test_queue: Arc<Mutex<TestQueueState>>,
-    pub dispatch_router: Arc<tokio::sync::Mutex<DispatchRouter>>,
+    pub dispatch_router: Arc<Mutex<DispatchRouter>>, // ponytail: std Mutex — critical section is µs, no need for async lock
     pub models_cache: Arc<Mutex<Option<ModelsCache>>>,
     pub tui_tx: Option<tokio::sync::mpsc::UnboundedSender<TuiEvent>>,
+    pub auth_cache: Arc<Mutex<HashMap<String, CachedAuth>>>,
+    pub model_cache: Arc<Mutex<HashMap<String, CachedModel>>>,
 }
 
 pub type AppRouter = Router;
@@ -69,6 +92,7 @@ pub type AppRouter = Router;
 #[derive(Clone)]
 struct RequestLogLayer {
     tui_tx: Option<tokio::sync::mpsc::UnboundedSender<TuiEvent>>,
+    base_path: String,
 }
 
 impl<S> Layer<S> for RequestLogLayer {
@@ -77,6 +101,7 @@ impl<S> Layer<S> for RequestLogLayer {
         RequestLogMiddleware {
             inner,
             tui_tx: self.tui_tx.clone(),
+            base_path: self.base_path.clone(),
         }
     }
 }
@@ -85,6 +110,7 @@ impl<S> Layer<S> for RequestLogLayer {
 struct RequestLogMiddleware<S> {
     inner: S,
     tui_tx: Option<tokio::sync::mpsc::UnboundedSender<TuiEvent>>,
+    base_path: String,
 }
 
 impl<S, B> Service<http::Request<B>> for RequestLogMiddleware<S>
@@ -105,6 +131,7 @@ where
         let method = req.method().clone();
         let uri = req.uri().clone();
         let path = uri.path().to_string();
+        let base_path = self.base_path.clone();
         let tui_tx = self.tui_tx.clone();
         let start = std::time::Instant::now();
 
@@ -119,19 +146,23 @@ where
             let latency_ms = start.elapsed().as_millis() as i64;
 
             if !is_static {
-                let kind_icon = if path.starts_with("/v1/chat/completions") || path.starts_with("/v1/messages") {
+                let effective = if !base_path.is_empty() && path.starts_with(base_path.as_str()) {
+                    let s = &path[base_path.len()..];
+                    if s.is_empty() { "/" } else { s }
+                } else { path.as_str() };
+                let kind_icon = if effective.starts_with("/v1/chat/completions") || effective.starts_with("/v1/messages") {
                     "💬"
-                } else if path.starts_with("/v1") {
+                } else if effective.starts_with("/v1") {
                     "🚀"
-                } else if path.starts_with("/api/models") || path.starts_with("/api/health") || path.starts_with("/api/activity") {
+                } else if effective.starts_with("/api/models") || effective.starts_with("/api/health") || effective.starts_with("/api/activity") {
                     "🤖"
-                } else if path.starts_with("/api/accounts") || path.starts_with("/api/auth") {
+                } else if effective.starts_with("/api/accounts") || effective.starts_with("/api/auth") {
                     "👤"
-                } else if path.starts_with("/api/keys") {
+                } else if effective.starts_with("/api/keys") {
                     "🔑"
-                } else if path.starts_with("/api/settings") || path.starts_with("/api/export") || path.starts_with("/api/import") {
+                } else if effective.starts_with("/api/settings") || effective.starts_with("/api/export") || effective.starts_with("/api/import") {
                     "⚙️"
-                } else if path.starts_with("/api/system") {
+                } else if effective.starts_with("/api/system") {
                     "🖥️"
                 } else {
                     "🌐"
@@ -148,12 +179,11 @@ where
                 );
                 // AI routes: Request events are sent from route handlers (with model name).
                 // Non-AI routes: send here without model.
-                let is_ai = path.starts_with("/v1/");
+                let is_ai = effective.starts_with("/v1/");
                 if !is_ai {
                     if let Some(tx) = &tui_tx {
-                        let ts = time::OffsetDateTime::now_local()
-                            .unwrap_or_else(|_| time::OffsetDateTime::now_utc())
-                            .format(&time::format_description::parse("[hour]:[minute]:[second]").unwrap())
+                        let ts = time::OffsetDateTime::now_utc()
+                            .format(&TIME_FMT)
                             .unwrap_or_default();
                         let _ = tx.send(TuiEvent::Request {
                             timestamp: ts,
@@ -171,8 +201,7 @@ where
     }
 }
 
-pub fn app(state: AppState) -> AppRouter {
-    let tui_tx = state.tui_tx.clone();
+fn core_router() -> AppRouter {
     Router::new()
         .route("/v1/chat/completions", post(v1::chat_completions))
         .route("/v1/responses", post(v1::responses))
@@ -266,12 +295,25 @@ pub fn app(state: AppState) -> AppRouter {
         .route("/api/settings/reset", post(settings::purge_database))
         .route("/api/export", get(settings::export_config))
         .route("/api/import", post(settings::import_config))
-        .layer(Extension(state))
         .layer(DefaultBodyLimit::max(128 * 1024 * 1024))
         .fallback(fallback)
+}
+
+pub fn app(state: AppState) -> AppRouter {
+    let base = state.base_path.clone();
+    let tui_tx = state.tui_tx.clone();
+    let core = core_router();
+    let router = if base.is_empty() {
+        core.layer(Extension(state.clone()))
+    } else {
+        Router::new()
+            .merge(core.clone().layer(Extension(state.clone())))
+            .nest(&base, core.layer(Extension(state.clone())))
+    };
+    router
         .layer(cors_layer())
         .layer(TraceLayer::new_for_http())
-        .layer(RequestLogLayer { tui_tx })
+        .layer(RequestLogLayer { tui_tx, base_path: base })
 }
 
 fn cors_layer() -> CorsLayer {
@@ -287,12 +329,22 @@ fn cors_layer() -> CorsLayer {
         .allow_headers(Any)
 }
 
-async fn fallback(OriginalUri(uri): OriginalUri) -> Response {
+async fn fallback(OriginalUri(uri): OriginalUri, Extension(state): Extension<AppState>) -> Response {
     let path = uri.path();
-    if path.starts_with("/api/") || path.starts_with("/v1/") {
+    let base = state.base_path.as_str();
+    let eff = if base.is_empty() {
+        path
+    } else if path == base {
+        "/"
+    } else if let Some(s) = path.strip_prefix(base) {
+        if s.is_empty() { "/" } else { s }
+    } else {
+        path
+    };
+    if eff.starts_with("/api/") || eff.starts_with("/v1/") {
         return crate::error::not_found();
     }
-    crate::static_ui::serve_spa(path).await
+    crate::static_ui::serve_spa_with_base(path, base).await
 }
 
 pub async fn serve(addr: std::net::SocketAddr, state: AppState) -> anyhow::Result<()> {
@@ -312,10 +364,37 @@ pub async fn test_state() -> AppState {
         pool,
         master_key: "test-master-key".to_string(),
         data_dir: std::path::PathBuf::from("."),
+        base_path: String::new(),
         test_queue: Arc::new(Mutex::new(TestQueueState::default())),
-        dispatch_router: Arc::new(tokio::sync::Mutex::new(DispatchRouter::default())),
+        dispatch_router: Arc::new(Mutex::new(DispatchRouter::default())),
         models_cache: Arc::new(Mutex::new(None)),
         tui_tx: None,
+        auth_cache: Arc::new(Mutex::new(HashMap::new())),
+        model_cache: Arc::new(Mutex::new(HashMap::new())),
+    }
+}
+
+
+impl AppState {
+    pub async fn resolve_model_cached(&self, model_name: &str) -> anyhow::Result<ModelResolution> {
+        let key = llmux_core::dispatcher::sanitize_model_name(model_name);
+        if let Some(cached) = self.model_cache.lock().unwrap().get(&key).cloned() {
+            if cached.expires > Instant::now() {
+                return Ok(cached.resolution);
+            }
+        }
+        let res = llmux_core::dispatcher::resolve_model(&self.pool, &key).await?;
+        let mut guard = self.model_cache.lock().unwrap();
+        guard.insert(key.clone(), CachedModel { resolution: res.clone(), expires: Instant::now() + HOT_CACHE_TTL });
+        if guard.len() > 512 { guard.retain(|_, v| v.expires > Instant::now()); }
+        Ok(res)
+    }
+    pub fn invalidate_model_cache(&self, alias: &str) {
+        let key = llmux_core::dispatcher::sanitize_model_name(alias);
+        self.model_cache.lock().unwrap().remove(&key);
+    }
+    pub fn clear_auth_cache(&self) {
+        self.auth_cache.lock().unwrap().clear();
     }
 }
 

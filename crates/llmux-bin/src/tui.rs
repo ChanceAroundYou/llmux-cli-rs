@@ -1,6 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io;
 
+use std::sync::LazyLock;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::ExecutableCommand;
@@ -14,6 +15,9 @@ use time;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use llmux_server::app::TuiEvent;
+
+static TUI_TIME_FMT: LazyLock<Vec<time::format_description::BorrowedFormatItem<'static>>> =
+    LazyLock::new(|| time::format_description::parse_borrowed::<1>("[hour]:[minute]:[second]").unwrap());
 
 const MAX_LOG_ENTRIES: usize = 500;
 
@@ -181,7 +185,7 @@ fn handle_event(ui: &mut UiState, event: TuiEvent) {
         TuiEvent::Retry { account, status, message } => {
             let ts = time::OffsetDateTime::now_local()
                 .unwrap_or_else(|_| time::OffsetDateTime::now_utc())
-                .format(&time::format_description::parse("[hour]:[minute]:[second]").unwrap())
+                .format(&TUI_TIME_FMT)
                 .unwrap_or_default();
             let line = format!("🔀 Account {} ({}): {}", account, status, message);
             ui.dispatch_logs.push_back(DispatchEntry { timestamp: ts, line });

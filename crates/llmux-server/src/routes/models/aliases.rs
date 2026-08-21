@@ -73,6 +73,7 @@ pub async fn set_model_alias(
             if let Ok(mut cache) = state.models_cache.lock() {
                 *cache = None;
             }
+            state.invalidate_model_cache(alias);
             tracing::info!("🏷️ Set alias {} -> {} (provider: {:?}), cache invalidated", alias, target_model, provider_id);
             Json(json!({ "success": true, "message": "Alias set successfully" })).into_response()
         },
@@ -160,6 +161,8 @@ pub async fn delete_model_alias(
     if let Ok(mut cache) = state.models_cache.lock() {
         *cache = None;
     }
+    state.invalidate_model_cache(&alias_row.alias);
+    state.clear_auth_cache();
 
     Json(json!({ "success": true, "message": "Alias deleted and API Keys synced successfully" })).into_response()
 }

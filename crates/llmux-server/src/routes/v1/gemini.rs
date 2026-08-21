@@ -1,5 +1,8 @@
 use std::collections::BTreeMap;
+use std::sync::LazyLock;
 use std::time::Instant;
+
+static DISPATCH_TIME_FMT: LazyLock<Vec<time::format_description::BorrowedFormatItem<'static>>> = LazyLock::new(|| time::format_description::parse_borrowed::<1>("[hour]:[minute]:[second]").unwrap());
 
 use axum::{
     body::Body,
@@ -17,7 +20,7 @@ use llmux_core::dispatcher::{self, get_accounts_by_ids, get_active_accounts, is_
 use crate::app::{AppState, TuiEvent};
 use crate::middleware::{self, AuthContext};
 
-use super::helpers::{log_usage, normalize_base_url, send_tui_request};
+use super::helpers::{log_usage, spawn_log_usage, normalize_base_url, send_tui_request};
 
 // ---------------------------------------------------------------------------
 // /v1beta/models/{model}:{action}  — Gemini native protocol passthrough
@@ -63,7 +66,7 @@ pub async fn gemini(
     }
 
     // Resolve model alias
-    let model_resolution = match dispatcher::resolve_model(&state.pool, &model_name).await {
+    let model_resolution = match state.resolve_model_cached(&model_name).await {
         Ok(r) => r,
         Err(e) => {
             return middleware::send_error(
@@ -108,7 +111,7 @@ pub async fn gemini(
         .unwrap_or_else(|| accounts.first().map(|a| a.id).unwrap_or(0));
 
     let (ordered_accounts, dispatch_meta) = {
-        let mut router = state.dispatch_router.lock().await;
+        let mut router = state.dispatch_router.lock().unwrap();
         router.select(&dispatch_key, &accounts, preferred_id)
     };
 
@@ -190,10 +193,7 @@ pub async fn gemini(
         );
         if let Some(tx) = &state.tui_tx {
             let _ = tx.send(TuiEvent::Dispatch {
-                timestamp: time::OffsetDateTime::now_local()
-                    .unwrap_or_else(|_| time::OffsetDateTime::now_utc())
-                    .format(&time::format_description::parse("[hour]:[minute]:[second]").unwrap())
-                    .unwrap_or_default(),
+                timestamp: time::OffsetDateTime::now_utc().format(&DISPATCH_TIME_FMT).unwrap_or_default(),
                 account: account.alias.clone(),
                 model: model_resolution.target_model.clone(),
                 url: dispatch_url,
@@ -218,7 +218,7 @@ pub async fn gemini(
                     });
                 }
                 if account.id == preferred_id {
-                    let mut router = state.dispatch_router.lock().await;
+                    let mut router = state.dispatch_router.lock().unwrap();
                     router.record_result(&dispatch_key, &dispatch_meta, None, false);
                 }
                 continue;
@@ -245,26 +245,25 @@ pub async fn gemini(
                     });
                 }
                 if account.id == preferred_id {
-                    let mut router = state.dispatch_router.lock().await;
+                    let mut router = state.dispatch_router.lock().unwrap();
                     router.record_result(&dispatch_key, &dispatch_meta, None, false);
                 }
                 continue;
             }
             let latency_ms = start.elapsed().as_millis() as i64;
-            let _ = log_usage(
-                &state.pool,
-                account,
-                &model_resolution.target_model,
-                &model_resolution.provider_id,
+            spawn_log_usage(
+                state.pool.clone(),
+                (*account).clone(),
+                model_resolution.target_model.clone(),
+                model_resolution.provider_id.clone(),
                 0,
                 0,
                 0,
                 0,
                 latency_ms,
                 false,
-                &last_error,
-            )
-            .await;
+                last_error.clone(),
+            );
             send_tui_request(&state.tui_tx, uri.path(), status.as_u16(), start, &model_resolution.target_model);
             return (status, Json(serde_json::from_str::<Value>(&error_body)
                 .unwrap_or(Value::String(error_body))))
@@ -281,7 +280,7 @@ pub async fn gemini(
 
         if is_stream {
             {
-                let mut router = state.dispatch_router.lock().await;
+                let mut router = state.dispatch_router.lock().unwrap();
                 router.record_result(&dispatch_key, &dispatch_meta, Some(account.id), true);
             }
             send_tui_request(&state.tui_tx, "/v1beta/models/...", status.as_u16(), start, &model_resolution.target_model);
@@ -316,23 +315,22 @@ pub async fn gemini(
         // Extract usage from Gemini format: usageMetadata.{promptTokenCount, candidatesTokenCount}
         let (prompt_tokens, completion_tokens) = gemini_usage(&data);
         let latency_ms = start.elapsed().as_millis() as i64;
-        let _ = log_usage(
-            &state.pool,
-            account,
-            &model_resolution.target_model,
-            &model_resolution.provider_id,
+        spawn_log_usage(
+            state.pool.clone(),
+            (*account).clone(),
+            model_resolution.target_model.clone(),
+            model_resolution.provider_id.clone(),
             prompt_tokens,
             completion_tokens,
             0,
             0,
             latency_ms,
             true,
-            &None,
-        )
-        .await;
+            None,
+        );
 
         {
-            let mut router = state.dispatch_router.lock().await;
+            let mut router = state.dispatch_router.lock().unwrap();
             router.record_result(&dispatch_key, &dispatch_meta, Some(account.id), true);
         }
         send_tui_request(&state.tui_tx, "/v1beta/models/...", 200, start, &model_resolution.target_model);
@@ -340,27 +338,26 @@ pub async fn gemini(
     }
 
     {
-        let mut router = state.dispatch_router.lock().await;
+        let mut router = state.dispatch_router.lock().unwrap();
         router.record_result(&dispatch_key, &dispatch_meta, None, false);
     }
 
     let latency_ms = start.elapsed().as_millis() as i64;
     let error_msg = last_error.unwrap_or_else(|| "All accounts exhausted".to_string());
     if let Some(account) = ordered_accounts.first() {
-        let _ = log_usage(
-            &state.pool,
-            account,
-            &model_resolution.target_model,
-            &model_resolution.provider_id,
+        spawn_log_usage(
+            state.pool.clone(),
+            (*account).clone(),
+            model_resolution.target_model.clone(),
+            model_resolution.provider_id.clone(),
             0,
             0,
             0,
             0,
             latency_ms,
             false,
-            &Some(error_msg.clone()),
-        )
-        .await;
+            Some(error_msg.clone()),
+        );
     }
     send_tui_request(&state.tui_tx, "/v1beta/models/...", 502, start, &model_resolution.target_model);
     middleware::send_error(
@@ -413,20 +410,19 @@ async fn gemini_streaming_passthrough(
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         let latency_ms = start.elapsed().as_millis() as i64;
-        let _ = log_usage(
-            &pool_clone,
-            &account,
-            &model,
-            &provider_id,
+        spawn_log_usage(
+            pool_clone.clone(),
+            account.clone(),
+            model.clone(),
+            provider_id.clone(),
             0,
             0,
             0,
             0,
             latency_ms,
             true,
-            &None,
-        )
-        .await;
+            None,
+        );
     });
 
     let body = Body::from_stream(stream);

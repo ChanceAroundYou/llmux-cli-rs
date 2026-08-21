@@ -28,18 +28,36 @@ pub async fn v1_auth_middleware(
     let has_x_api_key = headers.contains_key("x-api-key");
 
     match key {
-        Some(k) => match validate_api_key(&state.pool, &k).await {
-            Ok(ctx) => {
-                request.extensions_mut().insert(ctx);
-                next.run(request).await
+        Some(k) => {
+            // Hot cache (60s TTL) — avoids per-request DB RTT.
+            let cached = {
+                let guard = state.auth_cache.lock().unwrap();
+                guard.get(&k).filter(|c| c.expires > std::time::Instant::now()).map(|c| c.ctx.clone())
+            };
+            let ctx = if let Some(c) = cached {
+                Ok(c)
+            } else {
+                let res = validate_api_key(&state.pool, &k).await;
+                if let Ok(ref c) = res {
+                    let mut guard = state.auth_cache.lock().unwrap();
+                    guard.insert(k.clone(), crate::app::CachedAuth { ctx: c.clone(), expires: std::time::Instant::now() + crate::app::HOT_CACHE_TTL });
+                    if guard.len() > 512 { guard.retain(|_, v| v.expires > std::time::Instant::now()); }
+                }
+                res
+            };
+            match ctx {
+                Ok(ctx) => {
+                    request.extensions_mut().insert(ctx);
+                    next.run(request).await
+                }
+                Err(_) => send_error(
+                    "Invalid API Key",
+                    "authentication_error",
+                    StatusCode::UNAUTHORIZED,
+                    has_x_api_key,
+                ),
             }
-            Err(_) => send_error(
-                "Invalid API Key",
-                "authentication_error",
-                StatusCode::UNAUTHORIZED,
-                has_x_api_key,
-            ),
-        },
+        }
         None => send_error(
             "Missing API Key. Gateway is locked.",
             "authentication_error",

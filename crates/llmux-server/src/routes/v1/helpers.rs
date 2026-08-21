@@ -1,5 +1,9 @@
 use llmux_core::adapters;
+use std::sync::LazyLock;
 use std::time::Instant;
+
+static TIME_FMT_HELPERS: LazyLock<Vec<time::format_description::BorrowedFormatItem<'static>>> =
+    LazyLock::new(|| time::format_description::parse_borrowed::<1>("[hour]:[minute]:[second]").unwrap());
 
 use crate::app::TuiEvent;
 
@@ -15,11 +19,8 @@ pub fn send_tui_request(
     model: &str,
 ) {
     if let Some(tx) = tui_tx {
-        let ts = time::OffsetDateTime::now_local()
-            .unwrap_or_else(|_| time::OffsetDateTime::now_utc())
-            .format(
-                &time::format_description::parse("[hour]:[minute]:[second]").unwrap(),
-            )
+        let ts = time::OffsetDateTime::now_utc()
+            .format(&TIME_FMT_HELPERS)
             .unwrap_or_default();
         let latency_ms = start.elapsed().as_millis() as i64;
         let _ = tx.send(TuiEvent::Request {
@@ -70,8 +71,34 @@ pub fn iso8601_now() -> String {
     format!("{year:04}-{month:02}-{d:02}T{h:02}:{m:02}:{s:02}.{ms:03}Z")
 }
 
+// Fire-and-forget variant — does not block the response path.
+pub fn spawn_log_usage(
+    pool: sqlx::SqlitePool,
+    account: adapters::Account,
+    model: String,
+    provider_id: String,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_read_input_tokens: i64,
+    cache_creation_input_tokens: i64,
+    latency_ms: i64,
+    success: bool,
+    error_message: Option<String>,
+) {
+    let account = account.clone();
+    tokio::spawn(async move {
+        let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
+        let res = sqlx::query("INSERT INTO usage_logs (timestamp, account_id, provider_id, model, input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens, latency_ms, success, error_message, is_test) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            .bind(timestamp).bind(account.id).bind(&provider_id).bind(&model)
+            .bind(input_tokens).bind(output_tokens).bind(cache_read_input_tokens).bind(cache_creation_input_tokens)
+            .bind(latency_ms).bind(if success {1} else {0}).bind(error_message.as_deref()).bind(0)
+            .execute(&pool).await;
+        if let Err(e) = res { tracing::error!("📊 Failed to insert usage log: {e}"); }
+    });
+}
+
 // ---------------------------------------------------------------------------
-// Usage logging
+// Sync variant (used by background tasks)
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]

@@ -55,11 +55,11 @@ pub async fn create_api_key(
         .execute(&state.pool)
         .await
     {
-        Ok(_) => Json(json!({
+        Ok(_) => { state.clear_auth_cache(); Json(json!({
             "success": true,
             "key": key,
         }))
-        .into_response(),
+        .into_response() },
         Err(e) => crate::error::simple_error(
             format!("Failed to create API key: {e}"),
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -103,7 +103,7 @@ pub async fn update_api_key(
         .execute(&state.pool)
         .await
     {
-        Ok(_) => Json(json!({ "success": true })).into_response(),
+        Ok(_) => { state.clear_auth_cache(); Json(json!({ "success": true })).into_response() },
         Err(e) => crate::error::simple_error(
             format!("Failed to update API key: {e}"),
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -121,7 +121,7 @@ pub async fn delete_api_key(
         .execute(&state.pool)
         .await
     {
-        Ok(_) => Json(json!({ "success": true })).into_response(),
+        Ok(_) => { state.clear_auth_cache(); Json(json!({ "success": true })).into_response() },
         Err(e) => crate::error::simple_error(
             format!("Failed to delete API key: {e}"),
             StatusCode::INTERNAL_SERVER_ERROR,

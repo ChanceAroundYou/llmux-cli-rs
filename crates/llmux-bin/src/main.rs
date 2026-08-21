@@ -1,5 +1,4 @@
 use std::sync::{Arc, Mutex};
-use tokio::sync::Mutex as TokioMutex;
 
 use clap::{Parser, Subcommand};
 use llmux_core::config::AppConfig;
@@ -92,15 +91,18 @@ async fn start(port_override: Option<u16>, use_tui: bool) -> anyhow::Result<()> 
     let effective_port = port_override.unwrap_or(config.port);
 
     std::fs::create_dir_all(&config.data_dir)?;
+    cleanup_old_logs(&config.data_dir);
     let database_url = sqlite_url_from_path(&config.database_path);
     let pool = connect_sqlite(&database_url).await?;
     init_db(&pool).await?;
 
     let master_key = get_or_create_master_key(&config.data_dir, config.master_key.as_deref())?;
 
-    let dispatch_router = Arc::new(TokioMutex::new(llmux_core::dispatcher::DispatchRouter::default()));
+    let dispatch_router = Arc::new(Mutex::new(llmux_core::dispatcher::DispatchRouter::default()));
     let test_queue = Arc::new(Mutex::new(TestQueueState::default()));
     let models_cache = Arc::new(Mutex::new(None));
+    let auth_cache = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let model_cache = Arc::new(Mutex::new(std::collections::HashMap::new()));
 
     let lan_ip = get_local_lan_ip();
 
@@ -120,13 +122,20 @@ async fn start(port_override: Option<u16>, use_tui: bool) -> anyhow::Result<()> 
     };
 
     let db_path = config.database_path.display().to_string();
+    let base_path = config.base_path.clone();
+    if !base_path.is_empty() {
+        tracing::info!("🔧 BASE_PATH={}", base_path);
+    }
     let state = AppState {
         pool,
         master_key,
         data_dir: config.data_dir.clone(),
+        base_path,
         test_queue,
         dispatch_router,
         models_cache,
+        auth_cache,
+        model_cache,
         tui_tx,
     };
     let router = app(state);
@@ -177,6 +186,42 @@ async fn start(port_override: Option<u16>, use_tui: bool) -> anyhow::Result<()> 
     }
 
     Ok(())
+}
+
+static CLEANUP_FMT: std::sync::LazyLock<Vec<time::format_description::BorrowedFormatItem<'static>>> = std::sync::LazyLock::new(|| time::format_description::parse_borrowed::<1>("[year]-[month]-[day]").unwrap());
+
+fn cleanup_old_logs(dir: &std::path::Path) {
+    let retain: i64 = std::env::var("LOG_RETAIN_DAYS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(7);
+    if retain <= 0 {
+        return;
+    }
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let now = time::OffsetDateTime::now_local()
+        .unwrap_or_else(|_| time::OffsetDateTime::now_utc())
+        .date();
+    let fmt = &*CLEANUP_FMT;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let Some(date_str) = name.strip_prefix("llmux.log.") else {
+            continue;
+        };
+        let Ok(date) = time::Date::parse(date_str, &fmt) else {
+            continue;
+        };
+        if (now - date).whole_days() > retain {
+            let p = entry.path();
+            match std::fs::remove_file(&p) {
+                Ok(_) => tracing::info!("🗑️  removed old log {}", p.display()),
+                Err(e) => tracing::warn!("log cleanup: failed to remove {}: {}", p.display(), e),
+            }
+        }
+    }
 }
 
 fn get_local_lan_ip() -> String {

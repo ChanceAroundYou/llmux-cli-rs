@@ -1,5 +1,8 @@
 use std::collections::BTreeMap;
+use std::sync::LazyLock;
 use std::time::Instant;
+
+static DISPATCH_TIME_FMT: LazyLock<Vec<time::format_description::BorrowedFormatItem<'static>>> = LazyLock::new(|| time::format_description::parse_borrowed::<1>("[hour]:[minute]:[second]").unwrap());
 
 use axum::{
     body::Body,
@@ -25,7 +28,7 @@ use llmux_core::proxy::{build_anthropic_target_url, anthropic_openai::{parse_sse
 use crate::app::{AppState, TuiEvent};
 use crate::middleware::{self, AuthContext};
 
-use super::helpers::{log_usage, normalize_base_url, send_tui_request};
+use super::helpers::{log_usage, spawn_log_usage, normalize_base_url, send_tui_request};
 
 // ---------------------------------------------------------------------------
 // /v1/chat/completions  — pure OpenAI-compatible passthrough
@@ -104,7 +107,7 @@ async fn openai_dispatch(
     let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
 
     let model_resolution =
-        match dispatcher::resolve_model(&state.pool, &model_name).await {
+        match state.resolve_model_cached(&model_name).await {
             Ok(r) => r,
             Err(e) => {
                 return middleware::send_error(
@@ -164,7 +167,7 @@ async fn openai_dispatch(
         .unwrap_or_else(|| accounts.first().map(|a| a.id).unwrap_or(0));
 
     let (ordered_accounts, dispatch_meta) = {
-        let mut router = state.dispatch_router.lock().await;
+        let mut router = state.dispatch_router.lock().unwrap();
         router.select(&dispatch_key, &accounts, preferred_id)
     };
 
@@ -220,10 +223,7 @@ async fn openai_dispatch(
         );
         if let Some(tx) = &state.tui_tx {
             let _ = tx.send(TuiEvent::Dispatch {
-                timestamp: time::OffsetDateTime::now_local()
-                    .unwrap_or_else(|_| time::OffsetDateTime::now_utc())
-                    .format(&time::format_description::parse("[hour]:[minute]:[second]").unwrap())
-                    .unwrap_or_default(),
+                timestamp: time::OffsetDateTime::now_utc().format(&DISPATCH_TIME_FMT).unwrap_or_default(),
                 account: account.alias.clone(),
                 model: model_resolution.target_model.clone(),
                 url: format!("{}/{}", base_url, endpoint),
@@ -248,7 +248,7 @@ async fn openai_dispatch(
                     });
                 }
                 if account.id == preferred_id {
-                    let mut router = state.dispatch_router.lock().await;
+                    let mut router = state.dispatch_router.lock().unwrap();
                     router.record_result(&dispatch_key, &dispatch_meta, None, false);
                 }
                 continue;
@@ -276,7 +276,7 @@ async fn openai_dispatch(
                     });
                 }
                 if account.id == preferred_id {
-                    let mut router = state.dispatch_router.lock().await;
+                    let mut router = state.dispatch_router.lock().unwrap();
                     router.record_result(&dispatch_key, &dispatch_meta, None, false);
                 }
                 continue;
@@ -309,7 +309,7 @@ async fn openai_dispatch(
                 .await
                 {
                     {
-                        let mut router = state.dispatch_router.lock().await;
+                        let mut router = state.dispatch_router.lock().unwrap();
                         router.record_result(&dispatch_key, &dispatch_meta, Some(account.id), true);
                     }
                     send_tui_request(
@@ -324,20 +324,19 @@ async fn openai_dispatch(
             }
 
             let latency_ms = start.elapsed().as_millis() as i64;
-            let _ = log_usage(
-                &state.pool,
-                account,
-                &model_resolution.target_model,
-                &model_resolution.provider_id,
+            spawn_log_usage(
+                state.pool.clone(),
+                (*account).clone(),
+                model_resolution.target_model.clone(),
+                model_resolution.provider_id.clone(),
                 0,
                 0,
                 0,
                 0,
                 latency_ms,
                 false,
-                &last_error,
-            )
-            .await;
+                last_error.clone(),
+            );
             send_tui_request(&state.tui_tx, normalized_uri.path(), status.as_u16(), start, &model_resolution.target_model);
             if let Ok(json_val) = serde_json::from_str::<Value>(&error_body) {
                 return (status, Json(json_val)).into_response();
@@ -347,7 +346,7 @@ async fn openai_dispatch(
 
         if streaming {
             {
-                let mut router = state.dispatch_router.lock().await;
+                let mut router = state.dispatch_router.lock().unwrap();
                 router.record_result(&dispatch_key, &dispatch_meta, Some(account.id), true);
             }
             send_tui_request(&state.tui_tx, normalized_uri.path(), status.as_u16(), start, &model_resolution.target_model);
@@ -380,23 +379,22 @@ async fn openai_dispatch(
         let (prompt_tokens, completion_tokens) =
             adapters::usage_from_openai_response_body(&data);
         let latency_ms = start.elapsed().as_millis() as i64;
-        let _ = log_usage(
-            &state.pool,
-            account,
-            &model_resolution.target_model,
-            &model_resolution.provider_id,
+        spawn_log_usage(
+            state.pool.clone(),
+            (*account).clone(),
+            model_resolution.target_model.clone(),
+            model_resolution.provider_id.clone(),
             prompt_tokens,
             completion_tokens,
             0,
             0,
             latency_ms,
             true,
-            &None,
-        )
-        .await;
+            None,
+        );
 
         {
-            let mut router = state.dispatch_router.lock().await;
+            let mut router = state.dispatch_router.lock().unwrap();
             router.record_result(&dispatch_key, &dispatch_meta, Some(account.id), true);
         }
         send_tui_request(&state.tui_tx, normalized_uri.path(), 200, start, &model_resolution.target_model);
@@ -404,27 +402,26 @@ async fn openai_dispatch(
     }
 
     {
-        let mut router = state.dispatch_router.lock().await;
+        let mut router = state.dispatch_router.lock().unwrap();
         router.record_result(&dispatch_key, &dispatch_meta, None, false);
     }
 
     let latency_ms = start.elapsed().as_millis() as i64;
     let error_msg = last_error.unwrap_or_else(|| "All accounts exhausted".to_string());
     if let Some(account) = ordered_accounts.first() {
-        let _ = log_usage(
-            &state.pool,
-            account,
-            &model_resolution.target_model,
-            &model_resolution.provider_id,
+        spawn_log_usage(
+            state.pool.clone(),
+            (*account).clone(),
+            model_resolution.target_model.clone(),
+            model_resolution.provider_id.clone(),
             0,
             0,
             0,
             0,
             latency_ms,
             false,
-            &Some(error_msg.clone()),
-        )
-        .await;
+            Some(error_msg.clone()),
+        );
     }
     send_tui_request(&state.tui_tx, normalized_uri.path(), 502, start, &model_resolution.target_model);
     middleware::send_error(
@@ -464,20 +461,19 @@ async fn openai_streaming_passthrough(
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         let latency_ms = start.elapsed().as_millis() as i64;
-        let _ = log_usage(
-            &pool_clone,
-            &account,
-            &model_clone,
-            &account.provider_id,
+        spawn_log_usage(
+            pool_clone.clone(),
+            account.clone(),
+            model_clone.clone(),
+            account.provider_id.clone(),
             0,
             0,
             0,
             0,
             latency_ms,
             true,
-            &None,
-        )
-        .await;
+            None,
+        );
     });
 
     let body = Body::from_stream(stream);
@@ -565,20 +561,19 @@ async fn anthropic_fallback_response(
         };
         let openai_resp = anthropic_to_openai_response(&data, model);
         let usage = &data["usage"];
-        let _ = log_usage(
-            &pool,
-            account,
-            model,
-            &account.provider_id,
+        spawn_log_usage(
+            pool.clone(),
+            (*account).clone(),
+            model.to_string(),
+            account.provider_id.clone(),
             usage["input_tokens"].as_i64().unwrap_or(0),
             usage["output_tokens"].as_i64().unwrap_or(0),
             0,
             0,
             start.elapsed().as_millis() as i64,
             true,
-            &None,
-        )
-        .await;
+            None,
+        );
         Some(Json(openai_resp).into_response())
     }
 }
@@ -650,20 +645,19 @@ async fn anthropic_fallback_streaming(
                                 u.get("output_tokens").and_then(Value::as_i64).unwrap_or(0),
                             )
                         };
-                        let _ = log_usage(
-                            &pool,
-                            &account,
-                            &model,
-                            &account.provider_id,
+                        spawn_log_usage(
+                            pool.clone(),
+                            account.clone(),
+                            model.clone(),
+                            account.provider_id.clone(),
                             prompt,
                             completion,
                             0,
                             0,
                             start.elapsed().as_millis() as i64,
                             true,
-                            &None,
-                        )
-                        .await;
+                            None,
+                        );
                         return;
                     }
                     _ => {}

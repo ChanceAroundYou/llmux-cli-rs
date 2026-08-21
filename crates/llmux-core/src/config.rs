@@ -7,12 +7,15 @@ pub struct AppConfig {
     pub data_dir: PathBuf,
     pub database_path: PathBuf,
     pub master_key: Option<String>,
+    pub base_path: String,
 }
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("PORT must be a valid integer between 1 and 65535")]
     InvalidPort,
+    #[error("BASE_PATH must be a single path segment without '..' or '\\'")]
+    InvalidBasePath,
 }
 
 impl AppConfig {
@@ -36,14 +39,27 @@ impl AppConfig {
 
         let database_path = data_dir.join("llmux_db.db");
         let master_key = get("MASTER_KEY").filter(|v| !v.trim().is_empty());
+        let base_raw = get("BASE_PATH").or_else(|| get("LLMUX_BASE_PATH"));
+        let base_path = normalize_base_path(base_raw)?;
 
         Ok(Self {
             port,
             data_dir,
             database_path,
             master_key,
+            base_path,
         })
     }
+}
+
+pub fn normalize_base_path(raw: Option<String>) -> Result<String, ConfigError> {
+    let Some(raw) = raw else { return Ok(String::new()); };
+    let trimmed = raw.trim().trim_matches('/').to_string();
+    if trimmed.is_empty() { return Ok(String::new()); }
+    if trimmed.contains("..") || trimmed.contains('\\') || trimmed.contains('/') {
+        return Err(ConfigError::InvalidBasePath);
+    }
+    Ok(format!("/{trimmed}"))
 }
 
 fn default_data_dir() -> PathBuf {

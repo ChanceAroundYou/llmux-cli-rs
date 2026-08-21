@@ -1,5 +1,8 @@
 use std::collections::BTreeMap;
+use std::sync::LazyLock;
 use std::time::Instant;
+
+static DISPATCH_TIME_FMT: LazyLock<Vec<time::format_description::BorrowedFormatItem<'static>>> = LazyLock::new(|| time::format_description::parse_borrowed::<1>("[hour]:[minute]:[second]").unwrap());
 
 use axum::{
     body::Body,
@@ -24,7 +27,7 @@ use llmux_core::proxy::{build_anthropic_passthrough_request, extract_anthropic_u
 use crate::app::{AppState, TuiEvent};
 use crate::middleware::{self, AuthContext};
 
-use super::helpers::{log_usage, send_tui_request};
+use super::helpers::{log_usage, spawn_log_usage, send_tui_request};
 
 // ---------------------------------------------------------------------------
 // /v1/messages  (Anthropic Messages API)
@@ -76,7 +79,7 @@ pub async fn messages(
     let streaming = body["stream"].as_bool().unwrap_or(false);
 
     // Resolve model
-    let model_resolution = match dispatcher::resolve_model(&state.pool, &model_name).await {
+    let model_resolution = match state.resolve_model_cached(&model_name).await {
         Ok(r) => r,
         Err(e) => {
             return middleware::send_error(
@@ -121,7 +124,7 @@ pub async fn messages(
         .unwrap_or_else(|| accounts.first().map(|a| a.id).unwrap_or(0));
 
     let (ordered_accounts, dispatch_meta) = {
-        let mut router = state.dispatch_router.lock().await;
+        let mut router = state.dispatch_router.lock().unwrap();
         router.select(&dispatch_key, &accounts, preferred_id)
     };
 
@@ -217,7 +220,7 @@ pub async fn messages(
                     });
                 }
                 if account.id == preferred_id {
-                    let mut router = state.dispatch_router.lock().await;
+                    let mut router = state.dispatch_router.lock().unwrap();
                     router.record_result(&dispatch_key, &dispatch_meta, None, false);
                 }
                 continue;
@@ -233,10 +236,7 @@ pub async fn messages(
         );
         if let Some(tx) = &state.tui_tx {
             let _ = tx.send(TuiEvent::Dispatch {
-                timestamp: time::OffsetDateTime::now_local()
-                    .unwrap_or_else(|_| time::OffsetDateTime::now_utc())
-                    .format(&time::format_description::parse("[hour]:[minute]:[second]").unwrap())
-                    .unwrap_or_default(),
+                timestamp: time::OffsetDateTime::now_utc().format(&DISPATCH_TIME_FMT).unwrap_or_default(),
                 account: account.alias.clone(),
                 model: model_resolution.target_model.clone(),
                 url: provider_request.url.clone(),
@@ -257,7 +257,7 @@ pub async fn messages(
                     });
                 }
                 if account.id == preferred_id {
-                    let mut router = state.dispatch_router.lock().await;
+                    let mut router = state.dispatch_router.lock().unwrap();
                     router.record_result(&dispatch_key, &dispatch_meta, None, false);
                 }
                 continue;
@@ -284,7 +284,7 @@ pub async fn messages(
                     });
                 }
                 if account.id == preferred_id {
-                    let mut router = state.dispatch_router.lock().await;
+                    let mut router = state.dispatch_router.lock().unwrap();
                     router.record_result(&dispatch_key, &dispatch_meta, None, false);
                 }
                 continue;
@@ -322,7 +322,7 @@ pub async fn messages(
         // Success — streaming or non-streaming
         if streaming {
             {
-                let mut router = state.dispatch_router.lock().await;
+                let mut router = state.dispatch_router.lock().unwrap();
                 router.record_result(&dispatch_key, &dispatch_meta, Some(account.id), true);
             }
             send_tui_request(&state.tui_tx, "/v1/messages", status.as_u16(), start, &model_resolution.target_model);
@@ -372,22 +372,21 @@ pub async fn messages(
             let anthropic_resp = openai_to_anthropic_response(&data, &model_resolution.target_model);
             let usage = &data["usage"];
             let (cache_read, cache_create) = cache_usage_from_openai(usage);
-            let _ = log_usage(
-                &state.pool,
-                account,
-                &model_resolution.target_model,
-                &model_resolution.provider_id,
+            spawn_log_usage(
+                state.pool.clone(),
+                (*account).clone(),
+                model_resolution.target_model.clone(),
+                model_resolution.provider_id.clone(),
                 usage["prompt_tokens"].as_i64().unwrap_or(0),
                 usage["completion_tokens"].as_i64().unwrap_or(0),
                 cache_read,
                 cache_create,
                 latency_ms,
                 true,
-                &None,
-            )
-            .await;
+                None,
+            );
             {
-                let mut router = state.dispatch_router.lock().await;
+                let mut router = state.dispatch_router.lock().unwrap();
                 router.record_result(&dispatch_key, &dispatch_meta, Some(account.id), true);
             }
             send_tui_request(&state.tui_tx, "/v1/messages", 200, start, &model_resolution.target_model);
@@ -412,23 +411,22 @@ pub async fn messages(
             usage.cache_creation_input_tokens,
             usage.output_tokens,
         );
-        let _ = log_usage(
-            &state.pool,
-            account,
-            &model_resolution.target_model,
-            &model_resolution.provider_id,
+        spawn_log_usage(
+            state.pool.clone(),
+            (*account).clone(),
+            model_resolution.target_model.clone(),
+            model_resolution.provider_id.clone(),
             usage.input_tokens,
             usage.output_tokens,
             usage.cache_read_input_tokens,
             usage.cache_creation_input_tokens,
             latency_ms,
             true,
-            &None,
-        )
-        .await;
+            None,
+        );
 
         {
-            let mut router = state.dispatch_router.lock().await;
+            let mut router = state.dispatch_router.lock().unwrap();
             router.record_result(&dispatch_key, &dispatch_meta, Some(account.id), true);
         }
         send_tui_request(&state.tui_tx, "/v1/messages", 200, start, &model_resolution.target_model);
@@ -437,27 +435,26 @@ pub async fn messages(
 
     // All accounts exhausted
     {
-        let mut router = state.dispatch_router.lock().await;
+        let mut router = state.dispatch_router.lock().unwrap();
         router.record_result(&dispatch_key, &dispatch_meta, None, false);
     }
 
     let latency_ms = start.elapsed().as_millis() as i64;
     let error_msg = last_error.unwrap_or_else(|| "All accounts exhausted".to_string());
     if let Some(account) = ordered_accounts.first() {
-        let _ = log_usage(
-            &state.pool,
-            account,
-            &model_resolution.target_model,
-            &model_resolution.provider_id,
+        spawn_log_usage(
+            state.pool.clone(),
+            (*account).clone(),
+            model_resolution.target_model.clone(),
+            model_resolution.provider_id.clone(),
             0,
             0,
             0,
             0,
             latency_ms,
             false,
-            &Some(error_msg.clone()),
-        )
-        .await;
+            Some(error_msg.clone()),
+        );
     }
     send_tui_request(&state.tui_tx, "/v1/messages", 502, start, &model_resolution.target_model);
     middleware::send_error(&error_msg, "upstream_error", StatusCode::BAD_GATEWAY, is_anthropic)
@@ -492,20 +489,19 @@ async fn anthropic_streaming_passthrough(
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         let latency_ms = start.elapsed().as_millis() as i64;
-        let _ = log_usage(
-            &pool_clone,
-            &account,
-            &model,
-            &provider_id,
+        spawn_log_usage(
+            pool_clone.clone(),
+            account.clone(),
+            model.clone(),
+            provider_id.clone(),
             0,
             0,
             0,
             0,
             latency_ms,
             true,
-            &None,
-        )
-        .await;
+            None,
+        );
     });
 
     let body = Body::from_stream(stream);
@@ -644,20 +640,19 @@ async fn anthropic_to_openai_streaming(
         tracing::debug!("[stream:{model}] stream complete: done={done}, chunks={chunks_received}, buffer_remaining={}", buffer.len());
         let (input_tokens, output_tokens, cache_read, cache_create) = converter.usage_tokens();
         let latency_ms = start.elapsed().as_millis() as i64;
-        let _ = log_usage(
-            &pool,
-            &account,
-            &model,
-            &provider_id,
+        spawn_log_usage(
+            pool.clone(),
+            account.clone(),
+            model.clone(),
+            provider_id.clone(),
             input_tokens,
             output_tokens,
             cache_read,
             cache_create,
             latency_ms,
             true,
-            &None,
-        )
-        .await;
+            None,
+        );
     });
 
     let body = Body::from_stream(ReceiverStream::new(rx));
