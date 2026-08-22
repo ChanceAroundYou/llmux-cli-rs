@@ -48,10 +48,18 @@ pub async fn models(Extension(state): Extension<AppState>, headers: HeaderMap) -
             Err(_) => Vec::new(),
         };
     let mut alias_rows_with_agg = alias_rows;
+    // context_length 反映聚合别名当前激活候选的模型，而非恒为第一个候选
+    let active_map = state.aggregate_router.lock().unwrap().snapshot_actives();
     for (alias, candidates) in agg_rows {
         let target = llmux_core::aggregate::parse_candidates(&candidates)
             .ok()
-            .and_then(|v| v.into_iter().next().map(|c| c.model))
+            .and_then(|v| {
+                if v.is_empty() {
+                    return None;
+                }
+                let active = active_map.get(&alias).copied().unwrap_or(0).min(v.len() - 1);
+                Some(v[active].model.clone())
+            })
             .unwrap_or_default();
         alias_rows_with_agg.push((alias, Some(target)));
     }
