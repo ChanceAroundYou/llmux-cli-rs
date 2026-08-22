@@ -45,7 +45,7 @@ export default function Login() {
           <form onSubmit={onSubmit} className="space-y-4">
             <div className="space-y-2">
               <label className="text-sm font-medium">用户名</label>
-              <Input value={username} onChange={e => setUsername(e.target.value)} placeholder="xiaokubao" autoFocus />
+              <Input value={username} onChange={e => setUsername(e.target.value)} placeholder="请输入用户名" autoFocus />
             </div>
             <div className="space-y-2">
               <label className="text-sm font-medium">密码</label>
