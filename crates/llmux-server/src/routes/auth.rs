@@ -105,3 +105,90 @@ pub async fn handle_web_session(
         ),
     }
 }
+
+use axum::http::{HeaderMap, header};
+
+use crate::middleware::{SESSION_COOKIE, SESSION_TTL_SECS};
+
+fn admin_credentials() -> (String, String) {
+    let user = std::env::var("ADMIN_USERNAME").unwrap_or_else(|_| "xiaokubao".to_string());
+    let pass = std::env::var("ADMIN_PASSWORD").unwrap_or_else(|_| "Xkb111717!".to_string());
+    (user, pass)
+}
+
+fn extract_session_from_headers(headers: &HeaderMap) -> Option<String> {
+    let cookie = headers.get("cookie")?.to_str().ok()?;
+    for part in cookie.split(';') {
+        let part = part.trim();
+        if let Some(v) = part.strip_prefix(&format!("{}=", SESSION_COOKIE)) {
+            let v = v.trim().to_string();
+            if !v.is_empty() { return Some(v); }
+        }
+    }
+    None
+}
+
+fn is_session_valid(state: &AppState, token: &str) -> bool {
+    state.sessions.lock().unwrap().get(token).map(|exp| *exp > std::time::Instant::now()).unwrap_or(false)
+}
+
+pub async fn handle_login(
+    Extension(state): Extension<AppState>,
+    Json(body): Json<Value>,
+) -> Response {
+    let username = body.get("username").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    let password = body.get("password").and_then(Value::as_str).unwrap_or("").to_string();
+    let (exp_user, exp_pass) = admin_credentials();
+    if username != exp_user || password != exp_pass {
+        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Invalid credentials"}))).into_response();
+    }
+    let token = uuid::Uuid::new_v4().to_string();
+    {
+        let mut guard = state.sessions.lock().unwrap();
+        guard.insert(token.clone(), std::time::Instant::now() + std::time::Duration::from_secs(SESSION_TTL_SECS));
+        if guard.len() > 512 { guard.retain(|_, v| *v > std::time::Instant::now()); }
+    }
+    let cookie_val = format!("{}={}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}", SESSION_COOKIE, token, SESSION_TTL_SECS);
+    let base_cookie = if state.base_path.is_empty() { None } else {
+        Some(format!("{}={}; Path={}; HttpOnly; SameSite=Lax; Max-Age={}", SESSION_COOKIE, token, state.base_path, SESSION_TTL_SECS))
+    };
+    let mut res = Json(json!({"success": true})).into_response();
+    let headers = res.headers_mut();
+    headers.insert(header::SET_COOKIE, cookie_val.parse().unwrap());
+    if let Some(bc) = base_cookie {
+        headers.append(header::SET_COOKIE, bc.parse().unwrap());
+    }
+    res
+}
+
+pub async fn handle_logout(
+    Extension(state): Extension<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(token) = extract_session_from_headers(&headers) {
+        state.sessions.lock().unwrap().remove(&token);
+    }
+    let clear = format!("{}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0", SESSION_COOKIE);
+    let mut res = Json(json!({"success": true})).into_response();
+    let headers_mut = res.headers_mut();
+    headers_mut.insert(header::SET_COOKIE, clear.parse().unwrap());
+    if !state.base_path.is_empty() {
+        let clear2 = format!("{}=; Path={}; HttpOnly; SameSite=Lax; Max-Age=0", SESSION_COOKIE, state.base_path);
+        headers_mut.append(header::SET_COOKIE, clear2.parse().unwrap());
+    }
+    res
+}
+
+pub async fn handle_me(
+    Extension(state): Extension<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(token) = extract_session_from_headers(&headers) {
+        if is_session_valid(&state, &token) {
+            let (user, _) = admin_credentials();
+            return Json(json!({"authenticated": true, "username": user})).into_response();
+        }
+    }
+    (StatusCode::UNAUTHORIZED, Json(json!({"error": "Unauthorized"}))).into_response()
+}
+

@@ -146,6 +146,74 @@ pub fn send_error(
     }
 }
 
+pub const SESSION_COOKIE: &str = "llmux_session";
+pub const SESSION_TTL_SECS: u64 = 7 * 24 * 3600;
+
+fn extract_session_token(headers: &HeaderMap) -> Option<String> {
+    let cookie = headers.get("cookie")?.to_str().ok()?;
+    for part in cookie.split(';') {
+        let part = part.trim();
+        if let Some(v) = part.strip_prefix(&format!("{}=", SESSION_COOKIE)) {
+            let v = v.trim();
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn is_whitelisted(effective: &str) -> bool {
+    matches!(effective, "/api/auth/login" | "/api/health")
+}
+
+pub async fn ui_auth_middleware(
+    Extension(state): Extension<AppState>,
+    headers: HeaderMap,
+    request: Request,
+    next: Next,
+) -> Response {
+    let method_is_options = request.method() == axum::http::Method::OPTIONS;
+    if method_is_options {
+        return next.run(request).await;
+    }
+    let path = request.uri().path().to_string();
+    let base = state.base_path.clone();
+    let effective = if base.is_empty() {
+        path.clone()
+    } else if path == base {
+        "/".to_string()
+    } else if let Some(s) = path.strip_prefix(base.as_str()) {
+        if s.is_empty() { "/".to_string() } else { s.to_string() }
+    } else {
+        path.clone()
+    };
+
+    // Only protect /api/* ; let /v1/* and static/SPA through (v1 has its own middleware)
+    if !effective.starts_with("/api/") {
+        return next.run(request).await;
+    }
+    if is_whitelisted(&effective) {
+        return next.run(request).await;
+    }
+
+    if let Some(token) = extract_session_token(&headers) {
+        let valid = {
+            let guard = state.sessions.lock().unwrap();
+            guard.get(&token).map(|exp| *exp > std::time::Instant::now()).unwrap_or(false)
+        };
+        if valid {
+            return next.run(request).await;
+        }
+    }
+
+    // ponytail: fixed login gate — no JWT/DB, 7d TTL, lazy cleanup at 512
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({"error": "Unauthorized"})),
+    ).into_response()
+}
+
 /// Check whether a requested model is permitted by the allowed_models policy.
 /// Bun stores allowed_models as either `"*"` or a JSON array string like
 /// `["gpt-4","claude-3"]`.
