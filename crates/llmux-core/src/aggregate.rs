@@ -144,6 +144,7 @@ impl AggregateRouter {
     }
 
     /// Called when a request succeeds at `hit` (hit may equal active or downstream).
+    /// 连续 3 次命中同一非 active 候选才迁移；命中 active 则连续计数清零。
     /// Returns true if V actually migrated.
     pub fn record_request_outcome(&mut self, alias: &str, hit: usize, len: usize) -> bool {
         let e = self.ensure_entry(alias, len);
@@ -151,58 +152,60 @@ impl AggregateRouter {
             e.last_status[hit] = Some(true);
         }
         if hit == e.active {
-            // stable on current V — clear any pending downgrade
-            if e.pending_target.is_some() {
+            // 命中当前活跃：视为中断，降级连续计数清零（例：失败2次后成功1次 -> 重新计数）
+            if e.pending_target.is_some() || e.confirm_count != 0 {
                 e.pending_target = None;
                 e.confirm_count = 0;
             }
             e.probe_backoff_secs = 300;
             return false;
         }
-        // need to migrate V -> hit, via 3-confirm
+        // 命中下游候选：按同一 target 连续 3 次才切，不连续则重新计数
         Self::advance_pending(e, hit)
     }
 
     /// Called when a request exhausts all candidates (502). Treat as pending V=0.
+    /// 同样要求连续 3 次才生效，不连续清零。
     /// Returns true if V migrated.
     pub fn record_request_all_failed(&mut self, alias: &str, len: usize) -> bool {
         let e = self.ensure_entry(alias, len);
-        // mark all as failed for visibility
         for v in e.last_status.iter_mut() {
             *v = Some(false);
         }
         if e.active == 0 {
-            // already at default, no migration needed but clear pending that points elsewhere?
-            // keep pending logic: if pending_target was Some(0) already, count it
+            // 已在 0：无迁移，但对 pending 0 的“连续全失败”计数仍需 3 次连续才触发 backoff 翻倍
+            // 若中间有成功（record_request_outcome 已清零），此处从头计数
             if e.pending_target == Some(0) {
-                e.confirm_count += 1;
+                e.confirm_count = e.confirm_count.saturating_add(1);
                 if e.confirm_count >= 3 {
                     e.pending_target = None;
                     e.confirm_count = 0;
                     e.probe_backoff_secs = (e.probe_backoff_secs * 2).min(600);
-                    return false;
                 }
                 return false;
             }
-            // if pending was different, reset to 0 with 1
             if e.pending_target.is_some() {
+                // 之前在等切到别的 V，遇到全失败则视为中断，重置为等待 0 的第 1 次
                 e.pending_target = Some(0);
                 e.confirm_count = 1;
             }
+            // pending 为 None 时不累计（0 本就是 active，无需切）
             return false;
         }
+        // active != 0 且全失败：视为连续 3 次要求切回 0，中断则清零
         Self::advance_pending(e, 0)
     }
 
-    /// Probe gives candidate V' — migrate via same 3-confirm. Returns true if switched.
+    /// Probe gives candidate V' — 升级同样连续 3 次才切，不连续清零。
+    /// Returns true if switched.
     pub fn record_probe_candidate(&mut self, alias: &str, v_prime: usize, len: usize) -> bool {
         let e = self.ensure_entry(alias, len);
         if v_prime >= len && len > 0 {
             return false;
         }
         if v_prime == e.active {
-            // probe confirms current V healthy — clear pending and reset backoff
-            if e.pending_target.is_some() {
+            // 探测确认当前 V 健康：升级/降级等待均视为中断，清零
+            if e.pending_target.is_some() || e.confirm_count != 0 {
                 e.pending_target = None;
                 e.confirm_count = 0;
             }
@@ -215,16 +218,6 @@ impl AggregateRouter {
         }
         let switched = Self::advance_pending(e, v_prime);
         e.last_probe = Instant::now();
-        if switched {
-            // on actual switch, reset backoff if it was a hit, double if it was an all-failed reset to 0
-            // caller distinguishes via v_prime; we reset on any successful switch to a live candidate
-            // all-failed case (v_prime==0 after full scan) will have been a live candidate only if len==0 else it's a reset
-            // we treat any switched as stabilizing — reset unless it was an all-failed 3rd confirmation
-            // For simplicity, probe caller handles backoff for all-failed; here just mark last_status
-            if v_prime < e.last_status.len() {
-                // will be overwritten by probe loop's per-candidate status; keep as success marker
-            }
-        }
         switched
     }
 
