@@ -121,20 +121,23 @@ pub async fn set_aggregate_alias(
         .unwrap_or(300)
         .clamp(60, 3600);
 
-    // Validate account_ids exist and are active
+    // Validate account_ids exist and are active (dedup: same account may appear with different models)
     {
-        let placeholders: Vec<String> = account_ids.iter().map(|_| "?".to_string()).collect();
+        let mut unique_ids = account_ids.clone();
+        unique_ids.sort_unstable();
+        unique_ids.dedup();
+        let placeholders: Vec<String> = unique_ids.iter().map(|_| "?".to_string()).collect();
         let sql = format!(
             "SELECT id FROM accounts WHERE id IN ({}) AND is_active = 1",
             placeholders.join(",")
         );
         let mut query = sqlx::query(&sql);
-        for id in &account_ids {
+        for id in &unique_ids {
             query = query.bind(id);
         }
         match query.fetch_all(&state.pool).await {
             Ok(rows) => {
-                if rows.len() != account_ids.len() {
+                if rows.len() != unique_ids.len() {
                     return crate::error::simple_error(
                         "one or more account_id does not exist or is inactive",
                         StatusCode::BAD_REQUEST,
