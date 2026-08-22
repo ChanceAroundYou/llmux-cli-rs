@@ -1,5 +1,7 @@
 import React, { useState, useEffect } from 'react';
-import { BrowserRouter as Router, Routes, Route, Link, useLocation } from 'react-router-dom';
+import { BrowserRouter as Router, Routes, Route, Link, useLocation, Navigate, Outlet } from 'react-router-dom';
+import Login from './routes/login';
+import { useAuthStore } from './stores/auth';
 import {
   LayoutDashboard,
   Users,
@@ -12,6 +14,7 @@ import {
   Menu,
   X,
   BarChart3,
+  LogOut,
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import Accounts from './routes/accounts';
@@ -70,6 +73,26 @@ const NavItem = ({ to, icon: Icon, labelKey, onClick }: { to: string; icon: any;
       <span>{t(labelKey)}</span>
       {isActive && <ChevronRight size={14} className="ml-auto opacity-40" />}
     </Link>
+  );
+};
+
+function ProtectedLayout() {
+  const { isAuthenticated, checkAuth } = useAuthStore();
+  useEffect(() => { if (isAuthenticated === null) checkAuth(); }, []); // eslint-disable-line
+  if (isAuthenticated === null) return <div className="flex h-screen items-center justify-center text-sm text-muted-foreground">Loading...</div>;
+  if (!isAuthenticated) return <Navigate to="/login" replace />;
+  return <Outlet />;
+}
+
+const LogoutButton = () => {
+  const { isAuthenticated, logout } = useAuthStore();
+  const { t } = useTranslation();
+  if (!isAuthenticated) return null;
+  return (
+    <Button variant="ghost" size="sm" onClick={logout} title={t('common.logout', '退出登录')}>
+      <LogOut size={16} className="mr-1.5" />
+      {t('common.logout', '退出')}
+    </Button>
   );
 };
 
@@ -167,6 +190,7 @@ function App() {
             <h2 className="text-sm font-bold lg:hidden">LLMux</h2>
           </div>
           <div className="flex items-center gap-4">
+             <LogoutButton />
              <LanguageSwitcher />
           </div>
         </header>
@@ -174,13 +198,16 @@ function App() {
         <div className="flex-1 overflow-y-auto">
           <div className="p-4 lg:p-10 max-w-[1600px] mx-auto w-full">
             <Routes>
-              <Route path="/" element={<Dashboard />} />
-              <Route path="/accounts" element={<Accounts />} />
-              <Route path="/models" element={<Models />} />
-              <Route path="/keys" element={<KeysPage />} />
-              <Route path="/stats" element={<StatsPage />} />
-              <Route path="/settings" element={<SettingsPage />} />
-              <Route path="/about" element={<About />} />
+              <Route path="/login" element={<Login />} />
+              <Route element={<ProtectedLayout />}>
+                <Route path="/" element={<Dashboard />} />
+                <Route path="/accounts" element={<Accounts />} />
+                <Route path="/models" element={<Models />} />
+                <Route path="/keys" element={<KeysPage />} />
+                <Route path="/stats" element={<StatsPage />} />
+                <Route path="/settings" element={<SettingsPage />} />
+                <Route path="/about" element={<About />} />
+              </Route>
             </Routes>
           </div>
         </div>
