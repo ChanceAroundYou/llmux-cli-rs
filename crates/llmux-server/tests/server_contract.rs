@@ -2,12 +2,43 @@ use axum::body::Body;
 use http::{header, Method, Request, StatusCode};
 use serde_json::{json, Value};
 
+fn extract_session_cookie(response: &axum::response::Response) -> Option<String> {
+    for val in response.headers().get_all(header::SET_COOKIE) {
+        if let Ok(s) = val.to_str() {
+            if s.starts_with("llmux_session=") {
+                let token = s.split(';').next().unwrap_or("").trim().to_string();
+                if !token.is_empty() {
+                    return Some(token);
+                }
+            }
+        }
+    }
+    None
+}
+
+async fn login_and_get_cookie(app: &axum::Router, state: &llmux_server::app::AppState) -> Option<String> {
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/api/auth/login")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::json!({"username":"xiaokubao","password":"Xkb111717!"}).to_string()))
+        .unwrap();
+    let resp = llmux_server::test_request(app.clone(), req).await;
+    extract_session_cookie(&resp)
+}
+
 async fn request_json(method: Method, path: &str, body: Option<Value>) -> (StatusCode, Value) {
     let state = llmux_server::test_state().await;
-    let app = llmux_server::app(state);
-    let mut builder = Request::builder().method(method).uri(path);
+    let app = llmux_server::app(state.clone());
+    // auto-authenticate for /api/* (except login/health/v1)
+    let needs_auth = path.starts_with("/api/") && !path.starts_with("/api/auth/login") && !path.starts_with("/api/health");
+    let cookie = if needs_auth { login_and_get_cookie(&app, &state).await } else { None };
+    let mut builder = Request::builder().method(method.clone()).uri(path);
     if body.is_some() {
         builder = builder.header(header::CONTENT_TYPE, "application/json");
+    }
+    if let Some(c) = cookie {
+        builder = builder.header(header::COOKIE, c);
     }
     let request = builder
         .body(match body {
@@ -274,3 +305,58 @@ async fn system_claude_settings_returns_valid_structure() {
     assert!(body.get("exists").is_some());
     assert!(body.get("settings").is_some());
 }
+
+#[tokio::test]
+async fn ui_auth_login_and_me_and_logout_gate() {
+    use http::header;
+    // unauthorized without cookie
+    let (status, _) = request_json(http::Method::GET, "/api/settings", None).await;
+    // request_json auto-logins, so test raw without auth
+    let state = llmux_server::test_state().await;
+    let app = llmux_server::app(state.clone());
+    let req = http::Request::builder().method(http::Method::GET).uri("/api/settings").body(axum::body::Body::empty()).unwrap();
+    let resp = llmux_server::test_request(app.clone(), req).await;
+    assert_eq!(resp.status(), http::StatusCode::UNAUTHORIZED);
+
+    // health is whitelisted
+    let req = http::Request::builder().method(http::Method::GET).uri("/api/health").body(axum::body::Body::empty()).unwrap();
+    let resp = llmux_server::test_request(app.clone(), req).await;
+    assert_eq!(resp.status(), http::StatusCode::OK);
+
+    // login success sets cookie
+    let req = http::Request::builder().method(http::Method::POST).uri("/api/auth/login")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(axum::body::Body::from(r#"{"username":"xiaokubao","password":"Xkb111717!"}"#)).unwrap();
+    let resp = llmux_server::test_request(app.clone(), req).await;
+    assert_eq!(resp.status(), http::StatusCode::OK);
+    let cookie = extract_session_cookie(&resp).expect("set-cookie");
+    assert!(cookie.starts_with("llmux_session="));
+
+    // me with cookie
+    let req = http::Request::builder().method(http::Method::GET).uri("/api/auth/me")
+        .header(header::COOKIE, cookie.clone()).body(axum::body::Body::empty()).unwrap();
+    let resp = llmux_server::test_request(app.clone(), req).await;
+    assert_eq!(resp.status(), http::StatusCode::OK);
+
+    // logout clears
+    let req = http::Request::builder().method(http::Method::POST).uri("/api/auth/logout")
+        .header(header::COOKIE, cookie.clone()).body(axum::body::Body::empty()).unwrap();
+    let resp = llmux_server::test_request(app.clone(), req).await;
+    assert_eq!(resp.status(), http::StatusCode::OK);
+
+    // after logout, old cookie rejected
+    let req = http::Request::builder().method(http::Method::GET).uri("/api/settings")
+        .header(header::COOKIE, cookie).body(axum::body::Body::empty()).unwrap();
+    let resp = llmux_server::test_request(app, req).await;
+    assert_eq!(resp.status(), http::StatusCode::UNAUTHORIZED);
+
+    // wrong password
+    let state2 = llmux_server::test_state().await;
+    let app2 = llmux_server::app(state2);
+    let req = http::Request::builder().method(http::Method::POST).uri("/api/auth/login")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(axum::body::Body::from(r#"{"username":"xiaokubao","password":"wrong"}"#)).unwrap();
+    let resp = llmux_server::test_request(app2, req).await;
+    assert_eq!(resp.status(), http::StatusCode::UNAUTHORIZED);
+}
+
