@@ -236,7 +236,8 @@ export const useModelsStore = create<ModelsState>((set, get) => ({
         err.status = res.status;
         throw err;
       }
-      await get().fetchAliases();
+      // 覆盖聚合别名后聚合列表也会变化，须同步刷新
+      await Promise.all([get().fetchAliases(), get().fetchAggregateAliases()]);
     } catch (err: any) {
       set({ error: err.message });
       throw err;
@@ -259,7 +260,8 @@ export const useModelsStore = create<ModelsState>((set, get) => ({
       const body: any = { alias, candidates, interval_secs: intervalSecs ?? 300, ...(confirm ? { confirm: true } : {}) };
       const res = await apiFetch('/api/aggregate-aliases', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
       if (!res.ok) { const data = await res.json(); const err: any = new Error(data.error || 'Failed to save aggregate alias'); err.code = data.code; err.conflict = data.conflict; err.status = res.status; throw err; }
-      await get().fetchAggregateAliases();
+      // 覆盖普通别名后普通别名列表也会变化，须同步刷新
+      await Promise.all([get().fetchAggregateAliases(), get().fetchAliases()]);
     } catch (err: any) { set({ error: err.message }); throw err; }
   },
 
