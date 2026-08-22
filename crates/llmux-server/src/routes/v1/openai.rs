@@ -18,7 +18,6 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use llmux_core::adapters::{self, execute_provider_request, ProviderRequest};
-use llmux_core::aggregate::get_account_by_id;
 use llmux_core::dispatcher::{self, get_accounts_by_ids, get_active_accounts, is_retryable_status};
 use llmux_core::proxy::openai_anthropic::{
     anthropic_to_openai_response, is_unsupported_api_for_model, openai_to_anthropic_request,
@@ -42,10 +41,6 @@ pub async fn chat_completions(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    // Aggregate alias takes precedence over ordinary alias/prefix
-    if let Ok(Some(agg)) = state.resolve_aggregate_cached(body.get("model").and_then(Value::as_str).unwrap_or_default()).await {
-        return dispatch_aggregate_openai(state, auth, uri, headers, body, "chat/completions", agg).await;
-    }
     openai_dispatch(state, auth, uri, headers, body, "chat/completions").await
 }
 
@@ -57,9 +52,6 @@ pub async fn responses(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    if let Ok(Some(agg)) = state.resolve_aggregate_cached(body.get("model").and_then(Value::as_str).unwrap_or_default()).await {
-        return dispatch_aggregate_openai(state, auth, uri, headers, body, "responses", agg).await;
-    }
     openai_dispatch(state, auth, uri, headers, body, "responses").await
 }
 
@@ -438,178 +430,6 @@ async fn openai_dispatch(
         StatusCode::BAD_GATEWAY,
         is_anthropic,
     )
-}
-
-// ---------------------------------------------------------------------------
-// Aggregate (cross-model) OpenAI dispatch — V-anchored, 3-confirm
-// ---------------------------------------------------------------------------
-
-async fn dispatch_aggregate_openai(
-    state: AppState,
-    auth: AuthContext,
-    uri: axum::http::Uri,
-    _headers: HeaderMap,
-    body: Value,
-    endpoint: &str,
-    agg: llmux_core::aggregate::AggregateResolution,
-) -> Response {
-    let normalized_uri = crate::app::normalize_gateway_uri(&uri);
-    let is_anthropic = false;
-    let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
-    if !middleware::is_model_allowed(&auth.allowed_models, &agg.alias) {
-        return middleware::send_error(
-            &format!("Model '{}' is not allowed for this API key", agg.alias),
-            "permission_error",
-            StatusCode::UNAUTHORIZED,
-            is_anthropic,
-        );
-    }
-
-    let len = agg.candidates.len();
-    if len == 0 {
-        return middleware::send_error("Aggregate alias has no candidates", "server_error", StatusCode::INTERNAL_SERVER_ERROR, is_anthropic);
-    }
-
-    let start = Instant::now();
-    let alias = agg.alias.clone();
-    let active = agg.active.min(len.saturating_sub(1));
-    let mut last_error: Option<String> = None;
-    let mut hit_index: Option<usize> = None;
-    let mut hit_account: Option<adapters::Account> = None;
-    let mut hit_data: Option<Value> = None;
-    let mut hit_stream_resp: Option<reqwest::Response> = None;
-
-    for i in active..len {
-        let cand = &agg.candidates[i];
-        let account = match get_account_by_id(&state.pool, cand.account_id, &state.master_key).await {
-            Ok(Some(a)) => a,
-            Ok(None) => {
-                state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len);
-                last_error = Some(format!("Candidate {} account {} not found or inactive", i, cand.account_id));
-                continue;
-            }
-            Err(e) => {
-                state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len);
-                last_error = Some(format!("Failed to load account {}: {e}", cand.account_id));
-                continue;
-            }
-        };
-
-        // Patch body model to this candidate's model
-        let mut patched_body = body.clone();
-        patched_body["model"] = Value::String(cand.model.clone());
-
-        // Build provider request (OpenAI-compatible)
-        let default_base = if account.provider_id == "gemini" { "https://generativelanguage.googleapis.com/v1beta/openai" } else { "https://api.openai.com/v1" };
-        let base_url = normalize_base_url(account.base_url.as_deref().filter(|u| !u.is_empty()).unwrap_or(default_base));
-        let mut req_headers = BTreeMap::from([("content-type".to_string(), "application/json".to_string())]);
-        req_headers.insert("authorization".to_string(), format!("Bearer {}", account.api_key));
-        let provider_request = ProviderRequest { method: "POST".to_string(), url: format!("{base_url}/{endpoint}"), headers: req_headers, body: patched_body.clone() };
-
-        tracing::info!("🔀 [agg:{} V={}] {} → {} → {}/{}", alias, active, account.alias, cand.model, base_url, endpoint);
-        if let Some(tx) = &state.tui_tx {
-            let _ = tx.send(TuiEvent::Dispatch { timestamp: time::OffsetDateTime::now_utc().format(&DISPATCH_TIME_FMT).unwrap_or_default(), account: account.alias.clone(), model: cand.model.clone(), url: format!("{}/{}", base_url, endpoint), tag: Some(format!("agg:{alias}")) });
-        }
-
-        let response = match execute_provider_request(&provider_request).await {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!("🔀 [agg:{}] Account {} request failed: {e}", alias, account.alias);
-                last_error = Some(format!("Provider request failed: {e}"));
-                state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len);
-                if let Some(tx) = &state.tui_tx { let _ = tx.send(TuiEvent::Retry { account: account.alias.clone(), status: 0, message: format!("Network error: {e}") }); }
-                continue;
-            }
-        };
-
-        let status = response.status();
-        if !status.is_success() {
-            let error_body = response.text().await.unwrap_or_default();
-            last_error = Some(format!("Provider returned {status}: {error_body}"));
-            if is_retryable_status(status.as_u16()) {
-                tracing::warn!("🔀 [agg:{}] Account {} failed ({}) — trying next...", alias, account.alias, status.as_u16());
-                state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len);
-                if let Some(tx) = &state.tui_tx { let _ = tx.send(TuiEvent::Retry { account: account.alias.clone(), status: status.as_u16(), message: error_body.clone() }); }
-                continue;
-            }
-            if endpoint == "chat/completions" && is_unsupported_api_for_model(&error_body) && account.anthropic_base_url.as_deref().map(str::trim).is_some_and(|u| !u.is_empty()) {
-                tracing::info!("↩️ [agg:{}] {} rejected /chat/completions — retrying via /v1/messages", alias, account.alias);
-                if let Some(resp) = anthropic_fallback_response(&patched_body, &account, &cand.model, streaming, state.pool.clone(), start).await {
-                    state.aggregate_router.lock().unwrap().record_request_outcome(&alias, i, len);
-                    send_tui_request(&state.tui_tx, normalized_uri.path(), 200, start, &cand.model);
-                    return resp;
-                }
-            }
-            let latency_ms = start.elapsed().as_millis() as i64;
-            spawn_log_usage(state.pool.clone(), account.clone(), cand.model.clone(), account.provider_id.clone(), 0, 0, 0, 0, latency_ms, false, last_error.clone());
-            send_tui_request(&state.tui_tx, normalized_uri.path(), status.as_u16(), start, &cand.model);
-            // Non-retryable final for this candidate — treat as candidate failure, try next candidate
-            state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len);
-            // For non-retryable upstream errors, we still continue to next candidate (spec: failover down the list)
-            // But to avoid hiding the upstream error when all candidates fail with non-retryable, we keep last_error.
-            continue;
-        }
-
-        if streaming {
-            state.aggregate_router.lock().unwrap().note_candidate_success(&alias, i, len);
-            hit_index = Some(i);
-            hit_account = Some(account.clone());
-            hit_stream_resp = Some(response);
-            break;
-        }
-
-        let body_bytes = match response.bytes().await { Ok(b) => b, Err(e) => { last_error = Some(format!("Failed to read response: {e}")); state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); continue; } };
-        let data: Value = match serde_json::from_slice(&body_bytes) { Ok(v) => v, Err(e) => { last_error = Some(format!("Failed to parse response: {e}")); state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); continue; } };
-        let (prompt_tokens, completion_tokens) = adapters::usage_from_openai_response_body(&data);
-        let latency_ms = start.elapsed().as_millis() as i64;
-        spawn_log_usage(state.pool.clone(), account.clone(), cand.model.clone(), account.provider_id.clone(), prompt_tokens, completion_tokens, 0, 0, latency_ms, true, None);
-        state.aggregate_router.lock().unwrap().note_candidate_success(&alias, i, len);
-        hit_index = Some(i);
-        hit_account = Some(account);
-        hit_data = Some(data);
-        break;
-    }
-
-    if let Some(hit) = hit_index {
-        let switched = state.aggregate_router.lock().unwrap().record_request_outcome(&alias, hit, len);
-        if switched {
-            tracing::info!("🔀 [agg:{}] V migrated -> {} (after 3-confirm)", alias, hit);
-        } else if hit != active {
-            tracing::info!("🔀 [agg:{}] hit {} pending V migration ({}/3)", alias, hit, state.aggregate_router.lock().unwrap().entries.get(&alias).map(|e| e.confirm_count).unwrap_or(0));
-        }
-        if let Some(resp) = hit_stream_resp {
-            // need cand model for stream
-            let cand_model = agg.candidates[hit].model.clone();
-            let account = hit_account.unwrap();
-            send_tui_request(&state.tui_tx, normalized_uri.path(), 200, start, &cand_model);
-            return openai_streaming_passthrough(resp, &cand_model, &account, state.pool.clone(), start).await;
-        }
-        if let Some(data) = hit_data {
-            send_tui_request(&state.tui_tx, normalized_uri.path(), 200, start, &agg.candidates[hit].model);
-            return Json(data).into_response();
-        }
-        // fallback path (anthropic fallback already returned above)
-    }
-
-    // All candidates exhausted
-    let switched = state.aggregate_router.lock().unwrap().record_request_all_failed(&alias, len);
-    if switched {
-        tracing::info!("🔀 [agg:{}] all failed — V reset to 0 (after 3-confirm)", alias);
-    }
-    let latency_ms = start.elapsed().as_millis() as i64;
-    let error_msg = last_error.unwrap_or_else(|| "All aggregate candidates exhausted".to_string());
-    if let Some(idx) = hit_index {
-        if let Some(account) = hit_account {
-            spawn_log_usage(state.pool.clone(), account, agg.candidates[idx].model.clone(), String::new(), 0, 0, 0, 0, latency_ms, false, Some(error_msg.clone()));
-        }
-    } else if len > 0 {
-        // best-effort: log with alias name
-        if let Ok(Some(acc)) = get_account_by_id(&state.pool, agg.candidates[0].account_id, &state.master_key).await {
-            spawn_log_usage(state.pool.clone(), acc, agg.candidates[0].model.clone(), String::new(), 0, 0, 0, 0, latency_ms, false, Some(error_msg.clone()));
-        }
-    }
-    send_tui_request(&state.tui_tx, normalized_uri.path(), 502, start, &agg.alias);
-    middleware::send_error(&error_msg, "upstream_error", StatusCode::BAD_GATEWAY, is_anthropic)
 }
 
 // ---------------------------------------------------------------------------

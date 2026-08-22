@@ -17,7 +17,6 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use llmux_core::adapters::{self, execute_provider_request, ProviderRequest};
-use llmux_core::aggregate::get_account_by_id;
 use llmux_core::dispatcher::{self, get_accounts_by_ids, get_active_accounts, is_retryable_status};
 use llmux_core::proxy::anthropic_openai::{
     anthropic_to_openai_request, cache_usage_from_openai, openai_to_anthropic_response,
@@ -47,10 +46,6 @@ pub async fn messages(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    let raw_model = body["model"].as_str().unwrap_or_default().to_string();
-    if let Ok(Some(agg)) = state.resolve_aggregate_cached(&raw_model).await {
-        return dispatch_aggregate_anthropic(state, auth, headers, body, agg).await;
-    }
     let is_anthropic = true;
 
     let model_name = dispatcher::sanitize_model_name(
@@ -462,156 +457,6 @@ pub async fn messages(
         );
     }
     send_tui_request(&state.tui_tx, "/v1/messages", 502, start, &model_resolution.target_model);
-    middleware::send_error(&error_msg, "upstream_error", StatusCode::BAD_GATEWAY, is_anthropic)
-}
-
-async fn dispatch_aggregate_anthropic(
-    state: AppState,
-    auth: AuthContext,
-    headers: HeaderMap,
-    body: Value,
-    agg: llmux_core::aggregate::AggregateResolution,
-) -> Response {
-    let is_anthropic = true;
-    let streaming = body["stream"].as_bool().unwrap_or(false);
-    let anthropic_beta = headers.get("anthropic-beta").and_then(|v| v.to_str().ok()).map(|s| s.to_string());
-    if !middleware::is_model_allowed(&auth.allowed_models, &agg.alias) {
-        return middleware::send_error(&format!("Model '{}' is not allowed for this API key", agg.alias), "permission_error", StatusCode::UNAUTHORIZED, true);
-    }
-    let len = agg.candidates.len();
-    if len == 0 {
-        return middleware::send_error("Aggregate alias has no candidates", "server_error", StatusCode::INTERNAL_SERVER_ERROR, true);
-    }
-    let alias = agg.alias.clone();
-    let active = agg.active.min(len.saturating_sub(1));
-    let start = Instant::now();
-    let mut last_error: Option<String> = None;
-    let mut hit: Option<usize> = None;
-
-    // Pre-build a flag for streaming hit response (need account/model for passthrough)
-    let mut hit_stream: Option<(reqwest::Response, String, adapters::Account, String, bool)> = None;
-    let mut hit_json: Option<Value> = None;
-    let mut hit_account: Option<adapters::Account> = None;
-
-    for i in active..len {
-        let cand = &agg.candidates[i];
-        let account = match get_account_by_id(&state.pool, cand.account_id, &state.master_key).await {
-            Ok(Some(a)) => a,
-            Ok(None) => { state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); last_error = Some(format!("Candidate {} account {} not found or inactive", i, cand.account_id)); continue; }
-            Err(e) => { state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); last_error = Some(format!("Failed to load account {}: {e}", cand.account_id)); continue; }
-        };
-
-        // Patch body model
-        let mut patched_body = body.clone();
-        if let Some(obj) = patched_body.as_object_mut() {
-            obj.insert("model".to_string(), Value::String(cand.model.clone()));
-        } else {
-            patched_body["model"] = Value::String(cand.model.clone());
-        }
-
-        let anthropic_base = account.anthropic_base_url.as_deref().map(str::trim).filter(|u| !u.is_empty());
-        let openai_base = account.base_url.as_deref().map(str::trim).filter(|u| !u.is_empty());
-
-        let (provider_request, is_conversion) = if let Some(anthropic_base) = anthropic_base {
-            (build_anthropic_passthrough_request(&patched_body, &account, anthropic_base, &cand.model, anthropic_beta.as_deref()), false)
-        } else if let Some(openai_base) = openai_base {
-            match anthropic_to_openai_request(&patched_body, &cand.model) {
-                Ok(openai_body) => {
-                    let mut req_headers = BTreeMap::new();
-                    req_headers.insert("content-type".to_string(), "application/json".to_string());
-                    req_headers.insert("authorization".to_string(), format!("Bearer {}", account.api_key));
-                    (Ok(ProviderRequest { method: "POST".to_string(), url: format!("{}/chat/completions", openai_base.trim_end_matches('/')), headers: req_headers, body: openai_body }), true)
-                }
-                Err(e) => (Err(e), true),
-            }
-        } else {
-            (build_anthropic_passthrough_request(&patched_body, &account, "https://api.anthropic.com/v1", &cand.model, anthropic_beta.as_deref()), false)
-        };
-
-        let provider_request = match provider_request { Ok(r) => r, Err(e) => { tracing::error!("📡 [agg:{}] build request failed: {e}", alias); last_error = Some(format!("Failed to build provider request: {e}")); state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); continue; } };
-
-        tracing::info!("🔀 [agg:{} V={}] {} → {} → {} {}", alias, active, account.alias, cand.model, provider_request.url, if is_conversion { "[anthropic→openai]" } else { "" });
-        if let Some(tx) = &state.tui_tx { let _ = tx.send(TuiEvent::Dispatch { timestamp: time::OffsetDateTime::now_utc().format(&DISPATCH_TIME_FMT).unwrap_or_default(), account: account.alias.clone(), model: cand.model.clone(), url: provider_request.url.clone(), tag: Some(format!("agg:{alias}")) }); }
-
-        let response = match execute_provider_request(&provider_request).await {
-            Ok(r) => r,
-            Err(e) => { tracing::error!("📡 [agg:{}] provider request failed: {e}", alias); last_error = Some(format!("Provider request failed: {e}")); state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); continue; }
-        };
-
-        let status = response.status();
-        if !status.is_success() {
-            let error_body = response.text().await.unwrap_or_default();
-            last_error = Some(format!("Provider returned {status}: {error_body}"));
-            if is_retryable_status(status.as_u16()) {
-                tracing::warn!("🔀 [agg:{}] Account {} failed ({}) — trying next...", alias, account.alias, status.as_u16());
-                state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len);
-                continue;
-            }
-            // non-retryable — try next candidate as well (failover down the chain)
-            state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len);
-            continue;
-        }
-
-        if streaming {
-            state.aggregate_router.lock().unwrap().note_candidate_success(&alias, i, len);
-            hit = Some(i);
-            hit_account = Some(account.clone());
-            hit_stream = Some((response, cand.model.clone(), account.clone(), account.provider_id.clone(), is_conversion));
-            break;
-        }
-
-        let body_bytes = match response.bytes().await { Ok(b) => b, Err(e) => { last_error = Some(format!("Failed to read response: {e}")); state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); continue; } };
-        let data: Value = match serde_json::from_slice(&body_bytes) { Ok(v) => v, Err(e) => { last_error = Some(format!("Failed to parse response: {e}")); state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); continue; } };
-
-        let latency_ms = start.elapsed().as_millis() as i64;
-        if is_conversion {
-            let anthropic_resp = openai_to_anthropic_response(&data, &cand.model);
-            let usage = &data["usage"];
-            let (cache_read, cache_create) = cache_usage_from_openai(usage);
-            crate::routes::v1::helpers::spawn_log_usage(state.pool.clone(), account.clone(), cand.model.clone(), account.provider_id.clone(), usage["prompt_tokens"].as_i64().unwrap_or(0), usage["completion_tokens"].as_i64().unwrap_or(0), cache_read, cache_create, latency_ms, true, None);
-            state.aggregate_router.lock().unwrap().note_candidate_success(&alias, i, len);
-            hit = Some(i);
-            hit_account = Some(account);
-            hit_json = Some(anthropic_resp);
-            break;
-        }
-
-        let usage = extract_anthropic_usage_from_sse(&String::from_utf8_lossy(&body_bytes));
-        crate::routes::v1::helpers::spawn_log_usage(state.pool.clone(), account.clone(), cand.model.clone(), account.provider_id.clone(), usage.input_tokens, usage.output_tokens, usage.cache_read_input_tokens, usage.cache_creation_input_tokens, latency_ms, true, None);
-        state.aggregate_router.lock().unwrap().note_candidate_success(&alias, i, len);
-        hit = Some(i);
-        hit_account = Some(account);
-        hit_json = Some(data);
-        break;
-    }
-
-    if let Some(idx) = hit {
-        let switched = state.aggregate_router.lock().unwrap().record_request_outcome(&alias, idx, len);
-        if switched { tracing::info!("🔀 [agg:{}] V migrated -> {} (after 3-confirm)", alias, idx); }
-        let cand_model = agg.candidates[idx].model.clone();
-        if let Some((resp, model, account, provider_id, is_conv)) = hit_stream {
-            send_tui_request(&state.tui_tx, "/v1/messages", 200, start, &cand_model);
-            if is_conv {
-                return anthropic_to_openai_streaming(resp, &model, &account, state.pool.clone(), &provider_id, start).await;
-            }
-            return anthropic_streaming_passthrough(resp, &model, &account, state.pool.clone(), &provider_id, start).await;
-        }
-        if let Some(data) = hit_json {
-            send_tui_request(&state.tui_tx, "/v1/messages", 200, start, &cand_model);
-            return Json(data).into_response();
-        }
-    }
-
-    let switched = state.aggregate_router.lock().unwrap().record_request_all_failed(&alias, len);
-    if switched { tracing::info!("🔀 [agg:{}] all failed — V reset to 0 (after 3-confirm)", alias); }
-    let latency_ms = start.elapsed().as_millis() as i64;
-    let error_msg = last_error.unwrap_or_else(|| "All aggregate candidates exhausted".to_string());
-    if let Some(acc) = hit_account {
-        crate::routes::v1::helpers::spawn_log_usage(state.pool.clone(), acc, agg.candidates[0].model.clone(), String::new(), 0, 0, 0, 0, latency_ms, false, Some(error_msg.clone()));
-    } else if let Ok(Some(acc)) = get_account_by_id(&state.pool, agg.candidates[0].account_id, &state.master_key).await {
-        crate::routes::v1::helpers::spawn_log_usage(state.pool.clone(), acc, agg.candidates[0].model.clone(), String::new(), 0, 0, 0, 0, latency_ms, false, Some(error_msg.clone()));
-    }
-    send_tui_request(&state.tui_tx, "/v1/messages", 502, start, &agg.alias);
     middleware::send_error(&error_msg, "upstream_error", StatusCode::BAD_GATEWAY, is_anthropic)
 }
 

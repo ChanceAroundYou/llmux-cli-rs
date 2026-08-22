@@ -12,7 +12,6 @@ use axum::{
 };
 use std::task::{Context, Poll};
 use tower::{Layer, Service};
-use llmux_core::aggregate::{AggregateResolution, AggregateRouter};
 use llmux_core::dispatcher::{DispatchRouter, ModelResolution};
 use serde_json::Value;
 use sqlx::SqlitePool;
@@ -29,11 +28,6 @@ pub struct CachedAuth {
 #[derive(Debug, Clone)]
 pub struct CachedModel {
     pub resolution: ModelResolution,
-    pub expires: Instant,
-}
-#[derive(Debug, Clone)]
-pub struct CachedAggregate {
-    pub resolution: Option<AggregateResolution>,
     pub expires: Instant,
 }
 use tower_http::{
@@ -86,12 +80,10 @@ pub struct AppState {
     pub base_path: String,
     pub test_queue: Arc<Mutex<TestQueueState>>,
     pub dispatch_router: Arc<Mutex<DispatchRouter>>, // ponytail: std Mutex — critical section is µs, no need for async lock
-    pub aggregate_router: Arc<Mutex<AggregateRouter>>,
     pub models_cache: Arc<Mutex<Option<ModelsCache>>>,
     pub tui_tx: Option<tokio::sync::mpsc::UnboundedSender<TuiEvent>>,
     pub auth_cache: Arc<Mutex<HashMap<String, CachedAuth>>>,
     pub model_cache: Arc<Mutex<HashMap<String, CachedModel>>>,
-    pub aggregate_cache: Arc<Mutex<HashMap<String, CachedAggregate>>>,
 }
 
 pub type AppRouter = Router;
@@ -254,14 +246,6 @@ fn core_router() -> AppRouter {
             "/api/models/aliases/:id",
             delete(models::delete_model_alias),
         )
-        .route(
-            "/api/aggregate-aliases",
-            get(models::list_aggregate_aliases).post(models::set_aggregate_alias),
-        )
-        .route(
-            "/api/aggregate-aliases/:id",
-            delete(models::delete_aggregate_alias),
-        )
         .route("/api/models/health", get(models::get_models_health))
         .route(
             "/api/models/test-queue/status",
@@ -383,12 +367,10 @@ pub async fn test_state() -> AppState {
         base_path: String::new(),
         test_queue: Arc::new(Mutex::new(TestQueueState::default())),
         dispatch_router: Arc::new(Mutex::new(DispatchRouter::default())),
-        aggregate_router: Arc::new(Mutex::new(AggregateRouter::default())),
         models_cache: Arc::new(Mutex::new(None)),
         tui_tx: None,
         auth_cache: Arc::new(Mutex::new(HashMap::new())),
         model_cache: Arc::new(Mutex::new(HashMap::new())),
-        aggregate_cache: Arc::new(Mutex::new(HashMap::new())),
     }
 }
 
@@ -407,45 +389,9 @@ impl AppState {
         if guard.len() > 512 { guard.retain(|_, v| v.expires > Instant::now()); }
         Ok(res)
     }
-    pub async fn resolve_aggregate_cached(&self, model_name: &str) -> anyhow::Result<Option<AggregateResolution>> {
-        let key = llmux_core::dispatcher::sanitize_model_name(model_name);
-        // Aggregate lookup bypasses model_cache; use its own TTL cache
-        if let Some(cached) = self.aggregate_cache.lock().unwrap().get(&key).cloned() {
-            if cached.expires > Instant::now() {
-                return Ok(cached.resolution.clone());
-            }
-        }
-        // read active without holding aggregate lock across await
-        let active = self.aggregate_router.lock().unwrap().get_active(&key);
-        // Need to snapshot router map; easiest is to clone needed state first, then call DB helper with a temp router
-        // To avoid holding lock across DB, build a minimal AggregateRouter snapshot
-        let snapshot = {
-            let guard = self.aggregate_router.lock().unwrap();
-            let mut tmp = AggregateRouter::default();
-            if let Some(e) = guard.entries.get(&key) {
-                tmp.entries.insert(key.clone(), e.clone());
-            }
-            tmp
-        };
-        let res = llmux_core::aggregate::resolve_aggregate(&self.pool, &key, &snapshot).await?;
-        // reconcile active from live router (may have changed)
-        let res = if let Some(mut r) = res {
-            r.active = self.aggregate_router.lock().unwrap().get_active(&key).min(r.candidates.len().saturating_sub(1));
-            Some(r)
-        } else { None };
-        let _ = active; // keep for future probe logic
-        self.aggregate_cache.lock().unwrap().insert(key, CachedAggregate { resolution: res.clone(), expires: Instant::now() + HOT_CACHE_TTL });
-        Ok(res)
-    }
-    pub fn invalidate_aggregate_cache(&self, alias: &str) {
-        let key = llmux_core::dispatcher::sanitize_model_name(alias);
-        self.aggregate_cache.lock().unwrap().remove(&key);
-        self.model_cache.lock().unwrap().remove(&key);
-    }
     pub fn invalidate_model_cache(&self, alias: &str) {
         let key = llmux_core::dispatcher::sanitize_model_name(alias);
         self.model_cache.lock().unwrap().remove(&key);
-        self.aggregate_cache.lock().unwrap().remove(&key);
     }
     pub fn clear_auth_cache(&self) {
         self.auth_cache.lock().unwrap().clear();
