@@ -38,10 +38,27 @@ pub async fn models(Extension(state): Extension<AppState>, headers: HeaderMap) -
             );
         }
     };
+    // Merge aggregate aliases as first-class models
+    let agg_rows: Vec<(String, String)> =
+        match sqlx::query_as::<_, (String, String)>("SELECT alias, candidates FROM aggregate_aliases")
+            .fetch_all(&state.pool)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(_) => Vec::new(),
+        };
+    let mut alias_rows_with_agg = alias_rows;
+    for (alias, candidates) in agg_rows {
+        let target = llmux_core::aggregate::parse_candidates(&candidates)
+            .ok()
+            .and_then(|v| v.into_iter().next().map(|c| c.model))
+            .unwrap_or_default();
+        alias_rows_with_agg.push((alias, Some(target)));
+    }
 
     if is_anthropic {
         let created_at = iso8601_now();
-        let data: Vec<Value> = alias_rows
+        let data: Vec<Value> = alias_rows_with_agg
             .iter()
             .map(|(alias, target)| {
                 let mut obj = serde_json::json!({
@@ -75,7 +92,7 @@ pub async fn models(Extension(state): Extension<AppState>, headers: HeaderMap) -
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let data: Vec<Value> = alias_rows
+    let data: Vec<Value> = alias_rows_with_agg
         .into_iter()
         .map(|(alias, target)| {
             let mut obj = serde_json::json!({

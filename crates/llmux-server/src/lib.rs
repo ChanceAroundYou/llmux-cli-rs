@@ -1,3 +1,4 @@
+pub mod aggregate_probe;
 pub mod app;
 pub mod error;
 pub mod middleware;

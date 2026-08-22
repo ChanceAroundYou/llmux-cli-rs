@@ -56,6 +56,7 @@ async fn init_db_creates_fresh_schema_and_seed_providers() {
         vec![
             "account_model_cache",
             "accounts",
+            "aggregate_aliases",
             "api_keys",
             "model_aliases",
             "model_prices",
