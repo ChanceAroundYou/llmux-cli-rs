@@ -86,6 +86,17 @@ pub struct AccountBreakdown {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TimeseriesPoint {
+    pub bucket: i64,
+    pub input: i64,
+    pub output: i64,
+    pub cache_read: i64,
+    pub cache_create: i64,
+    pub requests: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FailoverStats {
     pub failover_triggers: i64,
     pub recovered_requests: i64,
@@ -378,6 +389,45 @@ impl UsageService {
                     requests: row.try_get("requests")?,
                     success_count: row.try_get("success_count")?,
                     avg_latency: row.try_get("avg_latency")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Time-bucketed token timeseries (stacked-line ready).
+    /// Buckets are [start, end) sliced by `granularity_ms` — caller chooses granularity based on window.
+    pub async fn get_timeseries(
+        &self,
+        start_time: Option<i64>,
+        end_time: Option<i64>,
+        granularity_ms: i64,
+    ) -> Result<Vec<TimeseriesPoint>> {
+        let gran = granularity_ms.max(60_000);
+        let mut sql = String::from(
+            "SELECT CAST(timestamp / ? AS INTEGER) * ? AS bucket,
+                    IFNULL(SUM(input_tokens), 0) AS input,
+                    IFNULL(SUM(output_tokens), 0) AS output,
+                    IFNULL(SUM(cache_read_input_tokens), 0) AS cache_read,
+                    IFNULL(SUM(cache_creation_input_tokens), 0) AS cache_create,
+                    COUNT(*) AS requests
+             FROM usage_logs
+             WHERE is_test = 0",
+        );
+        append_time_filter(&mut sql, "", start_time, end_time);
+        sql.push_str(" GROUP BY bucket ORDER BY bucket");
+        let mut query = sqlx::query(&sql);
+        query = query.bind(gran).bind(gran);
+        query = bind_time_filter(query, start_time, end_time);
+        let rows = query.fetch_all(&self.pool).await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(TimeseriesPoint {
+                    bucket: row.try_get("bucket")?,
+                    input: row.try_get("input")?,
+                    output: row.try_get("output")?,
+                    cache_read: row.try_get("cache_read")?,
+                    cache_create: row.try_get("cache_create")?,
+                    requests: row.try_get("requests")?,
                 })
             })
             .collect()

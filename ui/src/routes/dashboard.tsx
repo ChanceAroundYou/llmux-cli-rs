@@ -27,8 +27,9 @@ ChartJS.register(CategoryScale, LinearScale, BarElement, Tooltip)
 
 interface ProviderHealth { id: string; name?: string; status: string; totalChecks: number; }
 interface ActivityEntry { id: number; timestamp: number; model: string; success: number; latency_ms: number; error_message: string | null; account_name: string; }
-interface ModelHealthEntry { model: string; success: number; latency: number; error: string | null; last_checked: number; account_name: string; }
+interface ModelHealthEntry { model: string; success: number; latency: number; error: string | null; last_checked: number; account_name: string; account_id: number; provider_id: string; }
 interface ModelAlias { id: number; alias: string; target_model: string; provider_id: string | null; }
+interface AggregateAlias { id: number; alias: string; candidates: { account_id: number; model: string }[]; interval_secs: number; active: number; last_status: (boolean | null)[]; pending_target: number | null; confirm_count: number; }
 
 export default function Dashboard() {
   const { t } = useTranslation();
@@ -39,6 +40,7 @@ export default function Dashboard() {
   const [keyCount, setKeyCount] = useState(0);
   const [healthyCount, setHealthyCount] = useState(0);
   const [aliases, setAliases] = useState<ModelAlias[]>([]);
+  const [aggregateAliases, setAggregateAliases] = useState<AggregateAlias[]>([]);
   const [modelHealth, setModelHealth] = useState<ModelHealthEntry[]>([]);
   const [activityLogs, setActivityLogs] = useState<ActivityEntry[]>([]);
   const [isLoading, setIsLoading] = useState(true);
@@ -48,21 +50,23 @@ export default function Dashboard() {
   const loadAll = async () => {
     setIsLoading(true);
     try {
-      const [accRes, aliasRes, keyRes, healthRes, mhRes, actRes] = await Promise.all([
-        apiFetch('/api/accounts'), apiFetch('/api/models/aliases'), apiFetch('/api/keys'),
+      const [accRes, aliasRes, aggRes, keyRes, healthRes, mhRes, actRes] = await Promise.all([
+        apiFetch('/api/accounts'), apiFetch('/api/models/aliases'), apiFetch('/api/aggregate-aliases'), apiFetch('/api/keys'),
         apiFetch('/api/health'), apiFetch('/api/models/health'), apiFetch('/api/activity?limit=200'),
       ]);
       const accounts = accRes.ok ? await accRes.json() : [];
       const aliasData: ModelAlias[] = aliasRes.ok ? await aliasRes.json() : [];
+      const aggData: AggregateAlias[] = aggRes.ok ? await aggRes.json() : [];
       const keys = keyRes.ok ? await keyRes.json() : [];
       const health: ProviderHealth[] = healthRes.ok ? await healthRes.json() : [];
       const mh: ModelHealthEntry[] = mhRes.ok ? await mhRes.json() : [];
       const actData = actRes.ok ? await actRes.json() : { entries: [] };
       setAccountCount(accounts.length);
-      setAliasCount(aliasData.length);
+      setAliasCount(aliasData.length + aggData.length);
       setKeyCount(keys.length);
       setHealthyCount(health.filter(h => h.status !== 'down' && h.status !== 'unknown').length);
       setAliases(aliasData);
+      setAggregateAliases(Array.isArray(aggData) ? aggData : []);
       setModelHealth(mh);
       setActivityLogs(actData.entries || []);
     } catch (err) { console.error('Dashboard load failed:', err); }
@@ -72,6 +76,7 @@ export default function Dashboard() {
   useEffect(() => { loadAll(); }, []);
 
   const aliasHealthList = useMemo(() => {
+    // 普通别名：按 target_model 找最优的一条 model health
     const bestByModel = new Map<string, ModelHealthEntry>();
     modelHealth.forEach(h => {
       const ex = bestByModel.get(h.model);
@@ -79,14 +84,47 @@ export default function Dashboard() {
         bestByModel.set(h.model, h);
       }
     });
-    return aliases.map(a => {
+    // 聚合别名：按候选 (account_id, model) 多键取最优（不同候选可能落在不同账号/模型行）
+    const bestByCandidate = new Map<string, ModelHealthEntry>();
+    modelHealth.forEach(h => {
+      const key = `${h.account_id}::${h.model}`;
+      const ex = bestByCandidate.get(key);
+      if (!ex || (h.success && h.latency < ex.latency) || (!ex.success && h.success)) {
+        bestByCandidate.set(key, h);
+      }
+    });
+    const ordinary = aliases.map(a => {
       const h = bestByModel.get(a.target_model);
       return {
-        alias: a.alias, target_model: a.target_model, provider: a.provider_id || '',
+        alias: a.alias, target_model: a.target_model, provider: a.provider_id || '', kind: 'ordinary' as const,
         success: h ? h.success === 1 : false, latency: h?.latency ?? null, lastChecked: h?.last_checked ?? null,
       };
     });
-  }, [aliases, modelHealth]);
+    const aggregate = aggregateAliases.map(agg => {
+      const activeIdx = Math.min(agg.active ?? 0, Math.max(0, agg.candidates.length - 1));
+      const activeCand = agg.candidates[activeIdx];
+      let h: ModelHealthEntry | undefined;
+      if (activeCand) {
+        h = bestByCandidate.get(`${activeCand.account_id}::${activeCand.model}`);
+        if (!h) h = bestByModel.get(activeCand.model);
+      }
+      // 兜底：所有候选中取最新一条
+      if (!h && agg.candidates.length) {
+        let best: ModelHealthEntry | undefined;
+        for (const c of agg.candidates) {
+          const cand = bestByCandidate.get(`${c.account_id}::${c.model}`) || bestByModel.get(c.model);
+          if (cand && (!best || (cand.last_checked ?? 0) > (best.last_checked ?? 0))) best = cand;
+        }
+        h = best;
+      }
+      const label = activeCand ? `${activeCand.model} (#${activeIdx + 1}/${agg.candidates.length} 活跃)` : `${agg.candidates.length} 候选`;
+      return {
+        alias: agg.alias, target_model: label, provider: 'aggregate', kind: 'aggregate' as const,
+        success: h ? h.success === 1 : false, latency: h?.latency ?? null, lastChecked: h?.last_checked ?? null,
+      };
+    });
+    return [...ordinary, ...aggregate];
+  }, [aliases, aggregateAliases, modelHealth]);
 
   const filteredAliases = useMemo(() => {
     if (!searchQuery) return aliasHealthList;

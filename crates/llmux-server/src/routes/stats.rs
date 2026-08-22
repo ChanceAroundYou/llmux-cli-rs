@@ -24,6 +24,7 @@ const DAY_MS: i64 = 24 * 60 * 60 * 1000;
 pub struct StatsQuery {
     pub start: Option<i64>,
     pub end: Option<i64>,
+    pub granularity: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -49,12 +50,17 @@ pub async fn get_stats(
         return simple_error("start must be <= end", StatusCode::BAD_REQUEST);
     }
 
+    let granularity = params
+        .granularity
+        .unwrap_or_else(|| auto_granularity(start, end));
+
     let svc = UsageService::new(state.pool.clone());
-    let (summary, by_model, by_account, by_provider) = tokio::join!(
+    let (summary, by_model, by_account, by_provider, timeseries) = tokio::join!(
         svc.get_summary(Some(start), Some(end)),
         svc.get_breakdown_by_model(Some(start), Some(end)),
         svc.get_breakdown_by_account(Some(start), Some(end)),
         svc.get_breakdown_by_provider(Some(start), Some(end)),
+        svc.get_timeseries(Some(start), Some(end), granularity),
     );
 
     let summary = match summary {
@@ -73,14 +79,28 @@ pub async fn get_stats(
         Ok(v) => v,
         Err(e) => return simple_error(format!("Failed to get provider breakdown: {e}"), StatusCode::INTERNAL_SERVER_ERROR),
     };
+    let timeseries = match timeseries {
+        Ok(v) => v,
+        Err(e) => return simple_error(format!("Failed to get timeseries: {e}"), StatusCode::INTERNAL_SERVER_ERROR),
+    };
 
     Json(json!({
         "summary": summary,
         "byModel": by_model,
         "byAccount": by_account,
         "byProvider": by_provider,
+        "timeseries": timeseries,
+        "granularityMs": granularity,
     }))
     .into_response()
+}
+
+fn auto_granularity(start: i64, end: i64) -> i64 {
+    let span = (end - start).max(0);
+    if span <= 2 * 60 * 60 * 1000 { 5 * 60 * 1000 }        // ≤2h → 5m
+    else if span <= 48 * 60 * 60 * 1000 { 60 * 60 * 1000 } // ≤48h → 1h
+    else if span <= 14 * 24 * 60 * 60 * 1000 { 6 * 60 * 60 * 1000 } // ≤14d → 6h
+    else { 24 * 60 * 60 * 1000 }                           // else → 1d
 }
 
 /// Paginated detailed usage logs with optional filters.

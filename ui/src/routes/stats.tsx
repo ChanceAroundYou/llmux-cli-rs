@@ -13,14 +13,17 @@ import {
   CategoryScale,
   LinearScale,
   BarElement,
+  LineElement,
+  PointElement,
   Tooltip,
   Legend,
+  Filler,
   type ChartData,
   type ChartOptions,
 } from 'chart.js';
-import { Bar } from 'react-chartjs-2';
+import { Bar, Line } from 'react-chartjs-2';
 
-ChartJS.register(CategoryScale, LinearScale, BarElement, Tooltip, Legend);
+ChartJS.register(CategoryScale, LinearScale, BarElement, LineElement, PointElement, Tooltip, Legend, Filler);
 
 type Preset = '1h' | '24h' | '7d' | '30d' | 'custom';
 
@@ -89,6 +92,8 @@ export default function StatsPage() {
   const [summary, setSummary] = useState<Summary | null>(null);
   const [byModel, setByModel] = useState<ModelBreakdown[]>([]);
   const [byAccount, setByAccount] = useState<AccountBreakdown[]>([]);
+  const [timeseries, setTimeseries] = useState<Array<{ bucket: number; input: number; output: number; cacheRead: number; cacheCreate: number; requests: number }>>([]);
+  const [granularityMs, setGranularityMs] = useState<number | null>(null);
   const [loading, setLoading] = useState(false);
   const [modelFilter, setModelFilter] = useState('');
   const [accountFilter, setAccountFilter] = useState('');
@@ -118,6 +123,8 @@ export default function StatsPage() {
       setSummary(data.summary ?? null);
       setByModel(data.byModel ?? []);
       setByAccount(data.byAccount ?? []);
+      setTimeseries(Array.isArray(data.timeseries) ? data.timeseries : []);
+      setGranularityMs(typeof data.granularityMs === 'number' ? data.granularityMs : null);
     } catch (e) {
       console.error('stats fetch failed', e);
     } finally {
@@ -235,6 +242,37 @@ export default function StatsPage() {
     scales: { x: { stacked: true, ticks: { maxRotation: 0, font: { size: 9 } } }, y: { stacked: true, beginAtZero: true } },
   }), []);
 
+  const tokenTimeseriesData: ChartData<'line'> = useMemo(() => {
+    const labels = timeseries.map(p => {
+      const d = new Date(p.bucket);
+      const span = range.end - range.start;
+      if (span <= 2 * 60 * 60 * 1000) return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      if (span <= 48 * 60 * 60 * 1000) return d.toLocaleString([], { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
+      return d.toLocaleDateString([], { month: '2-digit', day: '2-digit' });
+    });
+    return {
+      labels,
+      datasets: [
+        { label: t('usage.legend.cache', { defaultValue: '缓存' }), data: timeseries.map(p => (p.cacheRead ?? 0) + (p.cacheCreate ?? 0)), borderColor: '#1d4ed8', backgroundColor: 'rgba(29,78,216,0.18)', fill: true, tension: 0.28, pointRadius: 0, borderWidth: 1.6, stack: 'tokens' },
+        { label: t('usage.legend.input', { defaultValue: '输入' }), data: timeseries.map(p => p.input), borderColor: '#3b82f6', backgroundColor: 'rgba(59,130,246,0.14)', fill: true, tension: 0.28, pointRadius: 0, borderWidth: 1.6, stack: 'tokens' },
+        { label: t('usage.legend.output', { defaultValue: '输出' }), data: timeseries.map(p => p.output), borderColor: '#22c55e', backgroundColor: 'rgba(34,197,94,0.14)', fill: true, tension: 0.28, pointRadius: 0, borderWidth: 1.6, stack: 'tokens' },
+      ],
+    };
+  }, [timeseries, range.start, range.end, t]);
+
+  const tokenTimeseriesOpts: ChartOptions<'line'> = useMemo(() => ({
+    responsive: true, maintainAspectRatio: false, animation: false,
+    interaction: { mode: 'index', intersect: false } as const,
+    plugins: {
+      legend: { display: true, position: 'bottom' as const, labels: { boxWidth: 10, font: { size: 10 }, padding: 12 } },
+      tooltip: { backgroundColor: '#1e293b', titleFont: { size: 10 }, bodyFont: { size: 10 }, itemSort: (a: any, b: any) => b.datasetIndex - a.datasetIndex },
+    },
+    scales: {
+      x: { stacked: false, ticks: { maxRotation: 0, font: { size: 9 }, maxTicksLimit: 12 } },
+      y: { stacked: true, beginAtZero: true, ticks: { font: { size: 9 } } },
+    },
+  }), []);
+
   const totalTokens = (summary?.total_input ?? 0) + (summary?.total_output ?? 0);
   const successRate = summary?.total_requests ? Math.round((summary.success_requests / summary.total_requests) * 100) : 0;
 
@@ -286,6 +324,12 @@ export default function StatsPage() {
       </section>
 
       {/* Charts */}
+      <div className="bg-card border border-border rounded-xl p-4">
+        <h3 className="text-sm font-bold mb-3">{t('usage.charts.tokenTimeseries', { defaultValue: 'Token 随时间（堆叠）' })}{granularityMs ? <span className="ml-2 text-xs font-normal text-muted-foreground">{t('usage.charts.granularity', { defaultValue: `· 粒度 ${(granularityMs/60000).toFixed(0)} 分钟`, minutes: Math.round(granularityMs/60000) })}</span> : null}</h3>
+        <div className="h-64">
+          {timeseries.length ? <Line data={tokenTimeseriesData} options={tokenTimeseriesOpts} /> : <EmptyState icon={Inbox} title={t('usage.noData', { defaultValue: '暂无数据' })} />}
+        </div>
+      </div>
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         <div className="bg-card border border-border rounded-xl p-4">
           <h3 className="text-sm font-bold mb-3">{t('usage.charts.byModelTop', { defaultValue: '按模型 Top' })}</h3>
