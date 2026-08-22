@@ -106,6 +106,7 @@ async fn start(port_override: Option<u16>, use_tui: bool) -> anyhow::Result<()> 
     let model_cache = Arc::new(Mutex::new(std::collections::HashMap::new()));
     let aggregate_cache = Arc::new(Mutex::new(std::collections::HashMap::new()));
 
+    let sessions = Arc::new(Mutex::new(std::collections::HashMap::new()));
     let lan_ip = get_local_lan_ip();
 
     let (tui_tx, tui_rx) = if use_tui {
@@ -140,6 +141,7 @@ async fn start(port_override: Option<u16>, use_tui: bool) -> anyhow::Result<()> 
         auth_cache,
         model_cache,
         aggregate_cache,
+        sessions,
         tui_tx,
     };
     // Spawn aggregate background probe (5 min, V-anchored, 3-confirm)

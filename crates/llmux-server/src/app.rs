@@ -92,6 +92,7 @@ pub struct AppState {
     pub auth_cache: Arc<Mutex<HashMap<String, CachedAuth>>>,
     pub model_cache: Arc<Mutex<HashMap<String, CachedModel>>>,
     pub aggregate_cache: Arc<Mutex<HashMap<String, CachedAggregate>>>,
+    pub sessions: Arc<Mutex<HashMap<String, Instant>>>,
 }
 
 pub type AppRouter = Router;
@@ -224,6 +225,9 @@ fn core_router() -> AppRouter {
         .route("/v1/v1/models", get(v1::models))
         .route_layer(middleware::from_fn(crate::middleware::v1_auth_middleware))
         .route("/api/auth/web-session", post(auth::handle_web_session))
+        .route("/api/auth/login", post(auth::handle_login))
+        .route("/api/auth/logout", post(auth::handle_logout))
+        .route("/api/auth/me", get(auth::handle_me))
         .route(
             "/api/keys",
             get(keys::list_api_keys).post(keys::create_api_key),
@@ -322,7 +326,8 @@ fn core_router() -> AppRouter {
 pub fn app(state: AppState) -> AppRouter {
     let base = state.base_path.clone();
     let tui_tx = state.tui_tx.clone();
-    let core = core_router();
+    let core = core_router()
+        .layer(middleware::from_fn(crate::middleware::ui_auth_middleware));
     let router = if base.is_empty() {
         core.layer(Extension(state.clone()))
     } else {
@@ -393,6 +398,7 @@ pub async fn test_state() -> AppState {
         auth_cache: Arc::new(Mutex::new(HashMap::new())),
         model_cache: Arc::new(Mutex::new(HashMap::new())),
         aggregate_cache: Arc::new(Mutex::new(HashMap::new())),
+        sessions: Arc::new(Mutex::new(HashMap::new())),
     }
 }
 
