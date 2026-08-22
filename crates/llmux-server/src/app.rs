@@ -259,6 +259,10 @@ fn core_router() -> AppRouter {
             get(models::list_aggregate_aliases).post(models::set_aggregate_alias),
         )
         .route(
+            "/api/aggregate-aliases/:id/active",
+            post(models::set_aggregate_active),
+        )
+        .route(
             "/api/aggregate-aliases/:id",
             delete(models::delete_aggregate_alias),
         )

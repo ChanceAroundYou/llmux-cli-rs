@@ -91,6 +91,25 @@ impl AggregateRouter {
         self.entries.remove(alias);
     }
 
+    pub fn set_active(&mut self, alias: &str, target: usize, len: usize) -> bool {
+        let e = self.ensure_entry(alias, len);
+        if target >= len {
+            return false;
+        }
+        if e.active == target && e.pending_target.is_none() {
+            return false;
+        }
+        e.active = target;
+        e.pending_target = None;
+        e.confirm_count = 0;
+        e.probe_backoff_secs = 300;
+        e.last_probe = Instant::now();
+        if target < e.last_status.len() {
+            e.last_status[target] = Some(true);
+        }
+        true
+    }
+
     fn ensure_entry(&mut self, alias: &str, len: usize) -> &mut AggregateEntry {
         let e = self.entries.entry(alias.to_string()).or_default();
         if e.last_status.len() != len {

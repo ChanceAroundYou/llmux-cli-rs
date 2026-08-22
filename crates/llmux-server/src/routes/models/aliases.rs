@@ -30,18 +30,43 @@ pub async fn set_model_alias(
     Extension(state): Extension<AppState>,
     Json(body): Json<Value>,
 ) -> Response {
-    let Some(alias) = body.get("alias").and_then(Value::as_str) else {
+    let Some(alias) = body.get("alias").and_then(Value::as_str).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) else {
         return crate::error::simple_error(
             "Missing required fields: alias, target_model",
             StatusCode::BAD_REQUEST,
         );
     };
-    let Some(target_model) = body.get("target_model").and_then(Value::as_str) else {
+    let Some(target_model) = body.get("target_model").and_then(Value::as_str).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) else {
         return crate::error::simple_error(
             "Missing required fields: alias, target_model",
             StatusCode::BAD_REQUEST,
         );
     };
+    let confirm = body.get("confirm").and_then(Value::as_bool).unwrap_or(false);
+    // If an aggregate alias with same name exists, require confirm to overwrite
+    let agg_exists: Option<i64> = match sqlx::query_scalar("SELECT id FROM aggregate_aliases WHERE alias = ?").bind(&alias).fetch_optional(&state.pool).await {
+        Ok(v) => v,
+        Err(e) => return crate::error::simple_error(format!("Failed to check aggregate collision: {e}"), StatusCode::INTERNAL_SERVER_ERROR),
+    };
+    if agg_exists.is_some() {
+        if !confirm {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": format!("alias '{}' already exists as an aggregate alias", alias),
+                    "code": "alias_conflict",
+                    "conflict": "aggregate",
+                    "alias": alias,
+                })),
+            )
+                .into_response();
+        }
+        let _ = sqlx::query("DELETE FROM aggregate_aliases WHERE alias = ?").bind(&alias).execute(&state.pool).await;
+        state.aggregate_router.lock().unwrap().remove(&alias);
+        state.invalidate_aggregate_cache(&alias);
+        if let Ok(mut cache) = state.models_cache.lock() { *cache = None; }
+        tracing::info!("🏷️ Overwrote aggregate alias '{}' with ordinary alias (confirmed)", alias);
+    }
     let provider_id = body.get("provider_id").and_then(Value::as_str);
 
     // Parse account_ids: JSON array like [1,5] or comma-separated "1,5"
@@ -60,8 +85,8 @@ pub async fn set_model_alias(
     match sqlx::query(
         "INSERT OR REPLACE INTO model_aliases (alias, target_model, provider_id, account_ids, preferred_account_id) VALUES (?, ?, ?, ?, ?)",
     )
-    .bind(alias)
-    .bind(target_model)
+    .bind(&alias)
+    .bind(&target_model)
     .bind(provider_id)
     .bind(&account_ids)
     .bind(preferred_account_id)
@@ -73,7 +98,7 @@ pub async fn set_model_alias(
             if let Ok(mut cache) = state.models_cache.lock() {
                 *cache = None;
             }
-            state.invalidate_model_cache(alias);
+            state.invalidate_model_cache(&alias);
             tracing::info!("🏷️ Set alias {} -> {} (provider: {:?}), cache invalidated", alias, target_model, provider_id);
             Json(json!({ "success": true, "message": "Alias set successfully" })).into_response()
         },

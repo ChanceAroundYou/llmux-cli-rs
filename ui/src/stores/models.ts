@@ -61,10 +61,11 @@ interface ModelsState {
   fetchAliases: () => Promise<void>;
   fetchAggregateAliases: () => Promise<void>;
   fetchAccounts: () => Promise<void>;
-  addAlias: (alias: string, targetModel: string, providerId?: string, accountIds?: number[], preferredAccountId?: number) => Promise<void>;
+  addAlias: (alias: string, targetModel: string, providerId?: string, accountIds?: number[], preferredAccountId?: number, confirm?: boolean) => Promise<void>;
   deleteAlias: (id: number) => Promise<void>;
-  saveAggregateAlias: (alias: string, candidates: AggregateCandidate[], intervalSecs?: number) => Promise<void>;
+  saveAggregateAlias: (alias: string, candidates: AggregateCandidate[], intervalSecs?: number, confirm?: boolean) => Promise<void>;
   deleteAggregateAlias: (id: number) => Promise<void>;
+  setAggregateActive: (id: number, active: number) => Promise<void>;
   testModel: (modelId: string, providerId?: string, accountId?: number) => Promise<{ success: boolean; error?: string; latency?: number }>;
   startTestQueue: (models: { model: string, providerId: string, accountId?: number }[]) => Promise<{ success: boolean; error?: string }>;
   fetchTestQueueStatus: () => Promise<{ isRunning: boolean; current: number; total: number; progress: number }>;
@@ -212,7 +213,7 @@ export const useModelsStore = create<ModelsState>((set, get) => ({
     }
   },
 
-  addAlias: async (alias, targetModel, providerId, accountIds, preferredAccountId) => {
+  addAlias: async (alias, targetModel, providerId, accountIds, preferredAccountId, confirm) => {
     try {
       const body: any = { alias, target_model: targetModel, provider_id: providerId };
       if (accountIds && accountIds.length > 0) {
@@ -221,6 +222,7 @@ export const useModelsStore = create<ModelsState>((set, get) => ({
       if (preferredAccountId != null) {
         body.preferred_account_id = preferredAccountId;
       }
+      if (confirm) body.confirm = true;
       const res = await apiFetch('/api/models/aliases', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -228,7 +230,11 @@ export const useModelsStore = create<ModelsState>((set, get) => ({
       });
       if (!res.ok) {
         const data = await res.json();
-        throw new Error(data.error || 'Failed to add alias');
+        const err: any = new Error(data.error || 'Failed to add alias');
+        err.code = data.code;
+        err.conflict = data.conflict;
+        err.status = res.status;
+        throw err;
       }
       await get().fetchAliases();
     } catch (err: any) {
@@ -248,11 +254,19 @@ export const useModelsStore = create<ModelsState>((set, get) => ({
     }
   },
 
-  saveAggregateAlias: async (alias, candidates, intervalSecs) => {
+  saveAggregateAlias: async (alias, candidates, intervalSecs, confirm) => {
     try {
-      const body: any = { alias, candidates, interval_secs: intervalSecs ?? 300 };
+      const body: any = { alias, candidates, interval_secs: intervalSecs ?? 300, ...(confirm ? { confirm: true } : {}) };
       const res = await apiFetch('/api/aggregate-aliases', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-      if (!res.ok) { const data = await res.json(); throw new Error(data.error || 'Failed to save aggregate alias'); }
+      if (!res.ok) { const data = await res.json(); const err: any = new Error(data.error || 'Failed to save aggregate alias'); err.code = data.code; err.conflict = data.conflict; err.status = res.status; throw err; }
+      await get().fetchAggregateAliases();
+    } catch (err: any) { set({ error: err.message }); throw err; }
+  },
+
+  setAggregateActive: async (id, active) => {
+    try {
+      const res = await apiFetch(`/api/aggregate-aliases/${id}/active`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ active }) });
+      if (!res.ok) { const data = await res.json(); throw new Error(data.error || 'Failed to set active'); }
       await get().fetchAggregateAliases();
     } catch (err: any) { set({ error: err.message }); throw err; }
   },

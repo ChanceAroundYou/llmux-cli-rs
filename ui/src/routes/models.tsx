@@ -40,7 +40,7 @@ function formatContextLength(n: number): string {
 
 export default function Models() {
   const { t, i18n } = useTranslation();
-  const { availableModels, cachedAt, aliases, aggregateAliases, accounts, isLoading, streaming, fetchModels, streamModels, fetchAliases, fetchAggregateAliases, fetchAccounts, addAlias, deleteAlias, saveAggregateAlias, deleteAggregateAlias, testModel } = useModelsStore();
+  const { availableModels, cachedAt, aliases, aggregateAliases, accounts, isLoading, streaming, fetchModels, streamModels, fetchAliases, fetchAggregateAliases, fetchAccounts, addAlias, deleteAlias, saveAggregateAlias, deleteAggregateAlias, setAggregateActive, testModel } = useModelsStore();
   const safeModels = availableModels || [];
   const safeAccounts = accounts || [];
   const [search, setSearch] = useState('');
@@ -69,6 +69,7 @@ export default function Models() {
   const [testAllConfirm, setTestAllConfirm] = useState(false);
   const [aliasToDelete, setAliasToDelete] = useState<{id: number, name: string} | null>(null);
   const [aggregateToDelete, setAggregateToDelete] = useState<{id: number, name: string} | null>(null);
+  const [overwriteConfirm, setOverwriteConfirm] = useState<{ kind: 'ordinary'|'aggregate', alias: string, pending: any } | null>(null);
   const [editingAliasId, setEditingAliasId] = useState<number | null>(null);
   const [isAggregateModalOpen, setIsAggregateModalOpen] = useState(false);
   const [editingAggregateId, setEditingAggregateId] = useState<number | null>(null);
@@ -214,7 +215,11 @@ export default function Models() {
       setIsModalOpen(false);
       setEditingAliasId(null);
       setAliasForm({ alias: '', target: '', provider: '', selectedAccountIds: [], preferredAccountId: null });
-    } catch (err) {
+    } catch (err: any) {
+      if (err?.status === 409 && err?.conflict === 'aggregate') {
+        setOverwriteConfirm({ kind: 'aggregate', alias: aliasForm.alias, pending: { target: aliasForm.target, provider: aliasForm.provider, selectedAccountIds: aliasForm.selectedAccountIds, preferredAccountId: aliasForm.preferredAccountId } });
+        return;
+      }
       console.error(err);
     }
   };
@@ -255,8 +260,16 @@ export default function Models() {
         await deleteAggregateAlias(editingAggregateId);
       }
     }
-    await saveAggregateAlias(aggregateForm.alias.trim(), candidates);
-    closeAggregateModal();
+    try {
+      await saveAggregateAlias(aggregateForm.alias.trim(), candidates);
+      closeAggregateModal();
+    } catch (err: any) {
+      if (err?.status === 409 && err?.conflict === 'ordinary') {
+        setOverwriteConfirm({ kind: 'ordinary', alias: aggregateForm.alias.trim(), pending: candidates });
+        return;
+      }
+      console.error(err);
+    }
   };
 
   return (
@@ -399,7 +412,7 @@ export default function Models() {
                   if (s === false) return "bg-destructive";
                   return "bg-muted-foreground/30";
                 };
-                const pendingNote = agg.pending_target != null ? ` ⏳待切到 ${agg.pending_target} (${agg.confirm_count}/3)` : "";
+                const pendingNote = agg.pending_target != null ? ` ⏳待切换到 #${agg.pending_target + 1} (${agg.confirm_count}/3)` : "";
                 return (
                   <div
                     key={agg.id}
@@ -424,7 +437,7 @@ export default function Models() {
                             <span className="font-bold">{acc ? acc.alias : `account#${c.account_id}`}</span>
                             <span className="text-muted-foreground">/</span>
                             <span className="truncate">{c.model}</span>
-                            {isActive(idx) && <span className="ml-auto text-primary font-bold">● V</span>}
+                            {isActive(idx) ? <span className="ml-auto text-primary font-bold text-[10px] px-1.5 py-0.5 rounded bg-primary/10 border border-primary/20">活跃</span> : <button onClick={(e) => { e.stopPropagation(); setAggregateActive(agg.id, idx).catch(()=>{}); }} className="ml-auto text-[10px] px-1.5 py-0.5 rounded border border-border bg-muted/50 hover:bg-primary/10 hover:text-primary transition-colors">设为活跃</button>}
                           </div>
                         );
                       })}
@@ -752,18 +765,31 @@ export default function Models() {
                       <option key={a.id} value={a.id}>[{a.provider_id}] {a.alias}</option>
                     ))}
                   </select>
-                  <Input
-                    type="text"
-                    value={c.model}
-                    onChange={e => {
-                      const next = [...aggregateForm.candidates];
-                      next[idx] = { ...next[idx], model: e.target.value };
-                      setAggregateForm({ ...aggregateForm, candidates: next });
-                    }}
-                    placeholder="模型名"
-                    list="agg-model-options"
-                    className="flex-1 h-8"
-                  />
+                  {(() => {
+                    const accAlias = safeAccounts.find(a => a.id === c.account_id)?.alias;
+                    const modelsForAccount = c.account_id ? safeModels.filter(m => m.owned_by === accAlias) : [];
+                    const hasModels = modelsForAccount.length > 0;
+                    // keep original value visible even if not in list
+                    const inList = hasModels && modelsForAccount.some(m => m.id === c.model);
+                    return (
+                      <select
+                        value={c.model}
+                        disabled={!c.account_id}
+                        onChange={e => {
+                          const next = [...aggregateForm.candidates];
+                          next[idx] = { ...next[idx], model: e.target.value };
+                          setAggregateForm({ ...aggregateForm, candidates: next });
+                        }}
+                        className="flex-1 h-8 px-2 rounded-md border border-input bg-background text-sm disabled:opacity-50"
+                      >
+                        <option value="">{!c.account_id ? "请先选择账户" : hasModels ? "选择模型" : "暂无可用模型"}</option>
+                        {modelsForAccount.map(m => (
+                          <option key={`${m.owned_by}:${m.id}`} value={m.id}>{m.id}</option>
+                        ))}
+                        {!inList && c.model && <option value={c.model}>{c.model} (不在列表)</option>}
+                      </select>
+                    );
+                  })()}
                   <Button type="button" variant="ghost" size="icon" className="h-7 w-7" disabled={idx === 0} onClick={() => {
                     const next = [...aggregateForm.candidates];
                     const tmp = next[idx-1]; next[idx-1] = next[idx]; next[idx] = tmp;
@@ -780,9 +806,7 @@ export default function Models() {
                 </div>
               ))}
             </div>
-            <datalist id="agg-model-options">
-              {safeModels.map(m => <option key={`${m.owned_by}:${m.id}`} value={m.id} />)}
-            </datalist>
+
             <p className="text-xs text-muted-foreground">顶部候选为默认模型，拖动排序即改默认/顺序。每行独立账户+模型。</p>
           </div>
           <div className="pt-4 flex gap-3">
@@ -791,6 +815,29 @@ export default function Models() {
           </div>
         </form>
       </Dialog>
+
+      <ConfirmDialog
+        isOpen={!!overwriteConfirm}
+        onClose={() => setOverwriteConfirm(null)}
+        onConfirm={async () => {
+          if (!overwriteConfirm) return;
+          if (overwriteConfirm.kind === 'ordinary') {
+            await saveAggregateAlias(overwriteConfirm.alias, overwriteConfirm.pending, undefined, true);
+            closeAggregateModal();
+          } else {
+            const pd = overwriteConfirm.pending;
+            await addAlias(overwriteConfirm.alias, pd.target, pd.provider || undefined, pd.selectedAccountIds?.length ? pd.selectedAccountIds : undefined, pd.preferredAccountId ?? undefined, true);
+            setIsModalOpen(false);
+            setEditingAliasId(null);
+            setAliasForm({ alias: '', target: '', provider: '', selectedAccountIds: [], preferredAccountId: null });
+          }
+          setOverwriteConfirm(null);
+        }}
+        title={overwriteConfirm?.kind === 'ordinary' ? '覆盖普通别名？' : '覆盖聚合别名？'}
+        description={overwriteConfirm?.kind === 'ordinary' ? `别名 "${overwriteConfirm?.alias}" 已是普通别名，确认用聚合别名覆盖？普通别名将被删除，密钥授权予以保留。` : `别名 "${overwriteConfirm?.alias}" 已是聚合别名，确认用普通别名覆盖？聚合别名将被删除，密钥授权予以保留。`}
+        confirmText="确认覆盖"
+        variant="warning"
+      />
 
       <ConfirmDialog
         isOpen={testAllConfirm}

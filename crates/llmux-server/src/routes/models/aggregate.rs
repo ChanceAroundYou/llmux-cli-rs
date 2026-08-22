@@ -150,7 +150,8 @@ pub async fn set_aggregate_alias(
         }
     }
 
-    // Prevent alias collision with ordinary aliases
+    let confirm = body.get("confirm").and_then(Value::as_bool).unwrap_or(false);
+    // Prevent alias collision with ordinary aliases unless explicitly confirmed
     let ordinary_exists: Option<i64> =
         match sqlx::query_scalar("SELECT id FROM model_aliases WHERE alias = ?")
             .bind(&alias)
@@ -166,10 +167,29 @@ pub async fn set_aggregate_alias(
             }
         };
     if ordinary_exists.is_some() {
-        return crate::error::simple_error(
-            format!("alias '{alias}' already exists as a regular alias"),
-            StatusCode::CONFLICT,
-        );
+        if !confirm {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": format!("alias '{alias}' already exists as a regular alias"),
+                    "code": "alias_conflict",
+                    "conflict": "ordinary",
+                    "alias": alias,
+                })),
+            )
+                .into_response();
+        }
+        // confirmed — delete the ordinary alias (keep api_keys allowed_models entry, alias name survives as aggregate)
+        let _ = sqlx::query("DELETE FROM model_aliases WHERE alias = ?")
+            .bind(&alias)
+            .execute(&state.pool)
+            .await;
+        state.invalidate_model_cache(&alias);
+        if let Ok(mut cache) = state.models_cache.lock() {
+            *cache = None;
+        }
+        state.clear_auth_cache();
+        tracing::info!("🔀 Overwrote ordinary alias '{}' with aggregate alias (confirmed)", alias);
     }
 
     // Validate candidates JSON is parseable via shared parser
@@ -275,4 +295,46 @@ pub async fn delete_aggregate_alias(
     state.clear_auth_cache();
 
     Json(json!({ "success": true, "message": "Aggregate alias deleted" })).into_response()
+}
+
+pub async fn set_aggregate_active(
+    Extension(state): Extension<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    let row = match sqlx::query_as::<_, AggregateAliasRow>(
+        "SELECT id, alias, candidates, interval_secs, created_at, updated_at FROM aggregate_aliases WHERE id = ?",
+    )
+    .bind(&id)
+    .fetch_optional(&state.pool)
+    .await
+    {
+        Ok(Some(r)) => r,
+        Ok(None) => return crate::error::simple_error("Aggregate alias not found", StatusCode::NOT_FOUND),
+        Err(e) => return crate::error::simple_error(format!("Failed to lookup aggregate alias: {e}"), StatusCode::INTERNAL_SERVER_ERROR),
+    };
+    let candidates = match serde_json::from_str::<Vec<Value>>(&row.candidates) {
+        Ok(v) => v,
+        Err(e) => return crate::error::simple_error(format!("Invalid candidates: {e}"), StatusCode::INTERNAL_SERVER_ERROR),
+    };
+    let len = candidates.len();
+    if len == 0 {
+        return crate::error::simple_error("Aggregate alias has no candidates", StatusCode::BAD_REQUEST);
+    }
+    let Some(active) = body.get("active").and_then(Value::as_i64) else {
+        return crate::error::simple_error("Missing required field: active", StatusCode::BAD_REQUEST);
+    };
+    if active < 0 || (active as usize) >= len {
+        return crate::error::simple_error(format!("active must be 0..{}", len - 1), StatusCode::BAD_REQUEST);
+    }
+    let target = active as usize;
+    let alias = row.alias.clone();
+    let changed = state.aggregate_router.lock().unwrap().set_active(&alias, target, len);
+    state.invalidate_aggregate_cache(&alias);
+    if let Ok(mut cache) = state.models_cache.lock() {
+        *cache = None;
+    }
+    tracing::info!("🔀 [agg:{}] active switched -> {} (manual)", alias, target);
+    let _ = changed;
+    Json(json!({ "success": true, "active": target })).into_response()
 }
