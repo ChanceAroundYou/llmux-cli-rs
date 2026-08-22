@@ -5,9 +5,7 @@ import {
   Box,
   Search,
   RefreshCcw,
-  ExternalLink,
   ChevronRight,
-  Database,
   Plus,
   Save,
   Trash2,
@@ -15,10 +13,9 @@ import {
   Zap,
   ArrowRight,
   Copy,
-  PenLine,
-  CheckCircle2,
-  XCircle,
-  Loader2
+  Layers,
+  ChevronUp,
+  ChevronDown
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { Dialog, ConfirmDialog } from '../components/Modal';
@@ -43,7 +40,7 @@ function formatContextLength(n: number): string {
 
 export default function Models() {
   const { t, i18n } = useTranslation();
-  const { availableModels, cachedAt, aliases, accounts, isLoading, streaming, fetchModels, streamModels, fetchAliases, fetchAccounts, addAlias, deleteAlias, testModel } = useModelsStore();
+  const { availableModels, cachedAt, aliases, aggregateAliases, accounts, isLoading, streaming, fetchModels, streamModels, fetchAliases, fetchAggregateAliases, fetchAccounts, addAlias, deleteAlias, saveAggregateAlias, deleteAggregateAlias, testModel } = useModelsStore();
   const safeModels = availableModels || [];
   const safeAccounts = accounts || [];
   const [search, setSearch] = useState('');
@@ -71,11 +68,11 @@ export default function Models() {
   const { startTestQueue, fetchTestQueueStatus } = useModelsStore();
   const [testAllConfirm, setTestAllConfirm] = useState(false);
   const [aliasToDelete, setAliasToDelete] = useState<{id: number, name: string} | null>(null);
+  const [aggregateToDelete, setAggregateToDelete] = useState<{id: number, name: string} | null>(null);
   const [editingAliasId, setEditingAliasId] = useState<number | null>(null);
-  const [isCustomModalOpen, setIsCustomModalOpen] = useState(false);
-  const [customForm, setCustomForm] = useState({ alias: '', target: '', accountId: '' });
-  const [isVerifying, setIsVerifying] = useState(false);
-  const [verifyResult, setVerifyResult] = useState<{ success: boolean; error?: string; latency?: number } | null>(null);
+  const [isAggregateModalOpen, setIsAggregateModalOpen] = useState(false);
+  const [editingAggregateId, setEditingAggregateId] = useState<number | null>(null);
+  const [aggregateForm, setAggregateForm] = useState<{ alias: string; candidates: { account_id: number | ''; model: string }[] }>({ alias: '', candidates: [{ account_id: '', model: '' }] });
 
   const handleTest = async (modelId: string, providerId: string, accountId?: number) => {
     let resolvedAccountId = accountId ?? null;
@@ -121,6 +118,7 @@ export default function Models() {
   useEffect(() => {
     fetchModels().then(() => streamModels(false));
     fetchAliases();
+    fetchAggregateAliases();
     fetchAccounts();
     fetchHealth();
     fetchTestQueueStatus().then(setQueueStatus);
@@ -227,36 +225,38 @@ export default function Models() {
     setAliasForm({ alias: '', target: '', provider: '', selectedAccountIds: [], preferredAccountId: null });
   };
 
-  const handleVerify = async () => {
-    if (!customForm.target || !customForm.accountId) return;
-    const account = safeAccounts.find(a => a.id === Number(customForm.accountId));
-    if (!account) return;
-
-    setIsVerifying(true);
-    setVerifyResult(null);
-    try {
-      const result = await testModel(customForm.target, account.provider_id, account.id);
-      setVerifyResult(result);
-    } catch (err: any) {
-      setVerifyResult({ success: false, error: err.message });
-    } finally {
-      setIsVerifying(false);
+  const openAggregateModal = (agg?: any) => {
+    if (agg) {
+      setEditingAggregateId(agg.id);
+      setAggregateForm({ alias: agg.alias, candidates: agg.candidates.map((c: any) => ({ account_id: c.account_id, model: c.model })) });
+    } else {
+      setEditingAggregateId(null);
+      setAggregateForm({ alias: '', candidates: [{ account_id: '', model: '' }] });
     }
+    setIsAggregateModalOpen(true);
   };
 
-  const handleCustomAddAlias = async (e: React.FormEvent) => {
+  const closeAggregateModal = () => {
+    setIsAggregateModalOpen(false);
+    setEditingAggregateId(null);
+    setAggregateForm({ alias: '', candidates: [{ account_id: '', model: '' }] });
+  };
+
+  const handleSaveAggregate = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!verifyResult?.success) return;
-    const account = safeAccounts.find(a => a.id === Number(customForm.accountId));
-    try {
-      // 使用账户别名作为 provider_id，dispatcher 会通过 alias 回退匹配
-      await addAlias(customForm.alias, customForm.target, account?.alias || '');
-      setIsCustomModalOpen(false);
-      setCustomForm({ alias: '', target: '', accountId: '' });
-      setVerifyResult(null);
-    } catch (err) {
-      console.error(err);
+    const candidates = aggregateForm.candidates
+      .filter(c => c.account_id !== '' && c.model.trim() !== '')
+      .map(c => ({ account_id: Number(c.account_id), model: c.model.trim() }));
+    if (!aggregateForm.alias.trim() || candidates.length === 0) return;
+    // If editing and alias changed, delete old first
+    if (editingAggregateId !== null) {
+      const orig = aggregateAliases.find(a => a.id === editingAggregateId);
+      if (orig && orig.alias !== aggregateForm.alias.trim()) {
+        await deleteAggregateAlias(editingAggregateId);
+      }
     }
+    await saveAggregateAlias(aggregateForm.alias.trim(), candidates);
+    closeAggregateModal();
   };
 
   return (
@@ -303,10 +303,10 @@ export default function Models() {
            <Button
              variant="outline"
              size="sm"
-             onClick={() => setIsCustomModalOpen(true)}
+             onClick={() => openAggregateModal()}
            >
-             <PenLine size={16} />
-             {t('models.customAlias')}
+             <Layers size={16} />
+             {'聚合别名'}
            </Button>
         </div>
       </div>
@@ -316,7 +316,7 @@ export default function Models() {
         <div className="space-y-4">
            <h2 className="text-xs font-semibold text-muted-foreground uppercase tracking-[0.2em] px-1 flex items-center gap-2">
               <Zap size={14} className="text-primary" />
-              {t('models.aliasSection')}
+              {'别名'}
            </h2>
            <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3">
               {aliases.map(a => {
@@ -376,6 +376,59 @@ export default function Models() {
                     >
                       <Trash2 size={12} />
                     </Button>
+                  </div>
+                );
+              })}
+           </div>
+        </div>
+      )}
+
+      {/* Aggregate Aliases Section */}
+      {aggregateAliases.length > 0 && (
+        <div className="space-y-4">
+           <h2 className="text-xs font-semibold text-muted-foreground uppercase tracking-[0.2em] px-1 flex items-center gap-2">
+              <Layers size={14} className="text-primary" />
+              {'聚合别名'}
+           </h2>
+           <div className="grid grid-cols-1 gap-3">
+              {aggregateAliases.map(agg => {
+                const isActive = (idx: number) => agg.active === idx;
+                const statusDot = (idx: number) => {
+                  const s = agg.last_status?.[idx];
+                  if (s === true) return "bg-success";
+                  if (s === false) return "bg-destructive";
+                  return "bg-muted-foreground/30";
+                };
+                const pendingNote = agg.pending_target != null ? ` ⏳待切到 ${agg.pending_target} (${agg.confirm_count}/3)` : "";
+                return (
+                  <div
+                    key={agg.id}
+                    onClick={() => openAggregateModal(agg)}
+                    className="p-3 bg-card border border-border rounded-xl flex flex-col gap-2 group hover:border-primary/30 transition-all cursor-pointer"
+                  >
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <span className="px-2 py-0.5 bg-primary/10 text-primary rounded text-xs font-bold uppercase truncate shadow-sm border border-primary/5">{agg.alias}</span>
+                        <CopyButton value={agg.alias} size={10} className="p-1 opacity-0 group-hover:opacity-100 transition-opacity" />
+                        {pendingNote && <span className="text-xs text-warning font-bold">{pendingNote}</span>}
+                      </div>
+                      <Button variant="ghost" size="icon" onClick={(e) => { e.stopPropagation(); setAggregateToDelete({ id: agg.id, name: agg.alias }); }} className="h-6 w-6 text-muted-foreground hover:text-destructive opacity-0 group-hover:opacity-100 transition-all"><Trash2 size={12} /></Button>
+                    </div>
+                    <div className="space-y-1">
+                      {agg.candidates.map((c: any, idx: number) => {
+                        const acc = safeAccounts.find(a => a.id === c.account_id);
+                        return (
+                          <div key={idx} className={cn("flex items-center gap-2 text-xs px-2 py-1 rounded", isActive(idx) ? "bg-primary/10 border border-primary/20" : "bg-muted/30")}>
+                            <span className="font-bold text-muted-foreground w-5">#{idx+1}</span>
+                            <div className={cn("w-2 h-2 rounded-full", statusDot(idx))} title={String(agg.last_status?.[idx] ?? "unknown")} />
+                            <span className="font-bold">{acc ? acc.alias : `account#${c.account_id}`}</span>
+                            <span className="text-muted-foreground">/</span>
+                            <span className="truncate">{c.model}</span>
+                            {isActive(idx) && <span className="ml-auto text-primary font-bold">● V</span>}
+                          </div>
+                        );
+                      })}
+                    </div>
                   </div>
                 );
               })}
@@ -669,91 +722,72 @@ export default function Models() {
         </form>
       </Dialog>
 
-      {/* Custom Alias Modal */}
-      <Dialog isOpen={isCustomModalOpen} onClose={() => { setIsCustomModalOpen(false); setVerifyResult(null); }} title={t('models.customAliasTitle')}>
-        <form onSubmit={handleCustomAddAlias} className="space-y-4">
-          <div className="space-y-1.5">
-            <label className="text-xs font-bold text-muted-foreground uppercase">{t('models.selectAccount')}</label>
-            <select
-              value={customForm.accountId}
-              onChange={e => {
-                setCustomForm({ ...customForm, accountId: e.target.value, target: '' });
-                setVerifyResult(null);
-              }}
-              className="w-full h-10 px-3 py-2 rounded-md border border-input bg-background text-sm ring-offset-background focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2"
-            >
-              <option value="">{t('models.selectAccountPlaceholder')}</option>
-              {safeAccounts.filter(a => a.is_active === 1).map(a => (
-                <option key={a.id} value={a.id}>[{a.provider_id}] {a.alias}</option>
-              ))}
-            </select>
-          </div>
+      {/* Aggregate Alias Modal */}
+      <Dialog isOpen={isAggregateModalOpen} onClose={closeAggregateModal} title={editingAggregateId !== null ? t('models.editAlias' as any) : (t('models.aggregateAlias' as any) as string) ?? '聚合别名'}>
+        <form onSubmit={handleSaveAggregate} className="space-y-4">
           <div className="space-y-1.5">
             <label className="text-xs font-bold text-muted-foreground uppercase">{t('models.aliasName')}</label>
-            <Input
-              type="text" required value={customForm.alias}
-              onChange={e => setCustomForm({ ...customForm, alias: e.target.value })}
-              placeholder={t('models.aliasPlaceholder')}
-            />
+            <Input type="text" required value={aggregateForm.alias} onChange={e => setAggregateForm({ ...aggregateForm, alias: e.target.value })} placeholder={t('models.aliasPlaceholder')} />
           </div>
           <div className="space-y-1.5">
-            <label className="text-xs font-bold text-muted-foreground uppercase">{t('models.manualModel')}</label>
-            <Input
-              type="text" required value={customForm.target}
-              onChange={e => {
-                setCustomForm({ ...customForm, target: e.target.value });
-                setVerifyResult(null);
-              }}
-              placeholder={t('models.manualModelPlaceholder')}
-              list="custom-model-options"
-            />
-            <datalist id="custom-model-options">
-              {safeModels
-                .filter(m => {
-                  if (!customForm.accountId) return true;
-                  const account = safeAccounts.find(a => a.id === Number(customForm.accountId));
-                  return account ? m.owned_by === account.provider_id : true;
-                })
-                .map(m => (
-                  <option key={m.id} value={m.id} />
-                ))}
+            <div className="flex items-center justify-between">
+              <label className="text-xs font-bold text-muted-foreground uppercase">候选列表（顶部为默认）</label>
+              <Button type="button" variant="outline" size="sm" onClick={() => setAggregateForm({ ...aggregateForm, candidates: [...aggregateForm.candidates, { account_id: '', model: '' }] })}>+ 添加候选</Button>
+            </div>
+            <div className="space-y-2 max-h-72 overflow-y-auto border border-border rounded-lg p-2 bg-muted/30">
+              {aggregateForm.candidates.map((c, idx) => (
+                <div key={idx} className="flex items-center gap-2 p-2 bg-card border border-border rounded-lg">
+                  <span className="text-xs font-bold w-6">#{idx+1}</span>
+                  <select
+                    value={c.account_id}
+                    onChange={e => {
+                      const next = [...aggregateForm.candidates];
+                      next[idx] = { ...next[idx], account_id: e.target.value ? Number(e.target.value) : '' };
+                      setAggregateForm({ ...aggregateForm, candidates: next });
+                    }}
+                    className="flex-1 h-8 px-2 rounded-md border border-input bg-background text-sm"
+                  >
+                    <option value="">选择账户</option>
+                    {safeAccounts.filter(a => a.is_active === 1).map(a => (
+                      <option key={a.id} value={a.id}>[{a.provider_id}] {a.alias}</option>
+                    ))}
+                  </select>
+                  <Input
+                    type="text"
+                    value={c.model}
+                    onChange={e => {
+                      const next = [...aggregateForm.candidates];
+                      next[idx] = { ...next[idx], model: e.target.value };
+                      setAggregateForm({ ...aggregateForm, candidates: next });
+                    }}
+                    placeholder="模型名"
+                    list="agg-model-options"
+                    className="flex-1 h-8"
+                  />
+                  <Button type="button" variant="ghost" size="icon" className="h-7 w-7" disabled={idx === 0} onClick={() => {
+                    const next = [...aggregateForm.candidates];
+                    const tmp = next[idx-1]; next[idx-1] = next[idx]; next[idx] = tmp;
+                    setAggregateForm({ ...aggregateForm, candidates: next });
+                  }}><ChevronUp size={12} /></Button>
+                  <Button type="button" variant="ghost" size="icon" className="h-7 w-7" disabled={idx === aggregateForm.candidates.length - 1} onClick={() => {
+                    const next = [...aggregateForm.candidates];
+                    const tmp = next[idx+1]; next[idx+1] = next[idx]; next[idx] = tmp;
+                    setAggregateForm({ ...aggregateForm, candidates: next });
+                  }}><ChevronDown size={12} /></Button>
+                  <Button type="button" variant="ghost" size="icon" className="h-7 w-7 text-destructive" disabled={aggregateForm.candidates.length <= 1} onClick={() => {
+                    setAggregateForm({ ...aggregateForm, candidates: aggregateForm.candidates.filter((_, i) => i !== idx) });
+                  }}><Trash2 size={12} /></Button>
+                </div>
+              ))}
+            </div>
+            <datalist id="agg-model-options">
+              {safeModels.map(m => <option key={`${m.owned_by}:${m.id}`} value={m.id} />)}
             </datalist>
+            <p className="text-xs text-muted-foreground">顶部候选为默认模型，拖动排序即改默认/顺序。每行独立账户+模型。</p>
           </div>
-
-          {/* Verify */}
-          <div className="space-y-2">
-            <Button
-              type="button"
-              variant="outline"
-              onClick={handleVerify}
-              disabled={isVerifying || !customForm.target || !customForm.accountId}
-              className="bg-warning/10 text-warning hover:bg-warning/20 border-0"
-            >
-              {isVerifying ? <Loader2 size={16} className="animate-spin" /> : <Zap size={16} />}
-              {isVerifying ? t('models.verifying') : t('models.verify')}
-            </Button>
-            {verifyResult && (
-              <div className={cn(
-                "flex items-center gap-2 p-3 rounded-lg text-sm font-medium",
-                verifyResult.success ? "bg-success/10 text-success" : "bg-destructive/10 text-destructive"
-              )}>
-                {verifyResult.success ? <CheckCircle2 size={16} /> : <XCircle size={16} />}
-                {verifyResult.success
-                  ? `${t('models.verifySuccess')}${verifyResult.latency ? ` (${(verifyResult.latency / 1000).toFixed(1)}s)` : ''}`
-                  : verifyResult.error || t('models.verifyFirst')}
-              </div>
-            )}
-          </div>
-
-          <div className="pt-2 flex gap-3">
-            <Button type="button" variant="outline" onClick={() => { setIsCustomModalOpen(false); setVerifyResult(null); }} className="flex-1">{t('common.cancel')}</Button>
-            <Button
-              type="submit"
-              disabled={!verifyResult?.success}
-              className="flex-1"
-            >
-              <Save size={16} /> {t('common.save')}
-            </Button>
+          <div className="pt-4 flex gap-3">
+            <Button type="button" variant="outline" onClick={closeAggregateModal} className="flex-1">{t('common.cancel')}</Button>
+            <Button type="submit" className="flex-1"><Save size={16} /> {t('common.save')}</Button>
           </div>
         </form>
       </Dialog>
@@ -779,6 +813,21 @@ export default function Models() {
         }}
         title={t('common.delete')}
         description={t('models.deleteConfirm', { name: aliasToDelete?.name })}
+        confirmText={t('common.delete')}
+        variant="danger"
+      />
+
+      <ConfirmDialog
+        isOpen={!!aggregateToDelete}
+        onClose={() => setAggregateToDelete(null)}
+        onConfirm={async () => {
+          if (aggregateToDelete) {
+            await deleteAggregateAlias(aggregateToDelete.id);
+            setAggregateToDelete(null);
+          }
+        }}
+        title={t('common.delete')}
+        description={t('models.deleteConfirm', { name: aggregateToDelete?.name })}
         confirmText={t('common.delete')}
         variant="danger"
       />

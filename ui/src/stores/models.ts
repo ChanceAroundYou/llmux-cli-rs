@@ -34,10 +34,23 @@ export interface PerAccountMeta {
   count: number;
 }
 
+export interface AggregateCandidate { account_id: number; model: string }
+export interface AggregateAlias {
+  id: number;
+  alias: string;
+  candidates: AggregateCandidate[];
+  interval_secs: number;
+  active: number;
+  last_status: (boolean | null)[];
+  pending_target: number | null;
+  confirm_count: number;
+}
+
 interface ModelsState {
   availableModels: AvailableModel[];
   cachedAt: number | null;
   aliases: ModelAlias[];
+  aggregateAliases: AggregateAlias[];
   accounts: Account[];
   isLoading: boolean;
   streaming: boolean;
@@ -46,9 +59,12 @@ interface ModelsState {
   fetchModels: (force?: boolean) => Promise<void>;
   streamModels: (force?: boolean) => Promise<void>;
   fetchAliases: () => Promise<void>;
+  fetchAggregateAliases: () => Promise<void>;
   fetchAccounts: () => Promise<void>;
   addAlias: (alias: string, targetModel: string, providerId?: string, accountIds?: number[], preferredAccountId?: number) => Promise<void>;
   deleteAlias: (id: number) => Promise<void>;
+  saveAggregateAlias: (alias: string, candidates: AggregateCandidate[], intervalSecs?: number) => Promise<void>;
+  deleteAggregateAlias: (id: number) => Promise<void>;
   testModel: (modelId: string, providerId?: string, accountId?: number) => Promise<{ success: boolean; error?: string; latency?: number }>;
   startTestQueue: (models: { model: string, providerId: string, accountId?: number }[]) => Promise<{ success: boolean; error?: string }>;
   fetchTestQueueStatus: () => Promise<{ isRunning: boolean; current: number; total: number; progress: number }>;
@@ -65,6 +81,7 @@ export const useModelsStore = create<ModelsState>((set, get) => ({
   availableModels: [],
   cachedAt: null,
   aliases: [],
+  aggregateAliases: [],
   accounts: [],
   isLoading: false,
   streaming: false,
@@ -173,6 +190,17 @@ export const useModelsStore = create<ModelsState>((set, get) => ({
     }
   },
 
+  fetchAggregateAliases: async () => {
+    try {
+      const res = await apiFetch('/api/aggregate-aliases');
+      if (!res.ok) throw new Error('Failed to fetch aggregate aliases');
+      const data = await res.json();
+      set({ aggregateAliases: Array.isArray(data) ? data : [] });
+    } catch (err: any) {
+      console.error('Failed to fetch aggregate aliases:', err.message);
+    }
+  },
+
   fetchAccounts: async () => {
     try {
       const res = await apiFetch('/api/accounts');
@@ -218,6 +246,23 @@ export const useModelsStore = create<ModelsState>((set, get) => ({
       set({ error: err.message });
       throw err;
     }
+  },
+
+  saveAggregateAlias: async (alias, candidates, intervalSecs) => {
+    try {
+      const body: any = { alias, candidates, interval_secs: intervalSecs ?? 300 };
+      const res = await apiFetch('/api/aggregate-aliases', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      if (!res.ok) { const data = await res.json(); throw new Error(data.error || 'Failed to save aggregate alias'); }
+      await get().fetchAggregateAliases();
+    } catch (err: any) { set({ error: err.message }); throw err; }
+  },
+
+  deleteAggregateAlias: async (id) => {
+    try {
+      const res = await apiFetch(`/api/aggregate-aliases/${id}`, { method: 'DELETE' });
+      if (!res.ok) throw new Error('Failed to delete aggregate alias');
+      await get().fetchAggregateAliases();
+    } catch (err: any) { set({ error: err.message }); throw err; }
   },
 
   testModel: async (modelId, providerId, accountId) => {

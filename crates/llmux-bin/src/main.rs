@@ -99,10 +99,12 @@ async fn start(port_override: Option<u16>, use_tui: bool) -> anyhow::Result<()> 
     let master_key = get_or_create_master_key(&config.data_dir, config.master_key.as_deref())?;
 
     let dispatch_router = Arc::new(Mutex::new(llmux_core::dispatcher::DispatchRouter::default()));
+    let aggregate_router = Arc::new(Mutex::new(llmux_core::aggregate::AggregateRouter::default()));
     let test_queue = Arc::new(Mutex::new(TestQueueState::default()));
     let models_cache = Arc::new(Mutex::new(None));
     let auth_cache = Arc::new(Mutex::new(std::collections::HashMap::new()));
     let model_cache = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let aggregate_cache = Arc::new(Mutex::new(std::collections::HashMap::new()));
 
     let lan_ip = get_local_lan_ip();
 
@@ -127,17 +129,21 @@ async fn start(port_override: Option<u16>, use_tui: bool) -> anyhow::Result<()> 
         tracing::info!("🔧 BASE_PATH={}", base_path);
     }
     let state = AppState {
-        pool,
-        master_key,
+        pool: pool.clone(),
+        master_key: master_key.clone(),
         data_dir: config.data_dir.clone(),
         base_path,
         test_queue,
         dispatch_router,
+        aggregate_router: aggregate_router.clone(),
         models_cache,
         auth_cache,
         model_cache,
+        aggregate_cache,
         tui_tx,
     };
+    // Spawn aggregate background probe (5 min, V-anchored, 3-confirm)
+    llmux_server::aggregate_probe::spawn_aggregate_probe(pool.clone(), master_key.clone(), aggregate_router.clone());
     let router = app(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], effective_port));
