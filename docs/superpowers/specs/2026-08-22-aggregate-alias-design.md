@@ -34,7 +34,7 @@ CREATE TABLE IF NOT EXISTS aggregate_aliases (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
   alias         TEXT NOT NULL UNIQUE,
   candidates    TEXT NOT NULL,               -- JSON 数组，按优先级
-  interval_secs INTEGER NOT NULL DEFAULT 300 -- 后台探测间隔，默认 5 分钟
+  interval_secs INTEGER NOT NULL DEFAULT 300, -- 后台探测间隔，默认 5 分钟
   created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
