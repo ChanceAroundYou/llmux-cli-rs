@@ -403,7 +403,7 @@ export default function Models() {
               <Layers size={14} className="text-primary" />
               {'聚合别名'}
            </h2>
-           <div className="grid grid-cols-1 gap-3">
+           <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3">
               {aggregateAliases.map(agg => {
                 const isActive = (idx: number) => agg.active === idx;
                 const statusDot = (idx: number) => {
@@ -417,27 +417,28 @@ export default function Models() {
                   <div
                     key={agg.id}
                     onClick={() => openAggregateModal(agg)}
-                    className="p-3 bg-card border border-border rounded-xl flex flex-col gap-2 group hover:border-primary/30 transition-all cursor-pointer"
+                    className="p-2.5 bg-card border border-border rounded-xl flex flex-col gap-2 group hover:border-primary/30 transition-all cursor-pointer min-w-0"
                   >
-                    <div className="flex items-center justify-between">
-                      <div className="flex items-center gap-2">
-                        <span className="px-2 py-0.5 bg-primary/10 text-primary rounded text-xs font-bold uppercase truncate shadow-sm border border-primary/5">{agg.alias}</span>
-                        <CopyButton value={agg.alias} size={10} className="p-1 opacity-0 group-hover:opacity-100 transition-opacity" />
-                        {pendingNote && <span className="text-xs text-warning font-bold">{pendingNote}</span>}
+                    <div className="flex items-center justify-between gap-2 min-w-0">
+                      <div className="flex items-center gap-1.5 min-w-0">
+                        <span className="px-2 py-0.5 bg-primary/10 text-primary rounded text-xs font-bold uppercase truncate shadow-sm border border-primary/5 shrink-0">{agg.alias}</span>
+                        <CopyButton value={agg.alias} size={10} className="p-1 opacity-0 group-hover:opacity-100 transition-opacity shrink-0" />
+                        {pendingNote && <span className="text-xs text-warning font-bold truncate">{pendingNote}</span>}
                       </div>
-                      <Button variant="ghost" size="icon" onClick={(e) => { e.stopPropagation(); setAggregateToDelete({ id: agg.id, name: agg.alias }); }} className="h-6 w-6 text-muted-foreground hover:text-destructive opacity-0 group-hover:opacity-100 transition-all"><Trash2 size={12} /></Button>
+                      <Button variant="ghost" size="icon" onClick={(e) => { e.stopPropagation(); setAggregateToDelete({ id: agg.id, name: agg.alias }); }} className="h-6 w-6 shrink-0 text-muted-foreground hover:text-destructive opacity-0 group-hover:opacity-100 transition-all"><Trash2 size={12} /></Button>
                     </div>
                     <div className="space-y-1">
                       {agg.candidates.map((c: any, idx: number) => {
                         const acc = safeAccounts.find(a => a.id === c.account_id);
                         return (
-                          <div key={idx} className={cn("flex items-center gap-2 text-xs px-2 py-1 rounded", isActive(idx) ? "bg-primary/10 border border-primary/20" : "bg-muted/30")}>
-                            <span className="font-bold text-muted-foreground w-5">#{idx+1}</span>
-                            <div className={cn("w-2 h-2 rounded-full", statusDot(idx))} title={String(agg.last_status?.[idx] ?? "unknown")} />
-                            <span className="font-bold">{acc ? acc.alias : `account#${c.account_id}`}</span>
-                            <span className="text-muted-foreground">/</span>
-                            <span className="truncate">{c.model}</span>
-                            {isActive(idx) ? <span className="ml-auto text-primary font-bold text-[10px] px-1.5 py-0.5 rounded bg-primary/10 border border-primary/20">活跃</span> : <button onClick={(e) => { e.stopPropagation(); setAggregateActive(agg.id, idx).catch(()=>{}); }} className="ml-auto text-[10px] px-1.5 py-0.5 rounded border border-border bg-muted/50 hover:bg-primary/10 hover:text-primary transition-colors">设为活跃</button>}
+                          <div key={idx} className={cn("flex flex-col gap-1 text-xs px-2 py-1.5 rounded", isActive(idx) ? "bg-primary/10 border border-primary/20" : "bg-muted/30")}>
+                            <div className="flex items-center gap-2 min-w-0">
+                              <span className="font-bold text-muted-foreground w-4 shrink-0">#{idx+1}</span>
+                              <div className={cn("w-2 h-2 rounded-full shrink-0", statusDot(idx))} title={String(agg.last_status?.[idx] ?? "unknown")} />
+                              <span className="font-bold truncate">{acc ? acc.alias : `account#${c.account_id}`}</span>
+                              {isActive(idx) ? <span className="ml-auto shrink-0 text-primary font-bold text-[10px] px-1.5 py-0.5 rounded bg-primary/10 border border-primary/20">活跃</span> : <button onClick={(e) => { e.stopPropagation(); setAggregateActive(agg.id, idx).catch(()=>{}); }} className="ml-auto shrink-0 text-[10px] px-1.5 py-0.5 rounded border border-border bg-muted/50 hover:bg-primary/10 hover:text-primary transition-colors">设为活跃</button>}
+                            </div>
+                            <div className="pl-6 truncate text-muted-foreground">{c.model}</div>
                           </div>
                         );
                       })}
@@ -749,60 +750,63 @@ export default function Models() {
             </div>
             <div className="space-y-2 max-h-72 overflow-y-auto border border-border rounded-lg p-2 bg-muted/30">
               {aggregateForm.candidates.map((c, idx) => (
-                <div key={idx} className="flex items-center gap-2 p-2 bg-card border border-border rounded-lg">
-                  <span className="text-xs font-bold w-6">#{idx+1}</span>
-                  <select
-                    value={c.account_id}
-                    onChange={e => {
+                <div key={idx} className="flex items-start gap-2 p-2 bg-card border border-border rounded-lg min-w-0">
+                  <span className="text-xs font-bold w-5 shrink-0 pt-2">#{idx+1}</span>
+                  <div className="flex-1 flex flex-col gap-1.5 min-w-0">
+                    <select
+                      value={c.account_id}
+                      onChange={e => {
+                        const next = [...aggregateForm.candidates];
+                        next[idx] = { ...next[idx], account_id: e.target.value ? Number(e.target.value) : '' };
+                        setAggregateForm({ ...aggregateForm, candidates: next });
+                      }}
+                      className="w-full h-8 px-2 rounded-md border border-input bg-background text-sm"
+                    >
+                      <option value="">选择账户</option>
+                      {safeAccounts.filter(a => a.is_active === 1).map(a => (
+                        <option key={a.id} value={a.id}>[{a.provider_id}] {a.alias}</option>
+                      ))}
+                    </select>
+                    {(() => {
+                      const accAlias = safeAccounts.find(a => a.id === c.account_id)?.alias;
+                      const modelsForAccount = c.account_id ? safeModels.filter(m => m.owned_by === accAlias) : [];
+                      const hasModels = modelsForAccount.length > 0;
+                      const inList = hasModels && modelsForAccount.some(m => m.id === c.model);
+                      return (
+                        <select
+                          value={c.model}
+                          disabled={!c.account_id}
+                          onChange={e => {
+                            const next = [...aggregateForm.candidates];
+                            next[idx] = { ...next[idx], model: e.target.value };
+                            setAggregateForm({ ...aggregateForm, candidates: next });
+                          }}
+                          className="w-full h-8 px-2 rounded-md border border-input bg-background text-sm disabled:opacity-50"
+                        >
+                          <option value="">{!c.account_id ? "请先选择账户" : hasModels ? "选择模型" : "暂无可用模型"}</option>
+                          {modelsForAccount.map(m => (
+                            <option key={`${m.owned_by}:${m.id}`} value={m.id}>{m.id}</option>
+                          ))}
+                          {!inList && c.model && <option value={c.model}>{c.model} (不在列表)</option>}
+                        </select>
+                      );
+                    })()}
+                  </div>
+                  <div className="flex flex-col gap-1 shrink-0">
+                    <Button type="button" variant="ghost" size="icon" className="h-7 w-7" disabled={idx === 0} onClick={() => {
                       const next = [...aggregateForm.candidates];
-                      next[idx] = { ...next[idx], account_id: e.target.value ? Number(e.target.value) : '' };
+                      const tmp = next[idx-1]; next[idx-1] = next[idx]; next[idx] = tmp;
                       setAggregateForm({ ...aggregateForm, candidates: next });
-                    }}
-                    className="flex-1 h-8 px-2 rounded-md border border-input bg-background text-sm"
-                  >
-                    <option value="">选择账户</option>
-                    {safeAccounts.filter(a => a.is_active === 1).map(a => (
-                      <option key={a.id} value={a.id}>[{a.provider_id}] {a.alias}</option>
-                    ))}
-                  </select>
-                  {(() => {
-                    const accAlias = safeAccounts.find(a => a.id === c.account_id)?.alias;
-                    const modelsForAccount = c.account_id ? safeModels.filter(m => m.owned_by === accAlias) : [];
-                    const hasModels = modelsForAccount.length > 0;
-                    // keep original value visible even if not in list
-                    const inList = hasModels && modelsForAccount.some(m => m.id === c.model);
-                    return (
-                      <select
-                        value={c.model}
-                        disabled={!c.account_id}
-                        onChange={e => {
-                          const next = [...aggregateForm.candidates];
-                          next[idx] = { ...next[idx], model: e.target.value };
-                          setAggregateForm({ ...aggregateForm, candidates: next });
-                        }}
-                        className="flex-1 h-8 px-2 rounded-md border border-input bg-background text-sm disabled:opacity-50"
-                      >
-                        <option value="">{!c.account_id ? "请先选择账户" : hasModels ? "选择模型" : "暂无可用模型"}</option>
-                        {modelsForAccount.map(m => (
-                          <option key={`${m.owned_by}:${m.id}`} value={m.id}>{m.id}</option>
-                        ))}
-                        {!inList && c.model && <option value={c.model}>{c.model} (不在列表)</option>}
-                      </select>
-                    );
-                  })()}
-                  <Button type="button" variant="ghost" size="icon" className="h-7 w-7" disabled={idx === 0} onClick={() => {
-                    const next = [...aggregateForm.candidates];
-                    const tmp = next[idx-1]; next[idx-1] = next[idx]; next[idx] = tmp;
-                    setAggregateForm({ ...aggregateForm, candidates: next });
-                  }}><ChevronUp size={12} /></Button>
-                  <Button type="button" variant="ghost" size="icon" className="h-7 w-7" disabled={idx === aggregateForm.candidates.length - 1} onClick={() => {
-                    const next = [...aggregateForm.candidates];
-                    const tmp = next[idx+1]; next[idx+1] = next[idx]; next[idx] = tmp;
-                    setAggregateForm({ ...aggregateForm, candidates: next });
-                  }}><ChevronDown size={12} /></Button>
-                  <Button type="button" variant="ghost" size="icon" className="h-7 w-7 text-destructive" disabled={aggregateForm.candidates.length <= 1} onClick={() => {
-                    setAggregateForm({ ...aggregateForm, candidates: aggregateForm.candidates.filter((_, i) => i !== idx) });
-                  }}><Trash2 size={12} /></Button>
+                    }}><ChevronUp size={12} /></Button>
+                    <Button type="button" variant="ghost" size="icon" className="h-7 w-7" disabled={idx === aggregateForm.candidates.length - 1} onClick={() => {
+                      const next = [...aggregateForm.candidates];
+                      const tmp = next[idx+1]; next[idx+1] = next[idx]; next[idx] = tmp;
+                      setAggregateForm({ ...aggregateForm, candidates: next });
+                    }}><ChevronDown size={12} /></Button>
+                    <Button type="button" variant="ghost" size="icon" className="h-7 w-7 text-destructive" disabled={aggregateForm.candidates.length <= 1} onClick={() => {
+                      setAggregateForm({ ...aggregateForm, candidates: aggregateForm.candidates.filter((_, i) => i !== idx) });
+                    }}><Trash2 size={12} /></Button>
+                  </div>
                 </div>
               ))}
             </div>
