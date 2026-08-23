@@ -75,7 +75,7 @@ pub async fn export_config(pool: &SqlitePool, encryption_secret: &str) -> Result
     }
 
     let aliases = sqlx::query_as::<_, (String, String, Option<String>, Option<String>, Option<i64>)>(
-        "SELECT alias, target_model, provider_id, account_ids, preferred_account_id FROM model_aliases ORDER BY id",
+        "SELECT alias, target_model, provider_id, account_ids, preferred_account_id, upstream_api FROM model_aliases ORDER BY id",
     )
     .fetch_all(pool)
     .await?

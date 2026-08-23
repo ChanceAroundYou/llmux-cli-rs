@@ -1,5 +1,6 @@
 pub mod anthropic_openai;
 pub mod openai_anthropic;
+pub mod responses;
 
 use crate::adapters::{Account, ProviderRequest};
 use serde_json::{json, Value};

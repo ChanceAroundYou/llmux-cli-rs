@@ -104,6 +104,7 @@ pub async fn start_test_queue(
                     account_ids: vec![],
                     preferred_account_id: None,
                     alias_name: None,
+                    upstream_api: Default::default(),
                 }
             });
 
