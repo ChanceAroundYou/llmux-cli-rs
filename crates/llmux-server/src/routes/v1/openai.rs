@@ -314,61 +314,42 @@ async fn responses_to_chat_streaming(
         let mut converter = llmux_core::proxy::responses::ResponsesToChatConverter::new(&model);
         let mut sse = response.bytes_stream();
         let mut chunks: u64 = 0;
-        let mut saw_done = false;
-        let mut saw_completed = false;
-        let mut last_usage: Option<Value> = None;
         while let Some(chunk) = sse.next().await {
             match chunk {
                 Ok(c) => {
                     chunks += 1;
                     buffer.extend_from_slice(&c);
                     for event_text in parse_sse_chunks(&mut buffer, 0) {
-                        if event_text.contains("[DONE]") { saw_done = true; }
-                        if event_text.contains("response.completed") { saw_completed = true; }
                         for out in converter.feed(&event_text) {
-                            if out.contains("[DONE]") { saw_done = true; }
-                            if let Ok(v) = serde_json::from_str::<Value>(out.trim_start_matches("data:").trim()) {
-                                if let Some(u) = v.get("usage") { last_usage = Some(u.clone()); }
-                            }
                             if tx.send(Ok(Bytes::from(out))).await.is_err() { return; }
                         }
-                        if saw_completed { break; }
+                        if converter.is_done() { break; }
                     }
-                    if saw_completed { break; }
+                    if converter.is_done() { break; }
                 }
                 Err(e) => { tracing::warn!("[responses→chat:{}] read error: {e}", model); break; }
             }
         }
-        // drain buffered
-        loop {
-            let events = parse_sse_chunks(&mut buffer, 0);
-            if events.is_empty() { break; }
-            for event_text in events {
-                if event_text.contains("response.completed") { saw_completed = true; }
-                for out in converter.feed(&event_text) {
-                    if out.contains("[DONE]") { saw_done = true; }
-                    if let Ok(v) = serde_json::from_str::<Value>(out.trim_start_matches("data:").trim()) {
-                        if let Some(u) = v.get("usage") { last_usage = Some(u.clone()); }
+        if !converter.is_done() {
+            loop {
+                let events = parse_sse_chunks(&mut buffer, 0);
+                if events.is_empty() { break; }
+                for event_text in events {
+                    for out in converter.feed(&event_text) {
+                        if tx.send(Ok(Bytes::from(out))).await.is_err() { return; }
                     }
-                    if tx.send(Ok(Bytes::from(out))).await.is_err() { return; }
+                    if converter.is_done() { break; }
                 }
+                if converter.is_done() { break; }
             }
         }
         for out in converter.finish() {
-            if out.contains("[DONE]") { saw_done = true; }
-            if let Ok(v) = serde_json::from_str::<Value>(out.trim_start_matches("data:").trim()) {
-                if let Some(u) = v.get("usage") { last_usage = Some(u.clone()); }
-            }
             if tx.send(Ok(Bytes::from(out))).await.is_err() { return; }
         }
-        let (prompt_tokens, completion_tokens) = match &last_usage {
-            Some(u) => (u.get("prompt_tokens").or_else(|| u.get("input_tokens")).and_then(Value::as_i64).unwrap_or(0), u.get("completion_tokens").or_else(|| u.get("output_tokens")).and_then(Value::as_i64).unwrap_or(0)),
-            None => (0, 0),
-        };
-        let done = saw_done || saw_completed || completion_tokens > 0;
-        let truncated = !done && chunks <= 4;
+        let (prompt_tokens, completion_tokens) = converter.usage_tokens();
+        let complete = converter.is_done();
         let latency_ms = start.elapsed().as_millis() as i64;
-        spawn_log_usage(pool.clone(), account.clone(), model.clone(), account.provider_id.clone(), prompt_tokens, completion_tokens, 0, 0, latency_ms, !truncated, if truncated { Some(format!("truncated: chunks={chunks} saw_done={saw_done} completed={saw_completed} tokens={completion_tokens}")) } else { None });
+        spawn_log_usage(pool.clone(), account.clone(), model.clone(), account.provider_id.clone(), prompt_tokens, completion_tokens, 0, 0, latency_ms, complete, if complete { None } else { Some(format!("Responses upstream ended without terminal event after {chunks} chunks")) });
     });
     let body = Body::from_stream(ReceiverStream::new(rx));
     Response::builder().status(StatusCode::OK).header("content-type", "text/event-stream").header("cache-control", "no-cache").header("connection", "keep-alive").body(body).unwrap().into_response()

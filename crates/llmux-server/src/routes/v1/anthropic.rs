@@ -920,12 +920,9 @@ async fn dispatch_via_responses(
     }
     let bytes = match resp.bytes().await { Ok(b) => b, Err(e) => return crate::middleware::send_error(&format!("Read failed: {e}"), "server_error", StatusCode::BAD_GATEWAY, true) };
     let data: Value = match serde_json::from_slice(&bytes) { Ok(v) => v, Err(e) => return crate::middleware::send_error(&format!("Parse failed: {e}"), "server_error", StatusCode::BAD_GATEWAY, true) };
-    // responses JSON -> anthropic JSON
-    let text = llmux_core::proxy::responses::extract_responses_text(&data);
-    let usage = data.get("usage").cloned().unwrap_or(serde_json::json!({}));
-    let input = usage.get("input_tokens").or_else(|| usage.get("prompt_tokens")).and_then(Value::as_i64).unwrap_or(0);
-    let output = usage.get("output_tokens").or_else(|| usage.get("completion_tokens")).and_then(Value::as_i64).unwrap_or(0);
-    let anth = serde_json::json!({"id": data.get("id").cloned().unwrap_or(serde_json::json!("msg_1")), "type":"message","role":"assistant","model": model, "content":[{"type":"text","text": text}], "stop_reason":"end_turn","usage":{"input_tokens": input, "output_tokens": output}});
+    let anth = llmux_core::proxy::responses::responses_to_anthropic(&data, model);
+    let input = anth["usage"]["input_tokens"].as_i64().unwrap_or(0);
+    let output = anth["usage"]["output_tokens"].as_i64().unwrap_or(0);
     crate::routes::v1::helpers::spawn_log_usage(state.pool.clone(), account.clone(), model.to_string(), account.provider_id.clone(), input, output, 0, 0, start.elapsed().as_millis() as i64, true, None);
     axum::Json(anth).into_response()
 }
@@ -1040,24 +1037,26 @@ async fn responses_to_anthropic_streaming(
         let mut buffer: Vec<u8> = Vec::with_capacity(4096);
         let mut conv = llmux_core::proxy::responses::ResponsesToAnthropicConverter::new(&model);
         let mut sse = response.bytes_stream();
-        let mut saw_completed = false;
         while let Some(chunk) = sse.next().await {
             let c = match chunk { Ok(c) => c, Err(_) => break };
             buffer.extend_from_slice(&c);
             for ev in llmux_core::proxy::anthropic_openai::parse_sse_chunks(&mut buffer, 0) {
-                if ev.contains("response.completed") { saw_completed = true; }
                 for out in conv.feed(&ev) { if tx.send(Ok(Bytes::from(out))).await.is_err() { return; } }
-                if ev.contains("[DONE]") { saw_completed = true; break; }
+                if conv.is_done() { break; }
             }
-            if saw_completed { break; }
+            if conv.is_done() { break; }
         }
         // drain buffered events
-        for ev in llmux_core::proxy::anthropic_openai::parse_sse_chunks(&mut buffer, 0) {
-            for out in conv.feed(&ev) { let _ = tx.send(Ok(Bytes::from(out))).await; }
+        if !conv.is_done() {
+            for ev in llmux_core::proxy::anthropic_openai::parse_sse_chunks(&mut buffer, 0) {
+                for out in conv.feed(&ev) { let _ = tx.send(Ok(Bytes::from(out))).await; }
+                if conv.is_done() { break; }
+            }
         }
         for out in conv.finish() { let _ = tx.send(Ok(Bytes::from(out))).await; }
+        let (input_tokens, output_tokens) = conv.usage_tokens();
         let latency_ms = start.elapsed().as_millis() as i64;
-        crate::routes::v1::helpers::spawn_log_usage(pool.clone(), account.clone(), model.clone(), provider_id.clone(), 0, 0, 0, 0, latency_ms, true, None);
+        crate::routes::v1::helpers::spawn_log_usage(pool.clone(), account.clone(), model.clone(), provider_id.clone(), input_tokens, output_tokens, 0, 0, latency_ms, conv.is_done(), if conv.is_done() { None } else { Some("Responses upstream ended without terminal event".to_string()) });
     });
     let body = Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx));
     Response::builder().status(StatusCode::OK).header("content-type", "text/event-stream").header("cache-control", "no-cache").header("connection", "keep-alive").body(body).unwrap().into_response()
