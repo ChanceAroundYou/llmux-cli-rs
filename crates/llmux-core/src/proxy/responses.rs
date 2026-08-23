@@ -4,6 +4,49 @@
 
 use serde_json::{json, Map, Value};
 
+/// Convert Chat Completions content parts to the Responses input vocabulary.
+/// Strings are valid in both APIs; structured parts are not.
+fn to_responses_content(content: &Value) -> Value {
+    match content {
+        Value::String(_) => content.clone(),
+        Value::Array(parts) => {
+            let parts: Vec<Value> = parts
+                .iter()
+                .filter_map(|part| {
+                    if part.is_string() {
+                        return Some(json!({"type": "input_text", "text": part}));
+                    }
+                    match part.get("type").and_then(Value::as_str) {
+                        Some("text") => part
+                            .get("text")
+                            .map(|text| json!({"type": "input_text", "text": text})),
+                        Some("image_url") => {
+                            let image = part.get("image_url")?;
+                            let url = image.get("url")?;
+                            let mut input = json!({"type": "input_image", "image_url": url});
+                            if let Some(detail) = image.get("detail") {
+                                input["detail"] = detail.clone();
+                            }
+                            Some(input)
+                        }
+                        Some("input_text") | Some("input_image") | Some("input_file") => {
+                            Some(part.clone())
+                        }
+                        _ => Some(part.clone()),
+                    }
+                })
+                .collect();
+            if parts.is_empty() {
+                Value::String(String::new())
+            } else {
+                Value::Array(parts)
+            }
+        }
+        Value::Null => Value::String(String::new()),
+        _ => content.clone(),
+    }
+}
+
 /// chat/completions body → responses body
 pub fn chat_to_responses(chat_body: &Value, resolved_model: &str) -> Value {
     let mut out = Map::new();
@@ -15,7 +58,9 @@ pub fn chat_to_responses(chat_body: &Value, resolved_model: &str) -> Value {
             .iter()
             .map(|m| {
                 let role = m.get("role").and_then(Value::as_str).unwrap_or("user");
-                let content = m.get("content").cloned().unwrap_or(Value::Null);
+                let content = to_responses_content(
+                    &m.get("content").cloned().unwrap_or(Value::Null),
+                );
                 // reasoning / tool_calls are passed through as-is in input
                 let mut obj = json!({"role": role, "content": content});
                 if let Some(tc) = m.get("tool_calls") {
@@ -110,7 +155,10 @@ pub fn anthropic_to_responses(anth_body: &Value, resolved_model: &str) -> Value 
                 }
                 _ => content.clone(),
             };
-            input.push(json!({"role": role, "content": content_val}));
+            input.push(json!({
+                "role": role,
+                "content": to_responses_content(&content_val),
+            }));
         }
     }
     out.insert("input".to_string(), Value::Array(input));
@@ -409,4 +457,50 @@ fn sse_event(event_type: &str, data: Value) -> String {
 fn uuid_simple() -> String {
     use uuid::Uuid;
     Uuid::new_v4().simple().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chat_content_parts_use_responses_vocabulary() {
+        let body = json!({
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "describe this"},
+                {"type": "image_url", "image_url": {"url": "https://example.com/a.png", "detail": "auto"}}
+            ]}]
+        });
+
+        let translated = chat_to_responses(&body, "muse");
+        let content = &translated["input"][0]["content"];
+        assert_eq!(content[0], json!({"type": "input_text", "text": "describe this"}));
+        assert_eq!(content[1], json!({
+            "type": "input_image",
+            "image_url": "https://example.com/a.png",
+            "detail": "auto",
+        }));
+    }
+
+    #[test]
+    fn anthropic_structured_parts_are_not_dropped() {
+        let body = json!({
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "call the tool"},
+                {"type": "tool_result", "tool_use_id": "call_1", "content": "ok"}
+            ]}]
+        });
+
+        let translated = anthropic_to_responses(&body, "muse");
+        let content = &translated["input"][0]["content"];
+        assert_eq!(content[0], json!({"type": "input_text", "text": "call the tool"}));
+        assert_eq!(content[1]["type"], "tool_result");
+    }
+
+    #[test]
+    fn chat_string_content_is_preserved() {
+        let body = json!({"messages": [{"role": "user", "content": "hello"}]});
+        let translated = chat_to_responses(&body, "muse");
+        assert_eq!(translated["input"][0]["content"], "hello");
+    }
 }
