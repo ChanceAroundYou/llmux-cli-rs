@@ -307,6 +307,88 @@ async fn system_claude_settings_returns_valid_structure() {
 }
 
 #[tokio::test]
+async fn server_rejects_alias_forced_protocol_unsupported_by_bound_account() {
+    use http::header;
+    // Share one state/app (request_json makes a fresh DB+master_key per call, which would
+    // drop the created account). Build once and issue both requests on the same app.
+    let state = llmux_server::test_state().await;
+    let app = llmux_server::app(state.clone());
+
+    // Login once to get a session cookie for /api/* routes
+    let login_req = Request::builder()
+        .method(Method::POST)
+        .uri("/api/auth/login")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::json!({"username":"xiaokubao","password":"Xkb111717!"}).to_string(),
+        ))
+        .unwrap();
+    let login_resp = llmux_server::test_request(app.clone(), login_req).await;
+    let cookie = extract_session_cookie(&login_resp).expect("session cookie");
+
+    let post = |app: axum::Router, cookie: &str, uri: &str, body: Value| {
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::COOKIE, cookie)
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        async move {
+            let resp = llmux_server::test_request(app, req).await;
+            let status = resp.status();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+            (status, value)
+        }
+    };
+
+    // Create an account that only supports chat (responses/messages endpoints null)
+    let (create_status, create_body) = post(
+        app.clone(),
+        &cookie,
+        "/api/accounts",
+        json!({
+            "alias": "chatonly",
+            "provider_id": "openai",
+            "api_key": "sk-test-chatonly",
+            "chat_endpoint": "https://api.openai.com/v1/chat/completions",
+            "responses_endpoint": null,
+            "messages_endpoint": null,
+            "default_protocol": "chat",
+            "skip_validation": true,
+        }),
+    )
+    .await;
+    assert_eq!(create_status, StatusCode::OK, "{:?}", create_body);
+    let acct_id = create_body["id"].as_i64().expect("account id");
+
+    // Binding an alias that forces responses to a chat-only account must be rejected
+    let (status, body) = post(
+        app.clone(),
+        &cookie,
+        "/api/models/aliases",
+        json!({
+            "alias": "respforced",
+            "target_model": "gpt-4o",
+            "account_ids": [acct_id],
+            "upstream_api": "responses",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "expected 409, got {:?}", body);
+    assert_eq!(body["code"], json!("alias_protocol_unsupported"));
+    assert_eq!(body["field"], json!("downstream_mode"));
+    let unsupported = body["unsupportedAccounts"]
+        .as_array()
+        .expect("unsupportedAccounts array");
+    assert!(unsupported.contains(&json!(acct_id)), "{:?}", body);
+}
+
+
+#[tokio::test]
 async fn ui_auth_login_and_me_and_logout_gate() {
     use http::header;
     // unauthorized without cookie — use raw request to avoid auto-login helper

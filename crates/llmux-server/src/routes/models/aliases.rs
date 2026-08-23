@@ -6,7 +6,9 @@ use axum::{
 };
 use serde_json::{json, Value};
 
+use llmux_core::dispatcher::{get_accounts_by_ids, get_active_accounts};
 use llmux_core::models::ModelAlias;
+use llmux_core::protocol::{self, DownstreamMode, Protocol};
 
 use crate::app::AppState;
 
@@ -78,10 +80,72 @@ pub async fn set_model_alias(
         }
     });
 
+    // Parse account_ids into Vec<i64> for protocol-capability validation
+    let account_ids_vec: Vec<i64> = body
+        .get("account_ids")
+        .and_then(|v| {
+            if let Some(arr) = v.as_array() {
+                Some(
+                    arr.iter()
+                        .filter_map(|x| x.as_i64().filter(|n| *n > 0))
+                        .collect(),
+                )
+            } else if let Some(s) = v.as_str() {
+                Some(
+                    s.split(',')
+                        .filter_map(|x| x.trim().parse::<i64>().ok().filter(|n| *n > 0))
+                        .collect(),
+                )
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default();
+
     let preferred_account_id = body
         .get("preferred_account_id")
         .and_then(|v| v.as_i64());
     let upstream_api = llmux_core::upstream_api::UpstreamApi::from_str(body.get("upstream_api").and_then(Value::as_str).unwrap_or("chat")).as_str().to_string();
+
+    // Reject forced protocols unsupported by any bound account (409)
+    let mode = DownstreamMode::from_str(body.get("upstream_api").and_then(Value::as_str).unwrap_or("default"));
+    if mode != DownstreamMode::Default {
+        let proto = match mode {
+            DownstreamMode::Chat => Protocol::Chat,
+            DownstreamMode::Responses => Protocol::Responses,
+            DownstreamMode::Messages => Protocol::Messages,
+            _ => unreachable!(),
+        };
+        let accounts = match if !account_ids_vec.is_empty() {
+            get_accounts_by_ids(&state.pool, &account_ids_vec, &state.master_key).await
+        } else {
+            get_active_accounts(&state.pool, provider_id, &state.master_key).await
+        } {
+            Ok(v) => v,
+            Err(e) => {
+                return crate::error::simple_error(
+                    format!("Failed to load accounts: {e}"),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                )
+            }
+        };
+        let unsupported: Vec<i64> = accounts
+            .iter()
+            .filter(|a| !protocol::supports(a, proto))
+            .map(|a| a.id)
+            .collect();
+        if !unsupported.is_empty() {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "code": "alias_protocol_unsupported",
+                    "field": "downstream_mode",
+                    "unsupportedAccounts": unsupported,
+                })),
+            )
+                .into_response();
+        }
+    }
 
     match sqlx::query(
         "INSERT OR REPLACE INTO model_aliases (alias, target_model, provider_id, account_ids, preferred_account_id, upstream_api) VALUES (?, ?, ?, ?, ?, ?)",
