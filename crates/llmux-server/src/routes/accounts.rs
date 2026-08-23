@@ -70,6 +70,10 @@ pub async fn create_account(
         is_active,
         weight,
         openai_compatible,
+        chat_endpoint: base_url.clone(),
+        responses_endpoint: None,
+        messages_endpoint: anthropic_base_url.clone(),
+        default_protocol: Some("chat".to_string()),
     };
 
     let provider_type = {
@@ -229,6 +233,10 @@ pub async fn update_account(
                 is_active,
                 weight,
                 openai_compatible,
+                chat_endpoint: base_url.clone(),
+                responses_endpoint: None,
+                messages_endpoint: anthropic_base_url.clone(),
+                default_protocol: Some("chat".to_string()),
             };
 
             let provider_type = {

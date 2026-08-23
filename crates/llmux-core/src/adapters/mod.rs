@@ -59,6 +59,10 @@ pub struct Account {
     pub is_active: i64,
     pub weight: i64,
     pub openai_compatible: i64,
+    pub chat_endpoint: Option<String>,
+    pub responses_endpoint: Option<String>,
+    pub messages_endpoint: Option<String>,
+    pub default_protocol: Option<String>,
 }
 
 impl From<crate::models::Account> for Account {
@@ -73,6 +77,10 @@ impl From<crate::models::Account> for Account {
             is_active: value.is_active,
             weight: value.weight,
             openai_compatible: value.openai_compatible.unwrap_or(0),
+            chat_endpoint: None,
+            responses_endpoint: None,
+            messages_endpoint: None,
+            default_protocol: None,
         }
     }
 }

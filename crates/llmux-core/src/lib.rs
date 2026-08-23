@@ -9,5 +9,6 @@ pub mod export_import;
 pub mod models;
 pub mod proxy;
 pub mod settings;
+pub mod protocol;
 pub mod upstream_api;
 pub mod usage;

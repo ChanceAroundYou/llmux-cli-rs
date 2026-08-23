@@ -8,6 +8,7 @@ pub enum UpstreamApi {
     Chat,
     Responses,
     Messages,
+    #[deprecated(note = "Auto is deprecated, use Chat or Default via protocol::DownstreamMode instead")]
     Auto,
 }
 
@@ -16,7 +17,10 @@ impl UpstreamApi {
         match s.trim().to_lowercase().as_str() {
             "responses" => Self::Responses,
             "messages" => Self::Messages,
-            "auto" => Self::Auto,
+            "auto" => {
+                // Auto now maps to Chat (Default) for backwards compat; callers should use protocol::DownstreamMode::from_str for Default semantics.
+                Self::Chat
+            }
             _ => Self::Chat,
         }
     }
