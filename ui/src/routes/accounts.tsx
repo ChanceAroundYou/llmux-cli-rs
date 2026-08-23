@@ -1,12 +1,12 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { useAccountsStore } from '../stores/accounts';
 import { useModelsStore } from '../stores/models';
-import { 
-  Users, 
-  Trash2, 
-  Plus, 
-  Settings2, 
-  Key, 
+import {
+  Users,
+  Trash2,
+  Plus,
+  Settings2,
+  Key,
   Globe,
   Loader2,
   AlertCircle,
@@ -25,6 +25,42 @@ import { cn } from '../lib/utils';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { StatusBadge } from '@/components/shared/StatusBadge';
+import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group';
+
+const PROTOCOLS = ['chat', 'responses', 'messages'] as const;
+type Protocol = typeof PROTOCOLS[number];
+
+const PROTOCOL_LABEL: Record<Protocol, string> = {
+  chat: '/v1/chat/completions',
+  responses: '/v1/responses',
+  messages: '/v1/messages',
+};
+
+function ProtocolBadge({ proto }: { proto: Protocol }) {
+  return (
+    <span className="inline-flex items-center rounded-md bg-muted px-2 py-0.5 text-xs font-medium uppercase tracking-tight border border-border">
+      {proto}
+    </span>
+  );
+}
+
+function EndpointRow({ label, enabled, url, urls, onToggle, onChange }: { label: Protocol; enabled: boolean; url: string; urls: string[]; onToggle: (v: boolean) => void; onChange: (v: string) => void }) {
+  return (
+    <div className="space-y-1.5">
+      <label className="flex items-center gap-2 cursor-pointer">
+        <input type="checkbox" checked={enabled} onChange={e => onToggle(e.target.checked)} className="w-4 h-4 rounded accent-primary" />
+        <span className="text-xs font-bold uppercase">{label}</span>
+        <span className="text-[10px] font-mono text-muted-foreground/70">{PROTOCOL_LABEL[label]}</span>
+      </label>
+      {enabled && (
+        <div className="flex gap-2">
+          <input list={`${label}-urls`} value={url} onChange={e => onChange(e.target.value)} placeholder="https://api.example.com/v1" className="flex-1 h-9 px-3 rounded-md border border-input bg-background text-sm font-mono" />
+          <datalist id={`${label}-urls`}>{urls.map(u => <option key={u} value={u} />)}</datalist>
+        </div>
+      )}
+    </div>
+  );
+}
 
 export default function Accounts() {
   const { t } = useTranslation();
@@ -33,15 +69,13 @@ export default function Accounts() {
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [isEditOpen, setIsEditOpen] = useState(false);
   const [editingAccount, setEditingAccount] = useState<any>(null);
-  const [formData, setFormData] = useState({ alias: '', provider_id: 'custom', api_key: '', base_url: '', anthropic_base_url: '' });
-  const [formSupportsAnthropic, setFormSupportsAnthropic] = useState(false);
-  const [formOpenAICompat, setFormOpenAICompat] = useState(false);
+  const [formData, setFormData] = useState({ alias: '', api_key: '', chat_endpoint: '', responses_endpoint: '', messages_endpoint: '', default_protocol: '' });
+  const [formEnabled, setFormEnabled] = useState<Record<Protocol, boolean>>({ chat: false, responses: false, messages: false });
   const [formSkipValidation, setFormSkipValidation] = useState(false);
-  const [editData, setEditData] = useState({ alias: '', provider_id: '', api_key: '', base_url: '', anthropic_base_url: '', notes: '' });
-  const [editSupportsAnthropic, setEditSupportsAnthropic] = useState(false);
-  const [editOpenAICompat, setEditOpenAICompat] = useState(false);
+  const [editData, setEditData] = useState({ alias: '', api_key: '', chat_endpoint: '', responses_endpoint: '', messages_endpoint: '', default_protocol: '', notes: '' });
+  const [editEnabled, setEditEnabled] = useState<Record<Protocol, boolean>>({ chat: false, responses: false, messages: false });
   const [editSkipValidation, setEditSkipValidation] = useState(false);
-  const [accountToDelete, setAccountToDelete] = useState<{id: number, name: string} | null>(null);
+  const [accountToDelete, setAccountToDelete] = useState<{ id: number; name: string } | null>(null);
   const [isValidating, setIsValidating] = useState(false);
   const [validationError, setValidationError] = useState<string | null>(null);
 
@@ -49,16 +83,49 @@ export default function Accounts() {
     fetchAccounts();
   }, []);
 
+  // Local dedup of endpoint URLs across all accounts for datalist suggestions.
+  const distinctUrls = useMemo(
+    () => [...new Set(accounts.flatMap(a => [a.chat_endpoint, a.responses_endpoint, a.messages_endpoint].filter((u): u is string => !!u)))],
+    [accounts]
+  );
+
+  const formEnabledProtocols = PROTOCOLS.filter(p => formEnabled[p]);
+  const formError = formEnabledProtocols.length === 0
+    ? t('accounts.needEndpoint', 'At least one endpoint must be enabled')
+    : (!formData.default_protocol || !formEnabledProtocols.includes(formData.default_protocol as Protocol))
+      ? t('accounts.defaultInEnabled', 'Default protocol must be one of the enabled endpoints')
+      : null;
+
+  const editEnabledProtocols = PROTOCOLS.filter(p => editEnabled[p]);
+  const editError = editEnabledProtocols.length === 0
+    ? t('accounts.needEndpoint', 'At least one endpoint must be enabled')
+    : (!editData.default_protocol || !editEnabledProtocols.includes(editData.default_protocol as Protocol))
+      ? t('accounts.defaultInEnabled', 'Default protocol must be one of the enabled endpoints')
+      : null;
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (formError) {
+      setValidationError(formError);
+      return;
+    }
     setIsValidating(true);
     setValidationError(null);
     try {
-      await addAccount({ ...formData, openai_compatible: formOpenAICompat ? 1 : 0, skip_validation: formSkipValidation });
+      await addAccount({
+        alias: formData.alias,
+        provider_id: 'custom',
+        api_key: formData.api_key,
+        chat_endpoint: formEnabled.chat ? formData.chat_endpoint.trim() || null : null,
+        responses_endpoint: formEnabled.responses ? formData.responses_endpoint.trim() || null : null,
+        messages_endpoint: formEnabled.messages ? formData.messages_endpoint.trim() || null : null,
+        default_protocol: formData.default_protocol,
+        openai_compatible: 0,
+        skip_validation: formSkipValidation,
+      });
       setIsModalOpen(false);
-      setFormData({ alias: '', provider_id: 'custom', api_key: '', base_url: '', anthropic_base_url: '' });
-      setFormSupportsAnthropic(false);
-      setFormOpenAICompat(false);
+      setFormData({ alias: '', api_key: '', chat_endpoint: '', responses_endpoint: '', messages_endpoint: '', default_protocol: '' });
+      setFormEnabled({ chat: false, responses: false, messages: false });
       setFormSkipValidation(false);
     } catch (err: any) {
       setValidationError(err.message || "Validation failed");
@@ -70,19 +137,46 @@ export default function Accounts() {
 
   const openEdit = (acc: any) => {
     setEditingAccount(acc);
-    setEditData({ alias: acc.alias, provider_id: acc.provider_id, api_key: '', base_url: acc.base_url || '', anthropic_base_url: acc.anthropic_base_url || '', notes: acc.notes || '' });
-    setEditSupportsAnthropic(!!acc.anthropic_base_url);
-    setEditOpenAICompat(!!acc.openai_compatible);
+    const enabled: Record<Protocol, boolean> = {
+      chat: !!acc.chat_endpoint,
+      responses: !!acc.responses_endpoint,
+      messages: !!acc.messages_endpoint,
+    };
+    setEditEnabled(enabled);
+    setEditData({
+      alias: acc.alias,
+      api_key: '',
+      chat_endpoint: acc.chat_endpoint || '',
+      responses_endpoint: acc.responses_endpoint || '',
+      messages_endpoint: acc.messages_endpoint || '',
+      default_protocol: acc.default_protocol || '',
+      notes: acc.notes || '',
+    });
     setIsEditOpen(true);
   };
 
   const handleEditSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (editError) {
+      setValidationError(editError);
+      return;
+    }
     if (!editingAccount) return;
     setIsValidating(true);
     setValidationError(null);
     try {
-      await updateAccount(editingAccount.id, { ...editData, openai_compatible: editOpenAICompat ? 1 : 0, skip_validation: editSkipValidation });
+      const payload: any = {
+        alias: editData.alias,
+        provider_id: editingAccount.provider_id,
+        notes: editData.notes,
+        chat_endpoint: editEnabled.chat ? editData.chat_endpoint.trim() || null : null,
+        responses_endpoint: editEnabled.responses ? editData.responses_endpoint.trim() || null : null,
+        messages_endpoint: editEnabled.messages ? editData.messages_endpoint.trim() || null : null,
+        default_protocol: editData.default_protocol,
+        skip_validation: editSkipValidation,
+      };
+      if (editData.api_key) payload.api_key = editData.api_key;
+      await updateAccount(editingAccount.id, payload);
       setIsEditOpen(false);
       setEditingAccount(null);
     } catch (err: any) {
@@ -93,7 +187,24 @@ export default function Accounts() {
   };
 
   const getSyncScript = () => {
-    return `(async()=>{const p="${formData.provider_id}";console.log("🚀 LLMux Syncing...");const t=localStorage.getItem("token")||document.cookie;fetch("http://localhost:25975/api/auth/sync",{method:"POST",body:JSON.stringify({provider:p,token:t})})})();`;
+    return `(async()=>{const p="custom";console.log("🚀 LLMux Syncing...");const t=localStorage.getItem("token")||document.cookie;fetch("http://localhost:25975/api/auth/sync",{method:"POST",body:JSON.stringify({provider:p,token:t})})})();`;
+  };
+
+  const handleToggle = (proto: Protocol, v: boolean) => {
+    setFormEnabled(prev => ({ ...prev, [proto]: v }));
+    // Auto-pick default when turning on the first endpoint or when current default no longer valid.
+    setFormData(prev => {
+      if (v && !prev.default_protocol) return { ...prev, default_protocol: proto };
+      return prev;
+    });
+  };
+
+  const handleEditToggle = (proto: Protocol, v: boolean) => {
+    setEditEnabled(prev => ({ ...prev, [proto]: v }));
+    setEditData(prev => {
+      if (v && !prev.default_protocol) return { ...prev, default_protocol: proto };
+      return prev;
+    });
   };
 
   return (
@@ -182,9 +293,9 @@ export default function Accounts() {
         )}
       </div>
 
-      <Dialog 
-        isOpen={isModalOpen} 
-        onClose={() => !isValidating && setIsModalOpen(false)} 
+      <Dialog
+        isOpen={isModalOpen}
+        onClose={() => !isValidating && setIsModalOpen(false)}
         title={t('accounts.registerTitle')}
       >
         <div className="space-y-6">
@@ -201,101 +312,69 @@ export default function Accounts() {
               <Input
                 type="text" required value={formData.alias}
                 disabled={isValidating}
-                onChange={e => setFormData({...formData, alias: e.target.value})}
+                onChange={e => setFormData({ ...formData, alias: e.target.value })}
                 placeholder={t('accounts.aliasPlaceholder')}
               />
-            </div>
-            <div className="space-y-1.5">
-              <label className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.provider')}</label>
-              <select
-                value={formData.provider_id}
-                disabled={isValidating}
-                onChange={e => {
-                  const pid = e.target.value;
-                  let burl = '';
-                  if (pid === 'openai') burl = '';
-                  else if (pid === 'anthropic') burl = '';
-                  else if (pid === 'gemini') burl = '';
-                  setFormData({...formData, provider_id: pid, base_url: burl});
-                }}
-                className="w-full h-10 px-3 py-2 rounded-md border border-input bg-background text-sm ring-offset-background focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:opacity-50"
-              >
-                <option value="custom">{t('accounts.custom')}</option>
-                <option value="custom-anthropic" hidden>{t('accounts.customAnthropic')}</option>
-                <option value="openai">{t('accounts.openai')}</option>
-                <option value="anthropic">{t('accounts.anthropic')}</option>
-                <option value="gemini">{t('accounts.gemini')}</option>
-              </select>
-              <p className="text-xs text-muted-foreground mt-1">{t('accounts.providerHint')}</p>
             </div>
             <div className="space-y-1.5">
               <label className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.apiKey')}</label>
               <Input
                 type="password" required value={formData.api_key}
                 disabled={isValidating}
-                onChange={e => setFormData({...formData, api_key: e.target.value})}
+                onChange={e => setFormData({ ...formData, api_key: e.target.value })}
                 placeholder="sk-..."
                 className="font-mono"
               />
             </div>
-            <div className="space-y-1.5">
-              <label className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.baseUrl')}</label>
-              <Input
-                type="text" value={formData.base_url}
-                disabled={isValidating}
-                onChange={e => setFormData({...formData, base_url: e.target.value})}
-                placeholder={formData.provider_id === 'anthropic' ? 'https://api.anthropic.com/v1' : formData.provider_id === 'gemini' ? 'https://generativelanguage.googleapis.com/v1beta' : 'https://api.openai.com/v1'}
-                className="font-mono"
+
+            <div className="space-y-3 border-t border-border pt-3">
+              <label className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.endpoints', 'Endpoints')}</label>
+              <EndpointRow
+                label="chat"
+                enabled={formEnabled.chat}
+                url={formData.chat_endpoint}
+                urls={distinctUrls}
+                onToggle={v => handleToggle('chat', v)}
+                onChange={v => setFormData({ ...formData, chat_endpoint: v })}
               />
-              <p className="text-xs text-muted-foreground">{t('accounts.baseUrlHint')}</p>
+              <EndpointRow
+                label="responses"
+                enabled={formEnabled.responses}
+                url={formData.responses_endpoint}
+                urls={distinctUrls}
+                onToggle={v => handleToggle('responses', v)}
+                onChange={v => setFormData({ ...formData, responses_endpoint: v })}
+              />
+              <EndpointRow
+                label="messages"
+                enabled={formEnabled.messages}
+                url={formData.messages_endpoint}
+                urls={distinctUrls}
+                onToggle={v => handleToggle('messages', v)}
+                onChange={v => setFormData({ ...formData, messages_endpoint: v })}
+              />
+              {formError && (
+                <p className="text-xs font-medium text-destructive">{formError}</p>
+              )}
             </div>
-            {formData.provider_id === 'gemini' && (
-              <div className="space-y-1.5 border-t border-border pt-3">
-                <label className="flex items-center gap-2 cursor-pointer select-none">
-                  <input
-                    type="checkbox"
-                    checked={formOpenAICompat}
-                    disabled={isValidating}
-                    onChange={e => setFormOpenAICompat(e.target.checked)}
-                    className="w-4 h-4 rounded accent-primary"
-                  />
-                  <span className="text-xs font-bold text-muted-foreground uppercase">OpenAI 兼容模式</span>
-                </label>
-                <p className="text-xs text-muted-foreground ml-6">通过 Gemini 的 OpenAI 兼容端点同时支持 /v1/chat/completions 请求</p>
-              </div>
-            )}
-            {formData.provider_id === 'custom' && (
-              <>
-                <div className="space-y-1.5 border-t border-border pt-3">
-                  <label className="flex items-center gap-2 cursor-pointer select-none">
-                    <input
-                      type="checkbox"
-                      checked={formSupportsAnthropic}
-                      disabled={isValidating}
-                      onChange={e => {
-                        setFormSupportsAnthropic(e.target.checked);
-                        if (!e.target.checked) setFormData({...formData, anthropic_base_url: ''});
-                      }}
-                      className="w-4 h-4 rounded accent-primary"
-                    />
-                    <span className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.supportsAnthropic')}</span>
-                  </label>
-                  <p className="text-xs text-muted-foreground ml-6">{t('accounts.supportsAnthropicHint')}</p>
-                </div>
-                {formSupportsAnthropic && (
-                  <div className="space-y-1.5 animate-in slide-in-from-top-1">
-                    <label className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.anthropicBaseUrl')}</label>
-                    <Input
-                      type="text" value={formData.anthropic_base_url}
-                      disabled={isValidating}
-                      onChange={e => setFormData({...formData, anthropic_base_url: e.target.value})}
-                      placeholder={t('accounts.anthropicBaseUrlPlaceholder')}
-                      className="font-mono"
-                    />
-                  </div>
-                )}
-              </>
-            )}
+
+            <div className="space-y-1.5">
+              <label className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.defaultProtocol', 'Default protocol')}</label>
+              <ToggleGroup
+                type="single"
+                variant="outline"
+                value={formData.default_protocol}
+                disabled={formEnabledProtocols.length === 0 || isValidating}
+                onValueChange={v => { if (v) setFormData({ ...formData, default_protocol: v }); }}
+                className="justify-start flex-wrap"
+              >
+                {formEnabledProtocols.map(p => (
+                  <ToggleGroupItem key={p} value={p} className="capitalize">{p}</ToggleGroupItem>
+                ))}
+              </ToggleGroup>
+              <p className="text-xs text-muted-foreground">{t('accounts.defaultProtocolHint', 'Used when a request does not specify a protocol')}</p>
+            </div>
+
             <div className="space-y-1.5 border-t border-border pt-3">
               <label className="flex items-center gap-2 cursor-pointer select-none">
                 <input
@@ -321,7 +400,7 @@ export default function Accounts() {
                </Button>
                <Button
                  type="submit"
-                 disabled={isValidating}
+                 disabled={isValidating || !!formError}
                  className="flex-1"
                >
                  {isValidating ? (
@@ -342,9 +421,9 @@ export default function Accounts() {
       </Dialog>
 
       {/* 编辑账户 Modal */}
-      <Dialog 
-        isOpen={isEditOpen} 
-        onClose={() => !isValidating && setIsEditOpen(false)} 
+      <Dialog
+        isOpen={isEditOpen}
+        onClose={() => !isValidating && setIsEditOpen(false)}
         title={t('accounts.editAccount')}
       >
         <div className="space-y-6">
@@ -361,24 +440,15 @@ export default function Accounts() {
               <Input
                 type="text" required value={editData.alias}
                 disabled={isValidating}
-                onChange={e => setEditData({...editData, alias: e.target.value})}
+                onChange={e => setEditData({ ...editData, alias: e.target.value })}
               />
             </div>
             <div className="space-y-1.5">
               <label className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.provider')}</label>
-              <select
-                value={editData.provider_id}
-                disabled={isValidating}
-                onChange={e => setEditData({...editData, provider_id: e.target.value})}
-                className="w-full h-10 px-3 py-2 rounded-md border border-input bg-background text-sm ring-offset-background focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:opacity-50"
-              >
-                <option value="custom">{t('accounts.custom')}</option>
-                <option value="custom-anthropic" hidden>{t('accounts.customAnthropic')}</option>
-                <option value="openai">{t('accounts.openai')}</option>
-                <option value="anthropic">{t('accounts.anthropic')}</option>
-                <option value="gemini">{t('accounts.gemini')}</option>
-              </select>
-              <p className="text-xs text-muted-foreground mt-1">{t('accounts.providerHint')}</p>
+              <div className="flex items-center gap-2 h-10 px-3 rounded-md border border-input bg-muted/40 text-sm">
+                <ProtocolBadge proto={editingAccount?.provider_id} />
+                <span className="text-xs text-muted-foreground italic">{t('accounts.readOnly', 'Read-only')}</span>
+              </div>
             </div>
             <div className="space-y-1.5">
               <div className="flex items-center justify-between">
@@ -388,69 +458,60 @@ export default function Accounts() {
               <Input
                 type="password" value={editData.api_key}
                 disabled={isValidating}
-                onChange={e => setEditData({...editData, api_key: e.target.value})}
+                onChange={e => setEditData({ ...editData, api_key: e.target.value })}
                 placeholder={t('accounts.leaveBlank')}
                 className="font-mono"
               />
             </div>
-            <div className="space-y-1.5">
-              <label className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.baseUrl')}</label>
-              <Input
-                type="text" value={editData.base_url}
-                disabled={isValidating}
-                onChange={e => setEditData({...editData, base_url: e.target.value})}
-                placeholder={editData.provider_id === 'anthropic' ? 'https://api.anthropic.com/v1' : editData.provider_id === 'gemini' ? 'https://generativelanguage.googleapis.com/v1beta' : 'https://api.openai.com/v1'}
-                className="font-mono"
+
+            <div className="space-y-3 border-t border-border pt-3">
+              <label className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.endpoints', 'Endpoints')}</label>
+              <EndpointRow
+                label="chat"
+                enabled={editEnabled.chat}
+                url={editData.chat_endpoint}
+                urls={distinctUrls}
+                onToggle={v => handleEditToggle('chat', v)}
+                onChange={v => setEditData({ ...editData, chat_endpoint: v })}
               />
-              <p className="text-xs text-muted-foreground">{t('accounts.baseUrlHint')}</p>
+              <EndpointRow
+                label="responses"
+                enabled={editEnabled.responses}
+                url={editData.responses_endpoint}
+                urls={distinctUrls}
+                onToggle={v => handleEditToggle('responses', v)}
+                onChange={v => setEditData({ ...editData, responses_endpoint: v })}
+              />
+              <EndpointRow
+                label="messages"
+                enabled={editEnabled.messages}
+                url={editData.messages_endpoint}
+                urls={distinctUrls}
+                onToggle={v => handleEditToggle('messages', v)}
+                onChange={v => setEditData({ ...editData, messages_endpoint: v })}
+              />
+              {editError && (
+                <p className="text-xs font-medium text-destructive">{editError}</p>
+              )}
             </div>
-            {editData.provider_id === 'gemini' && (
-              <div className="space-y-1.5 border-t border-border pt-3">
-                <label className="flex items-center gap-2 cursor-pointer select-none">
-                  <input
-                    type="checkbox"
-                    checked={editOpenAICompat}
-                    disabled={isValidating}
-                    onChange={e => setEditOpenAICompat(e.target.checked)}
-                    className="w-4 h-4 rounded accent-primary"
-                  />
-                  <span className="text-xs font-bold text-muted-foreground uppercase">OpenAI 兼容模式</span>
-                </label>
-                <p className="text-xs text-muted-foreground ml-6">通过 Gemini 的 OpenAI 兼容端点同时支持 /v1/chat/completions 请求</p>
-              </div>
-            )}
-            {editData.provider_id === 'custom' && (
-              <>
-                <div className="space-y-1.5 border-t border-border pt-3">
-                  <label className="flex items-center gap-2 cursor-pointer select-none">
-                    <input
-                      type="checkbox"
-                      checked={editSupportsAnthropic}
-                      disabled={isValidating}
-                      onChange={e => {
-                        setEditSupportsAnthropic(e.target.checked);
-                        if (!e.target.checked) setEditData({...editData, anthropic_base_url: ''});
-                      }}
-                      className="w-4 h-4 rounded accent-primary"
-                    />
-                    <span className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.supportsAnthropic')}</span>
-                  </label>
-                  <p className="text-xs text-muted-foreground ml-6">{t('accounts.supportsAnthropicHint')}</p>
-                </div>
-                {editSupportsAnthropic && (
-                  <div className="space-y-1.5 animate-in slide-in-from-top-1">
-                    <label className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.anthropicBaseUrl')}</label>
-                    <Input
-                      type="text" value={editData.anthropic_base_url}
-                      disabled={isValidating}
-                      onChange={e => setEditData({...editData, anthropic_base_url: e.target.value})}
-                      placeholder={t('accounts.anthropicBaseUrlPlaceholder')}
-                      className="font-mono"
-                    />
-                  </div>
-                )}
-              </>
-            )}
+
+            <div className="space-y-1.5">
+              <label className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.defaultProtocol', 'Default protocol')}</label>
+              <ToggleGroup
+                type="single"
+                variant="outline"
+                value={editData.default_protocol}
+                disabled={editEnabledProtocols.length === 0 || isValidating}
+                onValueChange={v => { if (v) setEditData({ ...editData, default_protocol: v }); }}
+                className="justify-start flex-wrap"
+              >
+                {editEnabledProtocols.map(p => (
+                  <ToggleGroupItem key={p} value={p} className="capitalize">{p}</ToggleGroupItem>
+                ))}
+              </ToggleGroup>
+              <p className="text-xs text-muted-foreground">{t('accounts.defaultProtocolHint', 'Used when a request does not specify a protocol')}</p>
+            </div>
+
             <div className="space-y-1.5 border-t border-border pt-3">
               <label className="flex items-center gap-2 cursor-pointer select-none">
                 <input
@@ -476,7 +537,7 @@ export default function Accounts() {
                </Button>
                <Button
                  type="submit"
-                 disabled={isValidating}
+                 disabled={isValidating || !!editError}
                  className="flex-1"
                >
                  {isValidating ? (
@@ -497,9 +558,9 @@ export default function Accounts() {
       </Dialog>
 
       {/* 增强型删除确认弹窗 */}
-      <Dialog 
-        isOpen={!!accountToDelete} 
-        onClose={() => setAccountToDelete(null)} 
+      <Dialog
+        isOpen={!!accountToDelete}
+        onClose={() => setAccountToDelete(null)}
         title={t('common.delete')}
         variant="danger"
         size="md"
