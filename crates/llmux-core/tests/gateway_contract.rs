@@ -20,6 +20,10 @@ fn account(provider_id: &str) -> Account {
         is_active: 1,
         weight: 10,
         openai_compatible: 0,
+        chat_endpoint: None,
+        responses_endpoint: None,
+        messages_endpoint: None,
+        default_protocol: None,
     }
 }
 

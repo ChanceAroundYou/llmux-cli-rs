@@ -392,6 +392,10 @@ pub async fn get_accounts_by_ids(
                 is_active: row.try_get::<i64, _>("is_active").unwrap_or(1),
                 weight: row.try_get("weight").unwrap_or(1),
                 openai_compatible: row.try_get("openai_compatible").unwrap_or(0),
+                chat_endpoint: row.try_get("chat_endpoint").ok(),
+                responses_endpoint: row.try_get("responses_endpoint").ok(),
+                messages_endpoint: row.try_get("messages_endpoint").ok(),
+                default_protocol: row.try_get("default_protocol").ok(),
             });
         } else {
             let alias: String = row.try_get("alias").unwrap_or_default();
@@ -445,6 +449,10 @@ pub async fn get_active_accounts(
                 is_active: row.try_get::<i64, _>("is_active").unwrap_or(1),
                 weight: row.try_get("weight").unwrap_or(1),
                 openai_compatible: row.try_get("openai_compatible").unwrap_or(0),
+                chat_endpoint: row.try_get("chat_endpoint").ok(),
+                responses_endpoint: row.try_get("responses_endpoint").ok(),
+                messages_endpoint: row.try_get("messages_endpoint").ok(),
+                default_protocol: row.try_get("default_protocol").ok(),
             });
         } else {
             let alias: String = row.try_get("alias").unwrap_or_default();
