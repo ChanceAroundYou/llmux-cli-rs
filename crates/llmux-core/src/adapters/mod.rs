@@ -77,10 +77,10 @@ impl From<crate::models::Account> for Account {
             is_active: value.is_active,
             weight: value.weight,
             openai_compatible: value.openai_compatible.unwrap_or(0),
-            chat_endpoint: None,
-            responses_endpoint: None,
-            messages_endpoint: None,
-            default_protocol: None,
+            chat_endpoint: value.chat_endpoint,
+            responses_endpoint: value.responses_endpoint,
+            messages_endpoint: value.messages_endpoint,
+            default_protocol: value.default_protocol,
         }
     }
 }
@@ -205,12 +205,25 @@ pub fn build_openai_passthrough(
 
 /// Protocol-driven passthrough: selects the upstream endpoint for `protocol`
 /// from the account's `chat/responses/messages_endpoint` fields, appends the
-/// corresponding path suffix, and adds `Authorization: Bearer {api_key}`.
+/// corresponding path suffix, and adds auth headers for the target protocol.
+/// `Messages` uses `x-api-key` + `anthropic-version` (+ `anthropic-beta` if
+/// provided); the other targets use `Authorization: Bearer {api_key}`.
 /// No format conversion — the body is forwarded as-is.
 pub fn build_passthrough(
     account: &Account,
     protocol: crate::protocol::Protocol,
     body: &Value,
+) -> ProviderRequest {
+    build_passthrough_with_beta(account, protocol, body, None)
+}
+
+/// Same as `build_passthrough` but attaches `anthropic-beta` when the target
+/// is `Messages`.
+pub fn build_passthrough_with_beta(
+    account: &Account,
+    protocol: crate::protocol::Protocol,
+    body: &Value,
+    anthropic_beta: Option<&str>,
 ) -> ProviderRequest {
     let proto = protocol;
     let base = crate::protocol::endpoint_for(account, proto).unwrap_or("https://api.openai.com/v1");
@@ -226,7 +239,15 @@ pub fn build_passthrough(
         format!("{base}/{suffix}")
     };
     let mut headers = json_headers();
-    headers.insert("authorization".into(), format!("Bearer {}", account.api_key));
+    if proto == crate::protocol::Protocol::Messages {
+        headers.insert("x-api-key".to_string(), account.api_key.clone());
+        headers.insert("anthropic-version".to_string(), "2023-06-01".to_string());
+        if let Some(beta) = anthropic_beta.filter(|s| !s.is_empty()) {
+            headers.insert("anthropic-beta".to_string(), beta.to_string());
+        }
+    } else {
+        headers.insert("authorization".into(), format!("Bearer {}", account.api_key));
+    }
     ProviderRequest {
         method: "POST".into(),
         url,

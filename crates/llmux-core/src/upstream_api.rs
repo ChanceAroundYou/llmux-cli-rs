@@ -8,6 +8,8 @@ pub enum UpstreamApi {
     Chat,
     Responses,
     Messages,
+    /// Passthrough-if-supported (legacy name: default); forced modes follow.
+    Default,
     #[deprecated(note = "Auto is deprecated, use Chat or Default via protocol::DownstreamMode instead")]
     Auto,
 }
@@ -17,10 +19,8 @@ impl UpstreamApi {
         match s.trim().to_lowercase().as_str() {
             "responses" => Self::Responses,
             "messages" => Self::Messages,
-            "auto" => {
-                // Auto now maps to Chat (Default) for backwards compat; callers should use protocol::DownstreamMode::from_str for Default semantics.
-                Self::Chat
-            }
+            "default" => Self::Default,
+            "auto" => Self::Default,
             _ => Self::Chat,
         }
     }
@@ -30,6 +30,7 @@ impl UpstreamApi {
             Self::Chat => "chat",
             Self::Responses => "responses",
             Self::Messages => "messages",
+            Self::Default => "default",
             Self::Auto => "auto",
         }
     }

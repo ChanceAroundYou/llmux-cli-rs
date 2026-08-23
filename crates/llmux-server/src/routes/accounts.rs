@@ -231,7 +231,11 @@ pub async fn update_account(
         }
     };
 
-    // Merge: use body values when present, otherwise keep existing.
+    // Merge: use body values when present, otherwise keep existing. Explicit
+    // null clears a field, a missing key keeps the stored value.
+    let parse_ep = |v: &Value| -> Option<String> {
+        if v.is_null() { None } else { v.as_str().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) }
+    };
     let alias = body
         .get("alias")
         .and_then(|v| v.as_str())
@@ -242,16 +246,18 @@ pub async fn update_account(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .unwrap_or(existing.provider_id);
-    let base_url = body
-        .get("base_url")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .or(existing.base_url);
-    let anthropic_base_url = body
-        .get("anthropic_base_url")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .or(existing.anthropic_base_url);
+    // Explicit null = clear (consistent with the *_endpoint columns below);
+    // missing key = keep existing.
+    let base_url = if body.as_object().map(|m| m.contains_key("base_url")).unwrap_or(false) {
+        body.get("base_url").and_then(parse_ep)
+    } else {
+        existing.base_url
+    };
+    let anthropic_base_url = if body.as_object().map(|m| m.contains_key("anthropic_base_url")).unwrap_or(false) {
+        body.get("anthropic_base_url").and_then(parse_ep)
+    } else {
+        existing.anthropic_base_url
+    };
     let is_active = body
         .get("is_active")
         .and_then(|v| v.as_i64())
@@ -275,10 +281,6 @@ pub async fn update_account(
     let has_resp_key = body.as_object().map(|m| m.contains_key("responses_endpoint")).unwrap_or(false);
     let has_msg_key = body.as_object().map(|m| m.contains_key("messages_endpoint")).unwrap_or(false);
     let has_default_key = body.as_object().map(|m| m.contains_key("default_protocol")).unwrap_or(false);
-
-    let parse_ep = |v: &Value| -> Option<String> {
-        if v.is_null() { None } else { v.as_str().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) }
-    };
 
     let chat_endpoint = if has_chat_key {
         body.get("chat_endpoint").and_then(parse_ep)
@@ -437,6 +439,10 @@ pub async fn update_account(
                 sqlx::query("UPDATE aggregate_aliases SET upstream_api='default' WHERE upstream_api = ? AND EXISTS (SELECT 1 FROM json_each(candidates) WHERE json_extract(value,'$.account_id') = ?)")
                     .bind(proto).bind(id).execute(&state.pool).await.ok();
             }
+            // Mode changed in DB — bust the hot resolution cache so the new
+            // default/chat/responses/messages semantics apply immediately.
+            for a in &affected_ordinary { state.invalidate_model_cache(a); }
+            for a in &affected_aggregate { state.invalidate_aggregate_cache(a); }
             if !affected_ordinary.is_empty() || !affected_aggregate.is_empty() {
                 Json(json!({ "success": true, "message": "Account updated successfully", "affectedAliases": { "ordinary": affected_ordinary, "aggregate": affected_aggregate }, "newDefaultProtocol": default_protocol })).into_response()
             } else {

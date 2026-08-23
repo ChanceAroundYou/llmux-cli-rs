@@ -310,7 +310,7 @@ pub async fn resolve_model(pool: &SqlitePool, model_name: &str) -> anyhow::Resul
             .unwrap_or_default();
 
         let alias_name = Some(alias.alias.clone());
-        let upstream_api = crate::upstream_api::UpstreamApi::from_str(alias.upstream_api.as_deref().unwrap_or("chat"));
+        let upstream_api = crate::upstream_api::UpstreamApi::from_str(alias.upstream_api.as_deref().unwrap_or("default"));
 
         if !account_ids.is_empty() {
             return Ok(ModelResolution {

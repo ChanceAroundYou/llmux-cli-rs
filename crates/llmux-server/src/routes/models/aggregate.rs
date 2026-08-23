@@ -157,7 +157,7 @@ pub async fn set_aggregate_alias(
     }
 
     let confirm = body.get("confirm").and_then(Value::as_bool).unwrap_or(false);
-    let upstream_api = llmux_core::upstream_api::UpstreamApi::from_str(body.get("upstream_api").and_then(Value::as_str).unwrap_or("chat")).as_str().to_string();
+    let upstream_api = llmux_core::protocol::DownstreamMode::from_str(body.get("upstream_api").and_then(Value::as_str).unwrap_or("default")).as_str().to_string();
 
     // Reject forced protocols unsupported by any bound candidate account (409)
     let mode = DownstreamMode::from_str(body.get("upstream_api").and_then(Value::as_str).unwrap_or("default"));

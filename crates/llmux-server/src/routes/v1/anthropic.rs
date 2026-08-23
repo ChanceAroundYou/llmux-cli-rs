@@ -44,24 +44,31 @@ use super::helpers::{spawn_log_usage, send_tui_request};
 pub async fn messages(
     Extension(state): Extension<AppState>,
     Extension(auth): Extension<AuthContext>,
+    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
     let raw_model = body["model"].as_str().unwrap_or_default().to_string();
-    // upstream_api: if messages ingress targets responses upstream, route via responses
+    // Aggregate aliases keep their dedicated paths (V-anchored failover).
     if let Ok(Some(agg)) = state.resolve_aggregate_cached(&raw_model).await {
         if agg.upstream_api.wants_responses() {
             return dispatch_aggregate_anthropic_via_responses(state, auth, headers, body, agg).await;
         }
         return dispatch_aggregate_anthropic(state, auth, headers, body, agg).await;
     }
-    // Check ordinary alias upstream_api
+    // Ordinary alias resolved → unified per-account decision table
+    // (target_protocol(Messages ingress, mode, account)). Subsumes the legacy
+    // URL-based passthrough/convert choice and messages_via_responses: Default
+    // mode passes Messages through when the account supports it (endpoint_for
+    // legacy fallback), else converts to the account default; forced modes
+    // always target the forced protocol.
     let model_for_check = dispatcher::sanitize_model_name(body.get("model").and_then(Value::as_str).unwrap_or(""));
     if !model_for_check.is_empty() {
         if let Ok(res) = state.resolve_model_cached(&model_for_check).await {
-            if res.upstream_api.wants_responses() {
-                return messages_via_responses(state, auth, headers, body, res).await;
-            }
+            return super::openai::dispatch_with_conversion(
+                llmux_core::protocol::Protocol::Messages,
+                state, auth, uri, headers, body, res,
+            ).await;
         }
     }
     let is_anthropic = true;
@@ -158,20 +165,21 @@ pub async fn messages(
     let mut last_error: Option<String> = None;
 
     for account in &ordered_accounts {
-        // Determine the outbound protocol:
-        //   valid anthropic_base_url  → native Anthropic passthrough
-        //   else OpenAI base_url      → Anthropic→OpenAI conversion
-        //   neither                   → fall back to Anthropic default
-        let anthropic_base = account
-            .anthropic_base_url
-            .as_deref()
-            .map(str::trim)
-            .filter(|u| !u.is_empty());
-        let openai_base = account
-            .base_url
-            .as_deref()
-            .map(str::trim)
-            .filter(|u| !u.is_empty());
+        // Endpoint resolution via new *_endpoint columns (legacy fallback inside
+        // protocol::endpoint_for): Messages prefers messages_endpoint/
+        // anthropic_base_url; Chat prefers chat_endpoint/base_url.
+        let anthropic_base = llmux_core::protocol::endpoint_for(
+            account,
+            llmux_core::protocol::Protocol::Messages,
+        )
+        .map(str::trim)
+        .filter(|u| !u.is_empty());
+        let openai_base = llmux_core::protocol::endpoint_for(
+            account,
+            llmux_core::protocol::Protocol::Chat,
+        )
+        .map(str::trim)
+        .filter(|u| !u.is_empty());
 
         let (provider_request, is_conversion) = if let Some(anthropic_base) = anthropic_base {
             (
@@ -522,8 +530,13 @@ async fn dispatch_aggregate_anthropic(
             patched_body["model"] = Value::String(cand.model.clone());
         }
 
-        let anthropic_base = account.anthropic_base_url.as_deref().map(str::trim).filter(|u| !u.is_empty());
-        let openai_base = account.base_url.as_deref().map(str::trim).filter(|u| !u.is_empty());
+        // New *_endpoint columns first (legacy fallback inside protocol::endpoint_for).
+        let anthropic_base =
+            llmux_core::protocol::endpoint_for(&account, llmux_core::protocol::Protocol::Messages)
+                .map(str::trim);
+        let openai_base =
+            llmux_core::protocol::endpoint_for(&account, llmux_core::protocol::Protocol::Chat)
+                .map(str::trim);
 
         let (provider_request, is_conversion) = if let Some(anthropic_base) = anthropic_base {
             (build_anthropic_passthrough_request(&patched_body, &account, anthropic_base, &cand.model, anthropic_beta.as_deref()), false)
@@ -898,7 +911,13 @@ async fn dispatch_via_responses(
     let Some(account) = accounts.into_iter().next() else {
         return crate::middleware::send_error("No active accounts", "server_error", StatusCode::SERVICE_UNAVAILABLE, true);
     };
-    let base = account.base_url.as_deref().unwrap_or("https://api.openai.com/v1").trim_end_matches('/');
+    // Honor responses_endpoint (legacy base_url fallback inside endpoint_for).
+    let base = llmux_core::protocol::endpoint_for(
+        &account,
+        llmux_core::protocol::Protocol::Responses,
+    )
+    .unwrap_or("https://api.openai.com/v1")
+    .trim_end_matches('/');
     let url = format!("{}/responses", base);
     let mut req_headers = std::collections::BTreeMap::new();
     req_headers.insert("content-type".to_string(), "application/json".to_string());
@@ -970,8 +989,13 @@ async fn fallback_messages(state: AppState, auth: AuthContext, headers: HeaderMa
     let start = Instant::now();
     let mut last_error: Option<String> = None;
     for account in &ordered_accounts {
-        let anthropic_base = account.anthropic_base_url.as_deref().map(str::trim).filter(|u| !u.is_empty());
-        let openai_base = account.base_url.as_deref().map(str::trim).filter(|u| !u.is_empty());
+        // New *_endpoint columns first (legacy fallback inside protocol::endpoint_for).
+        let anthropic_base =
+            llmux_core::protocol::endpoint_for(account, llmux_core::protocol::Protocol::Messages)
+                .map(str::trim);
+        let openai_base =
+            llmux_core::protocol::endpoint_for(account, llmux_core::protocol::Protocol::Chat)
+                .map(str::trim);
         let (provider_request, is_conversion) = if let Some(anthropic_base) = anthropic_base {
             (build_anthropic_passthrough_request(&body, account, anthropic_base, &model_resolution.target_model, anthropic_beta.as_deref()), false)
         } else if let Some(openai_base) = openai_base {

@@ -105,7 +105,7 @@ pub async fn set_model_alias(
     let preferred_account_id = body
         .get("preferred_account_id")
         .and_then(|v| v.as_i64());
-    let upstream_api = llmux_core::upstream_api::UpstreamApi::from_str(body.get("upstream_api").and_then(Value::as_str).unwrap_or("chat")).as_str().to_string();
+    let upstream_api = llmux_core::protocol::DownstreamMode::from_str(body.get("upstream_api").and_then(Value::as_str).unwrap_or("default")).as_str().to_string();
 
     // Reject forced protocols unsupported by any bound account (409)
     let mode = DownstreamMode::from_str(body.get("upstream_api").and_then(Value::as_str).unwrap_or("default"));
