@@ -27,6 +27,10 @@ export interface Account {
   provider_id: string;
   base_url: string | null;
   is_active: number;
+  chat_endpoint?: string | null;
+  responses_endpoint?: string | null;
+  messages_endpoint?: string | null;
+  default_protocol?: string | null;
 }
 
 export interface PerAccountMeta {
@@ -225,7 +229,8 @@ export const useModelsStore = create<ModelsState>((set, get) => ({
         body.preferred_account_id = preferredAccountId;
       }
       if (confirm) body.confirm = true;
-      if (upstreamApi) body.upstream_api = upstreamApi;
+      // downstreamMode (default/chat/responses/messages) → wire field upstream_api
+      body.upstream_api = upstreamApi ?? 'default';
       const res = await apiFetch('/api/models/aliases', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -260,7 +265,7 @@ export const useModelsStore = create<ModelsState>((set, get) => ({
 
   saveAggregateAlias: async (alias, candidates, intervalSecs, confirm, upstreamApi) => {
     try {
-      const body: any = { alias, candidates, interval_secs: intervalSecs ?? 300, ...(confirm ? { confirm: true } : {}), ...(upstreamApi ? { upstream_api: upstreamApi } : {}) };
+      const body: any = { alias, candidates, interval_secs: intervalSecs ?? 300, ...(confirm ? { confirm: true } : {}), upstream_api: upstreamApi ?? 'default' };
       const res = await apiFetch('/api/aggregate-aliases', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
       if (!res.ok) { const data = await res.json(); const err: any = new Error(data.error || 'Failed to save aggregate alias'); err.code = data.code; err.conflict = data.conflict; err.status = res.status; throw err; }
       // 覆盖普通别名后普通别名列表也会变化，须同步刷新
