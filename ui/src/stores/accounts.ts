@@ -11,6 +11,10 @@ export interface Account {
   notes: string | null;
   openai_compatible: number | null;
   created_at: string;
+  chat_endpoint: string | null;
+  responses_endpoint: string | null;
+  messages_endpoint: string | null;
+  default_protocol: string | null;
 }
 
 interface AccountsState {
@@ -18,8 +22,8 @@ interface AccountsState {
   isLoading: boolean;
   error: string | null;
   fetchAccounts: () => Promise<void>;
-  addAccount: (account: { alias: string; provider_id: string; api_key: string; base_url?: string; anthropic_base_url?: string; openai_compatible?: number; skip_validation?: boolean }) => Promise<void>;
-  updateAccount: (id: number, account: { alias?: string; provider_id?: string; api_key?: string; base_url?: string; anthropic_base_url?: string; notes?: string; openai_compatible?: number; skip_validation?: boolean }) => Promise<void>;
+  addAccount: (account: { alias: string; provider_id: string; api_key: string; chat_endpoint?: string | null; responses_endpoint?: string | null; messages_endpoint?: string | null; default_protocol?: string; openai_compatible?: number; skip_validation?: boolean }) => Promise<void>;
+  updateAccount: (id: number, account: { alias?: string; provider_id?: string; api_key?: string; chat_endpoint?: string | null; responses_endpoint?: string | null; messages_endpoint?: string | null; default_protocol?: string; notes?: string; openai_compatible?: number; skip_validation?: boolean }) => Promise<void>;
   deleteAccount: (id: number) => Promise<void>;
   toggleActive: (id: number, currentStatus: number) => Promise<void>;
 }
