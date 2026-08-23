@@ -397,6 +397,305 @@ pub fn responses_to_chat(resp: &Value, model: &str) -> Value {
         "usage": {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": prompt + completion}
     })
 }
+// ---------------------------------------------------------------------------
+// /v1/responses ingress conversions — Responses ⇄ Chat/Messages request and
+// response directions, used when a Responses-ingress client reaches a
+// non-Responses upstream (dispatch_with_conversion).
+// ---------------------------------------------------------------------------
+
+/// Flatten responses content parts ([{type:"text","text":...}]) into a plain
+/// string — chat upstreams expect string content on messages.
+fn flatten_content(v: Value) -> Value {
+    let Some(parts) = v.as_array() else { return v; };
+    let mut s = String::new();
+    for p in parts {
+        if p.get("type").and_then(Value::as_str) == Some("text") {
+            if let Some(t) = p.get("text").and_then(Value::as_str) { s.push_str(t); }
+        }
+    }
+    Value::String(s)
+}
+
+/// responses tool_choice → chat tool_choice ("auto"/"none"/"required" share
+/// their string form; a named choice maps to {"type":"function"}).
+fn remap_tool_choice_to_chat(tc: &Value) -> Value {
+    match tc {
+        Value::String(s) => Value::String(s.clone()),
+        Value::Object(_) => {
+            let name = tc["name"].as_str().unwrap_or_default();
+            if name.is_empty() { json!("auto") } else { json!({"type": "function", "function": {"name": name}}) }
+        }
+        _ => json!("auto"),
+    }
+}
+
+/// responses request body → chat completions request body (inverse of
+/// `chat_to_responses`). The `stream` flag is intentionally dropped so the
+/// upstream is queried buffered and the response can be back-converted once.
+pub fn responses_req_to_chat_req(v: &Value) -> Value {
+    let mut out = Map::new();
+    if let Some(m) = v.get("model") { out.insert("model".into(), m.clone()); }
+    let mut messages: Vec<Value> = Vec::new();
+    if let Some(instr) = v.get("instructions").and_then(Value::as_str) {
+        if !instr.is_empty() {
+            messages.push(json!({"role": "system", "content": instr}));
+        }
+    }
+    match v.get("input") {
+        Some(Value::String(s)) => messages.push(json!({"role": "user", "content": s})),
+        Some(Value::Array(items)) => {
+            for item in items {
+                match item.get("type").and_then(Value::as_str) {
+                    Some("function_call") => {
+                        let call_id = item.get("call_id").or_else(|| item.get("id")).and_then(Value::as_str).unwrap_or_default().to_string();
+                        let name = item.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
+                        let args_val = item.get("arguments").cloned().unwrap_or(json!({}));
+                        let arguments = match &args_val {
+                            Value::String(s) => s.clone(),
+                            _ => serde_json::to_string(&args_val).unwrap_or_else(|_| "{}".into()),
+                        };
+                        let call = json!({"id": call_id, "type": "function", "function": {"name": name, "arguments": arguments}});
+                        let mut appended = false;
+                        if let Some(m) = messages.last_mut() {
+                            if m.get("role").and_then(Value::as_str) == Some("assistant") {
+                                m["tool_calls"] = match m.get("tool_calls").cloned() {
+                                    Some(Value::Array(a)) => { let mut a = a; a.push(call.clone()); Value::Array(a) }
+                                    _ => json!([call]),
+                                };
+                                appended = true;
+                            }
+                        }
+                        if !appended {
+                            messages.push(json!({"role": "assistant", "content": Value::Null, "tool_calls": [call]}));
+                        }
+                    }
+                    Some("function_call_output") => {
+                        let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or_default().to_string();
+                        let output = stringify_output(item.get("output").cloned().unwrap_or(Value::Null));
+                        messages.push(json!({"role": "tool", "tool_call_id": call_id, "content": output}));
+                    }
+                    _ => {
+                        let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
+                        let content = flatten_content(item.get("content").cloned().unwrap_or(Value::Null));
+                        messages.push(json!({"role": role, "content": content}));
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    if !messages.is_empty() { out.insert("messages".into(), Value::Array(messages)); }
+    for key in ["temperature", "top_p", "reasoning"] {
+        if let Some(x) = v.get(key) { out.insert(key.into(), x.clone()); }
+    }
+    if let Some(x) = v.get("max_output_tokens") {
+        out.insert("max_tokens".into(), x.clone());
+    }
+    if let Some(tools) = v.get("tools").and_then(Value::as_array) {
+        let mapped: Vec<Value> = tools.iter().filter_map(|t| {
+            let name = t.get("name").and_then(Value::as_str)?;
+            Some(json!({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": t.get("description").cloned().unwrap_or(Value::Null),
+                    "parameters": t.get("parameters").cloned().unwrap_or(json!({})),
+                },
+            }))
+        }).collect();
+        if !mapped.is_empty() { out.insert("tools".into(), Value::Array(mapped)); }
+    }
+    if let Some(tc) = v.get("tool_choice") {
+        out.insert("tool_choice".into(), remap_tool_choice_to_chat(tc));
+    }
+    Value::Object(out)
+}
+
+fn stringify_output(v: Value) -> String {
+    match v {
+        Value::String(s) => s,
+        other => serde_json::to_string(&other).unwrap_or_default(),
+    }
+}
+
+/// chat completions body → responses-format response object (inverse of
+/// `responses_to_chat`). Text becomes an `output_text` item; chat tool_calls
+/// become `function_call` items with their call ids preserved.
+pub fn chat_resp_to_responses_resp(chat: &Value, model: &str) -> Value {
+    let msg = &chat["choices"][0]["message"];
+    let mut output: Vec<Value> = Vec::new();
+    if let Some(text) = msg.get("content").and_then(Value::as_str) {
+        if !text.is_empty() {
+            output.push(json!({
+                "type": "message",
+                "id": format!("msg_{}", uuid_simple()),
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": text}],
+            }));
+        }
+    }
+    for c in msg.get("tool_calls").and_then(Value::as_array).into_iter().flatten() {
+        output.push(function_call_item(
+            c.get("id").and_then(Value::as_str).unwrap_or_default(),
+            c["function"]["name"].as_str().unwrap_or_default(),
+            serde_json::from_str(c["function"]["arguments"].as_str().unwrap_or("{}")).unwrap_or(json!({})),
+        ));
+    }
+    let usage = &chat["usage"];
+    json!({
+        "id": chat.get("id").cloned().unwrap_or_else(|| json!(format!("resp_{}", uuid_simple()))),
+        "object": "response",
+        "model": model,
+        "status": "completed",
+        "output": Value::Array(output),
+        "usage": {
+            "input_tokens": usage["prompt_tokens"].as_i64().unwrap_or(0),
+            "output_tokens": usage["completion_tokens"].as_i64().unwrap_or(0),
+        },
+    })
+}
+
+/// responses request body → anthropic messages request body. Anthropic
+/// requires max_tokens; defaults to 4096 when the source has none.
+pub fn responses_req_to_anthropic_req(v: &Value, resolved_model: &str) -> Value {
+    let mut out = Map::new();
+    out.insert("model".into(), json!(resolved_model));
+    out.insert("max_tokens".into(), v.get("max_output_tokens").cloned().unwrap_or(json!(4096)));
+    if let Some(instr) = v.get("instructions") { out.insert("system".into(), instr.clone()); }
+    let mut messages: Vec<Value> = Vec::new();
+    match v.get("input") {
+        Some(Value::String(s)) => messages.push(json!({"role": "user", "content": s})),
+        Some(Value::Array(items)) => {
+            for item in items {
+                match item.get("type").and_then(Value::as_str) {
+                    Some("function_call") => {
+                        // tool_use blocks attach to a trailing assistant message.
+                        let call_id = item.get("call_id").or_else(|| item.get("id")).and_then(Value::as_str).unwrap_or_default();
+                        let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
+                        let args = item.get("arguments").cloned().unwrap_or(json!({}));
+                        let input_val = match &args {
+                            Value::String(s) => serde_json::from_str::<Value>(s).unwrap_or(json!({})),
+                            other => other.clone(),
+                        };
+                        let block = json!({"type": "tool_use", "id": call_id, "name": name, "input": input_val});
+                        let mut appended = false;
+                        if let Some(m) = messages.last_mut() {
+                            if m.get("role").and_then(Value::as_str) == Some("assistant") {
+                                if let Some(a) = m["content"].as_array_mut() {
+                                    a.push(block.clone());
+                                } else {
+                                    m["content"] = Value::Array(vec![block.clone()]);
+                                }
+                                appended = true;
+                            }
+                        }
+                        if !appended {
+                            messages.push(json!({"role": "assistant", "content": [block]}));
+                        }
+                    }
+                    Some("function_call_output") => {
+                        let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or_default();
+                        let output = stringify_output(item.get("output").cloned().unwrap_or(Value::Null));
+                        messages.push(json!({
+                            "role": "user",
+                            "content": [{"type": "tool_result", "tool_use_id": call_id, "content": output}],
+                        }));
+                    }
+                    _ => {
+                        let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
+                        let content = match item.get("content").cloned().unwrap_or(Value::Null) {
+                            Value::String(s) => Value::String(s),
+                            Value::Array(parts) => {
+                                let blocks: Vec<Value> = parts.iter().filter_map(|p| {
+                                    p.get("text").and_then(Value::as_str).map(|t| json!({"type": "text", "text": t}))
+                                }).collect();
+                                Value::Array(blocks)
+                            }
+                            other => other,
+                        };
+                        messages.push(json!({"role": role, "content": content}));
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    if !messages.is_empty() { out.insert("messages".into(), Value::Array(messages)); }
+    if let Some(tools) = v.get("tools").and_then(Value::as_array) {
+        let mapped: Vec<Value> = tools.iter().filter_map(|t| {
+            let name = t.get("name").and_then(Value::as_str)?;
+            Some(json!({
+                "name": name,
+                "description": t.get("description").cloned().unwrap_or(Value::Null),
+                "input_schema": t.get("parameters").cloned().unwrap_or(json!({})),
+            }))
+        }).collect();
+        if !mapped.is_empty() { out.insert("tools".into(), Value::Array(mapped)); }
+    }
+    if let Some(tc) = v.get("tool_choice") {
+        let mapped = match tc {
+            Value::String(s) if s == "required" => json!({"type": "any"}),
+            Value::String(s) if s == "none" => json!({"type": "none"}),
+            Value::String(_) => json!({"type": "auto"}),
+            Value::Object(_) => {
+                let name = tc["name"].as_str().unwrap_or_default();
+                if name.is_empty() { json!({"type": "auto"}) } else { json!({"type": "tool", "name": name}) }
+            }
+            _ => json!({"type": "auto"}),
+        };
+        out.insert("tool_choice".into(), mapped);
+    }
+    Value::Object(out)
+}
+
+/// anthropic messages reply → responses-format response object. `max_tokens`
+/// stop reason maps to Responses `incomplete` status with details.
+pub fn anthropic_resp_to_responses_resp(anth: &Value, model: &str) -> Value {
+    let mut output: Vec<Value> = Vec::new();
+    for b in anth["content"].as_array().into_iter().flatten() {
+        match b.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if let Some(t) = b.get("text").and_then(Value::as_str) {
+                    if !t.is_empty() {
+                        output.push(json!({
+                            "type": "message",
+                            "id": format!("msg_{}", uuid_simple()),
+                            "role": "assistant",
+                            "status": "completed",
+                            "content": [{"type": "output_text", "text": t}],
+                        }));
+                    }
+                }
+            }
+            Some("tool_use") => {
+                output.push(function_call_item(
+                    b.get("id").and_then(Value::as_str).unwrap_or_default(),
+                    b.get("name").and_then(Value::as_str).unwrap_or_default(),
+                    b.get("input").cloned().unwrap_or(json!({})),
+                ));
+            }
+            _ => {}
+        }
+    }
+    let incomplete = anth["stop_reason"].as_str() == Some("max_tokens");
+    let usage = &anth["usage"];
+    let mut resp = json!({
+        "id": anth.get("id").cloned().unwrap_or_else(|| json!(format!("resp_{}", uuid_simple()))),
+        "object": "response",
+        "model": model,
+        "status": if incomplete { "incomplete" } else { "completed" },
+        "output": Value::Array(output),
+        "usage": {
+            "input_tokens": usage["input_tokens"].as_i64().unwrap_or(0),
+            "output_tokens": usage["output_tokens"].as_i64().unwrap_or(0),
+        },
+    });
+    if incomplete {
+        resp["incomplete_details"] = json!({"reason": "max_output_tokens"});
+    }
+    resp
+}
 
 /// Detect if an error body suggests the upstream doesn't support /responses
 pub fn is_responses_unsupported(error_body: &str) -> bool {

@@ -59,12 +59,25 @@ pub fn supports(a: &Account, p: Protocol) -> bool {
 }
 
 pub fn endpoint_for(a: &Account, p: Protocol) -> Option<&str> {
-    match p {
+    let direct = match p {
         Protocol::Chat => a.chat_endpoint.as_deref(),
         Protocol::Responses => a.responses_endpoint.as_deref(),
         Protocol::Messages => a.messages_endpoint.as_deref(),
     }
-    .filter(|s| !s.is_empty())
+    .filter(|s| !s.is_empty());
+    if direct.is_some() {
+        return direct;
+    }
+    // Migration compat: fall back to legacy columns when new *_endpoint is still NULL.
+    match p {
+        Protocol::Chat => a.base_url.as_deref().filter(|s| !s.is_empty()),
+        Protocol::Responses => a.base_url.as_deref().filter(|s| !s.is_empty()),
+        Protocol::Messages => a
+            .anthropic_base_url
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .or_else(|| a.base_url.as_deref().filter(|s| !s.is_empty())),
+    }
 }
 
 pub fn target_protocol(
