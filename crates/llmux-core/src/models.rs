@@ -13,6 +13,10 @@ pub struct Account {
     pub weight: i64,
     pub notes: Option<String>,
     pub openai_compatible: Option<i64>,
+    pub chat_endpoint: Option<String>,
+    pub responses_endpoint: Option<String>,
+    pub messages_endpoint: Option<String>,
+    pub default_protocol: Option<String>,
     pub limits_cache: Option<String>,
     pub limits_cache_updated_at: Option<String>,
     pub created_at: Option<String>,
@@ -67,6 +71,10 @@ pub struct AccountPublic {
     pub weight: i64,
     pub notes: Option<String>,
     pub openai_compatible: Option<i64>,
+    pub chat_endpoint: Option<String>,
+    pub responses_endpoint: Option<String>,
+    pub messages_endpoint: Option<String>,
+    pub default_protocol: Option<String>,
     pub created_at: Option<String>,
 }
 
