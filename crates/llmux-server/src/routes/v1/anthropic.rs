@@ -1053,7 +1053,6 @@ async fn responses_to_anthropic_streaming(
         }
         // drain buffered events
         for ev in llmux_core::proxy::anthropic_openai::parse_sse_chunks(&mut buffer, 0) {
-            if ev.contains("response.completed") { saw_completed = true; }
             for out in conv.feed(&ev) { let _ = tx.send(Ok(Bytes::from(out))).await; }
         }
         for out in conv.finish() { let _ = tx.send(Ok(Bytes::from(out))).await; }
