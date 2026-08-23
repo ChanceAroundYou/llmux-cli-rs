@@ -38,6 +38,15 @@ function formatContextLength(n: number): string {
   return `${n}`;
 }
 
+// 下游模式（downstreamMode）→ 协议；default 表示尽可能透传（不过滤账户）
+const DOWNSTREAM_MODES = ['default', 'chat', 'responses', 'messages'];
+const normalizeMode = (v: any): string => (DOWNSTREAM_MODES.includes(v) ? v : 'chat');
+// 账户是否支持某协议：default 不调用（调用方已跳过）
+const supports = (acc: any, proto: string) =>
+  proto === 'chat' ? !!acc.chat_endpoint
+  : proto === 'responses' ? !!acc.responses_endpoint
+  : !!acc.messages_endpoint;
+
 export default function Models() {
   const { t, i18n } = useTranslation();
   const { availableModels, cachedAt, aliases, aggregateAliases, accounts, isLoading, streaming, fetchModels, streamModels, fetchAliases, fetchAggregateAliases, fetchAccounts, addAlias, deleteAlias, saveAggregateAlias, deleteAggregateAlias, setAggregateActive, testModel } = useModelsStore();
@@ -46,7 +55,9 @@ export default function Models() {
   const [search, setSearch] = useState('');
   const [activeProvider, setActiveProvider] = useState<string>('');
   const [isModalOpen, setIsModalOpen] = useState(false);
-  const [aliasForm, setAliasForm] = useState({ alias: '', target: '', provider: '', selectedAccountIds: [] as number[], preferredAccountId: null as number | null, upstreamApi: 'chat' as string });
+  const [aliasForm, setAliasForm] = useState({ alias: '', target: '', provider: '', selectedAccountIds: [] as number[], preferredAccountId: null as number | null, downstreamMode: 'default' as string });
+  // 提交时若强制模式选中了不支持的账户，提示并高亮
+  const [aliasModeNotice, setAliasModeNotice] = useState<string | null>(null);
   // 测速/健康按账户隔离：key = accountId:modelId（避免同名模型互串）
   const healthKey = (accountId: number | null | undefined, modelId: string) => `${accountId ?? 'na'}:${modelId}`;
   const modelAccountId = (owned_by: string, modelId: string): number | null => {
@@ -73,7 +84,7 @@ export default function Models() {
   const [editingAliasId, setEditingAliasId] = useState<number | null>(null);
   const [isAggregateModalOpen, setIsAggregateModalOpen] = useState(false);
   const [editingAggregateId, setEditingAggregateId] = useState<number | null>(null);
-  const [aggregateForm, setAggregateForm] = useState<{ alias: string; upstreamApi: string; candidates: { account_id: number | ''; model: string }[] }>({ alias: '', upstreamApi: 'chat', candidates: [{ account_id: '', model: '' }] });
+  const [aggregateForm, setAggregateForm] = useState<{ alias: string; downstreamMode: string; candidates: { account_id: number | ''; model: string }[] }>({ alias: '', downstreamMode: 'default', candidates: [{ account_id: '', model: '' }] });
 
   const handleTest = async (modelId: string, providerId: string, accountId?: number) => {
     let resolvedAccountId = accountId ?? null;
@@ -205,6 +216,17 @@ export default function Models() {
           await deleteAlias(editingAliasId);
         }
       }
+      // 强制模式（非 default）下，选中账户必须支持该协议，否则 409 提示
+      if (aliasForm.downstreamMode !== 'default') {
+        const unsupported = aliasForm.selectedAccountIds.filter(id => {
+          const acc = safeAccounts.find(a => a.id === id);
+          return acc ? !supports(acc, aliasForm.downstreamMode) : true;
+        });
+        if (unsupported.length > 0) {
+          setAliasModeNotice(`有 ${unsupported.length} 个已选账户不支持「${aliasForm.downstreamMode}」下游模式，请取消勾选或更换模式。`);
+          return;
+        }
+      }
       await addAlias(
         aliasForm.alias,
         aliasForm.target,
@@ -212,14 +234,19 @@ export default function Models() {
         aliasForm.selectedAccountIds.length > 0 ? aliasForm.selectedAccountIds : undefined,
         aliasForm.preferredAccountId ?? undefined,
         undefined,
-        aliasForm.upstreamApi || 'chat'
+        aliasForm.downstreamMode || 'default'
       );
       setIsModalOpen(false);
       setEditingAliasId(null);
-      setAliasForm({ alias: '', target: '', provider: '', selectedAccountIds: [], preferredAccountId: null, upstreamApi: 'chat' });
+      setAliasForm({ alias: '', target: '', provider: '', selectedAccountIds: [], preferredAccountId: null, downstreamMode: 'default' });
     } catch (err: any) {
       if (err?.status === 409 && err?.conflict === 'aggregate') {
-        setOverwriteConfirm({ kind: 'aggregate', alias: aliasForm.alias, pending: { target: aliasForm.target, provider: aliasForm.provider, selectedAccountIds: aliasForm.selectedAccountIds, preferredAccountId: aliasForm.preferredAccountId, upstreamApi: aliasForm.upstreamApi } });
+        setOverwriteConfirm({ kind: 'aggregate', alias: aliasForm.alias, pending: { target: aliasForm.target, provider: aliasForm.provider, selectedAccountIds: aliasForm.selectedAccountIds, preferredAccountId: aliasForm.preferredAccountId, downstreamMode: aliasForm.downstreamMode } });
+        return;
+      }
+      // 服务端强制模式校验返回 409（alias_protocol_unsupported）：高亮提示
+      if (err?.status === 409) {
+        setAliasModeNotice(err?.message || `所选账户不支持「${aliasForm.downstreamMode}」下游模式，请取消勾选或更换模式。`);
         return;
       }
       console.error(err);
@@ -229,16 +256,17 @@ export default function Models() {
   const closeAliasModal = () => {
     setIsModalOpen(false);
     setEditingAliasId(null);
-    setAliasForm({ alias: '', target: '', provider: '', selectedAccountIds: [], preferredAccountId: null, upstreamApi: 'chat' });
+    setAliasModeNotice(null);
+    setAliasForm({ alias: '', target: '', provider: '', selectedAccountIds: [], preferredAccountId: null, downstreamMode: 'default' });
   };
 
   const openAggregateModal = (agg?: any) => {
     if (agg) {
       setEditingAggregateId(agg.id);
-      setAggregateForm({ alias: agg.alias, upstreamApi: (agg as any).upstream_api || 'chat', candidates: agg.candidates.map((c: any) => ({ account_id: c.account_id, model: c.model })) });
+      setAggregateForm({ alias: agg.alias, downstreamMode: normalizeMode((agg as any).upstream_api), candidates: agg.candidates.map((c: any) => ({ account_id: c.account_id, model: c.model })) });
     } else {
       setEditingAggregateId(null);
-      setAggregateForm({ alias: '', upstreamApi: 'chat', candidates: [{ account_id: '', model: '' }] });
+      setAggregateForm({ alias: '', downstreamMode: 'default', candidates: [{ account_id: '', model: '' }] });
     }
     setIsAggregateModalOpen(true);
   };
@@ -246,7 +274,7 @@ export default function Models() {
   const closeAggregateModal = () => {
     setIsAggregateModalOpen(false);
     setEditingAggregateId(null);
-    setAggregateForm({ alias: '', upstreamApi: 'chat', candidates: [{ account_id: '', model: '' }] });
+    setAggregateForm({ alias: '', downstreamMode: 'default', candidates: [{ account_id: '', model: '' }] });
   };
 
   const handleSaveAggregate = async (e: React.FormEvent) => {
@@ -263,7 +291,7 @@ export default function Models() {
       }
     }
     try {
-      await saveAggregateAlias(aggregateForm.alias.trim(), candidates, undefined, undefined, aggregateForm.upstreamApi || 'chat');
+      await saveAggregateAlias(aggregateForm.alias.trim(), candidates, undefined, undefined, aggregateForm.downstreamMode || 'default');
       closeAggregateModal();
     } catch (err: any) {
       if (err?.status === 409 && err?.conflict === 'ordinary') {
@@ -310,7 +338,7 @@ export default function Models() {
            </Button>
            <Button
              size="sm"
-             onClick={() => { setEditingAliasId(null); setAliasForm({ alias: '', target: '', provider: '', selectedAccountIds: [], preferredAccountId: null, upstreamApi: 'chat' }); setIsModalOpen(true); }}
+             onClick={() => { setEditingAliasId(null); setAliasForm({ alias: '', target: '', provider: '', selectedAccountIds: [], preferredAccountId: null, downstreamMode: 'default' }); setIsModalOpen(true); }}
            >
              <Plus size={16} />
              {t('models.createAlias')}
@@ -354,7 +382,7 @@ export default function Models() {
                         provider: a.provider_id || '',
                         selectedAccountIds: selectedIds,
                         preferredAccountId: a.preferred_account_id,
-                        upstreamApi: (a as any).upstream_api || 'chat',
+                        downstreamMode: normalizeMode((a as any).upstream_api),
                       });
                       setEditingAliasId(a.id);
                       setIsModalOpen(true);
@@ -589,7 +617,7 @@ export default function Models() {
                       setEditingAliasId(null);
                       const matchingOwners = [...new Set(safeModels.filter(x => x.id === model.id).map(x => x.owned_by))];
                       const matchingIds = safeAccounts.filter(a => matchingOwners.includes(a.alias) && a.is_active === 1).map(a => a.id);
-                      setAliasForm({ alias: '', target: model.id, provider: model.owned_by, selectedAccountIds: matchingIds, preferredAccountId: null, upstreamApi: 'chat' });
+                      setAliasForm({ alias: '', target: model.id, provider: model.owned_by, selectedAccountIds: matchingIds, preferredAccountId: null, downstreamMode: 'default' });
                       setIsModalOpen(true);
                    }}
                    className="flex items-center gap-1 text-primary hover:opacity-80 transition-opacity"
@@ -657,27 +685,30 @@ export default function Models() {
               ? accts.filter(a => a.is_active === 1 && safeModels.some(m => m.id === aliasForm.target && m.owned_by === a.alias))
               : [];
             const otherAccounts = accts.filter(a => !matchingAccounts.some(m => m.id === a.id) && a.is_active === 1);
+            const filtered = aliasForm.downstreamMode === 'default'
+              ? matchingAccounts
+              : matchingAccounts.filter(a => supports(a, aliasForm.downstreamMode));
             if (!aliasForm.target) return null;
             return (
               <div className="space-y-1.5 border-t border-border pt-3">
                 <label className="text-xs font-bold text-muted-foreground uppercase">
                   {t('models.bindAccounts')}
-                  {matchingAccounts.length > 0 && (
-                    <span className="ml-1 text-primary font-normal">({matchingAccounts.length})</span>
+                  {filtered.length > 0 && (
+                    <span className="ml-1 text-primary font-normal">({filtered.length})</span>
                   )}
                 </label>
                 <p className="text-xs text-muted-foreground">{t('models.bindAccountsHint')}</p>
-                {aliasForm.target && matchingAccounts.length === 0 && (
+                {aliasForm.target && filtered.length === 0 && (
                   <p className="text-xs text-warning">{t('models.noAccountsForModel')}</p>
                 )}
                 {aliasForm.target && otherAccounts.length > 0 && (
                   <p className="text-xs text-muted-foreground/60">{t('models.otherAccountsHidden', { count: otherAccounts.length })}</p>
                 )}
-                {matchingAccounts.length > 0 && (
+                {filtered.length > 0 && (
                   <div className="flex items-center gap-2">
                     <button
                       type="button"
-                      onClick={() => setAliasForm({...aliasForm, selectedAccountIds: matchingAccounts.map(a => a.id)})}
+                      onClick={() => setAliasForm({...aliasForm, selectedAccountIds: filtered.map(a => a.id)})}
                       className="text-xs font-bold text-primary hover:underline"
                     >{t('models.selectAll')}</button>
                     <button
@@ -688,7 +719,7 @@ export default function Models() {
                   </div>
                 )}
                 <div className="max-h-32 overflow-y-auto space-y-1 border border-border rounded-lg p-2 bg-muted/30">
-                  {matchingAccounts.map(a => (
+                  {filtered.map(a => (
                 <label key={a.id} className="flex items-center gap-2 px-2 py-1 hover:bg-muted/50 rounded cursor-pointer">
                   <input
                     type="checkbox"
@@ -705,7 +736,7 @@ export default function Models() {
                   <span className="text-xs">[{a.provider_id}] {a.alias}</span>
                 </label>
               ))}
-                  {matchingAccounts.length === 0 && (
+                  {filtered.length === 0 && (
                     <p className="text-xs text-muted-foreground p-2">{t('accounts.noAccounts')}</p>
                   )}
                 </div>
@@ -721,7 +752,7 @@ export default function Models() {
                       className="w-full h-10 px-3 py-2 rounded-md border border-input bg-background text-sm ring-offset-background focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2"
                     >
                       <option value="">{t('models.preferredAccountAuto')}</option>
-                      {matchingAccounts.filter(a => aliasForm.selectedAccountIds.includes(a.id)).map(a => (
+                      {filtered.filter(a => aliasForm.selectedAccountIds.includes(a.id)).map(a => (
                         <option key={a.id} value={a.id}>[{a.provider_id}] {a.alias}</option>
                       ))}
                     </select>
@@ -731,18 +762,31 @@ export default function Models() {
             );
           })()}
           <div className="space-y-1.5 border-t border-border pt-3">
-            <label className="text-xs font-bold text-muted-foreground uppercase">上游优先接口</label>
-            <p className="text-xs text-muted-foreground">chat 为兼容层（默认），responses 为原生 Responses API，auto 自动优先 responses 失败回退 chat。</p>
+            <label className="text-xs font-bold text-muted-foreground uppercase">下游模式</label>
+            <p className="text-xs text-muted-foreground">默认（尽可能透传，不限制账户）；强制 Chat / Responses / Messages 仅允许具备对应接口上游的账户。</p>
             <select
-              value={aliasForm.upstreamApi}
-              onChange={e => setAliasForm({...aliasForm, upstreamApi: e.target.value})}
+              value={aliasForm.downstreamMode}
+              onChange={e => {
+                const mode = e.target.value;
+                // 切换模式时，移除不再支持该协议的已选账户
+                const nextSelected = mode === 'default' ? aliasForm.selectedAccountIds
+                  : aliasForm.selectedAccountIds.filter(id => {
+                      const acc = safeAccounts.find(a => a.id === id);
+                      return acc ? supports(acc, mode) : false;
+                    });
+                setAliasModeNotice(null);
+                setAliasForm({ ...aliasForm, downstreamMode: mode, selectedAccountIds: nextSelected });
+              }}
               className="w-full h-10 px-3 py-2 rounded-md border border-input bg-background text-sm"
             >
-              <option value="chat">默认 (Chat Completions)</option>
-              <option value="responses">Responses</option>
-              <option value="auto">Auto (Responses → Chat)</option>
-              <option value="messages">Messages</option>
+              <option value="default">默认（尽可能透传）</option>
+              <option value="chat">强制 Chat</option>
+              <option value="responses">强制 Responses</option>
+              <option value="messages">强制 Messages</option>
             </select>
+            {aliasModeNotice && (
+              <p className="text-xs text-destructive font-medium bg-destructive/10 border border-destructive/30 rounded px-2 py-1.5">{aliasModeNotice}</p>
+            )}
           </div>
           <div className="pt-4 flex gap-3">
              <Button type="button" variant="outline" onClick={closeAliasModal} className="flex-1">{t('common.cancel')}</Button>
@@ -780,7 +824,7 @@ export default function Models() {
                       className="w-full h-8 px-2 rounded-md border border-input bg-background text-sm"
                     >
                       <option value="">选择账户</option>
-                      {safeAccounts.filter(a => a.is_active === 1).map(a => (
+                      {safeAccounts.filter(a => a.is_active === 1 && (aggregateForm.downstreamMode === 'default' || supports(a, aggregateForm.downstreamMode))).map(a => (
                         <option key={a.id} value={a.id}>[{a.provider_id}] {a.alias}</option>
                       ))}
                     </select>
@@ -808,6 +852,14 @@ export default function Models() {
                         </select>
                       );
                     })()}
+                    {(() => {
+                      if (aggregateForm.downstreamMode === 'default' || c.account_id === '') return null;
+                      const acc = safeAccounts.find(a => a.id === c.account_id);
+                      if (acc && !supports(acc, aggregateForm.downstreamMode)) {
+                        return <p className="text-xs text-destructive font-medium bg-destructive/10 border border-destructive/30 rounded px-2 py-1">该账户不支持「{aggregateForm.downstreamMode}」下游模式，请更换账户或切换模式。</p>;
+                      }
+                      return null;
+                    })()}
                   </div>
                   <div className="flex flex-col gap-1 shrink-0">
                     <Button type="button" variant="ghost" size="icon" className="h-7 w-7" disabled={idx === 0} onClick={() => {
@@ -831,16 +883,17 @@ export default function Models() {
             <p className="text-xs text-muted-foreground">顶部候选为默认模型，拖动排序即改默认/顺序。每行独立账户+模型。</p>
           </div>
           <div className="space-y-1.5 border-t border-border pt-3">
-            <label className="text-xs font-bold text-muted-foreground uppercase">上游优先接口</label>
+            <label className="text-xs font-bold text-muted-foreground uppercase">下游模式</label>
+            <p className="text-xs text-muted-foreground">默认（尽可能透传，不限制账户）；强制 Chat / Responses / Messages 仅允许具备对应接口上游的账户。切换后将即时校验每个候选账户。</p>
             <select
-              value={aggregateForm.upstreamApi}
-              onChange={e => setAggregateForm({...aggregateForm, upstreamApi: e.target.value})}
+              value={aggregateForm.downstreamMode}
+              onChange={e => setAggregateForm({...aggregateForm, downstreamMode: e.target.value})}
               className="w-full h-10 px-3 py-2 rounded-md border border-input bg-background text-sm"
             >
-              <option value="chat">默认 (Chat Completions)</option>
-              <option value="responses">Responses</option>
-              <option value="auto">Auto (Responses → Chat)</option>
-              <option value="messages">Messages</option>
+              <option value="default">默认（尽可能透传）</option>
+              <option value="chat">强制 Chat</option>
+              <option value="responses">强制 Responses</option>
+              <option value="messages">强制 Messages</option>
             </select>
           </div>
           <div className="pt-4 flex gap-3">
@@ -860,10 +913,10 @@ export default function Models() {
             closeAggregateModal();
           } else {
             const pd = overwriteConfirm.pending;
-            await addAlias(overwriteConfirm.alias, pd.target, pd.provider || undefined, pd.selectedAccountIds?.length ? pd.selectedAccountIds : undefined, pd.preferredAccountId ?? undefined, true, pd.upstreamApi || 'chat');
+            await addAlias(overwriteConfirm.alias, pd.target, pd.provider || undefined, pd.selectedAccountIds?.length ? pd.selectedAccountIds : undefined, pd.preferredAccountId ?? undefined, true, pd.downstreamMode || 'chat');
             setIsModalOpen(false);
             setEditingAliasId(null);
-            setAliasForm({ alias: '', target: '', provider: '', selectedAccountIds: [], preferredAccountId: null, upstreamApi: 'chat' });
+            setAliasForm({ alias: '', target: '', provider: '', selectedAccountIds: [], preferredAccountId: null, downstreamMode: 'default' });
           }
           setOverwriteConfirm(null);
         }}
