@@ -16,7 +16,7 @@ fn extract_session_cookie(response: &axum::response::Response) -> Option<String>
     None
 }
 
-async fn login_and_get_cookie(app: &axum::Router, state: &llmux_server::app::AppState) -> Option<String> {
+async fn login_and_get_cookie(app: &axum::Router, _state: &llmux_server::app::AppState) -> Option<String> {
     let req = Request::builder()
         .method(Method::POST)
         .uri("/api/auth/login")
@@ -309,9 +309,7 @@ async fn system_claude_settings_returns_valid_structure() {
 #[tokio::test]
 async fn ui_auth_login_and_me_and_logout_gate() {
     use http::header;
-    // unauthorized without cookie
-    let (status, _) = request_json(http::Method::GET, "/api/settings", None).await;
-    // request_json auto-logins, so test raw without auth
+    // unauthorized without cookie — use raw request to avoid auto-login helper
     let state = llmux_server::test_state().await;
     let app = llmux_server::app(state.clone());
     let req = http::Request::builder().method(http::Method::GET).uri("/api/settings").body(axum::body::Body::empty()).unwrap();

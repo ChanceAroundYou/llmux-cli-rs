@@ -129,6 +129,11 @@ fn extract_session_from_headers(headers: &HeaderMap) -> Option<String> {
 }
 
 fn is_session_valid(state: &AppState, token: &str) -> bool {
+    // denylisted JWT (logout) must not be considered valid
+    let denied = token.contains('.')
+        && state.sessions.lock().unwrap().get(token).map(|exp| *exp > std::time::Instant::now()).unwrap_or(false);
+    if denied { return false; }
+    if crate::middleware::verify_jwt(token, &state.master_key).is_some() { return true; }
     state.sessions.lock().unwrap().get(token).map(|exp| *exp > std::time::Instant::now()).unwrap_or(false)
 }
 
@@ -142,12 +147,7 @@ pub async fn handle_login(
     if username != exp_user || password != exp_pass {
         return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Invalid credentials"}))).into_response();
     }
-    let token = uuid::Uuid::new_v4().to_string();
-    {
-        let mut guard = state.sessions.lock().unwrap();
-        guard.insert(token.clone(), std::time::Instant::now() + std::time::Duration::from_secs(SESSION_TTL_SECS));
-        if guard.len() > 512 { guard.retain(|_, v| *v > std::time::Instant::now()); }
-    }
+    let token = crate::middleware::sign_jwt(&username, &state.master_key, SESSION_TTL_SECS);
     let cookie_val = format!("{}={}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}", SESSION_COOKIE, token, SESSION_TTL_SECS);
     let base_cookie = if state.base_path.is_empty() { None } else {
         Some(format!("{}={}; Path={}; HttpOnly; SameSite=Lax; Max-Age={}", SESSION_COOKIE, token, state.base_path, SESSION_TTL_SECS))
@@ -166,7 +166,14 @@ pub async fn handle_logout(
     headers: HeaderMap,
 ) -> Response {
     if let Some(token) = extract_session_from_headers(&headers) {
-        state.sessions.lock().unwrap().remove(&token);
+        let mut guard = state.sessions.lock().unwrap();
+        // legacy token: drop it; JWT: denylist until natural expiry so stolen token dies on logout
+        if token.contains('.') {
+            guard.insert(token.clone(), std::time::Instant::now() + std::time::Duration::from_secs(SESSION_TTL_SECS));
+            if guard.len() > 512 { guard.retain(|_, v| *v > std::time::Instant::now()); }
+        } else {
+            guard.remove(&token);
+        }
     }
     let clear = format!("{}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0", SESSION_COOKIE);
     let mut res = Json(json!({"success": true})).into_response();
