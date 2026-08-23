@@ -921,7 +921,7 @@ async fn dispatch_via_responses(
     let bytes = match resp.bytes().await { Ok(b) => b, Err(e) => return crate::middleware::send_error(&format!("Read failed: {e}"), "server_error", StatusCode::BAD_GATEWAY, true) };
     let data: Value = match serde_json::from_slice(&bytes) { Ok(v) => v, Err(e) => return crate::middleware::send_error(&format!("Parse failed: {e}"), "server_error", StatusCode::BAD_GATEWAY, true) };
     // responses JSON -> anthropic JSON
-    let text = data.get("output_text").and_then(Value::as_str).unwrap_or("").to_string();
+    let text = llmux_core::proxy::responses::extract_responses_text(&data);
     let usage = data.get("usage").cloned().unwrap_or(serde_json::json!({}));
     let input = usage.get("input_tokens").or_else(|| usage.get("prompt_tokens")).and_then(Value::as_i64).unwrap_or(0);
     let output = usage.get("output_tokens").or_else(|| usage.get("completion_tokens")).and_then(Value::as_i64).unwrap_or(0);
@@ -1040,14 +1040,21 @@ async fn responses_to_anthropic_streaming(
         let mut buffer: Vec<u8> = Vec::with_capacity(4096);
         let mut conv = llmux_core::proxy::responses::ResponsesToAnthropicConverter::new(&model);
         let mut sse = response.bytes_stream();
-        let mut done = false;
-        while !done {
-            let chunk = match sse.next().await { Some(Ok(c)) => c, Some(Err(_)) => break, None => break };
-            buffer.extend_from_slice(&chunk);
+        let mut saw_completed = false;
+        while let Some(chunk) = sse.next().await {
+            let c = match chunk { Ok(c) => c, Err(_) => break };
+            buffer.extend_from_slice(&c);
             for ev in llmux_core::proxy::anthropic_openai::parse_sse_chunks(&mut buffer, 0) {
+                if ev.contains("response.completed") { saw_completed = true; }
                 for out in conv.feed(&ev) { if tx.send(Ok(Bytes::from(out))).await.is_err() { return; } }
-                if ev.contains("[DONE]") { done = true; break; }
+                if ev.contains("[DONE]") { saw_completed = true; break; }
             }
+            if saw_completed { break; }
+        }
+        // drain buffered events
+        for ev in llmux_core::proxy::anthropic_openai::parse_sse_chunks(&mut buffer, 0) {
+            if ev.contains("response.completed") { saw_completed = true; }
+            for out in conv.feed(&ev) { let _ = tx.send(Ok(Bytes::from(out))).await; }
         }
         for out in conv.finish() { let _ = tx.send(Ok(Bytes::from(out))).await; }
         let latency_ms = start.elapsed().as_millis() as i64;

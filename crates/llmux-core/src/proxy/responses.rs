@@ -140,40 +140,35 @@ pub fn anthropic_to_responses(anth_body: &Value, resolved_model: &str) -> Value 
     Value::Object(out)
 }
 
-/// responses non-streaming body → chat completions body
-pub fn responses_to_chat(resp: &Value, model: &str) -> Value {
-    // Try to extract output text from responses format
-    // Responses API: {output: [{type:"message", content:[{type:"output_text", text:"..."}]}]}
+pub fn extract_responses_text(resp: &Value) -> String {
     let mut text = String::new();
     if let Some(output) = resp.get("output").and_then(Value::as_array) {
         for item in output {
+            if item.get("type").and_then(Value::as_str) == Some("reasoning") { continue; }
             if let Some(content) = item.get("content").and_then(Value::as_array) {
                 for c in content {
                     if c.get("type").and_then(Value::as_str) == Some("output_text") {
-                        if let Some(t) = c.get("text").and_then(Value::as_str) {
-                            text.push_str(t);
-                        }
+                        if let Some(t) = c.get("text").and_then(Value::as_str) { text.push_str(t); }
                     }
                 }
+            }
+            // some providers use item.content as string
+            if text.is_empty() {
+                if let Some(t) = item.get("content").and_then(Value::as_str) { text.push_str(t); }
             }
         }
     }
     if text.is_empty() {
-        // fallback: try output_text top-level or choices
-        if let Some(t) = resp.get("output_text").and_then(Value::as_str) {
-            text = t.to_string();
-        } else if let Some(t) = resp
-            .get("choices")
-            .and_then(|c| c.get(0))
-            .and_then(|c| c.get("message"))
-            .and_then(|m| m.get("content"))
-            .and_then(Value::as_str)
-        {
-            text = t.to_string();
-        } else if let Some(v) = resp.get("content") {
-            text = v.as_str().unwrap_or("").to_string();
-        }
+        if let Some(t) = resp.get("output_text").and_then(Value::as_str) { text = t.to_string(); }
+        else if let Some(t) = resp.get("choices").and_then(|c| c.get(0)).and_then(|c| c.get("message")).and_then(|m| m.get("content")).and_then(Value::as_str) { text = t.to_string(); }
+        else if let Some(v) = resp.get("content") { text = v.as_str().unwrap_or("").to_string(); }
     }
+    text
+}
+
+/// responses non-streaming body → chat completions body
+pub fn responses_to_chat(resp: &Value, model: &str) -> Value {
+    let text = extract_responses_text(resp);
     let usage = resp.get("usage").cloned().unwrap_or(json!({}));
     let prompt = usage.get("input_tokens").or_else(|| usage.get("prompt_tokens")).and_then(Value::as_i64).unwrap_or(0);
     let completion = usage.get("output_tokens").or_else(|| usage.get("completion_tokens")).and_then(Value::as_i64).unwrap_or(0);
@@ -293,7 +288,7 @@ impl ResponsesToChatConverter {
                 out.push(format!("data: {}\n\n", chunk));
             }
         }
-        if etype.contains("completed") || etype.contains("response.completed") {
+        if etype.contains("response.completed") || etype.contains("completed") {
             // capture usage from completed event
             if let Some(u) = data.get("response").and_then(|r| r.get("usage")).or_else(|| data.get("usage")) {
                 self.last_usage = Some(u.clone());
@@ -356,12 +351,24 @@ impl ResponsesToAnthropicConverter {
         let mut out = Vec::new();
         let etype = parse_event_type(event_text);
         let Some(data_str) = sse_data(event_text) else { return out };
-        if data_str == "[DONE]" {
-            return out;
-        }
+        if data_str == "[DONE]" { return out; }
         let Ok(data) = serde_json::from_str::<Value>(data_str) else { return out };
         if let Some(u) = data.get("usage").or_else(|| data.get("response").and_then(|r| r.get("usage"))) {
             if u.is_object() { self.last_usage = Some(u.clone()); }
+        }
+        // responses completed carries final output; if we never emitted deltas, emit full text now
+        if etype.contains("response.completed") {
+            if let Some(resp) = data.get("response") {
+                if let Some(u) = resp.get("usage") { self.last_usage = Some(u.clone()); }
+                let full = extract_responses_text(resp);
+                if !full.is_empty() && !self.started {
+                    self.started = true;
+                    out.push(sse_event("message_start", json!({"type":"message_start","message":{"id": self.message_id, "type":"message","role":"assistant","model": self.model, "content":[],"usage":{"input_tokens":0,"output_tokens":0}}})));
+                    out.push(sse_event("content_block_start", json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}})));
+                    out.push(sse_event("content_block_delta", json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text": full}})));
+                }
+            }
+            return out;
         }
         let mut delta_text: Option<String> = None;
         if etype.contains("output_text.delta") {
