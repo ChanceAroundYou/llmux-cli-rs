@@ -84,6 +84,16 @@ async fn init_db_creates_fresh_schema_and_seed_providers() {
     assert_eq!(cache_read_column, "INTEGER");
 }
 
+#[tokio::test]
+async fn migration_0009_adds_endpoints_and_backfills() {
+    let pool = memory_db().await; // init_db already runs migrations
+    // after init_db, columns must exist and at least one account inserted via old base_url is backfilled
+    let cols: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('accounts') WHERE name IN ('chat_endpoint','responses_endpoint','messages_endpoint','default_protocol') ORDER BY name")
+        .fetch_all(&pool).await.unwrap();
+    assert!(cols.contains(&"chat_endpoint".to_string()));
+    assert!(cols.contains(&"default_protocol".to_string()));
+}
+
 #[test]
 fn api_key_encryption_uses_authenticated_random_ciphertext() {
     let secret = "correct horse battery staple";
@@ -341,6 +351,10 @@ fn model_structs_preserve_legacy_field_names() {
         is_active: 1,
         weight: 1,
         openai_compatible: Some(0),
+        chat_endpoint: None,
+        responses_endpoint: None,
+        messages_endpoint: None,
+        default_protocol: None,
         notes: None,
         limits_cache: None,
         limits_cache_updated_at: None,
