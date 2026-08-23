@@ -18,6 +18,7 @@ export interface ModelAlias {
   provider_id: string | null;
   account_ids: string | null;
   preferred_account_id: number | null;
+  upstream_api?: string | null;
 }
 
 export interface Account {
@@ -40,6 +41,7 @@ export interface AggregateAlias {
   alias: string;
   candidates: AggregateCandidate[];
   interval_secs: number;
+  upstream_api?: string | null;
   active: number;
   last_status: (boolean | null)[];
   pending_target: number | null;
@@ -61,9 +63,9 @@ interface ModelsState {
   fetchAliases: () => Promise<void>;
   fetchAggregateAliases: () => Promise<void>;
   fetchAccounts: () => Promise<void>;
-  addAlias: (alias: string, targetModel: string, providerId?: string, accountIds?: number[], preferredAccountId?: number, confirm?: boolean) => Promise<void>;
+  addAlias: (alias: string, targetModel: string, providerId?: string, accountIds?: number[], preferredAccountId?: number, confirm?: boolean, upstreamApi?: string) => Promise<void>;
   deleteAlias: (id: number) => Promise<void>;
-  saveAggregateAlias: (alias: string, candidates: AggregateCandidate[], intervalSecs?: number, confirm?: boolean) => Promise<void>;
+  saveAggregateAlias: (alias: string, candidates: AggregateCandidate[], intervalSecs?: number, confirm?: boolean, upstreamApi?: string) => Promise<void>;
   deleteAggregateAlias: (id: number) => Promise<void>;
   setAggregateActive: (id: number, active: number) => Promise<void>;
   testModel: (modelId: string, providerId?: string, accountId?: number) => Promise<{ success: boolean; error?: string; latency?: number }>;
@@ -213,7 +215,7 @@ export const useModelsStore = create<ModelsState>((set, get) => ({
     }
   },
 
-  addAlias: async (alias, targetModel, providerId, accountIds, preferredAccountId, confirm) => {
+  addAlias: async (alias, targetModel, providerId, accountIds, preferredAccountId, confirm, upstreamApi) => {
     try {
       const body: any = { alias, target_model: targetModel, provider_id: providerId };
       if (accountIds && accountIds.length > 0) {
@@ -223,6 +225,7 @@ export const useModelsStore = create<ModelsState>((set, get) => ({
         body.preferred_account_id = preferredAccountId;
       }
       if (confirm) body.confirm = true;
+      if (upstreamApi) body.upstream_api = upstreamApi;
       const res = await apiFetch('/api/models/aliases', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -255,9 +258,9 @@ export const useModelsStore = create<ModelsState>((set, get) => ({
     }
   },
 
-  saveAggregateAlias: async (alias, candidates, intervalSecs, confirm) => {
+  saveAggregateAlias: async (alias, candidates, intervalSecs, confirm, upstreamApi) => {
     try {
-      const body: any = { alias, candidates, interval_secs: intervalSecs ?? 300, ...(confirm ? { confirm: true } : {}) };
+      const body: any = { alias, candidates, interval_secs: intervalSecs ?? 300, ...(confirm ? { confirm: true } : {}), ...(upstreamApi ? { upstream_api: upstreamApi } : {}) };
       const res = await apiFetch('/api/aggregate-aliases', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
       if (!res.ok) { const data = await res.json(); const err: any = new Error(data.error || 'Failed to save aggregate alias'); err.code = data.code; err.conflict = data.conflict; err.status = res.status; throw err; }
       // 覆盖普通别名后普通别名列表也会变化，须同步刷新

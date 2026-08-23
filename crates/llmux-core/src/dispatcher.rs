@@ -14,6 +14,7 @@ pub struct ModelResolution {
     pub account_ids: Vec<i64>,
     pub preferred_account_id: Option<i64>,
     pub alias_name: Option<String>,
+    pub upstream_api: crate::upstream_api::UpstreamApi,
 }
 
 // ---------------------------------------------------------------------------
@@ -287,13 +288,14 @@ pub fn resolve_model_by_prefix(model_name: &str) -> ModelResolution {
         account_ids: Vec::new(),
         preferred_account_id: None,
         alias_name: None,
+        upstream_api: Default::default(),
     }
 }
 
 pub async fn resolve_model(pool: &SqlitePool, model_name: &str) -> anyhow::Result<ModelResolution> {
     let model_name = sanitize_model_name(model_name);
     let alias = sqlx::query_as::<_, ModelAlias>(
-        "SELECT id, alias, target_model, provider_id, account_ids, preferred_account_id FROM model_aliases WHERE alias = ?",
+        "SELECT id, alias, target_model, provider_id, account_ids, preferred_account_id, upstream_api FROM model_aliases WHERE alias = ?",
     )
     .bind(&model_name)
     .fetch_optional(pool)
@@ -308,6 +310,7 @@ pub async fn resolve_model(pool: &SqlitePool, model_name: &str) -> anyhow::Resul
             .unwrap_or_default();
 
         let alias_name = Some(alias.alias.clone());
+        let upstream_api = crate::upstream_api::UpstreamApi::from_str(alias.upstream_api.as_deref().unwrap_or("chat"));
 
         if !account_ids.is_empty() {
             return Ok(ModelResolution {
@@ -316,6 +319,7 @@ pub async fn resolve_model(pool: &SqlitePool, model_name: &str) -> anyhow::Resul
                 account_ids,
                 preferred_account_id: alias.preferred_account_id,
                 alias_name,
+                upstream_api,
             });
         }
 
@@ -326,6 +330,7 @@ pub async fn resolve_model(pool: &SqlitePool, model_name: &str) -> anyhow::Resul
                 account_ids: Vec::new(),
                 preferred_account_id: alias.preferred_account_id,
                 alias_name,
+                upstream_api,
             });
         }
     }

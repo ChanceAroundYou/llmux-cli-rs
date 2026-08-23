@@ -46,7 +46,7 @@ export default function Models() {
   const [search, setSearch] = useState('');
   const [activeProvider, setActiveProvider] = useState<string>('');
   const [isModalOpen, setIsModalOpen] = useState(false);
-  const [aliasForm, setAliasForm] = useState({ alias: '', target: '', provider: '', selectedAccountIds: [] as number[], preferredAccountId: null as number | null });
+  const [aliasForm, setAliasForm] = useState({ alias: '', target: '', provider: '', selectedAccountIds: [] as number[], preferredAccountId: null as number | null, upstreamApi: 'chat' as string });
   // 测速/健康按账户隔离：key = accountId:modelId（避免同名模型互串）
   const healthKey = (accountId: number | null | undefined, modelId: string) => `${accountId ?? 'na'}:${modelId}`;
   const modelAccountId = (owned_by: string, modelId: string): number | null => {
@@ -73,7 +73,7 @@ export default function Models() {
   const [editingAliasId, setEditingAliasId] = useState<number | null>(null);
   const [isAggregateModalOpen, setIsAggregateModalOpen] = useState(false);
   const [editingAggregateId, setEditingAggregateId] = useState<number | null>(null);
-  const [aggregateForm, setAggregateForm] = useState<{ alias: string; candidates: { account_id: number | ''; model: string }[] }>({ alias: '', candidates: [{ account_id: '', model: '' }] });
+  const [aggregateForm, setAggregateForm] = useState<{ alias: string; upstreamApi: string; candidates: { account_id: number | ''; model: string }[] }>({ alias: '', upstreamApi: 'chat', candidates: [{ account_id: '', model: '' }] });
 
   const handleTest = async (modelId: string, providerId: string, accountId?: number) => {
     let resolvedAccountId = accountId ?? null;
@@ -210,14 +210,16 @@ export default function Models() {
         aliasForm.target,
         aliasForm.provider || undefined,
         aliasForm.selectedAccountIds.length > 0 ? aliasForm.selectedAccountIds : undefined,
-        aliasForm.preferredAccountId ?? undefined
+        aliasForm.preferredAccountId ?? undefined,
+        undefined,
+        aliasForm.upstreamApi || 'chat'
       );
       setIsModalOpen(false);
       setEditingAliasId(null);
-      setAliasForm({ alias: '', target: '', provider: '', selectedAccountIds: [], preferredAccountId: null });
+      setAliasForm({ alias: '', target: '', provider: '', selectedAccountIds: [], preferredAccountId: null, upstreamApi: 'chat' });
     } catch (err: any) {
       if (err?.status === 409 && err?.conflict === 'aggregate') {
-        setOverwriteConfirm({ kind: 'aggregate', alias: aliasForm.alias, pending: { target: aliasForm.target, provider: aliasForm.provider, selectedAccountIds: aliasForm.selectedAccountIds, preferredAccountId: aliasForm.preferredAccountId } });
+        setOverwriteConfirm({ kind: 'aggregate', alias: aliasForm.alias, pending: { target: aliasForm.target, provider: aliasForm.provider, selectedAccountIds: aliasForm.selectedAccountIds, preferredAccountId: aliasForm.preferredAccountId, upstreamApi: aliasForm.upstreamApi } });
         return;
       }
       console.error(err);
@@ -227,16 +229,16 @@ export default function Models() {
   const closeAliasModal = () => {
     setIsModalOpen(false);
     setEditingAliasId(null);
-    setAliasForm({ alias: '', target: '', provider: '', selectedAccountIds: [], preferredAccountId: null });
+    setAliasForm({ alias: '', target: '', provider: '', selectedAccountIds: [], preferredAccountId: null, upstreamApi: 'chat' });
   };
 
   const openAggregateModal = (agg?: any) => {
     if (agg) {
       setEditingAggregateId(agg.id);
-      setAggregateForm({ alias: agg.alias, candidates: agg.candidates.map((c: any) => ({ account_id: c.account_id, model: c.model })) });
+      setAggregateForm({ alias: agg.alias, upstreamApi: (agg as any).upstream_api || 'chat', candidates: agg.candidates.map((c: any) => ({ account_id: c.account_id, model: c.model })) });
     } else {
       setEditingAggregateId(null);
-      setAggregateForm({ alias: '', candidates: [{ account_id: '', model: '' }] });
+      setAggregateForm({ alias: '', upstreamApi: 'chat', candidates: [{ account_id: '', model: '' }] });
     }
     setIsAggregateModalOpen(true);
   };
@@ -244,7 +246,7 @@ export default function Models() {
   const closeAggregateModal = () => {
     setIsAggregateModalOpen(false);
     setEditingAggregateId(null);
-    setAggregateForm({ alias: '', candidates: [{ account_id: '', model: '' }] });
+    setAggregateForm({ alias: '', upstreamApi: 'chat', candidates: [{ account_id: '', model: '' }] });
   };
 
   const handleSaveAggregate = async (e: React.FormEvent) => {
@@ -261,7 +263,7 @@ export default function Models() {
       }
     }
     try {
-      await saveAggregateAlias(aggregateForm.alias.trim(), candidates);
+      await saveAggregateAlias(aggregateForm.alias.trim(), candidates, undefined, undefined, aggregateForm.upstreamApi || 'chat');
       closeAggregateModal();
     } catch (err: any) {
       if (err?.status === 409 && err?.conflict === 'ordinary') {
@@ -308,7 +310,7 @@ export default function Models() {
            </Button>
            <Button
              size="sm"
-             onClick={() => { setEditingAliasId(null); setAliasForm({ alias: '', target: '', provider: '', selectedAccountIds: [], preferredAccountId: null }); setIsModalOpen(true); }}
+             onClick={() => { setEditingAliasId(null); setAliasForm({ alias: '', target: '', provider: '', selectedAccountIds: [], preferredAccountId: null, upstreamApi: 'chat' }); setIsModalOpen(true); }}
            >
              <Plus size={16} />
              {t('models.createAlias')}
@@ -352,6 +354,7 @@ export default function Models() {
                         provider: a.provider_id || '',
                         selectedAccountIds: selectedIds,
                         preferredAccountId: a.preferred_account_id,
+                        upstreamApi: (a as any).upstream_api || 'chat',
                       });
                       setEditingAliasId(a.id);
                       setIsModalOpen(true);
@@ -586,7 +589,7 @@ export default function Models() {
                       setEditingAliasId(null);
                       const matchingOwners = [...new Set(safeModels.filter(x => x.id === model.id).map(x => x.owned_by))];
                       const matchingIds = safeAccounts.filter(a => matchingOwners.includes(a.alias) && a.is_active === 1).map(a => a.id);
-                      setAliasForm({ alias: '', target: model.id, provider: model.owned_by, selectedAccountIds: matchingIds, preferredAccountId: null });
+                      setAliasForm({ alias: '', target: model.id, provider: model.owned_by, selectedAccountIds: matchingIds, preferredAccountId: null, upstreamApi: 'chat' });
                       setIsModalOpen(true);
                    }}
                    className="flex items-center gap-1 text-primary hover:opacity-80 transition-opacity"
@@ -727,6 +730,20 @@ export default function Models() {
               </div>
             );
           })()}
+          <div className="space-y-1.5 border-t border-border pt-3">
+            <label className="text-xs font-bold text-muted-foreground uppercase">上游优先接口</label>
+            <p className="text-xs text-muted-foreground">chat 为兼容层（默认），responses 为原生 Responses API，auto 自动优先 responses 失败回退 chat。</p>
+            <select
+              value={aliasForm.upstreamApi}
+              onChange={e => setAliasForm({...aliasForm, upstreamApi: e.target.value})}
+              className="w-full h-10 px-3 py-2 rounded-md border border-input bg-background text-sm"
+            >
+              <option value="chat">默认 (Chat Completions)</option>
+              <option value="responses">Responses</option>
+              <option value="auto">Auto (Responses → Chat)</option>
+              <option value="messages">Messages</option>
+            </select>
+          </div>
           <div className="pt-4 flex gap-3">
              <Button type="button" variant="outline" onClick={closeAliasModal} className="flex-1">{t('common.cancel')}</Button>
              <Button type="submit" className="flex-1">
@@ -813,6 +830,19 @@ export default function Models() {
 
             <p className="text-xs text-muted-foreground">顶部候选为默认模型，拖动排序即改默认/顺序。每行独立账户+模型。</p>
           </div>
+          <div className="space-y-1.5 border-t border-border pt-3">
+            <label className="text-xs font-bold text-muted-foreground uppercase">上游优先接口</label>
+            <select
+              value={aggregateForm.upstreamApi}
+              onChange={e => setAggregateForm({...aggregateForm, upstreamApi: e.target.value})}
+              className="w-full h-10 px-3 py-2 rounded-md border border-input bg-background text-sm"
+            >
+              <option value="chat">默认 (Chat Completions)</option>
+              <option value="responses">Responses</option>
+              <option value="auto">Auto (Responses → Chat)</option>
+              <option value="messages">Messages</option>
+            </select>
+          </div>
           <div className="pt-4 flex gap-3">
             <Button type="button" variant="outline" onClick={closeAggregateModal} className="flex-1">{t('common.cancel')}</Button>
             <Button type="submit" className="flex-1"><Save size={16} /> {t('common.save')}</Button>
@@ -826,14 +856,14 @@ export default function Models() {
         onConfirm={async () => {
           if (!overwriteConfirm) return;
           if (overwriteConfirm.kind === 'ordinary') {
-            await saveAggregateAlias(overwriteConfirm.alias, overwriteConfirm.pending, undefined, true);
+            await saveAggregateAlias(overwriteConfirm.alias, overwriteConfirm.pending, undefined, true, 'chat');
             closeAggregateModal();
           } else {
             const pd = overwriteConfirm.pending;
-            await addAlias(overwriteConfirm.alias, pd.target, pd.provider || undefined, pd.selectedAccountIds?.length ? pd.selectedAccountIds : undefined, pd.preferredAccountId ?? undefined, true);
+            await addAlias(overwriteConfirm.alias, pd.target, pd.provider || undefined, pd.selectedAccountIds?.length ? pd.selectedAccountIds : undefined, pd.preferredAccountId ?? undefined, true, pd.upstreamApi || 'chat');
             setIsModalOpen(false);
             setEditingAliasId(null);
-            setAliasForm({ alias: '', target: '', provider: '', selectedAccountIds: [], preferredAccountId: null });
+            setAliasForm({ alias: '', target: '', provider: '', selectedAccountIds: [], preferredAccountId: null, upstreamApi: 'chat' });
           }
           setOverwriteConfirm(null);
         }}

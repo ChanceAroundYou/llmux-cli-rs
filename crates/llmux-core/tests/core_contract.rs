@@ -353,6 +353,7 @@ fn model_structs_preserve_legacy_field_names() {
         provider_id: Some("openai".into()),
         account_ids: None,
         preferred_account_id: None,
+        upstream_api: None,
     };
     let key = ApiKey {
         id: Some(1),

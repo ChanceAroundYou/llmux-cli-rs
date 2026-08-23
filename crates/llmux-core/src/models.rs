@@ -35,6 +35,7 @@ pub struct ModelAlias {
     pub provider_id: Option<String>,
     pub account_ids: Option<String>,
     pub preferred_account_id: Option<i64>,
+    pub upstream_api: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, PartialEq)]

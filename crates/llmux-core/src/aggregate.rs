@@ -19,6 +19,7 @@ pub struct AggregateAliasRow {
     pub alias: String,
     pub candidates: String,
     pub interval_secs: Option<i64>,
+    pub upstream_api: Option<String>,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
 }
@@ -48,6 +49,7 @@ pub struct AggregateResolution {
     pub alias: String,
     pub candidates: Vec<AggregateCandidate>,
     pub active: usize,
+    pub upstream_api: crate::upstream_api::UpstreamApi,
 }
 
 // ---------------------------------------------------------------------------
@@ -276,7 +278,7 @@ pub async fn resolve_aggregate(
     }
     // Ordinary alias takes precedence
     let ordinary = sqlx::query_as::<_, crate::models::ModelAlias>(
-        "SELECT id, alias, target_model, provider_id, account_ids, preferred_account_id FROM model_aliases WHERE alias = ?",
+        "SELECT id, alias, target_model, provider_id, account_ids, preferred_account_id, upstream_api FROM model_aliases WHERE alias = ?",
     )
     .bind(&m)
     .fetch_optional(pool)
@@ -285,7 +287,7 @@ pub async fn resolve_aggregate(
         return Ok(None);
     }
     let row = sqlx::query_as::<_, AggregateAliasRow>(
-        "SELECT id, alias, candidates, interval_secs, created_at, updated_at FROM aggregate_aliases WHERE alias = ?",
+        "SELECT id, alias, candidates, interval_secs, upstream_api, created_at, updated_at FROM aggregate_aliases WHERE alias = ?",
     )
     .bind(&m)
     .fetch_optional(pool)
@@ -300,10 +302,12 @@ pub async fn resolve_aggregate(
     } else {
         0
     };
+    let upstream_api = crate::upstream_api::UpstreamApi::from_str(row.upstream_api.as_deref().unwrap_or("chat"));
     Ok(Some(AggregateResolution {
         alias: row.alias,
         candidates,
         active,
+        upstream_api,
     }))
 }
 

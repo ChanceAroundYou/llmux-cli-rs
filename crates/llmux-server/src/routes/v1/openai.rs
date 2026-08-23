@@ -42,9 +42,26 @@ pub async fn chat_completions(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
+    // Resolve early to check upstream_api — chat ingress may be routed to responses upstream
+    let raw_model = body.get("model").and_then(Value::as_str).unwrap_or("");
     // Aggregate alias takes precedence over ordinary alias/prefix
-    if let Ok(Some(agg)) = state.resolve_aggregate_cached(body.get("model").and_then(Value::as_str).unwrap_or_default()).await {
+    if let Ok(Some(agg)) = state.resolve_aggregate_cached(raw_model).await {
+        // honor aggregate's upstream_api
+        let endpoint = match agg.upstream_api {
+            llmux_core::upstream_api::UpstreamApi::Responses | llmux_core::upstream_api::UpstreamApi::Auto => "responses",
+            _ => "chat/completions",
+        };
+        // if responses preferred, use responses dispatch with translation
+        if endpoint == "responses" {
+            return dispatch_aggregate_openai_responses(state, auth, uri, headers, body, agg).await;
+        }
         return dispatch_aggregate_openai(state, auth, uri, headers, body, "chat/completions", agg).await;
+    }
+    // Check ordinary alias upstream_api — if responses/auto, route chat via responses
+    if let Ok(res) = state.resolve_model_cached(raw_model).await {
+        if res.upstream_api.wants_responses() {
+            return chat_via_responses(state, auth, uri, body, res).await;
+        }
     }
     openai_dispatch(state, auth, uri, headers, body, "chat/completions").await
 }
@@ -61,6 +78,281 @@ pub async fn responses(
         return dispatch_aggregate_openai(state, auth, uri, headers, body, "responses", agg).await;
     }
     openai_dispatch(state, auth, uri, headers, body, "responses").await
+}
+
+// --- chat/messages -> responses routing (upstream_api = responses/auto) ---
+async fn chat_via_responses(
+    state: AppState,
+    auth: AuthContext,
+    uri: axum::http::Uri,
+    body: Value,
+    res: llmux_core::dispatcher::ModelResolution,
+) -> Response {
+    let target = res.target_model.clone();
+    let is_auto = res.upstream_api == llmux_core::upstream_api::UpstreamApi::Auto;
+    let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    let translated = llmux_core::proxy::responses::chat_to_responses(&body, &target);
+    let resp = dispatch_openai_responses(state.clone(), auth.clone(), uri.clone(), translated, &res, streaming).await;
+    if is_auto && is_responses_error(&resp) {
+        tracing::warn!("[chat_via_responses] {} responses unsupported, fallback to chat", target);
+        return openai_dispatch(state, auth, uri, HeaderMap::new(), body, "chat/completions").await;
+    }
+    resp
+}
+
+async fn dispatch_aggregate_openai_responses(
+    state: AppState,
+    auth: AuthContext,
+    uri: axum::http::Uri,
+    headers: HeaderMap,
+    body: Value,
+    agg: llmux_core::aggregate::AggregateResolution,
+) -> Response {
+    // Per-candidate chat -> responses translation + responses->chat back-translation
+    dispatch_aggregate_openai_with_responses(state, auth, uri, headers, body, agg).await
+}
+
+fn is_responses_error(resp: &Response) -> bool {
+    matches!(
+        resp.status(),
+        StatusCode::NOT_FOUND | StatusCode::NOT_IMPLEMENTED | StatusCode::METHOD_NOT_ALLOWED | StatusCode::BAD_GATEWAY
+    )
+}
+
+#[allow(dead_code)]
+async fn openai_dispatch_via_body(
+    state: AppState,
+    auth: AuthContext,
+    uri: axum::http::Uri,
+    body: Value,
+    endpoint: &str,
+    res: &llmux_core::dispatcher::ModelResolution,
+) -> Response {
+    let mut patched = body;
+    patched["model"] = Value::String(res.target_model.clone());
+    openai_dispatch(state, auth, uri, HeaderMap::new(), patched, endpoint).await
+}
+
+/// Direct dispatch to /responses with back-translation to chat completions
+async fn dispatch_openai_responses(
+    state: AppState,
+    _auth: AuthContext,
+    uri: axum::http::Uri,
+    translated_body: Value,
+    res: &llmux_core::dispatcher::ModelResolution,
+    streaming: bool,
+) -> Response {
+    let normalized_uri = crate::app::normalize_gateway_uri(&uri);
+    let is_anthropic = false;
+    let model_name = res.target_model.clone();
+
+    // Load accounts (same as openai_dispatch but bypass re-resolution)
+    let accounts = if !res.account_ids.is_empty() {
+        match get_accounts_by_ids(&state.pool, &res.account_ids, &state.master_key).await {
+            Ok(a) => a,
+            Err(e) => return middleware::send_error(&format!("Failed to load accounts: {e}"), "server_error", StatusCode::INTERNAL_SERVER_ERROR, is_anthropic),
+        }
+    } else {
+        match get_active_accounts(&state.pool, Some(&res.provider_id), &state.master_key).await {
+            Ok(a) => a,
+            Err(e) => return middleware::send_error(&format!("Failed to load accounts: {e}"), "server_error", StatusCode::INTERNAL_SERVER_ERROR, is_anthropic),
+        }
+    };
+    if accounts.is_empty() {
+        return middleware::send_error(&format!("No active accounts for model '{}'", model_name), "server_error", StatusCode::SERVICE_UNAVAILABLE, is_anthropic);
+    }
+    let accounts: Vec<_> = accounts.into_iter().filter(|a| a.provider_id != "gemini" || a.openai_compatible == 1).collect();
+    if accounts.is_empty() {
+        return middleware::send_error("No Gemini-compatible accounts", "server_error", StatusCode::SERVICE_UNAVAILABLE, is_anthropic);
+    }
+    let dispatch_key = res.alias_name.as_deref().map(|n| format!("alias:{}", n)).unwrap_or_else(|| format!("provider:{}", res.provider_id));
+    let preferred_id = res.preferred_account_id.unwrap_or_else(|| accounts.first().map(|a| a.id).unwrap_or(0));
+    let (ordered_accounts, dispatch_meta) = { let mut r = state.dispatch_router.lock().unwrap(); r.select(&dispatch_key, &accounts, preferred_id) };
+    let dispatch_tag = if dispatch_meta.is_probe { Some("probe".to_string()) } else if ordered_accounts.first().map(|a| a.id) != Some(preferred_id) { Some("fallback".to_string()) } else { None };
+    let start = Instant::now();
+    let mut last_error: Option<String> = None;
+    for account in &ordered_accounts {
+        let default_base = if account.provider_id == "gemini" { "https://generativelanguage.googleapis.com/v1beta/openai" } else { "https://api.openai.com/v1" };
+        let base_url = normalize_base_url(account.base_url.as_deref().filter(|u| !u.is_empty()).unwrap_or(default_base));
+        let mut req_headers = BTreeMap::from([("content-type".to_string(), "application/json".to_string())]);
+        req_headers.insert("authorization".to_string(), format!("Bearer {}", account.api_key));
+        let provider_request = ProviderRequest { method: "POST".to_string(), url: format!("{base_url}/responses"), headers: req_headers, body: translated_body.clone() };
+        tracing::info!("⚡ {} → {} → {}/responses [chat→responses]", account.alias, model_name, base_url);
+        if let Some(tx) = &state.tui_tx { let _ = tx.send(TuiEvent::Dispatch { timestamp: time::OffsetDateTime::now_utc().format(&DISPATCH_TIME_FMT).unwrap_or_default(), account: account.alias.clone(), model: model_name.clone(), url: format!("{}/responses", base_url), tag: dispatch_tag.clone() }); }
+        let response = match execute_provider_request(&provider_request).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("🔀 Account {} (id={}) request failed: {e}", account.alias, account.id);
+                last_error = Some(format!("Provider request failed: {e}"));
+                if account.id == preferred_id { let mut r = state.dispatch_router.lock().unwrap(); r.record_result(&dispatch_key, &dispatch_meta, None, false); }
+                continue;
+            }
+        };
+        let status = response.status();
+        if !status.is_success() {
+            let error_body = response.text().await.unwrap_or_default();
+            // Detect responses unsupported for Auto fallback
+            if llmux_core::proxy::responses::is_responses_unsupported(&error_body) && res.upstream_api == llmux_core::upstream_api::UpstreamApi::Auto {
+                return middleware::send_error(&error_body, "responses_unsupported", StatusCode::NOT_FOUND, is_anthropic);
+            }
+            last_error = Some(format!("Provider returned {status}: {error_body}"));
+            if is_retryable_status(status.as_u16()) {
+                if account.id == preferred_id { let mut r = state.dispatch_router.lock().unwrap(); r.record_result(&dispatch_key, &dispatch_meta, None, false); }
+                continue;
+            }
+            let latency_ms = start.elapsed().as_millis() as i64;
+            spawn_log_usage(state.pool.clone(), (*account).clone(), model_name.clone(), res.provider_id.clone(), 0, 0, 0, 0, latency_ms, false, last_error.clone());
+            send_tui_request(&state.tui_tx, normalized_uri.path(), status.as_u16(), start, &model_name);
+            if let Ok(v) = serde_json::from_str::<Value>(&error_body) { return (status, Json(v)).into_response(); }
+            return (status, error_body).into_response();
+        }
+        if streaming {
+            { let mut r = state.dispatch_router.lock().unwrap(); r.record_result(&dispatch_key, &dispatch_meta, Some(account.id), true); }
+            send_tui_request(&state.tui_tx, normalized_uri.path(), status.as_u16(), start, &model_name);
+            return responses_to_chat_streaming(response, &model_name, account, state.pool.clone(), start).await;
+        }
+        let body_bytes = match response.bytes().await { Ok(b) => b, Err(e) => { last_error = Some(format!("Failed to read response: {e}")); continue; } };
+        let data: Value = match serde_json::from_slice(&body_bytes) { Ok(v) => v, Err(e) => { last_error = Some(format!("Failed to parse response: {e}")); continue; } };
+        let chat_resp = llmux_core::proxy::responses::responses_to_chat(&data, &model_name);
+        let (prompt_tokens, completion_tokens) = adapters::usage_from_openai_response_body(&chat_resp);
+        let latency_ms = start.elapsed().as_millis() as i64;
+        spawn_log_usage(state.pool.clone(), (*account).clone(), model_name.clone(), res.provider_id.clone(), prompt_tokens, completion_tokens, 0, 0, latency_ms, true, None);
+        { let mut r = state.dispatch_router.lock().unwrap(); r.record_result(&dispatch_key, &dispatch_meta, Some(account.id), true); }
+        send_tui_request(&state.tui_tx, normalized_uri.path(), 200, start, &model_name);
+        return Json(chat_resp).into_response();
+    }
+    { let mut r = state.dispatch_router.lock().unwrap(); r.record_result(&dispatch_key, &dispatch_meta, None, false); }
+    let error_msg = last_error.unwrap_or_else(|| "All accounts exhausted".to_string());
+    send_tui_request(&state.tui_tx, normalized_uri.path(), 502, start, &model_name);
+    middleware::send_error(&error_msg, "upstream_error", StatusCode::BAD_GATEWAY, is_anthropic)
+}
+
+async fn dispatch_aggregate_openai_with_responses(
+    state: AppState,
+    _auth: AuthContext,
+    uri: axum::http::Uri,
+    _headers: HeaderMap,
+    body: Value,
+    agg: llmux_core::aggregate::AggregateResolution,
+) -> Response {
+    let normalized_uri = crate::app::normalize_gateway_uri(&uri);
+    let is_anthropic = false;
+    let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    let len = agg.candidates.len();
+    let alias = agg.alias.clone();
+    let active = agg.active.min(len.saturating_sub(1));
+    let start = Instant::now();
+    let mut last_error: Option<String> = None;
+    let mut hit_index: Option<usize> = None;
+    let mut hit_stream_resp: Option<reqwest::Response> = None;
+    let mut hit_data: Option<Value> = None;
+    let mut hit_account: Option<adapters::Account> = None;
+    for i in active..len {
+        let cand = &agg.candidates[i];
+        let account = match get_account_by_id(&state.pool, cand.account_id, &state.master_key).await {
+            Ok(Some(a)) => a, Ok(None) => { state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); last_error = Some(format!("Candidate {} account {} not found", i, cand.account_id)); continue; }
+            Err(e) => { state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); last_error = Some(format!("Failed to load account {}: {e}", cand.account_id)); continue; }
+        };
+        let translated = llmux_core::proxy::responses::chat_to_responses(&body, &cand.model);
+        let default_base = if account.provider_id == "gemini" { "https://generativelanguage.googleapis.com/v1beta/openai" } else { "https://api.openai.com/v1" };
+        let base_url = normalize_base_url(account.base_url.as_deref().filter(|u| !u.is_empty()).unwrap_or(default_base));
+        let mut req_headers = BTreeMap::from([("content-type".to_string(), "application/json".to_string())]);
+        req_headers.insert("authorization".to_string(), format!("Bearer {}", account.api_key));
+        let provider_request = ProviderRequest { method: "POST".to_string(), url: format!("{base_url}/responses"), headers: req_headers, body: translated };
+        tracing::info!("🔀 [agg:{} V={}] {} → {} → {}/responses [chat→responses]", alias, active, account.alias, cand.model, base_url);
+        let response = match execute_provider_request(&provider_request).await { Ok(r) => r, Err(e) => { state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); last_error = Some(format!("Provider request failed: {e}")); continue; } };
+        let status = response.status();
+        if !status.is_success() {
+            let error_body = response.text().await.unwrap_or_default();
+            last_error = Some(format!("Provider returned {status}: {error_body}"));
+            if is_retryable_status(status.as_u16()) { state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); continue; }
+            state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len);
+            continue;
+        }
+        if streaming {
+            state.aggregate_router.lock().unwrap().note_candidate_success(&alias, i, len);
+            hit_index = Some(i); hit_account = Some(account.clone()); hit_stream_resp = Some(response); break;
+        }
+        let body_bytes = match response.bytes().await { Ok(b) => b, Err(e) => { last_error = Some(format!("Failed to read response: {e}")); state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); continue; } };
+        let data: Value = match serde_json::from_slice(&body_bytes) { Ok(v) => v, Err(e) => { last_error = Some(format!("Failed to parse response: {e}")); state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); continue; } };
+        let chat_resp = llmux_core::proxy::responses::responses_to_chat(&data, &cand.model);
+        let (pt, ct) = adapters::usage_from_openai_response_body(&chat_resp);
+        spawn_log_usage(state.pool.clone(), account.clone(), cand.model.clone(), account.provider_id.clone(), pt, ct, 0, 0, start.elapsed().as_millis() as i64, true, None);
+        state.aggregate_router.lock().unwrap().note_candidate_success(&alias, i, len);
+        hit_index = Some(i); hit_account = Some(account); hit_data = Some(chat_resp); break;
+    }
+    if let Some(hit) = hit_index {
+        let switched = state.aggregate_router.lock().unwrap().record_request_outcome(&alias, hit, len);
+        if switched { tracing::info!("🔀 [agg:{}] V migrated -> {} (after 3-confirm)", alias, hit); }
+        if let Some(resp) = hit_stream_resp {
+            let cand_model = agg.candidates[hit].model.clone();
+            let account = hit_account.unwrap();
+            send_tui_request(&state.tui_tx, normalized_uri.path(), 200, start, &cand_model);
+            return responses_to_chat_streaming(resp, &cand_model, &account, state.pool.clone(), start).await;
+        }
+        if let Some(data) = hit_data { send_tui_request(&state.tui_tx, normalized_uri.path(), 200, start, &agg.candidates[hit].model); return Json(data).into_response(); }
+    }
+    let switched = state.aggregate_router.lock().unwrap().record_request_all_failed(&alias, len);
+    if switched { tracing::info!("🔀 [agg:{}] all failed — V reset to 0", alias); }
+    let error_msg = last_error.unwrap_or_else(|| "All aggregate candidates exhausted".to_string());
+    send_tui_request(&state.tui_tx, normalized_uri.path(), 502, start, &agg.alias);
+    middleware::send_error(&error_msg, "upstream_error", StatusCode::BAD_GATEWAY, is_anthropic)
+}
+
+async fn responses_to_chat_streaming(
+    response: reqwest::Response,
+    model: &str,
+    account: &adapters::Account,
+    pool: sqlx::SqlitePool,
+    start: Instant,
+) -> Response {
+    let model = model.to_string();
+    let account = account.clone();
+    let (tx, rx) = mpsc::channel::<Result<Bytes, axum::Error>>(64);
+    tokio::spawn(async move {
+        let mut buffer: Vec<u8> = Vec::with_capacity(4096);
+        let mut converter = llmux_core::proxy::responses::ResponsesToChatConverter::new(&model);
+        let mut sse = response.bytes_stream();
+        let mut chunks: u64 = 0;
+        let mut saw_done = false;
+        let mut last_usage: Option<Value> = None;
+        while let Some(chunk) = sse.next().await {
+            match chunk {
+                Ok(c) => {
+                    chunks += 1;
+                    buffer.extend_from_slice(&c);
+                    for event_text in parse_sse_chunks(&mut buffer, 0) {
+                        if event_text.contains("[DONE]") { saw_done = true; }
+                        for out in converter.feed(&event_text) {
+                            if let Ok(v) = serde_json::from_str::<Value>(out.trim_start_matches("data:").trim()) {
+                                if let Some(u) = v.get("usage") { last_usage = Some(u.clone()); }
+                            }
+                            if tx.send(Ok(Bytes::from(out))).await.is_err() { return; }
+                        }
+                    }
+                }
+                Err(e) => { tracing::warn!("[responses→chat:{}] read error: {e}", model); break; }
+            }
+        }
+        // drain buffered
+        loop {
+            let events = parse_sse_chunks(&mut buffer, 0);
+            if events.is_empty() { break; }
+            for event_text in events {
+                for out in converter.feed(&event_text) { if tx.send(Ok(Bytes::from(out))).await.is_err() { return; } }
+            }
+        }
+        for out in converter.finish() { if tx.send(Ok(Bytes::from(out))).await.is_err() { return; } }
+        let (prompt_tokens, completion_tokens) = match &last_usage {
+            Some(u) => (u.get("prompt_tokens").or_else(|| u.get("input_tokens")).and_then(Value::as_i64).unwrap_or(0), u.get("completion_tokens").or_else(|| u.get("output_tokens")).and_then(Value::as_i64).unwrap_or(0)),
+            None => (0, 0),
+        };
+        let truncated = !saw_done && completion_tokens == 0 && chunks <= 4;
+        let latency_ms = start.elapsed().as_millis() as i64;
+        spawn_log_usage(pool.clone(), account.clone(), model.clone(), account.provider_id.clone(), prompt_tokens, completion_tokens, 0, 0, latency_ms, !truncated, if truncated { Some(format!("truncated: chunks={chunks} saw_done={saw_done}")) } else { None });
+    });
+    let body = Body::from_stream(ReceiverStream::new(rx));
+    Response::builder().status(StatusCode::OK).header("content-type", "text/event-stream").header("cache-control", "no-cache").header("connection", "keep-alive").body(body).unwrap().into_response()
 }
 
 /// Shared OpenAI-protocol passthrough dispatcher.

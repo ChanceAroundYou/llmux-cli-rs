@@ -12,7 +12,7 @@ use crate::app::AppState;
 
 pub async fn list_aggregate_aliases(Extension(state): Extension<AppState>) -> Response {
     let rows = match sqlx::query_as::<_, AggregateAliasRow>(
-        "SELECT id, alias, candidates, interval_secs, created_at, updated_at FROM aggregate_aliases ORDER BY id",
+        "SELECT id, alias, candidates, interval_secs, upstream_api, created_at, updated_at FROM aggregate_aliases ORDER BY id",
     )
     .fetch_all(&state.pool)
     .await
@@ -43,6 +43,7 @@ pub async fn list_aggregate_aliases(Extension(state): Extension<AppState>) -> Re
             "alias": row.alias,
             "candidates": candidates,
             "interval_secs": row.interval_secs.unwrap_or(300),
+            "upstream_api": row.upstream_api.clone().unwrap_or_else(|| "chat".to_string()),
             "active": active,
             "last_status": last_status,
             "pending_target": pending_target,
@@ -154,6 +155,7 @@ pub async fn set_aggregate_alias(
     }
 
     let confirm = body.get("confirm").and_then(Value::as_bool).unwrap_or(false);
+    let upstream_api = llmux_core::upstream_api::UpstreamApi::from_str(body.get("upstream_api").and_then(Value::as_str).unwrap_or("chat")).as_str().to_string();
     // Prevent alias collision with ordinary aliases unless explicitly confirmed
     let ordinary_exists: Option<i64> =
         match sqlx::query_scalar("SELECT id FROM model_aliases WHERE alias = ?")
@@ -205,11 +207,12 @@ pub async fn set_aggregate_alias(
     }
 
     match sqlx::query(
-        "INSERT INTO aggregate_aliases (alias, candidates, interval_secs, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP) ON CONFLICT(alias) DO UPDATE SET candidates=excluded.candidates, interval_secs=excluded.interval_secs, updated_at=CURRENT_TIMESTAMP",
+        "INSERT INTO aggregate_aliases (alias, candidates, interval_secs, upstream_api, updated_at) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP) ON CONFLICT(alias) DO UPDATE SET candidates=excluded.candidates, interval_secs=excluded.interval_secs, upstream_api=excluded.upstream_api, updated_at=CURRENT_TIMESTAMP",
     )
     .bind(&alias)
     .bind(&candidates_json)
     .bind(interval_secs)
+    .bind(&upstream_api)
     .execute(&state.pool)
     .await
     {
@@ -234,7 +237,7 @@ pub async fn delete_aggregate_alias(
     Path(id): Path<String>,
 ) -> Response {
     let row = match sqlx::query_as::<_, AggregateAliasRow>(
-        "SELECT id, alias, candidates, interval_secs, created_at, updated_at FROM aggregate_aliases WHERE id = ?",
+        "SELECT id, alias, candidates, interval_secs, upstream_api, created_at, updated_at FROM aggregate_aliases WHERE id = ?",
     )
     .bind(&id)
     .fetch_optional(&state.pool)
@@ -306,7 +309,7 @@ pub async fn set_aggregate_active(
     Json(body): Json<Value>,
 ) -> Response {
     let row = match sqlx::query_as::<_, AggregateAliasRow>(
-        "SELECT id, alias, candidates, interval_secs, created_at, updated_at FROM aggregate_aliases WHERE id = ?",
+        "SELECT id, alias, candidates, interval_secs, upstream_api, created_at, updated_at FROM aggregate_aliases WHERE id = ?",
     )
     .bind(&id)
     .fetch_optional(&state.pool)
