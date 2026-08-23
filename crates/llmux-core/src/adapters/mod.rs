@@ -203,6 +203,38 @@ pub fn build_openai_passthrough(
     }
 }
 
+/// Protocol-driven passthrough: selects the upstream endpoint for `protocol`
+/// from the account's `chat/responses/messages_endpoint` fields, appends the
+/// corresponding path suffix, and adds `Authorization: Bearer {api_key}`.
+/// No format conversion — the body is forwarded as-is.
+pub fn build_passthrough(
+    account: &Account,
+    protocol: crate::protocol::Protocol,
+    body: &Value,
+) -> ProviderRequest {
+    let proto = protocol;
+    let base = crate::protocol::endpoint_for(account, proto).unwrap_or("https://api.openai.com/v1");
+    let base = normalize_base_url(base);
+    let suffix = match proto {
+        crate::protocol::Protocol::Chat => "chat/completions",
+        crate::protocol::Protocol::Responses => "responses",
+        crate::protocol::Protocol::Messages => "v1/messages",
+    };
+    let url = if base.ends_with("/v1") && suffix.starts_with("v1/") {
+        format!("{}/{}", base, &suffix[3..])
+    } else {
+        format!("{base}/{suffix}")
+    };
+    let mut headers = json_headers();
+    headers.insert("authorization".into(), format!("Bearer {}", account.api_key));
+    ProviderRequest {
+        method: "POST".into(),
+        url,
+        headers,
+        body: body.clone(),
+    }
+}
+
 pub fn usage_from_openai_response_body(data: &Value) -> (i64, i64) {
     (
         data["usage"]["prompt_tokens"].as_i64().unwrap_or_default(),
@@ -243,40 +275,15 @@ pub async fn test_provider_connection(account: &Account) -> Result<(), String> {
         .build()
         .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
 
-    let base_url = normalize_base_url(
-        account
-            .base_url
-            .as_deref()
-            .unwrap_or(match account.provider_id.as_str() {
-                "openai" => "https://api.openai.com/v1",
-                "anthropic" | "custom-anthropic" => "https://api.anthropic.com/v1",
-                "gemini" => "https://generativelanguage.googleapis.com/v1beta",
-                _ => "https://api.openai.com/v1",
-            }),
-    );
+    let proto = crate::protocol::default_protocol_for(account);
+    let base = crate::protocol::endpoint_for(account, proto).unwrap_or("https://api.openai.com/v1");
+    let base_url = normalize_base_url(base);
 
-    let response = if account.provider_id == "anthropic"
-        || account.provider_id == "custom-anthropic"
-    {
-        client
-            .get(format!("{base_url}/models"))
-            .header("x-api-key", &account.api_key)
-            .header("anthropic-version", "2023-06-01")
-            .send()
-            .await
-    } else if account.provider_id == "gemini" {
-        client
-            .get(format!("{base_url}/models"))
-            .header("x-goog-api-key", &account.api_key)
-            .send()
-            .await
-    } else {
-        client
-            .get(format!("{base_url}/models"))
-            .header("Authorization", format!("Bearer {}", account.api_key))
-            .send()
-            .await
-    };
+    let response = client
+        .get(format!("{base_url}/models"))
+        .header("Authorization", format!("Bearer {}", account.api_key))
+        .send()
+        .await;
 
     match response {
         Ok(resp) => {

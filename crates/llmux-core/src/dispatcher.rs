@@ -368,7 +368,7 @@ pub async fn get_accounts_by_ids(
     // Build query with dynamic placeholders
     let placeholders: Vec<String> = ids.iter().map(|_| "?".to_string()).collect();
     let sql = format!(
-        "SELECT id, alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight, openai_compatible, chat_endpoint, responses_endpoint, messages_endpoint, default_protocol, chat_endpoint, responses_endpoint, messages_endpoint, default_protocol \
+        "SELECT id, alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight, openai_compatible, chat_endpoint, responses_endpoint, messages_endpoint, default_protocol \
          FROM accounts WHERE id IN ({}) AND is_active = 1 ORDER BY weight DESC, id ASC",
         placeholders.join(",")
     );
@@ -417,12 +417,12 @@ pub async fn get_active_accounts(
 ) -> anyhow::Result<Vec<Account>> {
     let rows = if let Some(provider) = provider_or_alias {
         // ponytail: single query path — try provider_id first, alias fallback only if empty (saves one COUNT(*) RTT)
-        let rows = sqlx::query("SELECT id, alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight, openai_compatible, chat_endpoint, responses_endpoint, messages_endpoint, default_protocol, chat_endpoint, responses_endpoint, messages_endpoint, default_protocol FROM accounts WHERE provider_id = ? AND is_active = 1 ORDER BY weight DESC, id ASC")
+        let rows = sqlx::query("SELECT id, alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight, openai_compatible, chat_endpoint, responses_endpoint, messages_endpoint, default_protocol FROM accounts WHERE provider_id = ? AND is_active = 1 ORDER BY weight DESC, id ASC")
                 .bind(provider)
                 .fetch_all(pool)
                 .await?;
         if rows.is_empty() {
-            sqlx::query("SELECT id, alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight, openai_compatible, chat_endpoint, responses_endpoint, messages_endpoint, default_protocol, chat_endpoint, responses_endpoint, messages_endpoint, default_protocol FROM accounts WHERE alias = ? AND is_active = 1 ORDER BY weight DESC, id ASC")
+            sqlx::query("SELECT id, alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight, openai_compatible, chat_endpoint, responses_endpoint, messages_endpoint, default_protocol FROM accounts WHERE alias = ? AND is_active = 1 ORDER BY weight DESC, id ASC")
                 .bind(provider)
                 .fetch_all(pool)
                 .await?
@@ -430,7 +430,7 @@ pub async fn get_active_accounts(
             rows
         }
     } else {
-        sqlx::query("SELECT id, alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight, openai_compatible, chat_endpoint, responses_endpoint, messages_endpoint, default_protocol, chat_endpoint, responses_endpoint, messages_endpoint, default_protocol FROM accounts WHERE is_active = 1 ORDER BY weight DESC, id ASC")
+        sqlx::query("SELECT id, alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight, openai_compatible, chat_endpoint, responses_endpoint, messages_endpoint, default_protocol FROM accounts WHERE is_active = 1 ORDER BY weight DESC, id ASC")
             .fetch_all(pool)
             .await?
     };

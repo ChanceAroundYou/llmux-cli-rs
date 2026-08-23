@@ -13,7 +13,7 @@ use crate::routes::models::fetch_provider_models;
 
 pub async fn list_accounts(Extension(state): Extension<AppState>) -> Response {
     match sqlx::query_as::<_, AccountPublic>(
-        "SELECT id, alias, provider_id, base_url, anthropic_base_url, CAST(is_active AS INTEGER) as is_active, weight, notes, openai_compatible, created_at FROM accounts ORDER BY id DESC",
+        "SELECT id, alias, provider_id, base_url, anthropic_base_url, CAST(is_active AS INTEGER) as is_active, weight, notes, openai_compatible, created_at, chat_endpoint, responses_endpoint, messages_endpoint, default_protocol FROM accounts ORDER BY id DESC",
     )
     .fetch_all(&state.pool)
     .await
@@ -149,7 +149,7 @@ pub async fn update_account(
 ) -> Response {
     // Verify the account exists.
     let existing = sqlx::query_as::<_, llmux_core::models::Account>(
-        "SELECT id, alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight, notes, limits_cache, limits_cache_updated_at, openai_compatible, created_at FROM accounts WHERE id = ?",
+        "SELECT id, alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight, notes, limits_cache, limits_cache_updated_at, openai_compatible, created_at, chat_endpoint, responses_endpoint, messages_endpoint, default_protocol FROM accounts WHERE id = ?",
     )
     .bind(id)
     .fetch_optional(&state.pool)
