@@ -1,6 +1,8 @@
 use llmux_core::adapters::{
-    build_custom_request, build_openai_request, Account, ChatMessage, ChatRequest,
+    build_custom_request, build_openai_request, build_passthrough, Account, ChatMessage,
+    ChatRequest,
 };
+use llmux_core::protocol::Protocol;
 use llmux_core::dispatcher::{
     is_retryable_status, resolve_model_by_prefix, resolve_provider_type, DispatchRouter,
 };
@@ -126,6 +128,19 @@ fn sse_usage_parsing_merges_max_tokens_across_events() {
     assert_eq!(usage.input_tokens, 5);
     assert_eq!(usage.output_tokens, 9);
     assert_eq!(usage.cache_read_input_tokens, 2);
+}
+
+#[test]
+fn build_passthrough_selects_endpoint_by_protocol() {
+    let acc = Account { id: 1, alias: "x".into(), provider_id: "custom".into(), api_key: "sk".into(),
+        base_url: Some("https://old/v1".into()), anthropic_base_url: None,
+        chat_endpoint: Some("https://a.example/v1".into()), responses_endpoint: Some("https://a.example/v1".into()),
+        messages_endpoint: Some("https://a.example/v1".into()), default_protocol: Some("chat".into()),
+        is_active: 1, weight: 1, openai_compatible: 0 };
+    let req = llmux_core::adapters::build_passthrough(&acc, Protocol::Messages, &json!({"model":"m"}));
+    assert!(req.url.ends_with("/v1/messages"));
+    let req2 = llmux_core::adapters::build_passthrough(&acc, Protocol::Chat, &json!({"model":"m"}));
+    assert!(req2.url.ends_with("/chat/completions"));
 }
 
 #[test]
