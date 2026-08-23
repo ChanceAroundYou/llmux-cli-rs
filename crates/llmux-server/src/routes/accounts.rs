@@ -59,6 +59,62 @@ pub async fn create_account(
         );
     }
 
+    // New multi-endpoint fields: explicit null/empty = disabled. If not provided, fall back to legacy base_url for compat.
+    let mut chat_endpoint = body
+        .get("chat_endpoint")
+        .and_then(|v| if v.is_null() { Some(None) } else { v.as_str().map(|s| s.trim().to_string()).map(|s| if s.is_empty() { None } else { Some(s) }) })
+        .unwrap_or_else(|| base_url.clone());
+    // base_url fallback already handled above; keep as-is if body didn't contain chat_endpoint
+    if !body.as_object().map(|m| m.contains_key("chat_endpoint")).unwrap_or(false) {
+        chat_endpoint = base_url.clone();
+    }
+    let responses_endpoint = body
+        .get("responses_endpoint")
+        .and_then(|v| if v.is_null() { Some(None) } else { v.as_str().map(|s| s.trim().to_string()).map(|s| if s.is_empty() { None } else { Some(s) }) })
+        .unwrap_or(None);
+    let mut messages_endpoint = body
+        .get("messages_endpoint")
+        .and_then(|v| if v.is_null() { Some(None) } else { v.as_str().map(|s| s.trim().to_string()).map(|s| if s.is_empty() { None } else { Some(s) }) })
+        .unwrap_or_else(|| anthropic_base_url.clone());
+    if !body.as_object().map(|m| m.contains_key("messages_endpoint")).unwrap_or(false) {
+        messages_endpoint = anthropic_base_url.clone();
+    }
+    let mut default_protocol = body
+        .get("default_protocol")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_lowercase())
+        .unwrap_or_else(|| "chat".to_string());
+
+    // Normalize default_protocol
+    if !["chat", "responses", "messages"].contains(&default_protocol.as_str()) {
+        default_protocol = "chat".to_string();
+    }
+
+    // Validate at least one endpoint
+    let enabled: Vec<&str> = [
+        ("chat", chat_endpoint.as_deref()),
+        ("responses", responses_endpoint.as_deref()),
+        ("messages", messages_endpoint.as_deref()),
+    ]
+    .iter()
+    .filter_map(|(k, v)| v.filter(|s| !s.trim().is_empty()).map(|_| *k))
+    .collect();
+    if enabled.is_empty() {
+        return crate::error::simple_error("At least one endpoint is required", StatusCode::BAD_REQUEST);
+    }
+    if !enabled.contains(&default_protocol.as_str()) {
+        return crate::error::simple_error(
+            "default_protocol must be one of the enabled protocols",
+            StatusCode::BAD_REQUEST,
+        );
+    }
+    // Validate URLs are parseable
+    for ep in [&chat_endpoint, &responses_endpoint, &messages_endpoint].iter().filter_map(|o| o.as_deref()) {
+        if url::Url::parse(ep).is_err() {
+            return crate::error::simple_error(format!("Invalid endpoint URL: {ep}"), StatusCode::BAD_REQUEST);
+        }
+    }
+
     // Always try to validate — but only reject on failure if skip_validation is false.
     let test_account = Account {
         id: 0,
@@ -70,10 +126,10 @@ pub async fn create_account(
         is_active,
         weight,
         openai_compatible,
-        chat_endpoint: base_url.clone(),
-        responses_endpoint: None,
-        messages_endpoint: anthropic_base_url.clone(),
-        default_protocol: Some("chat".to_string()),
+        chat_endpoint: chat_endpoint.clone(),
+        responses_endpoint: responses_endpoint.clone(),
+        messages_endpoint: messages_endpoint.clone(),
+        default_protocol: Some(default_protocol.clone()),
     };
 
     let provider_type = {
@@ -109,8 +165,8 @@ pub async fn create_account(
     };
 
     match sqlx::query(
-        "INSERT INTO accounts (alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight, notes, openai_compatible)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO accounts (alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight, notes, openai_compatible, chat_endpoint, responses_endpoint, messages_endpoint, default_protocol)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&alias)
     .bind(&provider_id)
@@ -121,6 +177,10 @@ pub async fn create_account(
     .bind(weight)
     .bind(&notes)
     .bind(openai_compatible)
+    .bind(&chat_endpoint)
+    .bind(&responses_endpoint)
+    .bind(&messages_endpoint)
+    .bind(&default_protocol)
     .execute(&state.pool)
     .await
     {
@@ -210,13 +270,74 @@ pub async fn update_account(
         .and_then(|v| v.as_i64())
         .unwrap_or(existing.openai_compatible.unwrap_or(0));
 
+    // New multi-endpoint fields: explicit null/empty = disabled; missing = keep existing; legacy fallback only for create.
+    let has_chat_key = body.as_object().map(|m| m.contains_key("chat_endpoint")).unwrap_or(false);
+    let has_resp_key = body.as_object().map(|m| m.contains_key("responses_endpoint")).unwrap_or(false);
+    let has_msg_key = body.as_object().map(|m| m.contains_key("messages_endpoint")).unwrap_or(false);
+    let has_default_key = body.as_object().map(|m| m.contains_key("default_protocol")).unwrap_or(false);
+
+    let parse_ep = |v: &Value| -> Option<String> {
+        if v.is_null() { None } else { v.as_str().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) }
+    };
+
+    let chat_endpoint = if has_chat_key {
+        body.get("chat_endpoint").and_then(parse_ep)
+    } else {
+        existing.chat_endpoint.clone()
+    };
+    let responses_endpoint = if has_resp_key {
+        body.get("responses_endpoint").and_then(parse_ep)
+    } else {
+        existing.responses_endpoint.clone()
+    };
+    let messages_endpoint = if has_msg_key {
+        body.get("messages_endpoint").and_then(parse_ep)
+    } else {
+        existing.messages_endpoint.clone()
+    };
+    let mut default_protocol = if has_default_key {
+        body.get("default_protocol").and_then(|v| v.as_str()).map(|s| s.trim().to_lowercase()).unwrap_or_else(|| "chat".to_string())
+    } else {
+        existing.default_protocol.clone().unwrap_or_else(|| "chat".to_string())
+    };
+    if !["chat", "responses", "messages"].contains(&default_protocol.as_str()) {
+        default_protocol = "chat".to_string();
+    }
+
+    // Validate at least one endpoint and default in enabled set
+    let enabled: Vec<&str> = [
+        ("chat", chat_endpoint.as_deref()),
+        ("responses", responses_endpoint.as_deref()),
+        ("messages", messages_endpoint.as_deref()),
+    ].iter().filter_map(|(k, v)| v.filter(|s| !s.trim().is_empty()).map(|_| *k)).collect();
+    if enabled.is_empty() {
+        return crate::error::simple_error("At least one endpoint is required", StatusCode::BAD_REQUEST);
+    }
+    // Auto-fix default_protocol if it was removed
+    if !enabled.contains(&default_protocol.as_str()) {
+        // pick fallback chat > messages > responses among remaining
+        default_protocol = if enabled.contains(&"chat") { "chat".to_string() } else if enabled.contains(&"messages") { "messages".to_string() } else { "responses".to_string() };
+    }
+    for ep in [&chat_endpoint, &responses_endpoint, &messages_endpoint].iter().filter_map(|o| o.as_deref()) {
+        if url::Url::parse(ep).is_err() {
+            return crate::error::simple_error(format!("Invalid endpoint URL: {ep}"), StatusCode::BAD_REQUEST);
+        }
+    }
+
+    // Detect removed protocols for bulk alias fallback
+    let was_enabled = |opt: &Option<String>| opt.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false);
+    let mut removed: Vec<String> = Vec::new();
+    if was_enabled(&existing.chat_endpoint) && chat_endpoint.is_none() { removed.push("chat".to_string()); }
+    if was_enabled(&existing.responses_endpoint) && responses_endpoint.is_none() { removed.push("responses".to_string()); }
+    if was_enabled(&existing.messages_endpoint) && messages_endpoint.is_none() { removed.push("messages".to_string()); }
+
     // Handle API key: if a new one is provided, encrypt it; otherwise keep the old ciphertext.
     // Bun only re-validates when api_key !== "********" or base_url is present.
     let api_key_changed = body
         .get("api_key")
         .and_then(|v| v.as_str())
         .is_some_and(|s| !s.is_empty() && s != "********");
-    let base_url_changed = body.get("base_url").is_some();
+    let base_url_changed = body.get("base_url").is_some() || has_chat_key || has_msg_key;
     let skip_validation = body["skip_validation"].as_bool().unwrap_or(false);
 
     let api_key_ciphertext = if api_key_changed {
@@ -233,10 +354,10 @@ pub async fn update_account(
                 is_active,
                 weight,
                 openai_compatible,
-                chat_endpoint: base_url.clone(),
-                responses_endpoint: None,
-                messages_endpoint: anthropic_base_url.clone(),
-                default_protocol: Some("chat".to_string()),
+                chat_endpoint: chat_endpoint.clone(),
+                responses_endpoint: responses_endpoint.clone(),
+                messages_endpoint: messages_endpoint.clone(),
+                default_protocol: Some(default_protocol.clone()),
             };
 
             let provider_type = {
@@ -275,7 +396,7 @@ pub async fn update_account(
     };
 
     let update_res = sqlx::query(
-        "UPDATE accounts SET alias = ?, provider_id = ?, api_key = ?, base_url = ?, anthropic_base_url = ?, is_active = ?, weight = ?, notes = ?, openai_compatible = ? WHERE id = ?",
+        "UPDATE accounts SET alias = ?, provider_id = ?, api_key = ?, base_url = ?, anthropic_base_url = ?, is_active = ?, weight = ?, notes = ?, openai_compatible = ?, chat_endpoint = ?, responses_endpoint = ?, messages_endpoint = ?, default_protocol = ? WHERE id = ?",
     )
     .bind(&alias)
     .bind(&provider_id)
@@ -286,6 +407,10 @@ pub async fn update_account(
     .bind(weight)
     .bind(&notes)
     .bind(openai_compatible)
+    .bind(&chat_endpoint)
+    .bind(&responses_endpoint)
+    .bind(&messages_endpoint)
+    .bind(&default_protocol)
     .bind(id)
     .execute(&state.pool)
     .await;
@@ -297,7 +422,26 @@ pub async fn update_account(
                     .execute(&state.pool)
                     .await;
             }
-            Json(json!({ "success": true, "message": "Account updated successfully" })).into_response()
+            // Bulk fallback aliases that forced the removed protocol
+            let mut affected_ordinary: Vec<String> = Vec::new();
+            let mut affected_aggregate: Vec<String> = Vec::new();
+            for proto in &removed {
+                let rows = sqlx::query_scalar::<_, String>("SELECT alias FROM model_aliases WHERE upstream_api = ? AND (account_ids LIKE ? OR (account_ids IS NULL AND provider_id = (SELECT provider_id FROM accounts WHERE id = ?)))")
+                    .bind(proto).bind(format!("%{}%", id)).bind(id).fetch_all(&state.pool).await.unwrap_or_default();
+                affected_ordinary.extend(rows);
+                sqlx::query("UPDATE model_aliases SET upstream_api='default' WHERE upstream_api = ? AND (account_ids LIKE ? OR (account_ids IS NULL AND provider_id = (SELECT provider_id FROM accounts WHERE id = ?)))")
+                    .bind(proto).bind(format!("%{}%", id)).bind(id).execute(&state.pool).await.ok();
+                let agg_rows = sqlx::query_scalar::<_, String>("SELECT alias FROM aggregate_aliases WHERE upstream_api = ? AND EXISTS (SELECT 1 FROM json_each(candidates) WHERE json_extract(value,'$.account_id') = ?)")
+                    .bind(proto).bind(id).fetch_all(&state.pool).await.unwrap_or_default();
+                affected_aggregate.extend(agg_rows);
+                sqlx::query("UPDATE aggregate_aliases SET upstream_api='default' WHERE upstream_api = ? AND EXISTS (SELECT 1 FROM json_each(candidates) WHERE json_extract(value,'$.account_id') = ?)")
+                    .bind(proto).bind(id).execute(&state.pool).await.ok();
+            }
+            if !affected_ordinary.is_empty() || !affected_aggregate.is_empty() {
+                Json(json!({ "success": true, "message": "Account updated successfully", "affectedAliases": { "ordinary": affected_ordinary, "aggregate": affected_aggregate }, "newDefaultProtocol": default_protocol })).into_response()
+            } else {
+                Json(json!({ "success": true, "message": "Account updated successfully" })).into_response()
+            }
         }
         Err(e) => crate::error::simple_error(
             format!("Failed to update account: {e}"),
