@@ -64,7 +64,7 @@ const NavItem = ({ to, icon: Icon, labelKey, onClick }: { to: string; icon: any;
       onClick={onClick}
       className={cn(
         "flex items-center gap-3 px-3 py-2 rounded-lg text-sm font-medium transition-colors",
-        isActive 
+        isActive
           ? "border-l-2 border-primary bg-primary/5 text-primary pl-2.5"
           : "text-muted-foreground hover:bg-muted"
       )}
@@ -79,7 +79,7 @@ const NavItem = ({ to, icon: Icon, labelKey, onClick }: { to: string; icon: any;
 function ProtectedLayout() {
   const { isAuthenticated, checkAuth } = useAuthStore();
   useEffect(() => { if (isAuthenticated === null) checkAuth(); }, []); // eslint-disable-line
-  if (isAuthenticated === null) return <div className="flex h-screen items-center justify-center text-sm text-muted-foreground">Loading...</div>;
+  if (isAuthenticated === null) return <div className="flex h-[100dvh] items-center justify-center text-sm text-muted-foreground">Loading...</div>;
   if (!isAuthenticated) return <Navigate to="/login" replace />;
   return <Outlet />;
 }
@@ -96,43 +96,24 @@ const LogoutButton = () => {
   );
 };
 
-function App() {
+function Shell() {
   const { t } = useTranslation();
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
   const location = useLocation();
 
-  const { config, fetchSettings, isInitialized } = useSettingsStore();
-
-  useEffect(() => {
-    fetchSettings();
-  }, []);
-
-  useEffect(() => {
-    // 默认开启深色模式，除非显式设置为 light
-    const theme = config.theme || 'dark';
-    if (theme === 'light') {
-      document.documentElement.classList.remove('dark');
-    } else {
-      document.documentElement.classList.add('dark');
-    }
-  }, [config.theme]);
-
-  // 路由跳转时自动关闭侧边栏 (移动端)
   useEffect(() => {
     setIsSidebarOpen(false);
   }, [location.pathname]);
 
   return (
     <div className="flex h-screen bg-background text-foreground overflow-hidden">
-      {/* Mobile Overlay */}
       {isSidebarOpen && (
-        <div 
+        <div
           className="fixed inset-0 bg-background/80 backdrop-blur-sm z-40 lg:hidden"
           onClick={() => setIsSidebarOpen(false)}
         />
       )}
 
-      {/* Sidebar */}
       <aside className={cn(
         "fixed inset-y-0 left-0 w-64 border-r border-border bg-card/80 backdrop-blur-xl flex flex-col z-50 transition-transform duration-300 ease-in-out lg:relative lg:translate-x-0",
         isSidebarOpen ? "translate-x-0" : "-translate-x-full"
@@ -175,7 +156,6 @@ function App() {
         </div>
       </aside>
 
-      {/* Main Content */}
       <main className="flex-1 flex flex-col overflow-hidden w-full">
         <header className="h-14 border-b border-border/50 flex items-center px-4 lg:px-10 bg-card/50 backdrop-blur-md sticky top-0 z-30">
           <Button
@@ -197,22 +177,45 @@ function App() {
 
         <div className="flex-1 overflow-y-auto">
           <div className="p-4 lg:p-10 max-w-[1600px] mx-auto w-full">
-            <Routes>
-              <Route path="/login" element={<Login />} />
-              <Route element={<ProtectedLayout />}>
-                <Route path="/" element={<Dashboard />} />
-                <Route path="/accounts" element={<Accounts />} />
-                <Route path="/models" element={<Models />} />
-                <Route path="/keys" element={<KeysPage />} />
-                <Route path="/stats" element={<StatsPage />} />
-                <Route path="/settings" element={<SettingsPage />} />
-                <Route path="/about" element={<About />} />
-              </Route>
-            </Routes>
+            <Outlet />
           </div>
         </div>
       </main>
     </div>
+  );
+}
+
+function App() {
+  const { config, fetchSettings } = useSettingsStore();
+
+  useEffect(() => {
+    fetchSettings();
+  }, []);
+
+  useEffect(() => {
+    const theme = config.theme || 'dark';
+    if (theme === 'light') {
+      document.documentElement.classList.remove('dark');
+    } else {
+      document.documentElement.classList.add('dark');
+    }
+  }, [config.theme]);
+
+  return (
+    <Routes>
+      <Route path="/login" element={<Login />} />
+      <Route element={<ProtectedLayout />}>
+        <Route element={<Shell />}>
+          <Route path="/" element={<Dashboard />} />
+          <Route path="/accounts" element={<Accounts />} />
+          <Route path="/models" element={<Models />} />
+          <Route path="/keys" element={<KeysPage />} />
+          <Route path="/stats" element={<StatsPage />} />
+          <Route path="/settings" element={<SettingsPage />} />
+          <Route path="/about" element={<About />} />
+        </Route>
+      </Route>
+    </Routes>
   );
 }
 
