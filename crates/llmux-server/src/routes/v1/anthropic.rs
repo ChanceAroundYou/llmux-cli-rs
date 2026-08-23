@@ -631,7 +631,7 @@ async fn dispatch_aggregate_anthropic(
 /// Streaming passthrough for Anthropic responses.
 /// Bytes are forwarded as-is. Usage is not captured (requires SSE parsing —
 /// a future improvement would parse the stream inline like Bun's wrapStreamWithUsage).
-async fn anthropic_streaming_passthrough(
+pub(crate) async fn anthropic_streaming_passthrough(
     response: reqwest::Response,
     model: &str,
     account: &adapters::Account,
@@ -687,7 +687,7 @@ async fn anthropic_streaming_passthrough(
 /// upstream, translates them to Anthropic SSE events via `OpenAISseConverter`,
 /// and forwards them to the client. Real usage is captured from the
 /// `include_usage` tail chunk (when the provider emits one) and logged.
-async fn anthropic_to_openai_streaming(
+pub(crate) async fn anthropic_to_openai_streaming(
     response: reqwest::Response,
     model: &str,
     account: &adapters::Account,
@@ -1021,7 +1021,7 @@ async fn fallback_messages(state: AppState, auth: AuthContext, headers: HeaderMa
     crate::middleware::send_error(&error_msg, "upstream_error", StatusCode::BAD_GATEWAY, is_anthropic)
 }
 
-async fn responses_to_anthropic_streaming(
+pub(crate) async fn responses_to_anthropic_streaming(
     response: reqwest::Response,
     model: &str,
     account: &adapters::Account,
