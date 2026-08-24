@@ -140,7 +140,7 @@ function EndpointRow({ label, enabled, url, urls, onToggle, onChange }: { label:
 
 export default function Accounts() {
   const { t } = useTranslation();
-  const { accounts, isLoading, fetchAccounts, addAccount, updateAccount, deleteAccount, toggleActive } = useAccountsStore();
+  const { accounts, isLoading, keys, fetchAccounts, fetchAccountKey, addAccount, updateAccount, deleteAccount, toggleActive } = useAccountsStore();
   const { fetchModels, startTestQueue, availableModels } = useModelsStore();
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [isEditOpen, setIsEditOpen] = useState(false);
@@ -155,6 +155,8 @@ export default function Accounts() {
   const [isValidating, setIsValidating] = useState(false);
   const [validationError, setValidationError] = useState<string | null>(null);
   const [visibleKeyId, setVisibleKeyId] = useState<number | null>(null);
+  const [revealedKeys, setRevealedKeys] = useState<Record<number, string>>({});
+  const [revealing, setRevealing] = useState<number | null>(null);
   // 账户列表搜索 + 状态筛选（循环：全部 → 禁用 → 启用）
   const [accountSearch, setAccountSearch] = useState('');
   const [accountFilter, setAccountFilter] = useState<'all' | 'disabled' | 'enabled'>('all');
@@ -169,6 +171,16 @@ export default function Accounts() {
       return true;
     });
   }, [accounts, accountSearch, accountFilter]);
+
+  const toggleReveal = async (id: number) => {
+    if (visibleKeyId === id) { setVisibleKeyId(null); return; }
+    if (revealedKeys[id] || keys[id]) { setVisibleKeyId(id); return; }
+    setRevealing(id);
+    const k = await fetchAccountKey(id);
+    setRevealing(null);
+    if (k) setRevealedKeys(s => ({ ...s, [id]: k }));
+    setVisibleKeyId(id);
+  };
 
   useEffect(() => {
     fetchAccounts();
@@ -397,12 +409,13 @@ export default function Accounts() {
             </div>
             {/* API key 独立末行：明文换行显示，不把按钮顶走 */}
             <div className="text-xs text-muted-foreground mt-2 flex items-start gap-1.5 uppercase tracking-tight">
-              <Key size={10} className="mt-0.5 shrink-0" /> {t('accounts.apiKey')}: {visibleKeyId === acc.id && acc.api_key ? <span className="font-mono normal-case lowercase break-all min-w-0">{acc.api_key}</span> : '****'}
+              <Key size={10} className="mt-0.5 shrink-0" /> {t('accounts.apiKey')}: {visibleKeyId === acc.id ? (revealing === acc.id ? <span className="font-mono normal-case lowercase text-muted-foreground/50">…</span> : ((revealedKeys[acc.id] ?? keys[acc.id]) ? <span className="font-mono normal-case lowercase break-all min-w-0">{revealedKeys[acc.id] ?? keys[acc.id]}</span> : <span className="text-muted-foreground/50">—</span>)) : '****'}
               <button
                 type="button"
                 aria-label={visibleKeyId === acc.id ? 'Hide API key' : 'Show API key'}
-                onClick={() => setVisibleKeyId(visibleKeyId === acc.id ? null : acc.id)}
-                className="p-0.5 rounded text-muted-foreground hover:text-foreground hover:bg-muted transition-colors shrink-0"
+                onClick={() => toggleReveal(acc.id)}
+                disabled={revealing === acc.id}
+                className="p-0.5 rounded text-muted-foreground hover:text-foreground hover:bg-muted transition-colors shrink-0 disabled:opacity-50"
               >
                 {visibleKeyId === acc.id ? <EyeOff size={12} /> : <Eye size={12} />}
               </button>
