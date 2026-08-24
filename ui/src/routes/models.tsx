@@ -51,7 +51,7 @@ const supports = (acc: any, proto: string) =>
 
 export default function Models() {
   const { t, i18n } = useTranslation();
-  const { availableModels, aliases, aggregateAliases, accounts, isLoading, streaming, fetchModels, streamModels, fetchAliases, fetchAggregateAliases, fetchAccounts, addAlias, deleteAlias, saveAggregateAlias, deleteAggregateAlias, setAggregateActive, testModel } = useModelsStore();
+  const { availableModels, aliases, aggregateAliases, accounts, isLoading, streaming, healthCache, queueCache, fetchModels, streamModels, fetchAliases, fetchAggregateAliases, fetchAccounts, fetchSummary, addAlias, deleteAlias, saveAggregateAlias, deleteAggregateAlias, setAggregateActive, testModel } = useModelsStore();
   const safeModels = availableModels || [];
   const safeAccounts = accounts || [];
   const [search, setSearch] = useState('');
@@ -128,15 +128,38 @@ export default function Models() {
     }
   };
 
-  // 1. 初始加载数据：秒开用缓存快照，随后自动开流增量刷新
+  // 1. 初始加载：models snapshot + summary 聚合(5→1)，随后增量流。summary 失败自动回退到 fan-out。
   useEffect(() => {
     fetchModels().then(() => streamModels(false));
-    fetchAliases();
-    fetchAggregateAliases();
-    fetchAccounts();
-    fetchHealth();
-    fetchTestQueueStatus().then(setQueueStatus);
+    const ac = new AbortController();
+    fetchSummary(ac.signal);
+    return () => ac.abort();
   }, []);
+
+  // summary 到位后把 health/queue 同步到本地 state（首屏不再等最慢一路）
+  useEffect(() => {
+    if (!healthCache?.length) return;
+    setTestResults(prev => {
+      const next = { ...prev };
+      for (const row of healthCache as any[]) {
+        const key = healthKey(row.account_id as number, row.model as string);
+        if (next[key]?.loading) continue;
+        next[key] = {
+          success: Boolean((row as any).success),
+          latency: (row as any).latency,
+          error: (row as any).error,
+          lastChecked: (row as any).last_checked,
+          limitsCache: (row as any).limits_cache,
+          limitsUpdatedAt: (row as any).limits_cache_updated_at,
+        };
+      }
+      return next;
+    });
+  }, [healthCache]);
+
+  useEffect(() => {
+    if (queueCache) setQueueStatus(queueCache as any);
+  }, [queueCache]);
 
   // 2. 智能轮询：仅在队列运行时开启定时器
   useEffect(() => {

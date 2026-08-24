@@ -61,12 +61,15 @@ interface ModelsState {
   isLoading: boolean;
   streaming: boolean;
   perAccountMeta: Record<string, PerAccountMeta>;
+  healthCache: any[] | null;
+  queueCache: { isRunning: boolean; current: number; total: number; progress: number } | null;
   error: string | null;
   fetchModels: (force?: boolean) => Promise<void>;
   streamModels: (force?: boolean) => Promise<void>;
   fetchAliases: () => Promise<void>;
   fetchAggregateAliases: () => Promise<void>;
   fetchAccounts: () => Promise<void>;
+  fetchSummary: (signal?: AbortSignal) => Promise<void>;
   addAlias: (alias: string, targetModel: string, providerId?: string, accountIds?: number[], preferredAccountId?: number, confirm?: boolean, upstreamApi?: string) => Promise<void>;
   deleteAlias: (id: number) => Promise<void>;
   saveAggregateAlias: (alias: string, candidates: AggregateCandidate[], intervalSecs?: number, confirm?: boolean, upstreamApi?: string) => Promise<void>;
@@ -93,6 +96,8 @@ export const useModelsStore = create<ModelsState>((set, get) => ({
   isLoading: false,
   streaming: false,
   perAccountMeta: {},
+  healthCache: null,
+  queueCache: null,
   error: null,
 
   fetchModels: async (force = false) => {
@@ -216,6 +221,28 @@ export const useModelsStore = create<ModelsState>((set, get) => ({
       set({ accounts: data });
     } catch (err: any) {
       console.error('Failed to fetch accounts:', err.message);
+    }
+  },
+
+  fetchSummary: async (signal?: AbortSignal) => {
+    try {
+      const res = await apiFetch('/api/models/summary', { signal } as any);
+      if (!res.ok) throw new Error(`summary ${res.status}`);
+      const data = await res.json();
+      set({
+        aliases: Array.isArray(data.aliases) ? data.aliases : [],
+        aggregateAliases: Array.isArray(data.aggregateAliases) ? data.aggregateAliases : [],
+        accounts: Array.isArray(data.accounts) ? data.accounts : [],
+        healthCache: Array.isArray(data.health) ? data.health : [],
+        queueCache: data.queue ?? null,
+      });
+      return data;
+    } catch (err: any) {
+      if (err?.name === 'AbortError') return null;
+      console.error('fetchSummary failed, falling back to fan-out', err?.message);
+      // fallback: old fan-out so an undeployed backend still works
+      await Promise.allSettled([get().fetchAliases(), get().fetchAggregateAliases(), get().fetchAccounts()]);
+      return null;
     }
   },
 
