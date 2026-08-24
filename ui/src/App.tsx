@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, lazy, Suspense } from 'react';
 import { BrowserRouter as Router, Routes, Route, Link, useLocation, Navigate, Outlet } from 'react-router-dom';
 import Login from './routes/login';
 import { useAuthStore } from './stores/auth';
@@ -7,27 +7,33 @@ import {
   Users,
   Box,
   Settings,
-  Info,
   ChevronRight,
   Zap,
   Key as KeyIcon,
   Menu,
   X,
   BarChart3,
+  ScrollText,
   LogOut,
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import Accounts from './routes/accounts';
-import Models from './routes/models';
 import Dashboard from './routes/dashboard';
-import SettingsPage from './routes/settings';
-import About from './routes/about';
-import KeysPage from './routes/keys';
-import StatsPage from './routes/stats';
 import { useSettingsStore } from './stores/settings';
+import { applyTheme, watchSystemTheme } from './lib/theme';
 import { cn } from './lib/utils'
 import { StatusDot } from './components/shared/StatusDot'
 import { Button } from '@/components/ui/button'
+
+const Accounts = lazy(() => import('./routes/accounts'));
+const Models = lazy(() => import('./routes/models'));
+const KeysPage = lazy(() => import('./routes/keys'));
+const StatsPage = lazy(() => import('./routes/stats'));
+const LogsPage = lazy(() => import('./routes/logs'));
+const SettingsPage = lazy(() => import('./routes/settings'));
+
+const RouteFallback = () => (
+  <div className="flex h-40 items-center justify-center text-sm text-muted-foreground">Loading...</div>
+);
 
 const LanguageSwitcher = () => {
   const { i18n } = useTranslation();
@@ -142,10 +148,10 @@ function Shell() {
           <NavItem to="/models" icon={Box} labelKey="common.models" />
           <NavItem to="/keys" icon={KeyIcon} labelKey="common.keys" />
           <NavItem to="/stats" icon={BarChart3} labelKey="common.usage" />
+          <NavItem to="/logs" icon={ScrollText} labelKey="common.logs" />
 
           <div className="pt-6 text-xs font-bold text-muted-foreground/50 uppercase tracking-wider px-3 mb-2">{t('common.menuPref')}</div>
           <NavItem to="/settings" icon={Settings} labelKey="common.settings" />
-          <NavItem to="/about" icon={Info} labelKey="common.about" />
         </nav>
 
         <div className="p-4 border-t border-border mt-auto">
@@ -193,12 +199,8 @@ function App() {
   }, []);
 
   useEffect(() => {
-    const theme = config.theme || 'dark';
-    if (theme === 'light') {
-      document.documentElement.classList.remove('dark');
-    } else {
-      document.documentElement.classList.add('dark');
-    }
+    applyTheme(config.theme);
+    return watchSystemTheme();
   }, [config.theme]);
 
   return (
@@ -207,12 +209,12 @@ function App() {
       <Route element={<ProtectedLayout />}>
         <Route element={<Shell />}>
           <Route path="/" element={<Dashboard />} />
-          <Route path="/accounts" element={<Accounts />} />
-          <Route path="/models" element={<Models />} />
-          <Route path="/keys" element={<KeysPage />} />
-          <Route path="/stats" element={<StatsPage />} />
-          <Route path="/settings" element={<SettingsPage />} />
-          <Route path="/about" element={<About />} />
+          <Route path="/accounts" element={<Suspense fallback={<RouteFallback />}><Accounts /></Suspense>} />
+          <Route path="/models" element={<Suspense fallback={<RouteFallback />}><Models /></Suspense>} />
+          <Route path="/keys" element={<Suspense fallback={<RouteFallback />}><KeysPage /></Suspense>} />
+          <Route path="/stats" element={<Suspense fallback={<RouteFallback />}><StatsPage /></Suspense>} />
+          <Route path="/logs" element={<Suspense fallback={<RouteFallback />}><LogsPage /></Suspense>} />
+          <Route path="/settings" element={<Suspense fallback={<RouteFallback />}><SettingsPage /></Suspense>} />
         </Route>
       </Route>
     </Routes>

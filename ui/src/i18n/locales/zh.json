@@ -6,7 +6,6 @@
     "usage": "用量统计",
     "settings": "系统设置",
     "keys": "密钥管理",
-    "about": "关于",
     "confirm": "确认",
     "cancel": "取消",
     "confirmText": "确认",
@@ -36,7 +35,8 @@
     "healthy": "健康",
     "degraded": "部分降级",
     "down": "故障",
-    "alias": "别名"
+    "alias": "别名",
+    "logs": "请求日志"
   },
   "dashboard": {
     "overview": "系统概览",
@@ -52,7 +52,12 @@
     "providerStatus": "账户在线状态",
     "activeModels": "当前模型状态",
     "noActiveModels": "该时间范围内无活动记录",
-    "recentLogs": "最近日志动态",
+    "recentLogs": "日志动态",
+    "logDetail": {
+      "title": "日志详情",
+      "request": "请求（发送）",
+      "response": "响应（收到）"
+    },
     "connected": "已连接",
     "viewReports": "查看详细报告",
     "charts": {
@@ -64,7 +69,7 @@
     "connectNew": "快速连接",
     "noTraffic": "暂无流量",
     "calls": "次调用",
-    "aliasHealth": "别名健康概览",
+    "aliasHealth": "别名健康",
     "healthy": "健康",
     "untested": "未测试",
     "noAliases": "暂无别名配置",
@@ -86,7 +91,11 @@
       "avgLag": "平均延迟",
       "successRate": "最近成功率",
       "liveFeed": "实时动态",
-      "reqs": "次请求"
+      "reqs": "次请求",
+      "avgTtft": "平均TTFT",
+      "p95Latency": "P95 延迟",
+      "avgTps": "平均 t/s",
+      "ttftPulse": "TTFT 脉搏"
     }
   },
   "usage": {
@@ -127,7 +136,7 @@
     "custom": {
       "start": "开始",
       "end": "结束",
-      "apply": "应用自定义"
+      "apply": "应用"
     },
     "statsCards": {
       "totalTokens": "总 Token",
@@ -194,7 +203,7 @@
     "autoUpdateDesc": "定期从服务商拉取最新的模型列表。",
     "ui": "界面与交互",
     "theme": "界面主题",
-    "themeDesc": "在深色和浅色模式之间切换。",
+    "themeDesc": "在深色、浅色与跟随系统之间切换。",
     "themeDark": "深色",
     "themeLight": "浅色",
     "frequency": "刷新频率",
@@ -227,28 +236,8 @@
     "reservedPortTitle": "端口已被占用",
     "reservedPort": "该端口已被常用数据库或 Web 服务占用，为了避免冲突，请选择其他端口。",
     "restartRequired": "需要重新启动",
-    "restartDesc": "服务端口已修改成功。为了使更改生效，请手动关闭当前运行的 LLMux 进程并重新启动。"
-  },
-  "about": {
-    "established": "始于 2024",
-    "title": "统一 AI 网关引擎",
-    "desc": "LLMux 是一款专业级的多账户网关，旨在为您所有喜爱的 LLM 提供本地访问体验。",
-    "features": {
-      "speed": "极致响应",
-      "speedDesc": "零开销本地代理。您的模型，您的速度，拒绝中间层延迟。",
-      "privacy": "隐私透明",
-      "privacyDesc": "会话凭据本地存储。我们永远不会将您的敏感信息上传至外部服务器。",
-      "agnostic": "模型无关",
-      "agnosticDesc": "原生支持 OpenAI, Anthropic, Gemini 及自定义端点。连接一次，处处调用。",
-      "multi": "混合多租户",
-      "multiDesc": "在一个统一界面内，无缝切换多个账户及 API 服务商。"
-    },
-    "tech": "技术驱动工程",
-    "madeWith": "由 LLMux 团队倾力打造",
-    "source": "项目源码",
-    "docs": "文档地址",
-    "support": "致支持者",
-    "sponsor": "爱发电赞助"
+    "restartDesc": "服务端口已修改成功。为了使更改生效，请手动关闭当前运行的 LLMux 进程并重新启动。",
+    "themeSystem": "跟随系统"
   },
   "accounts": {
     "title": "账户管理",
@@ -263,12 +252,19 @@
     "apiKey": "API Key",
     "baseUrl": "Base URL",
     "noAccounts": "暂无账户配置",
+    "noMatch": "无匹配账户",
     "addFirst": "点击上方按钮添加您的第一个 AI 服务商 Key。",
     "deleteConfirm": "确定要删除账户 \"{{name}}\" 吗？此操作不可恢复！",
     "deleteWarning": "警告：此操作将抹除该账户在系统中的所有痕迹。",
     "deleteWarningDetail": "注意：如该账户配置了别名 (alias)，请自行前往服务商控制台手动删除。确认删除后，本地数据库中的相关记录将被永久抹除且无法找回。",
     "keyEncrypted": "您的 Key 已在本地加密，永远不会离开您的设备。",
     "offline": "离线",
+    "filter": {
+      "all": "全部",
+      "disabled": "禁用",
+      "enabled": "启用",
+      "searchPlaceholder": "搜索账户..."
+    },
     "leaveBlank": "留空以保持现有密钥",
     "optional": "选填",
     "editAccount": "编辑账户",
@@ -283,13 +279,15 @@
     "anthropicBaseUrl": "Anthropic Base URL",
     "anthropicBaseUrlPlaceholder": "例如：https://api.deepseek.com/anthropic",
     "baseUrlHint": "留空使用默认地址。网关会按目标协议转换请求格式，并替换模型名与鉴权头。",
-    "skipValidation": "模型不可用时仍允许添加",
-    "skipValidationHint": "第三方 API 可能未实现 /models 端点。勾选后：模型可用则自动拉取，不可用时仅提示警告不阻止创建。",
     "copied": "已复制！",
     "copyScript": "复制脚本",
     "validating": "验证中...",
     "validationFailed": "验证失败：无法从该账户获取任何模型。请检查 API Key 和 Base URL。",
-    "validationError": "验证出错：{{message}}"
+    "validationError": "验证出错：{{message}}",
+    "defaultProtocol": "默认协议",
+    "defaultProtocolHint": "请求未指定协议时使用的上游协议。",
+    "needEndpoint": "至少启用一个服务端点",
+    "defaultInEnabled": "默认协议必须是已启用的端点之一"
   },
   "models": {
     "title": "模型管理",
@@ -302,6 +300,7 @@
     "availableSubtitle": "从您已启用的账户中实时探测到的模型。",
     "createAlias": "创建别名",
     "editAlias": "编辑别名",
+    "aggregateAlias": "聚合别名",
     "customAlias": "自定义别名",
     "customAliasTitle": "自定义模型别名",
     "selectAccount": "选择账户",
@@ -357,7 +356,23 @@
     "testAllDesc": "在后台顺序拨测当前筛选出的所有模型",
     "noAccountsConnected": "未连接任何账户",
     "apiUnavailable": "API 不可用，可通过上方「笔」按钮手动添加别名",
-    "noModelsFound": "该厂商下未找到任何模型"
+    "noModelsFound": "该厂商下未找到任何模型",
+    "downstreamMode": "路由模式",
+    "downstream": {
+      "default": "透传",
+      "chat": "Chat",
+      "responses": "Responses",
+      "messages": "Messages"
+    },
+    "downstreamHint": {
+      "default": "透传：按接口自动选择协议，不限制账户。",
+      "chat": "强制走 OpenAI 兼容 chat/completions；仅允许配置了 chat 端点的账户。",
+      "responses": "强制走 Responses API；仅允许配置了 responses 端点的账户。",
+      "messages": "强制走 Anthropic /v1/messages；仅允许配置了 messages 端点的账户。"
+    },
+    "downstreamHintValidate": "切换后将即时校验每个候选账户。",
+    "accountUnsupportedMode": "该账户不支持「{{mode}}」路由模式，请更换账户或切换模式。",
+    "downstreamUnsupportedBadge": "不支持 {{mode}}"
   },
   "keys": {
     "title": "API 密钥管理",
@@ -406,5 +421,42 @@
       "error": "❌ 同步失败：",
       "notFound": "❌ 未找到 Token！请确保您已在当前页面登录。"
     }
+  },
+  "logs": {
+    "title": "请求日志",
+    "subtitle": "按请求维度查看网关处理明细。",
+    "expandAll": "展开全部",
+    "collapseAll": "收起全部",
+    "truncated": "（内容已截断，仅显示前缀）",
+    "time": "时间",
+    "model": "模型",
+    "account": "账户",
+    "tokens": "Tokens",
+    "input": "输入",
+    "output": "输出",
+    "latency": "延迟",
+    "status": "状态",
+    "error": "错误",
+    "all": "全部",
+    "success": "成功",
+    "failed": "失败",
+    "filterModel": "模型过滤",
+    "pageInfo": "第 {{page}} 页（共 {{pages}} 页）",
+    "goToPage": "跳转到页码",
+    "go": "跳转",
+    "empty": "没有符合条件的日志记录。",
+    "loading": "加载中...",
+    "prev": "上一页",
+    "next": "下一页",
+    "last24h": "最近 24 小时",
+    "last7d": "最近 7 天",
+    "allTime": "全部时间",
+    "ttft": "首字延迟",
+    "throughput": "吞吐 (t/s)",
+    "total": "总耗时",
+    "stream": "流式",
+    "nonStream": "非流式",
+    "streamOnly": "仅流式",
+    "slowOnly": "慢查询"
   }
 }

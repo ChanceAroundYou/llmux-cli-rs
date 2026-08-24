@@ -7,7 +7,6 @@ import {
   Plus,
   Settings2,
   Key,
-  Globe,
   Loader2,
   AlertCircle,
   Save,
@@ -16,7 +15,12 @@ import {
   CheckCircle2,
   Pencil,
   ShieldAlert,
-  Power
+  Power,
+  Eye,
+  EyeOff,
+  ChevronDown,
+  Search,
+  Filter,
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { Dialog, ConfirmDialog } from '../components/Modal';
@@ -24,38 +28,110 @@ import { CopyButton } from '../components/CopyButton';
 import { cn } from '../lib/utils';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
-import { StatusBadge } from '@/components/shared/StatusBadge';
+import { StatusDot } from '@/components/shared/StatusDot';
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group';
 
 const PROTOCOLS = ['chat', 'responses', 'messages'] as const;
 type Protocol = typeof PROTOCOLS[number];
 
-const PROTOCOL_LABEL: Record<Protocol, string> = {
-  chat: '/v1/chat/completions',
-  responses: '/v1/responses',
-  messages: '/v1/messages',
+// Mirror of llmux-core join_upstream_url: merge path segments, dropping an
+// adjacent duplicate "v1" (config carries the version segment).
+const ENDPOINT_SUFFIX: Record<Protocol, string> = {
+  chat: 'chat/completions',
+  responses: 'responses',
+  messages: 'v1/messages',
 };
 
-function ProtocolBadge({ proto }: { proto: Protocol }) {
-  return (
-    <span className="inline-flex items-center rounded-md bg-muted px-2 py-0.5 text-xs font-medium uppercase tracking-tight border border-border">
-      {proto}
-    </span>
-  );
+function joinUpstreamUrl(base: string, endpoint: string): string {
+  try {
+    const url = new URL(base.trim());
+    const segments: string[] = [];
+    for (const seg of url.pathname.split('/').filter(Boolean)) {
+      if (seg === 'v1' && segments[segments.length - 1] === 'v1') continue;
+      segments.push(seg);
+    }
+    for (const seg of endpoint.split('/').filter(Boolean)) {
+      if (seg === 'v1' && segments[segments.length - 1] === 'v1') continue;
+      segments.push(seg);
+    }
+    url.pathname = '/' + segments.join('/');
+    return url.toString().replace(/\/+$/, '');
+  } catch {
+    return '';
+  }
+}
+
+function resolvedEndpointUrl(base: string, proto: Protocol): string {
+  if (!base.trim()) return '';
+  return joinUpstreamUrl(base, ENDPOINT_SUFFIX[proto]);
 }
 
 function EndpointRow({ label, enabled, url, urls, onToggle, onChange }: { label: Protocol; enabled: boolean; url: string; urls: string[]; onToggle: (v: boolean) => void; onChange: (v: string) => void }) {
+  const resolved = enabled ? resolvedEndpointUrl(url, label) : '';
+  const [open, setOpen] = useState(false);
+  // Sort suggestions by similarity to the current input: prefix match first,
+  // then substring containment; ties keep the original order.
+  const suggestions = useMemo(() => {
+    const q = url.trim().toLowerCase();
+    const score = (u: string) => {
+      const s = u.toLowerCase();
+      if (!q) return 0;
+      if (s === q) return 3;
+      if (s.startsWith(q)) return 2;
+      if (s.includes(q)) return 1;
+      return 0;
+    };
+    return urls
+      .filter(u => !!u && u !== url)
+      .map((u, idx) => ({ u, idx, score: score(u) }))
+      .sort((a, b) => b.score - a.score || a.idx - b.idx)
+      .map(x => x.u);
+  }, [urls, url]);
   return (
     <div className="space-y-1.5">
       <label className="flex items-center gap-2 cursor-pointer">
         <input type="checkbox" checked={enabled} onChange={e => onToggle(e.target.checked)} className="w-4 h-4 rounded accent-primary" />
         <span className="text-xs font-bold uppercase">{label}</span>
-        <span className="text-[10px] font-mono text-muted-foreground/70">{PROTOCOL_LABEL[label]}</span>
+        {resolved && (
+          <span className="text-[10px] font-mono text-muted-foreground/70">{resolved}</span>
+        )}
       </label>
       {enabled && (
-        <div className="flex gap-2">
-          <input list={`${label}-urls`} value={url} onChange={e => onChange(e.target.value)} placeholder="https://api.example.com/v1" className="flex-1 h-9 px-3 rounded-md border border-input bg-background text-sm font-mono" />
-          <datalist id={`${label}-urls`}>{urls.map(u => <option key={u} value={u} />)}</datalist>
+        <div className="relative">
+          <div className="flex gap-2">
+            <input
+              value={url}
+              onChange={e => onChange(e.target.value)}
+              onFocus={() => setOpen(true)}
+              onBlur={() => setTimeout(() => setOpen(false), 150)}
+              placeholder="https://api.example.com/v1"
+              className="flex-1 h-9 px-3 rounded-md border border-input bg-background text-sm font-mono"
+            />
+            <button
+              type="button"
+              tabIndex={-1}
+              aria-label={`Select ${label} endpoint`}
+              onClick={() => setOpen(v => !v)}
+              className="shrink-0 h-9 px-2.5 rounded-md border border-input bg-background text-muted-foreground hover:text-foreground transition-colors"
+            >
+              <ChevronDown size={14} className={cn('transition-transform duration-200', open && 'rotate-180')} />
+            </button>
+          </div>
+          {open && suggestions.length > 0 && (
+            <div className="absolute z-20 mt-1 w-full max-h-44 overflow-y-auto rounded-md border border-border bg-popover text-popover-foreground shadow-lg">
+              {suggestions.map(u => (
+                <button
+                  key={u}
+                  type="button"
+                  onMouseDown={e => e.preventDefault()}
+                  onClick={() => { onChange(u); setOpen(false); }}
+                  className="w-full text-left px-3 py-1.5 font-mono text-xs hover:bg-muted truncate"
+                >
+                  {u}
+                </button>
+              ))}
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -71,13 +147,28 @@ export default function Accounts() {
   const [editingAccount, setEditingAccount] = useState<any>(null);
   const [formData, setFormData] = useState({ alias: '', api_key: '', chat_endpoint: '', responses_endpoint: '', messages_endpoint: '', default_protocol: '' });
   const [formEnabled, setFormEnabled] = useState<Record<Protocol, boolean>>({ chat: false, responses: false, messages: false });
-  const [formSkipValidation, setFormSkipValidation] = useState(false);
+  const [formShowKey, setFormShowKey] = useState(false);
   const [editData, setEditData] = useState({ alias: '', api_key: '', chat_endpoint: '', responses_endpoint: '', messages_endpoint: '', default_protocol: '', notes: '' });
   const [editEnabled, setEditEnabled] = useState<Record<Protocol, boolean>>({ chat: false, responses: false, messages: false });
-  const [editSkipValidation, setEditSkipValidation] = useState(false);
+  const [editShowKey, setEditShowKey] = useState(false);
   const [accountToDelete, setAccountToDelete] = useState<{ id: number; name: string } | null>(null);
   const [isValidating, setIsValidating] = useState(false);
   const [validationError, setValidationError] = useState<string | null>(null);
+  const [visibleKeyId, setVisibleKeyId] = useState<number | null>(null);
+  // 账户列表搜索 + 状态筛选（循环：全部 → 禁用 → 启用）
+  const [accountSearch, setAccountSearch] = useState('');
+  const [accountFilter, setAccountFilter] = useState<'all' | 'disabled' | 'enabled'>('all');
+  const FILTER_CYCLE = ['all', 'disabled', 'enabled'] as const;
+
+  const filteredAccounts = useMemo(() => {
+    const q = accountSearch.trim().toLowerCase();
+    return accounts.filter(acc => {
+      if (accountFilter === 'disabled' && acc.is_active !== 0) return false;
+      if (accountFilter === 'enabled' && acc.is_active === 0) return false;
+      if (q && !acc.alias.toLowerCase().includes(q) && !(acc.provider_id || '').toLowerCase().includes(q)) return false;
+      return true;
+    });
+  }, [accounts, accountSearch, accountFilter]);
 
   useEffect(() => {
     fetchAccounts();
@@ -88,6 +179,15 @@ export default function Accounts() {
     () => [...new Set(accounts.flatMap(a => [a.chat_endpoint, a.responses_endpoint, a.messages_endpoint].filter((u): u is string => !!u)))],
     [accounts]
   );
+
+  // Edit mode suggests the endpoints this account already has configured on top
+  // of the global list (the field itself may have been cleared in the form).
+  const editUrlSuggestions = useMemo(() => {
+    const own = editingAccount
+      ? [editingAccount.base_url, editingAccount.anthropic_base_url, editingAccount.chat_endpoint, editingAccount.responses_endpoint, editingAccount.messages_endpoint].filter((u): u is string => !!u)
+      : [];
+    return [...new Set([...distinctUrls, ...own])];
+  }, [distinctUrls, editingAccount]);
 
   const formEnabledProtocols = PROTOCOLS.filter(p => formEnabled[p]);
   const formError = formEnabledProtocols.length === 0
@@ -121,12 +221,11 @@ export default function Accounts() {
         messages_endpoint: formEnabled.messages ? formData.messages_endpoint.trim() || null : null,
         default_protocol: formData.default_protocol,
         openai_compatible: 0,
-        skip_validation: formSkipValidation,
       });
       setIsModalOpen(false);
       setFormData({ alias: '', api_key: '', chat_endpoint: '', responses_endpoint: '', messages_endpoint: '', default_protocol: '' });
       setFormEnabled({ chat: false, responses: false, messages: false });
-      setFormSkipValidation(false);
+      setFormShowKey(false);
     } catch (err: any) {
       setValidationError(err.message || "Validation failed");
     } finally {
@@ -173,7 +272,6 @@ export default function Accounts() {
         responses_endpoint: editEnabled.responses ? editData.responses_endpoint.trim() || null : null,
         messages_endpoint: editEnabled.messages ? editData.messages_endpoint.trim() || null : null,
         default_protocol: editData.default_protocol,
-        skip_validation: editSkipValidation,
       };
       if (editData.api_key) payload.api_key = editData.api_key;
       await updateAccount(editingAccount.id, payload);
@@ -228,6 +326,31 @@ export default function Accounts() {
         </Button>
       </div>
 
+      {/* 搜索 + 禁用筛选 */}
+      <div className="flex items-center gap-2 justify-between">
+        <div className="relative flex-1 max-w-sm">
+          {accountSearch === '' && (
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground z-10" size={14} />
+          )}
+          <Input
+            type="text"
+            placeholder={t('accounts.filter.searchPlaceholder')}
+            value={accountSearch}
+            onChange={e => setAccountSearch(e.target.value)}
+            className={accountSearch ? 'pl-3' : 'pl-9'}
+          />
+        </div>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => setAccountFilter(FILTER_CYCLE[(FILTER_CYCLE.indexOf(accountFilter) + 1) % FILTER_CYCLE.length])}
+          className={accountFilter !== 'all' ? 'text-primary border-primary/40' : ''}
+        >
+          <Filter size={14} />
+          {t(`accounts.filter.${accountFilter}`)}
+        </Button>
+      </div>
+
       {isLoading && (
         <div className="py-20 flex justify-center">
           <Loader2 className="animate-spin text-primary/50" />
@@ -235,26 +358,15 @@ export default function Accounts() {
       )}
 
       <div className="space-y-3">
-        {accounts.map((acc) => (
-          <div key={acc.id} className="p-4 rounded-xl border border-border bg-card hover:bg-muted/30 transition-all flex items-center justify-between group">
-            <div className="flex items-center gap-4">
-              <div className="w-10 h-10 rounded-lg bg-muted flex items-center justify-center font-bold text-xs uppercase border border-border">
-                {acc.provider_id.slice(0, 2)}
+        {filteredAccounts.map((acc) => (
+          <div key={acc.id} className="p-4 rounded-xl border border-border bg-card hover:bg-muted/30 transition-all group">
+            <div className="flex items-center justify-between gap-4">
+              <div className="flex items-center gap-2 min-w-0">
+                <h3 className="font-semibold text-sm truncate">{acc.alias}</h3>
+                <StatusDot status={acc.is_active === 1 ? 'online' : 'offline'} />
               </div>
-              <div>
-                <div className="flex items-center gap-2">
-                   <h3 className="font-semibold text-sm">{acc.alias}</h3>
-                   <StatusBadge status={acc.is_active === 1 ? 'online' : 'offline'} label={acc.is_active === 1 ? t('common.online') : t('accounts.offline')} />
-                </div>
-                <div className="text-xs text-muted-foreground mt-0.5 flex items-center gap-2 uppercase tracking-tight">
-                  <Globe size={10} /> {acc.provider_id}
-                  <span className="opacity-20">|</span>
-                  <Key size={10} /> {t('accounts.apiKey')}: ****
-                </div>
-              </div>
-            </div>
 
-              <div className="flex items-center gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
+              <div className="flex items-center gap-2 shrink-0">
                   <Button
                     variant="ghost"
                     size="icon"
@@ -282,8 +394,27 @@ export default function Accounts() {
                     <Trash2 size={16} />
                   </Button>
                 </div>
+            </div>
+            {/* API key 独立末行：明文换行显示，不把按钮顶走 */}
+            <div className="text-xs text-muted-foreground mt-2 flex items-start gap-1.5 uppercase tracking-tight">
+              <Key size={10} className="mt-0.5 shrink-0" /> {t('accounts.apiKey')}: {visibleKeyId === acc.id && acc.api_key ? <span className="font-mono normal-case lowercase break-all min-w-0">{acc.api_key}</span> : '****'}
+              <button
+                type="button"
+                aria-label={visibleKeyId === acc.id ? 'Hide API key' : 'Show API key'}
+                onClick={() => setVisibleKeyId(visibleKeyId === acc.id ? null : acc.id)}
+                className="p-0.5 rounded text-muted-foreground hover:text-foreground hover:bg-muted transition-colors shrink-0"
+              >
+                {visibleKeyId === acc.id ? <EyeOff size={12} /> : <Eye size={12} />}
+              </button>
+            </div>
           </div>
         ))}
+
+        {!isLoading && accounts.length > 0 && filteredAccounts.length === 0 && (
+          <div className="py-10 text-center border border-dashed border-border rounded-xl">
+             <p className="text-sm text-muted-foreground">{t('accounts.noMatch')}</p>
+          </div>
+        )}
 
         {!isLoading && accounts.length === 0 && (
           <div className="py-20 text-center border-2 border-dashed border-border rounded-xl">
@@ -297,6 +428,7 @@ export default function Accounts() {
         isOpen={isModalOpen}
         onClose={() => !isValidating && setIsModalOpen(false)}
         title={t('accounts.registerTitle')}
+        size="lg"
       >
         <div className="space-y-6">
           {validationError && (
@@ -318,13 +450,24 @@ export default function Accounts() {
             </div>
             <div className="space-y-1.5">
               <label className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.apiKey')}</label>
-              <Input
-                type="password" required value={formData.api_key}
-                disabled={isValidating}
-                onChange={e => setFormData({ ...formData, api_key: e.target.value })}
-                placeholder="sk-..."
-                className="font-mono"
-              />
+              <div className="relative">
+                <Input
+                  type={formShowKey ? 'text' : 'password'} required value={formData.api_key}
+                  disabled={isValidating}
+                  onChange={e => setFormData({ ...formData, api_key: e.target.value })}
+                  placeholder="sk-..."
+                  className="font-mono pr-10"
+                />
+                <button
+                  type="button"
+                  tabIndex={-1}
+                  aria-label={formShowKey ? 'Hide API key' : 'Show API key'}
+                  onClick={() => setFormShowKey(v => !v)}
+                  className="absolute right-2 top-1/2 -translate-y-1/2 p-1 text-muted-foreground hover:text-foreground"
+                >
+                  {formShowKey ? <EyeOff size={14} /> : <Eye size={14} />}
+                </button>
+              </div>
             </div>
 
             <div className="space-y-3 border-t border-border pt-3">
@@ -375,19 +518,6 @@ export default function Accounts() {
               <p className="text-xs text-muted-foreground">{t('accounts.defaultProtocolHint', 'Used when a request does not specify a protocol')}</p>
             </div>
 
-            <div className="space-y-1.5 border-t border-border pt-3">
-              <label className="flex items-center gap-2 cursor-pointer select-none">
-                <input
-                  type="checkbox"
-                  checked={formSkipValidation}
-                  disabled={isValidating}
-                  onChange={e => setFormSkipValidation(e.target.checked)}
-                  className="w-4 h-4 rounded accent-primary"
-                />
-                <span className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.skipValidation')}</span>
-              </label>
-              <p className="text-xs text-muted-foreground ml-6">{t('accounts.skipValidationHint')}</p>
-            </div>
             <div className="pt-4 flex gap-3">
                <Button
                  type="button"
@@ -425,6 +555,7 @@ export default function Accounts() {
         isOpen={isEditOpen}
         onClose={() => !isValidating && setIsEditOpen(false)}
         title={t('accounts.editAccount')}
+        size="lg"
       >
         <div className="space-y-6">
           {validationError && (
@@ -444,24 +575,28 @@ export default function Accounts() {
               />
             </div>
             <div className="space-y-1.5">
-              <label className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.provider')}</label>
-              <div className="flex items-center gap-2 h-10 px-3 rounded-md border border-input bg-muted/40 text-sm">
-                <ProtocolBadge proto={editingAccount?.provider_id} />
-                <span className="text-xs text-muted-foreground italic">{t('accounts.readOnly', 'Read-only')}</span>
-              </div>
-            </div>
-            <div className="space-y-1.5">
               <div className="flex items-center justify-between">
                 <label className="text-xs font-bold text-muted-foreground uppercase">API Key</label>
                 <span className="text-xs text-muted-foreground italic">{t('accounts.leaveBlank')}</span>
               </div>
-              <Input
-                type="password" value={editData.api_key}
-                disabled={isValidating}
-                onChange={e => setEditData({ ...editData, api_key: e.target.value })}
-                placeholder={t('accounts.leaveBlank')}
-                className="font-mono"
-              />
+              <div className="relative">
+                <Input
+                  type={editShowKey ? 'text' : 'password'} value={editData.api_key}
+                  disabled={isValidating}
+                  onChange={e => setEditData({ ...editData, api_key: e.target.value })}
+                  placeholder={t('accounts.leaveBlank')}
+                  className="font-mono pr-10"
+                />
+                <button
+                  type="button"
+                  tabIndex={-1}
+                  aria-label={editShowKey ? 'Hide API key' : 'Show API key'}
+                  onClick={() => setEditShowKey(v => !v)}
+                  className="absolute right-2 top-1/2 -translate-y-1/2 p-1 text-muted-foreground hover:text-foreground"
+                >
+                  {editShowKey ? <EyeOff size={14} /> : <Eye size={14} />}
+                </button>
+              </div>
             </div>
 
             <div className="space-y-3 border-t border-border pt-3">
@@ -470,7 +605,7 @@ export default function Accounts() {
                 label="chat"
                 enabled={editEnabled.chat}
                 url={editData.chat_endpoint}
-                urls={distinctUrls}
+                urls={editUrlSuggestions}
                 onToggle={v => handleEditToggle('chat', v)}
                 onChange={v => setEditData({ ...editData, chat_endpoint: v })}
               />
@@ -478,7 +613,7 @@ export default function Accounts() {
                 label="responses"
                 enabled={editEnabled.responses}
                 url={editData.responses_endpoint}
-                urls={distinctUrls}
+                urls={editUrlSuggestions}
                 onToggle={v => handleEditToggle('responses', v)}
                 onChange={v => setEditData({ ...editData, responses_endpoint: v })}
               />
@@ -486,7 +621,7 @@ export default function Accounts() {
                 label="messages"
                 enabled={editEnabled.messages}
                 url={editData.messages_endpoint}
-                urls={distinctUrls}
+                urls={editUrlSuggestions}
                 onToggle={v => handleEditToggle('messages', v)}
                 onChange={v => setEditData({ ...editData, messages_endpoint: v })}
               />
@@ -512,19 +647,6 @@ export default function Accounts() {
               <p className="text-xs text-muted-foreground">{t('accounts.defaultProtocolHint', 'Used when a request does not specify a protocol')}</p>
             </div>
 
-            <div className="space-y-1.5 border-t border-border pt-3">
-              <label className="flex items-center gap-2 cursor-pointer select-none">
-                <input
-                  type="checkbox"
-                  checked={editSkipValidation}
-                  disabled={isValidating}
-                  onChange={e => setEditSkipValidation(e.target.checked)}
-                  className="w-4 h-4 rounded accent-primary"
-                />
-                <span className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.skipValidation')}</span>
-              </label>
-              <p className="text-xs text-muted-foreground ml-6">{t('accounts.skipValidationHint')}</p>
-            </div>
             <div className="pt-4 flex gap-3">
                <Button
                  type="button"

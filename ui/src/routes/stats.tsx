@@ -34,6 +34,10 @@ interface Summary {
   total_cache_create: number;
   cache_hit_rate: number;
   avg_latency: number;
+  p95_latency: number;
+  avg_ttft: number;
+  p95_ttft: number;
+  avg_tps: number;
   total_requests: number;
   success_requests: number;
 }
@@ -47,6 +51,9 @@ interface ModelBreakdown {
   requests: number;
   successCount: number;
   avgLatency: number;
+  avgTtft: number;
+  p95Ttft: number;
+  avgTps: number;
 }
 interface AccountBreakdown {
   id: number;
@@ -61,6 +68,9 @@ interface AccountBreakdown {
   requests: number;
   successCount: number;
   avgLatency: number;
+  avgTtft: number;
+  p95Ttft: number;
+  avgTps: number;
 }
 
 const PRESET_MS: Record<Exclude<Preset, 'custom'>, number> = {
@@ -92,7 +102,7 @@ export default function StatsPage() {
   const [summary, setSummary] = useState<Summary | null>(null);
   const [byModel, setByModel] = useState<ModelBreakdown[]>([]);
   const [byAccount, setByAccount] = useState<AccountBreakdown[]>([]);
-  const [timeseries, setTimeseries] = useState<Array<{ bucket: number; input: number; output: number; cacheRead: number; cacheCreate: number; requests: number }>>([]);
+  const [timeseries, setTimeseries] = useState<Array<{ bucket: number; input: number; output: number; cacheRead: number; cacheCreate: number; requests: number; avgLatency: number; p95Latency: number; avgTtft: number; p95Ttft: number; avgTps: number }>>([]);
   const [granularityMs, setGranularityMs] = useState<number | null>(null);
   const [loading, setLoading] = useState(false);
   const [modelFilter, setModelFilter] = useState('');
@@ -163,6 +173,9 @@ export default function StatsPage() {
         case 'requests': return m.requests;
         case 'successRate': return m.requests ? m.successCount / m.requests : 0;
         case 'avgLatency': return m.avgLatency;
+        case 'avgTtft': return m.avgTtft;
+        case 'p95Ttft': return m.p95Ttft;
+        case 'avgTps': return m.avgTps;
         default: return 0;
       }
     };
@@ -187,6 +200,10 @@ export default function StatsPage() {
         case 'hitRate': return a.cacheHitRate;
         case 'requests': return a.requests;
         case 'successRate': return a.requests ? a.successCount / a.requests : 0;
+        case 'avgLatency': return a.avgLatency;
+        case 'avgTtft': return a.avgTtft;
+        case 'p95Ttft': return a.p95Ttft;
+        case 'avgTps': return a.avgTps;
         default: return 0;
       }
     };
@@ -273,6 +290,96 @@ export default function StatsPage() {
     },
   }), []);
 
+  const tsLabels: string[] = useMemo(() => timeseries.map(p => {
+    const d = new Date(p.bucket);
+    const span = range.end - range.start;
+    if (span <= 2 * 60 * 60 * 1000) return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    if (span <= 48 * 60 * 60 * 1000) return d.toLocaleString([], { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
+    return d.toLocaleDateString([], { month: '2-digit', day: '2-digit' });
+  }), [timeseries, range.start, range.end]);
+
+  // Dual-axis: latency (avg/p95) on left y, TTFT (avg/p95) on right y1.
+  const latencyDualData: ChartData<'line'> = useMemo(() => ({
+    labels: tsLabels,
+    datasets: [
+      { label: t('usage.latency.avg', { defaultValue: '均延' }), data: timeseries.map(p => Math.round(p.avgLatency)), borderColor: '#f59e0b', backgroundColor: 'rgba(245,158,11,0.12)', fill: false, tension: 0.28, pointRadius: 0, borderWidth: 1.6, yAxisID: 'y' },
+      { label: t('usage.latency.p95', { defaultValue: 'P95 延' }), data: timeseries.map(p => Math.round(p.p95Latency)), borderColor: '#ef4444', backgroundColor: 'rgba(239,68,68,0.12)', fill: false, tension: 0.28, pointRadius: 0, borderWidth: 1.6, borderDash: [4, 3], yAxisID: 'y' },
+      { label: t('usage.ttft.avg', { defaultValue: '均 TTFT' }), data: timeseries.map(p => Math.round(p.avgTtft)), borderColor: '#06b6d4', backgroundColor: 'rgba(6,182,212,0.12)', fill: false, tension: 0.28, pointRadius: 0, borderWidth: 1.6, yAxisID: 'y1' },
+      { label: t('usage.ttft.p95', { defaultValue: 'P95 TTFT' }), data: timeseries.map(p => Math.round(p.p95Ttft)), borderColor: '#8b5cf6', backgroundColor: 'rgba(139,92,246,0.12)', fill: false, tension: 0.28, pointRadius: 0, borderWidth: 1.6, borderDash: [4, 3], yAxisID: 'y1' },
+    ],
+  }), [timeseries, tsLabels, t]);
+
+  const latencyDualOpts: ChartOptions<'line'> = useMemo(() => ({
+    responsive: true, maintainAspectRatio: false, animation: false,
+    interaction: { mode: 'index', intersect: false } as const,
+    plugins: {
+      legend: { display: true, position: 'bottom' as const, labels: { boxWidth: 10, font: { size: 10 }, padding: 12 } },
+      tooltip: { backgroundColor: '#1e293b', titleFont: { size: 10 }, bodyFont: { size: 10 } },
+    },
+    scales: {
+      x: { stacked: false, ticks: { maxRotation: 0, font: { size: 9 }, maxTicksLimit: 12 } },
+      y: { type: 'linear' as const, position: 'left' as const, beginAtZero: true, title: { display: true, text: 'ms', font: { size: 9 } }, ticks: { font: { size: 9 } } },
+      y1: { type: 'linear' as const, position: 'right' as const, beginAtZero: true, title: { display: true, text: 'ms', font: { size: 9 } }, ticks: { font: { size: 9 } }, grid: { drawOnChartArea: false } },
+    },
+  }), []);
+
+  const throughputData: ChartData<'line'> = useMemo(() => ({
+    labels: tsLabels,
+    datasets: [
+      { label: t('usage.throughput', { defaultValue: '吞吐 t/s' }), data: timeseries.map(p => Math.round(p.avgTps * 10) / 10), borderColor: '#22c55e', backgroundColor: 'rgba(34,197,94,0.20)', fill: true, tension: 0.28, pointRadius: 0, borderWidth: 1.6 },
+    ],
+  }), [timeseries, tsLabels, t]);
+
+  const throughputOpts: ChartOptions<'line'> = useMemo(() => ({
+    responsive: true, maintainAspectRatio: false, animation: false,
+    interaction: { mode: 'index', intersect: false } as const,
+    plugins: {
+      legend: { display: true, position: 'bottom' as const, labels: { boxWidth: 10, font: { size: 10 }, padding: 12 } },
+      tooltip: { backgroundColor: '#1e293b', titleFont: { size: 10 }, bodyFont: { size: 10 } },
+    },
+    scales: {
+      x: { stacked: false, ticks: { maxRotation: 0, font: { size: 9 }, maxTicksLimit: 12 } },
+      y: { stacked: false, beginAtZero: true, ticks: { font: { size: 9 }, callback: (v: any) => `${v}` } },
+    },
+  }), []);
+
+  // ponytail: histogram buckets per-interval averages (avgLatency/avgTtft), not raw per-request latencies — only bucketed aggregates are sent by the stats endpoint.
+  const HIST_BUCKETS = [
+    { label: '0-200', min: 0, max: 200 },
+    { label: '200-500', min: 200, max: 500 },
+    { label: '500-1k', min: 500, max: 1000 },
+    { label: '1k-2k', min: 1000, max: 2000 },
+    { label: '2k-5k', min: 2000, max: 5000 },
+    { label: '5k+', min: 5000, max: Infinity },
+  ];
+  const histogramData: ChartData<'bar'> = useMemo(() => {
+    const lat = new Array(HIST_BUCKETS.length).fill(0);
+    const tt = new Array(HIST_BUCKETS.length).fill(0);
+    for (const p of timeseries) {
+      for (let i = 0; i < HIST_BUCKETS.length; i++) {
+        const b = HIST_BUCKETS[i];
+        if (p.avgLatency >= b.min && p.avgLatency < b.max) lat[i]++;
+        if (p.avgTtft >= b.min && p.avgTtft < b.max) tt[i]++;
+      }
+    }
+    return {
+      labels: HIST_BUCKETS.map(b => b.label),
+      datasets: [
+        { label: t('usage.latency.label', { defaultValue: '时延' }), data: lat, backgroundColor: '#f59e0b', borderRadius: 3 },
+        { label: t('usage.ttft.label', { defaultValue: 'TTFT' }), data: tt, backgroundColor: '#06b6d4', borderRadius: 3 },
+      ],
+    };
+  }, [timeseries, t]);
+
+  const histogramOpts: ChartOptions<'bar'> = useMemo(() => ({
+    responsive: true, maintainAspectRatio: false, animation: false,
+    plugins: {
+      legend: { display: true, position: 'bottom' as const, labels: { boxWidth: 10, font: { size: 10 }, padding: 12 } },
+      tooltip: { backgroundColor: '#1e293b', titleFont: { size: 10 }, bodyFont: { size: 10 }, callbacks: { title: (items: any) => `${items[0].label} ms` } },
+    },
+    scales: { x: { stacked: false, ticks: { font: { size: 9 } } }, y: { stacked: false, beginAtZero: true, ticks: { font: { size: 9 }, precision: 0, stepSize: 1 } } },
+  }), []);
+
   const totalTokens = (summary?.total_input ?? 0) + (summary?.total_output ?? 0);
   const successRate = summary?.total_requests ? Math.round((summary.success_requests / summary.total_requests) * 100) : 0;
 
@@ -308,19 +415,22 @@ export default function StatsPage() {
             <span className="text-xs text-muted-foreground">{t('usage.custom.end', { defaultValue: '结束' })}</span>
             <Input type="datetime-local" value={customEnd} onChange={e => setCustomEnd(e.target.value)} className="h-8 text-xs" />
           </div>
-          <Button size="sm" onClick={applyCustom} className="h-8">{t('usage.custom.apply', { defaultValue: '应用自定义' })}</Button>
+          <Button size="sm" variant={preset === 'custom' ? 'default' : 'outline'} onClick={applyCustom} className="h-8">{t('usage.custom.apply', { defaultValue: '应用' })}</Button>
           <span className="text-xs text-muted-foreground ml-2">
             {new Date(range.start).toLocaleString()} — {new Date(range.end).toLocaleString()}
           </span>
         </div>
       </div>
 
-      {/* Summary — cache_hit_rate = cache_read / (input+cache_read+cache_create) */}
+      {/* Summary */}
       <section className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         <StatCard label={t('usage.statsCards.totalTokens', { defaultValue: '总 Token' })} value={totalTokens.toLocaleString()} subtitle={t('usage.statsCards.inputOutput', { defaultValue: `输入 ${summary?.total_input ?? 0} / 输出 ${summary?.total_output ?? 0}`, input: summary?.total_input ?? 0, output: summary?.total_output ?? 0 })} icon={BarChart3} />
         <StatCard label={t('usage.statsCards.cacheHit', { defaultValue: '缓存命中' })} value={`${(summary?.cache_hit_rate ?? 0).toFixed(1)}%`} subtitle={t('usage.statsCards.cacheDetail', { defaultValue: `读 ${summary?.total_cache_read ?? 0} · 写 ${summary?.total_cache_create ?? 0} — 读/总输入(含缓存)`, read: summary?.total_cache_read ?? 0, write: summary?.total_cache_create ?? 0 })} icon={BarChart3} />
         <StatCard label={t('usage.statsCards.effectiveTokens', { defaultValue: '有效 Token' })} value={(totalTokens + (summary?.total_cache_read ?? 0) + (summary?.total_cache_create ?? 0)).toLocaleString()} subtitle={t('usage.statsCards.effectiveHint', { defaultValue: '输入+命中+创建的总输入面' })} icon={BarChart3} />
         <StatCard label={t('usage.statsCards.requests', { defaultValue: '请求' })} value={summary?.total_requests ?? 0} subtitle={`${t('usage.success', { defaultValue: '成功' })} ${successRate}% · ${t('usage.latency', { defaultValue: '耗时' })} ${(summary?.avg_latency ?? 0).toFixed(0)}ms`} icon={BarChart3} />
+        <StatCard label={t('usage.statsCards.avgTtft', { defaultValue: '均 TTFT' })} value={`${(summary?.avg_ttft ?? 0).toFixed(0)}ms`} subtitle={t('usage.statsCards.ttftHint', { defaultValue: `P95 ${(summary?.p95_ttft ?? 0).toFixed(0)}ms` })} icon={BarChart3} />
+        <StatCard label={t('usage.statsCards.p95Latency', { defaultValue: 'P95 时延' })} value={`${(summary?.p95_latency ?? 0).toFixed(0)}ms`} subtitle={t('usage.statsCards.latencyHint', { defaultValue: `均值 ${(summary?.avg_latency ?? 0).toFixed(0)}ms` })} icon={BarChart3} />
+        <StatCard label={t('usage.statsCards.avgTps', { defaultValue: '均吞吐' })} value={`${(summary?.avg_tps ?? 0).toFixed(1)}`} subtitle={t('usage.statsCards.tpsHint', { defaultValue: 't/s 输出令牌/秒' })} icon={BarChart3} />
       </section>
 
       {/* Charts */}
@@ -330,6 +440,31 @@ export default function StatsPage() {
           {timeseries.length ? <Line data={tokenTimeseriesData} options={tokenTimeseriesOpts} /> : <EmptyState icon={Inbox} title={t('usage.noData', { defaultValue: '暂无数据' })} />}
         </div>
       </div>
+
+      {/* Latency & TTFT dual-axis timeseries */}
+      <div className="bg-card border border-border rounded-xl p-4">
+        <h3 className="text-sm font-bold mb-3">{t('usage.charts.latencyDual', { defaultValue: '时延 & TTFT 随时间' })}</h3>
+        <div className="h-64">
+          {timeseries.length ? <Line data={latencyDualData} options={latencyDualOpts} /> : <EmptyState icon={Inbox} title={t('usage.noData', { defaultValue: '暂无数据' })} />}
+        </div>
+      </div>
+
+      {/* Throughput timeseries (area) */}
+      <div className="bg-card border border-border rounded-xl p-4">
+        <h3 className="text-sm font-bold mb-3">{t('usage.charts.throughput', { defaultValue: '吞吐随时间 (t/s)' })}</h3>
+        <div className="h-64">
+          {timeseries.length ? <Line data={throughputData} options={throughputOpts} /> : <EmptyState icon={Inbox} title={t('usage.noData', { defaultValue: '暂无数据' })} />}
+        </div>
+      </div>
+
+      {/* Latency/TTFT histogram */}
+      <div className="bg-card border border-border rounded-xl p-4">
+        <h3 className="text-sm font-bold mb-3">{t('usage.charts.histogram', { defaultValue: '时延 / TTFT 分布' })}</h3>
+        <div className="h-64">
+          {timeseries.length ? <Bar data={histogramData} options={histogramOpts} /> : <EmptyState icon={Inbox} title={t('usage.noData', { defaultValue: '暂无数据' })} />}
+        </div>
+      </div>
+
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         <div className="bg-card border border-border rounded-xl p-4">
           <h3 className="text-sm font-bold mb-3">{t('usage.charts.byModelTop', { defaultValue: '按模型 Top' })}</h3>
@@ -367,11 +502,14 @@ export default function StatsPage() {
                 <th className="text-right px-3 py-2 cursor-pointer select-none" onClick={() => toggleModelSort('requests')}>{t('usage.tables.headers.requests', { defaultValue: '请求' })}{sortIndicator(modelSort,'requests')}</th>
                 <th className="text-right px-3 py-2 cursor-pointer select-none" onClick={() => toggleModelSort('successRate')}>{t('usage.tables.headers.successRate', { defaultValue: '成功率' })}{sortIndicator(modelSort,'successRate')}</th>
                 <th className="text-right px-3 py-2 cursor-pointer select-none" onClick={() => toggleModelSort('avgLatency')}>{t('usage.tables.headers.avgLatency', { defaultValue: '均延' })}{sortIndicator(modelSort,'avgLatency')}</th>
+                <th className="text-right px-3 py-2 cursor-pointer select-none" onClick={() => toggleModelSort('avgTtft')}>{t('usage.tables.headers.avgTtft', { defaultValue: '均TTFT' })}{sortIndicator(modelSort,'avgTtft')}</th>
+                <th className="text-right px-3 py-2 cursor-pointer select-none" onClick={() => toggleModelSort('p95Ttft')}>{t('usage.tables.headers.p95Ttft', { defaultValue: 'P95TTFT' })}{sortIndicator(modelSort,'p95Ttft')}</th>
+                <th className="text-right px-3 py-2 cursor-pointer select-none" onClick={() => toggleModelSort('avgTps')}>{t('usage.tables.headers.avgTps', { defaultValue: 't/s' })}{sortIndicator(modelSort,'avgTps')}</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-border/50">
               {sortedModels.length === 0 ? (
-                <tr><td colSpan={9} className="py-8"><EmptyState icon={Inbox} title={t('usage.noData', { defaultValue: '暂无数据' })} /></td></tr>
+                <tr><td colSpan={12} className="py-8"><EmptyState icon={Inbox} title={t('usage.noData', { defaultValue: '暂无数据' })} /></td></tr>
               ) : sortedModels.map((m, i) => (
                 <tr key={i} className="hover:bg-muted/30">
                   <td className="px-4 py-2 font-mono truncate max-w-[260px]">{m.model ?? '—'}</td>
@@ -383,6 +521,9 @@ export default function StatsPage() {
                   <td className="text-right px-3 py-2">{m.requests}</td>
                   <td className="text-right px-3 py-2">{m.requests ? Math.round(m.successCount / m.requests * 100) : 0}%</td>
                   <td className="text-right px-3 py-2">{m.avgLatency.toFixed(0)}ms</td>
+                  <td className="text-right px-3 py-2">{m.avgTtft.toFixed(0)}ms</td>
+                  <td className="text-right px-3 py-2">{m.p95Ttft.toFixed(0)}ms</td>
+                  <td className="text-right px-3 py-2">{m.avgTps.toFixed(1)}</td>
                 </tr>
               ))}
             </tbody>
@@ -411,11 +552,15 @@ export default function StatsPage() {
                 <th className="text-right px-3 py-2 cursor-pointer select-none" onClick={() => toggleAccountSort('hitRate')}>{t('usage.tables.headers.hitRate', { defaultValue: '命中率' })}{sortIndicator(accountSort,'hitRate')}</th>
                 <th className="text-right px-3 py-2 cursor-pointer select-none" onClick={() => toggleAccountSort('requests')}>{t('usage.tables.headers.requests', { defaultValue: '请求' })}{sortIndicator(accountSort,'requests')}</th>
                 <th className="text-right px-3 py-2 cursor-pointer select-none" onClick={() => toggleAccountSort('successRate')}>{t('usage.tables.headers.successRate', { defaultValue: '成功率' })}{sortIndicator(accountSort,'successRate')}</th>
+                <th className="text-right px-3 py-2 cursor-pointer select-none" onClick={() => toggleAccountSort('avgLatency')}>{t('usage.tables.headers.avgLatency', { defaultValue: '均延' })}{sortIndicator(accountSort,'avgLatency')}</th>
+                <th className="text-right px-3 py-2 cursor-pointer select-none" onClick={() => toggleAccountSort('avgTtft')}>{t('usage.tables.headers.avgTtft', { defaultValue: '均TTFT' })}{sortIndicator(accountSort,'avgTtft')}</th>
+                <th className="text-right px-3 py-2 cursor-pointer select-none" onClick={() => toggleAccountSort('p95Ttft')}>{t('usage.tables.headers.p95Ttft', { defaultValue: 'P95TTFT' })}{sortIndicator(accountSort,'p95Ttft')}</th>
+                <th className="text-right px-3 py-2 cursor-pointer select-none" onClick={() => toggleAccountSort('avgTps')}>{t('usage.tables.headers.avgTps', { defaultValue: 't/s' })}{sortIndicator(accountSort,'avgTps')}</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-border/50">
               {sortedAccounts.length === 0 ? (
-                <tr><td colSpan={8} className="py-8"><EmptyState icon={Inbox} title={t('usage.noData', { defaultValue: '暂无数据' })} /></td></tr>
+                <tr><td colSpan={12} className="py-8"><EmptyState icon={Inbox} title={t('usage.noData', { defaultValue: '暂无数据' })} /></td></tr>
               ) : sortedAccounts.map(a => (
                 <tr key={a.id} className="hover:bg-muted/30">
                   <td className="px-4 py-2 font-medium">{a.name}</td>
@@ -426,6 +571,10 @@ export default function StatsPage() {
                   <td className="text-right px-3 py-2">{a.cacheHitRate.toFixed(1)}%</td>
                   <td className="text-right px-3 py-2">{a.requests}</td>
                   <td className="text-right px-3 py-2">{a.requests ? Math.round(a.successCount / a.requests * 100) : 0}%</td>
+                  <td className="text-right px-3 py-2">{a.avgLatency.toFixed(0)}ms</td>
+                  <td className="text-right px-3 py-2">{a.avgTtft.toFixed(0)}ms</td>
+                  <td className="text-right px-3 py-2">{a.p95Ttft.toFixed(0)}ms</td>
+                  <td className="text-right px-3 py-2">{a.avgTps.toFixed(1)}</td>
                 </tr>
               ))}
             </tbody>

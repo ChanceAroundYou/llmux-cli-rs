@@ -6,7 +6,6 @@
     "keys": "API Keys",
     "usage": "Usage",
     "settings": "Settings",
-    "about": "About",
     "confirm": "Confirm",
     "cancel": "Cancel",
     "save": "Save",
@@ -34,7 +33,8 @@
     "healthy": "Healthy",
     "degraded": "Degraded",
     "down": "Down",
-    "alias": "Alias"
+    "alias": "Alias",
+    "logs": "Logs"
   },
   "dashboard": {
     "overview": "System Overview",
@@ -51,6 +51,11 @@
     "activeModels": "Active Models",
     "noActiveModels": "No activity in this period",
     "recentLogs": "Recent Logs",
+    "logDetail": {
+      "title": "Log Detail",
+      "request": "Request (Sent)",
+      "response": "Response (Received)"
+    },
     "connected": "Connected",
     "viewReports": "View Detailed Reports",
     "charts": {
@@ -84,7 +89,11 @@
       "avgLag": "Avg Lag",
       "successRate": "Success Rate",
       "liveFeed": "Live Feed",
-      "reqs": "reqs"
+      "reqs": "reqs",
+      "avgTtft": "Avg TTFT",
+      "p95Latency": "P95 Latency",
+      "avgTps": "Avg TPS",
+      "ttftPulse": "TTFT Pulse"
     }
   },
   "usage": {
@@ -125,7 +134,7 @@
     "custom": {
       "start": "Start",
       "end": "End",
-      "apply": "Apply Custom"
+      "apply": "Apply"
     },
     "statsCards": {
       "totalTokens": "Total Tokens",
@@ -192,7 +201,7 @@
     "autoUpdateDesc": "Periodically fetch fresh model lists from providers.",
     "ui": "Experience & UI",
     "theme": "Theme Appearance",
-    "themeDesc": "Switch between dark and light modes.",
+    "themeDesc": "Switch between dark, light and system theme.",
     "themeDark": "Dark",
     "themeLight": "Light",
     "frequency": "Refresh Frequency",
@@ -225,28 +234,8 @@
     "reservedPortTitle": "Port Reserved",
     "reservedPort": "This port is reserved for common database or web services. Please choose another port to avoid conflicts.",
     "restartRequired": "Restart Required",
-    "restartDesc": "Service port updated successfully. To apply these changes, please manually stop the running LLMux process and restart it."
-  },
-  "about": {
-    "established": "Established 2024",
-    "title": "Unified AI Gateway Engine",
-    "desc": "LLMux is a professional-grade multi-account gateway designed for local access to all your favorite LLMs.",
-    "features": {
-      "speed": "Blazing Fast Pulse",
-      "speedDesc": "Zero overhead local proxying. Your models, your speed, no middleman latency.",
-      "privacy": "Privacy First",
-      "privacyDesc": "Local data storage. We never transmit your sensitive keys to any external servers.",
-      "agnostic": "Model Agnostic",
-      "agnosticDesc": "Native support for OpenAI, Anthropic, Gemini, and custom endpoints.",
-      "multi": "Hybrid Multi-Tenancy",
-      "multiDesc": "Switch between multiple accounts and API providers seamlessly."
-    },
-    "tech": "Powered by Modern Engineering",
-    "madeWith": "Made with heart by LLMux Team",
-    "source": "Source Code",
-    "docs": "Documentation",
-    "support": "Support Development",
-    "sponsor": "Sponsor on Aifadian"
+    "restartDesc": "Service port updated successfully. To apply these changes, please manually stop the running LLMux process and restart it.",
+    "themeSystem": "System"
   },
   "accounts": {
     "title": "Account Management",
@@ -261,12 +250,19 @@
     "apiKey": "API Key",
     "baseUrl": "Base URL",
     "noAccounts": "No accounts configured",
+    "noMatch": "No matching accounts",
     "addFirst": "Click the button above to add your first AI provider key.",
     "deleteConfirm": "Are you sure you want to delete account \"{{name}}\"? This action cannot be undone!",
     "deleteWarning": "Warning: This action will erase all traces of this account from the system.",
     "deleteWarningDetail": "Note: If an alias is configured for this account, please delete it manually from the provider console. Once confirmed, all records in the local database will be permanently wiped and cannot be recovered.",
     "keyEncrypted": "Your keys are encrypted locally and never leave your device.",
     "offline": "Offline",
+    "filter": {
+      "all": "All",
+      "disabled": "Disabled",
+      "enabled": "Enabled",
+      "searchPlaceholder": "Search accounts..."
+    },
     "leaveBlank": "Leave blank to keep current",
     "optional": "Optional",
     "editAccount": "Edit Account",
@@ -281,13 +277,15 @@
     "anthropicBaseUrl": "Anthropic Base URL",
     "anthropicBaseUrlPlaceholder": "e.g. https://api.deepseek.com/anthropic",
     "baseUrlHint": "Leave empty to use the default. The gateway converts the request to the target protocol and patches the model name and auth header.",
-    "skipValidation": "Allow if /models is unavailable",
-    "skipValidationHint": "Some third-party APIs don't implement the /models endpoint. When checked: models are fetched if available, but an empty result won't block account creation.",
     "copied": "Copied!",
     "copyScript": "Copy Script",
     "validating": "Validating...",
     "validationFailed": "Validation failed: Could not fetch any models from this account. Please check your API Key and Base URL.",
-    "validationError": "Validation error: {{message}}"
+    "validationError": "Validation error: {{message}}",
+    "defaultProtocol": "Default protocol",
+    "defaultProtocolHint": "Upstream protocol used when a request does not specifiy one.",
+    "needEndpoint": "At least one endpoint must be enabled",
+    "defaultInEnabled": "Default protocol must be one of the enabled endpoints"
   },
   "models": {
     "title": "Model Management",
@@ -300,6 +298,7 @@
     "availableSubtitle": "Live detected models from your enabled accounts.",
     "createAlias": "Create Alias",
     "editAlias": "Edit Alias",
+    "aggregateAlias": "Aggregate alias",
     "customAlias": "Custom Alias",
     "customAliasTitle": "Custom Model Alias",
     "selectAccount": "Select Account",
@@ -355,7 +354,23 @@
     "testAllDesc": "Test all filtered models sequentially in backend",
     "noAccountsConnected": "No accounts connected",
     "apiUnavailable": "API unavailable, use the pencil button above to manually add aliases",
-    "noModelsFound": "No models found in this provider"
+    "noModelsFound": "No models found in this provider",
+    "downstreamMode": "Routing mode",
+    "downstream": {
+      "default": "Passthrough",
+      "chat": "Chat",
+      "responses": "Responses",
+      "messages": "Messages"
+    },
+    "downstreamHint": {
+      "default": "Passthrough: protocol auto-selected per account endpoint; no account filtering.",
+      "chat": "Force OpenAI-compatible chat/completions; only accounts with a chat endpoint.",
+      "responses": "Force Responses API; only accounts with a responses endpoint.",
+      "messages": "Force Anthropic /v1/messages; only accounts with a messages endpoint."
+    },
+    "downstreamHintValidate": "Every candidate is validated when switching modes.",
+    "accountUnsupportedMode": "Account does not support the \"{{mode}}\" routing mode. Pick another account or switch modes.",
+    "downstreamUnsupportedBadge": "unsupported: {{mode}}"
   },
   "auth": {
     "webLogin": "Web Session Login",
@@ -405,5 +420,42 @@
     "selectedModels": "Selected Models",
     "copySuccess": "Copied to clipboard",
     "deleteConfirm": "Are you sure you want to delete key \"{{name}}\"? This cannot be undone, and associated clients will lose access."
+  },
+  "logs": {
+    "title": "Request Logs",
+    "subtitle": "Per-request gateway processing details.",
+    "expandAll": "Expand all",
+    "collapseAll": "Collapse all",
+    "truncated": "(truncated, showing prefix only)",
+    "time": "Time",
+    "model": "Model",
+    "account": "Account",
+    "tokens": "Tokens",
+    "input": "In",
+    "output": "Out",
+    "latency": "Latency",
+    "status": "Status",
+    "error": "Error",
+    "all": "All",
+    "success": "Success",
+    "failed": "Failed",
+    "filterModel": "Model filter",
+    "pageInfo": "Page {{page}} of {{pages}}",
+    "goToPage": "Jump to page",
+    "go": "Go",
+    "empty": "No log entries match the filters.",
+    "loading": "Loading...",
+    "prev": "Prev",
+    "next": "Next",
+    "last24h": "Last 24 hours",
+    "last7d": "Last 7 days",
+    "allTime": "All time",
+    "ttft": "TTFT",
+    "throughput": "Throughput (t/s)",
+    "total": "Total",
+    "stream": "Stream",
+    "nonStream": "Non-stream",
+    "streamOnly": "Stream only",
+    "slowOnly": "Slow queries"
   }
 }
