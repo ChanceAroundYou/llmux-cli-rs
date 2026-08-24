@@ -1,6 +1,6 @@
 use llmux_core::adapters::{
-    build_custom_request, build_openai_request, build_passthrough, Account, ChatMessage,
-    ChatRequest,
+    build_custom_request, build_openai_request, build_passthrough, join_upstream_url, Account,
+    ChatMessage, ChatRequest,
 };
 use llmux_core::protocol::Protocol;
 use llmux_core::dispatcher::{
@@ -116,6 +116,22 @@ fn target_url_construction_handles_v1_suffix() {
     assert_eq!(
         build_anthropic_target_url("https://host/api"),
         "https://host/api/v1/messages"
+    );
+}
+
+#[test]
+fn upstream_url_join_deduplicates_adjacent_v1_segments() {
+    assert_eq!(
+        join_upstream_url("https://host/v1/v1/", "v1/messages"),
+        "https://host/v1/messages"
+    );
+    assert_eq!(
+        join_upstream_url("https://host/api/v1", "v1/messages"),
+        "https://host/api/v1/messages"
+    );
+    assert_eq!(
+        join_upstream_url("https://host/api/v1?region=cn", "responses"),
+        "https://host/api/v1/responses?region=cn"
     );
 }
 
