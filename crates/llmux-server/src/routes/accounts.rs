@@ -5,20 +5,20 @@ use axum::{Extension, Json};
 use llmux_core::adapters::Account;
 use llmux_core::crypto::encrypt_api_key;
 use llmux_core::dispatcher::resolve_provider_type;
-use llmux_core::models::AccountPublic;
 use serde_json::{json, Value};
 
 use crate::app::AppState;
 use crate::routes::models::fetch_provider_models;
 
 pub async fn list_accounts(Extension(state): Extension<AppState>) -> Response {
-    let accounts = match sqlx::query_as::<_, AccountPublic>(
-        "SELECT id, alias, provider_id, api_key, base_url, anthropic_base_url, CAST(is_active AS INTEGER) as is_active, weight, notes, openai_compatible, created_at, chat_endpoint, responses_endpoint, messages_endpoint, default_protocol FROM accounts ORDER BY id DESC",
+    // Lazy decrypt: list never returns api_key (eye fetches /:id/key on demand).
+    let rows = match sqlx::query(
+        "SELECT id, alias, provider_id, base_url, anthropic_base_url, is_active, weight, notes, openai_compatible, created_at, chat_endpoint, responses_endpoint, messages_endpoint, default_protocol FROM accounts ORDER BY id DESC",
     )
     .fetch_all(&state.pool)
     .await
     {
-        Ok(a) => a,
+        Ok(r) => r,
         Err(e) => {
             return crate::error::simple_error(
                 format!("Failed to list accounts: {e}"),
@@ -26,17 +26,64 @@ pub async fn list_accounts(Extension(state): Extension<AppState>) -> Response {
             )
         }
     };
-    let accounts: Vec<AccountPublic> = accounts
-        .into_iter()
-        .map(|mut a| {
-            // UI key-reveal toggle: decrypt in place; on failure keep None.
-            if let Some(enc) = a.api_key.take() {
-                a.api_key = llmux_core::crypto::decrypt_api_key(&enc, &state.master_key).ok();
-            }
-            a
+    use sqlx::Row as _;
+    let out: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            json!({
+                "id": r.try_get::<i64, _>("id").unwrap_or_default(),
+                "alias": r.try_get::<String, _>("alias").unwrap_or_default(),
+                "provider_id": r.try_get::<String, _>("provider_id").unwrap_or_default(),
+                "api_key": Value::Null,
+                "base_url": r.try_get::<Option<String>, _>("base_url").unwrap_or_default(),
+                "anthropic_base_url": r.try_get::<Option<String>, _>("anthropic_base_url").unwrap_or_default(),
+                "is_active": r.try_get::<i64, _>("is_active").unwrap_or(0),
+                "weight": r.try_get::<i64, _>("weight").unwrap_or(1),
+                "notes": r.try_get::<Option<String>, _>("notes").unwrap_or_default(),
+                "openai_compatible": r.try_get::<Option<i64>, _>("openai_compatible").unwrap_or_default(),
+                "created_at": r.try_get::<Option<String>, _>("created_at").unwrap_or_default(),
+                "chat_endpoint": r.try_get::<Option<String>, _>("chat_endpoint").unwrap_or_default(),
+                "responses_endpoint": r.try_get::<Option<String>, _>("responses_endpoint").unwrap_or_default(),
+                "messages_endpoint": r.try_get::<Option<String>, _>("messages_endpoint").unwrap_or_default(),
+                "default_protocol": r.try_get::<Option<String>, _>("default_protocol").unwrap_or_default(),
+            })
         })
         .collect();
-    Json(serde_json::to_value(accounts).unwrap_or(Value::Array(vec![]))).into_response()
+    Json(Value::Array(out)).into_response()
+}
+
+pub async fn get_account_key(
+    Extension(state): Extension<AppState>,
+    Path(id): Path<i64>,
+) -> Response {
+    let row = match sqlx::query("SELECT api_key FROM accounts WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&state.pool)
+        .await
+    {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return crate::error::simple_error(
+                format!("Account with id {id} not found"),
+                StatusCode::NOT_FOUND,
+            )
+        }
+        Err(e) => {
+            return crate::error::simple_error(
+                format!("Failed to lookup account: {e}"),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            )
+        }
+    };
+    use sqlx::Row as _;
+    let enc: String = row.try_get("api_key").unwrap_or_default();
+    match llmux_core::crypto::decrypt_api_key(&enc, &state.master_key) {
+        Ok(k) => Json(json!({ "key": k })).into_response(),
+        Err(e) => crate::error::simple_error(
+            format!("Failed to decrypt API key: {e}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
 }
 
 pub async fn create_account(
