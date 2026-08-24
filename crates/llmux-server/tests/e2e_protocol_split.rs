@@ -20,8 +20,8 @@
 //!
 //! Run with: `bash scripts/e2e_protocol_split.sh`  (which invokes this test).
 
-use axum::body::{to_bytes, Body};
-use axum::http::{header, Method, Request, StatusCode};
+use axum::response::IntoResponse;
+use axum::{body::{to_bytes, Body}, http::{header, Method, Request, StatusCode}};
 use serde_json::{json, Value};
 
 // --- mock upstreams -----------------------------------------------------------
@@ -74,8 +74,18 @@ async fn spawn_mock_upstreams() -> (String, String) {
     let listener_a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr_a = listener_a.local_addr().unwrap();
     let router_a = axum::Router::new()
-        .route("/chat/completions", axum::routing::post(|| async {
-            axum::Json(chat_completion_body("A-chat"))
+        .route("/chat/completions", axum::routing::post(|axum::Json(body): axum::Json<Value>| async move {
+            if body["stream"].as_bool() == Some(true) {
+                return axum::response::Response::builder()
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .body(Body::from(concat!(
+                        "data: {\"id\":\"mock_cmpl_1\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"A-chat-stream\"},\"finish_reason\":null}]}\n\n",
+                        "data: {\"id\":\"mock_cmpl_1\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":22}}\n\n",
+                        "data: [DONE]\n\n",
+                    )))
+                    .unwrap();
+            }
+            axum::Json(chat_completion_body("A-chat")).into_response()
         }))
         .route("/responses", axum::routing::post(|| async {
             axum::Json(responses_body("A-resp"))
@@ -238,11 +248,12 @@ async fn e2e_protocol_split_passthrough_and_fallback() {
     assert_eq!(create_status, StatusCode::OK, "{create_body:?}");
     let acct_id = create_body["id"].as_i64().expect("account id");
 
-    // Step 2: three aliases — default / forced-chat / forced-responses.
+    // Step 2: four aliases — default / forced-chat / forced-responses / forced-messages.
     for (alias, upstream_api) in [
         ("of-default", "default"),
         ("of-chat", "chat"),
         ("of-resp", "responses"),
+        ("of-msg", "messages"),
     ] {
         let (st, body) = api_post(
             app.clone(),
@@ -273,7 +284,7 @@ async fn e2e_protocol_split_passthrough_and_fallback() {
         _ => json!({"model": "", "messages": [{"role": "user", "content": "hi"}]}),
     };
 
-    for alias in ["of-default", "of-chat", "of-resp"] {
+    for alias in ["of-default", "of-chat", "of-resp", "of-msg"] {
         for (path, ingress) in ingresses {
             let mut body = mk_body(ingress);
             body["model"] = json!(alias);
@@ -289,6 +300,9 @@ async fn e2e_protocol_split_passthrough_and_fallback() {
                 ("of-chat", _) => "A-chat",
                 // Forced responses: always the responses endpoint (mock B).
                 ("of-resp", _) => "B-resp",
+                // Forced messages: always the messages endpoint (mock A), with
+                // back-conversion for chat/responses ingresses.
+                ("of-msg", _) => "A-msg",
                 _ => unreachable!(),
             };
             assert_eq!(
@@ -306,6 +320,34 @@ async fn e2e_protocol_split_passthrough_and_fallback() {
             );
         }
     }
+
+    // A Messages ingress forced to Chat must transform the upstream OpenAI SSE
+    // into Anthropic SSE; passing the raw OpenAI chunks makes Anthropic clients
+    // receive no usable content.
+    let (stream_status, _stream_value, stream_raw) = v1_post(
+        app.clone(),
+        "sk-test",
+        "/v1/messages",
+        json!({
+            "model": "of-chat",
+            "stream": true,
+            "max_tokens": 32,
+            "messages": [{"role": "user", "content": "hi"}],
+        }),
+    )
+    .await;
+    assert_eq!(stream_status, StatusCode::OK, "{stream_raw}");
+    assert!(
+        stream_raw.contains("event: message_start")
+            && stream_raw.contains("event: content_block_delta")
+            && stream_raw.contains("A-chat-stream")
+            && stream_raw.contains("event: message_stop"),
+        "Messages→Chat stream must be Anthropic SSE, got:\n{stream_raw}"
+    );
+    assert!(
+        !stream_raw.contains("\"choices\""),
+        "Messages→Chat stream leaked OpenAI SSE: {stream_raw}"
+    );
 
     // Step 4: clear responses_endpoint (+ legacy URLs) → bulk fallback must
     // retarget of-resp to default; responses ingress then lands on chat (A).
@@ -372,4 +414,234 @@ fn path_ingress_path(ingress: &str) -> &'static str {
         "responses" => "/v1/responses",
         _ => "/v1/messages",
     }
+}
+
+/// Aggregate alias with upstream_api=responses: a Messages-ingress request must
+/// travel anthropic→responses (mock B) and come back responses→anthropic
+/// (previously dispatch_aggregate_anthropic_via_responses was a placeholder that
+/// delegated to the plain aggregate path and POSTed /v1/messages instead).
+#[tokio::test]
+async fn e2e_aggregate_messages_ingress_responses_upstream() {
+    let (upstream_a, upstream_b) = spawn_mock_upstreams().await;
+
+    let state = llmux_server::test_state().await;
+    let app = llmux_server::app(state.clone());
+
+    sqlx::query("INSERT INTO api_keys (name, key, allowed_models) VALUES (?, ?, ?)")
+        .bind("e2e-agg")
+        .bind("sk-agg")
+        .bind("*")
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+    let cookie = login(app.clone()).await;
+
+    let (create_status, create_body) = api_post(
+        app.clone(),
+        &cookie,
+        "/api/accounts",
+        json!({
+            "alias": "mockagg",
+            "provider_id": "openai",
+            "api_key": "sk-mock",
+            "base_url": upstream_a,
+            "chat_endpoint": upstream_a,
+            "responses_endpoint": upstream_b,
+            "messages_endpoint": upstream_a,
+            "anthropic_base_url": upstream_a,
+            "default_protocol": "chat",
+        }),
+    )
+    .await;
+    assert_eq!(create_status, StatusCode::OK, "{create_body:?}");
+    let acct_id = create_body["id"].as_i64().expect("account id");
+
+    let (st, body) = api_post(
+        app.clone(),
+        &cookie,
+        "/api/aggregate-aliases",
+        json!({
+            "alias": "agg-resp",
+            "candidates": [{"account_id": acct_id, "model": "gpt-4o"}],
+            "upstream_api": "responses",
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body:?}");
+
+    // Non-streaming: messages ingress → responses upstream (mock B) → anthropic.
+    let (st, resp, raw) = v1_post(
+        app.clone(),
+        "sk-agg",
+        "/v1/messages",
+        json!({
+            "model": "agg-resp",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "expected 200, got {st:?}\nraw={raw}");
+    assert!(
+        usage_nonzero(&resp),
+        "usage must be non-zero, got {resp:?}"
+    );
+    assert!(
+        raw.contains("B-resp"),
+        "expected responses-upstream marker B-resp, got: {raw}"
+    );
+}
+
+/// Forced modes must NOT reject unsupported accounts on save anymore (2026-08):
+/// the UI warns per candidate and the runtime skips them. A forced-chat alias
+/// bound to an account WITHOUT a chat endpoint must save (200) and skip that
+/// account at dispatch time (502 with an explicit guard message) instead of
+/// hitting build_passthrough's api.openai.com fallback URL.
+#[tokio::test]
+async fn e2e_forced_mode_unsupported_account_saves_and_skips() {
+    let (upstream_a, upstream_b) = spawn_mock_upstreams().await;
+
+    let state = llmux_server::test_state().await;
+    let app = llmux_server::app(state.clone());
+
+    sqlx::query("INSERT INTO api_keys (name, key, allowed_models) VALUES (?, ?, ?)")
+        .bind("e2e-unsup")
+        .bind("sk-unsup")
+        .bind("*")
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    let cookie = login(app.clone()).await;
+
+    // Account with messages+responses endpoints but NO chat endpoint and NO
+    // legacy base_url (Chat would otherwise fall back to base_url and appear
+    // supported).
+    let (create_status, create_body) = api_post(
+        app.clone(),
+        &cookie,
+        "/api/accounts",
+        json!({
+            "alias": "nofit",
+            "provider_id": "openai",
+            "api_key": "sk-mock",
+            "messages_endpoint": upstream_a,
+            "responses_endpoint": upstream_b,
+            "default_protocol": "messages",
+        }),
+    )
+    .await;
+    assert_eq!(create_status, StatusCode::OK, "{create_body:?}");
+    let acct_id = create_body["id"].as_i64().expect("account id");
+
+    // Save must succeed — no more 409 alias_protocol_unsupported.
+    let (st, body) = api_post(
+        app.clone(),
+        &cookie,
+        "/api/models/aliases",
+        json!({
+            "alias": "forced-chat2",
+            "target_model": "gpt-4o",
+            "account_ids": [acct_id],
+            "upstream_api": "chat",
+            "provider_id": "openai",
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "forced-mode save must pass, got {st:?} {body:?}");
+
+    // Dispatch must skip the unsupported account and fail with the guard error.
+    let (st, _resp, raw) = v1_post(
+        app.clone(),
+        "sk-unsup",
+        "/v1/chat/completions",
+        json!({
+            "model": "forced-chat2",
+            "messages": [{"role": "user", "content": "hi"}],
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_GATEWAY, "expected 502, got {st:?}\nraw={raw}");
+    assert!(
+        raw.contains("does not support"),
+        "expected skip guard message, got: {raw}"
+    );
+    assert!(
+        !raw.contains("api.openai.com"),
+        "must not hit the fallback URL, got: {raw}"
+    );
+}
+
+/// Aggregate alias with upstream_api=chat: a Messages-ingress request must be
+/// converted to the Chat upstream even when the bound account HAS a messages
+/// endpoint (forced mode overrides per-account endpoint auto-selection).
+#[tokio::test]
+async fn e2e_aggregate_chat_mode_forces_chat_over_messages_endpoint() {
+    let (upstream_a, upstream_b) = spawn_mock_upstreams().await;
+
+    let state = llmux_server::test_state().await;
+    let app = llmux_server::app(state.clone());
+
+    sqlx::query("INSERT INTO api_keys (name, key, allowed_models) VALUES (?, ?, ?)")
+        .bind("e2e-aggchat")
+        .bind("sk-aggchat")
+        .bind("*")
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    let cookie = login(app.clone()).await;
+
+    // Account with BOTH chat+messages endpoints (messages endpoint on A).
+    let (create_status, create_body) = api_post(
+        app.clone(),
+        &cookie,
+        "/api/accounts",
+        json!({
+            "alias": "mockboth",
+            "provider_id": "openai",
+            "api_key": "sk-mock",
+            "base_url": upstream_a,
+            "chat_endpoint": upstream_a,
+            "responses_endpoint": upstream_b,
+            "messages_endpoint": upstream_a,
+            "anthropic_base_url": upstream_a,
+            "default_protocol": "chat",
+        }),
+    )
+    .await;
+    assert_eq!(create_status, StatusCode::OK, "{create_body:?}");
+    let acct_id = create_body["id"].as_i64().expect("account id");
+
+    let (st, body) = api_post(
+        app.clone(),
+        &cookie,
+        "/api/aggregate-aliases",
+        json!({
+            "alias": "agg-chat",
+            "candidates": [{"account_id": acct_id, "model": "gpt-4o"}],
+            "upstream_api": "chat",
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body:?}");
+
+    // Messages ingress under forced Chat must land on the chat upstream (A-chat),
+    // NOT the messages endpoint (A-msg) — regression guard for the go-series
+    // endpoints + chat-mode combination.
+    let (st, _resp, raw) = v1_post(
+        app.clone(),
+        "sk-aggchat",
+        "/v1/messages",
+        json!({
+            "model": "agg-chat",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "expected 200, got {st:?}\nraw={raw}");
+    assert!(
+        raw.contains("A-chat"),
+        "forced chat must hit the chat upstream, got: {raw}"
+    );
 }

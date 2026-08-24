@@ -56,6 +56,20 @@ fn default_mode_falls_back_to_default_protocol() {
 }
 
 #[test]
+fn base_url_only_account_is_chat_only() {
+    // Accounts backed by an OpenAI-compatible base_url (no explicit Anthropic
+    // endpoint) must NOT be treated as messages-capable: their /v1/messages
+    // route typically doesn't exist. messages ingress converts to chat instead.
+    let mut a = acc(Some("https://a/v1"), None, None, "chat");
+    a.base_url = Some("https://a/v1".into());
+    a.anthropic_base_url = Some(String::new());
+    assert_eq!(
+        target_protocol(Protocol::Messages, DownstreamMode::Default, &a),
+        Protocol::Chat
+    );
+}
+
+#[test]
 fn forced_mode_always_targets_forced() {
     let a = acc(Some("https://a/v1"), Some("https://a/v1"), None, "chat");
     assert_eq!(

@@ -270,6 +270,82 @@ async fn unknown_api_routes_return_gateway_not_found_error_without_spa_fallback(
 }
 
 #[tokio::test]
+async fn stats_logs_accepts_numeric_success_flag() {
+    // The UI sends success=0/1 — serde bool would reject these with 400.
+    for flag in ["0", "1"] {
+        let (status, body) = request_json(
+            Method::GET,
+            &format!("/api/stats/logs?limit=50&offset=0&start=0&success={flag}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "success={flag}: {body}");
+        assert!(body["logs"].is_array(), "success={flag}: {body}");
+        assert!(body["total"].is_i64() || body["total"].is_u64(), "success={flag}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn activity_detail_returns_captured_bodies_and_404() {
+    use http::header;
+    // Missing id → 404
+    let (status, body) = request_json(Method::GET, "/api/activity/99999", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"], "Activity not found");
+
+    // Insert a row carrying captured request/response bodies (RETURNING avoids
+    // cross-connection last_insert_rowid issues in the pool).
+    let state = llmux_server::test_state().await;
+    let app = llmux_server::app(state.clone());
+    let id: i64 = sqlx::query_scalar(
+        "INSERT INTO usage_logs (timestamp, account_id, provider_id, model, input_tokens, output_tokens, latency_ms, success, error_message, request_body, response_body, is_test) \
+         VALUES (?, NULL, ?, ?, ?, ?, ?, ?, NULL, ?, ?, 0) RETURNING id",
+    )
+    .bind(1_700_000_000_000i64)
+    .bind("openai")
+    .bind("gpt-4o")
+    .bind(10i64)
+    .bind(5i64)
+    .bind(123i64)
+    .bind(1i64)
+    .bind(r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#)
+    .bind(r#"{"choices":[{"message":{"content":"hello"}}]}"#)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap();
+
+    let login_req = Request::builder()
+        .method(Method::POST)
+        .uri("/api/auth/login")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::json!({"username":"xiaokubao","password":"Xkb111717!"}).to_string(),
+        ))
+        .unwrap();
+    let login_resp = llmux_server::test_request(app.clone(), login_req).await;
+    let cookie = extract_session_cookie(&login_resp).expect("session cookie");
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(format!("/api/activity/{id}"))
+        .header(header::COOKIE, cookie)
+        .body(Body::empty())
+        .unwrap();
+    let resp = llmux_server::test_request(app, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["id"].as_i64(), Some(id));
+    assert_eq!(body["model"], "gpt-4o");
+    assert_eq!(body["success"], 1);
+    assert_eq!(
+        body["request_body"],
+        r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#
+    );
+    assert_eq!(body["response_body"], r#"{"choices":[{"message":{"content":"hello"}}]}"#);
+}
+
+#[tokio::test]
 async fn root_ui_and_non_api_paths_use_spa_fallback() {
     for path in ["/", "/ui", "/ui/", "/dashboard/settings"] {
         let (status, text, content_type) = request_text(Method::GET, path).await;
@@ -365,7 +441,9 @@ async fn server_rejects_alias_forced_protocol_unsupported_by_bound_account() {
     assert_eq!(create_status, StatusCode::OK, "{:?}", create_body);
     let acct_id = create_body["id"].as_i64().expect("account id");
 
-    // Binding an alias that forces responses to a chat-only account must be rejected
+    // Binding an alias that forces responses to a chat-only account used to be
+    // rejected with 409. Since 2026-08 forced modes no longer reject unsupported
+    // accounts (UI warns per account; runtime skips them) — save must succeed.
     let (status, body) = post(
         app.clone(),
         &cookie,
@@ -378,13 +456,70 @@ async fn server_rejects_alias_forced_protocol_unsupported_by_bound_account() {
         }),
     )
     .await;
-    assert_eq!(status, StatusCode::CONFLICT, "expected 409, got {:?}", body);
-    assert_eq!(body["code"], json!("alias_protocol_unsupported"));
-    assert_eq!(body["field"], json!("downstream_mode"));
-    let unsupported = body["unsupportedAccounts"]
+    assert_eq!(status, StatusCode::OK, "forced-mode save must pass, got {:?}", body);
+}
+
+#[tokio::test]
+async fn account_create_syncs_chat_endpoint_into_base_url() {
+    use http::header;
+    let state = llmux_server::test_state().await;
+    let app = llmux_server::app(state.clone());
+
+    // Login once to get a session cookie for /api/* routes
+    let login_req = Request::builder()
+        .method(Method::POST)
+        .uri("/api/auth/login")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::json!({"username":"xiaokubao","password":"Xkb111717!"}).to_string(),
+        ))
+        .unwrap();
+    let login_resp = llmux_server::test_request(app.clone(), login_req).await;
+    let cookie = extract_session_cookie(&login_resp).expect("session cookie");
+
+    // Create an account with chat_endpoint only (the UI's single endpoint field).
+    let create_req = Request::builder()
+        .method(Method::POST)
+        .uri("/api/accounts")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::COOKIE, &cookie)
+        .body(Body::from(
+            json!({
+                "alias": "ep-sync",
+                "provider_id": "custom",
+                "api_key": "sk-test-ep-sync",
+                "chat_endpoint": "http://127.0.0.1:9/v1",
+                "default_protocol": "chat",
+                "skip_validation": true,
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let create_resp = llmux_server::test_request(app.clone(), create_req).await;
+    assert_eq!(create_resp.status(), StatusCode::OK);
+
+    // Read the account back: base_url must mirror chat_endpoint (0012 unification).
+    let list_req = Request::builder()
+        .method(Method::GET)
+        .uri("/api/accounts")
+        .header(header::COOKIE, &cookie)
+        .body(Body::empty())
+        .unwrap();
+    let list_resp = llmux_server::test_request(app.clone(), list_req).await;
+    let bytes = axum::body::to_bytes(list_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let accounts: Value = serde_json::from_slice(&bytes).unwrap();
+    let acct = accounts
         .as_array()
-        .expect("unsupportedAccounts array");
-    assert!(unsupported.contains(&json!(acct_id)), "{:?}", body);
+        .and_then(|a| a.iter().find(|a| a["alias"] == "ep-sync"))
+        .expect("account ep-sync must exist");
+    assert_eq!(
+        acct["base_url"], "http://127.0.0.1:9/v1",
+        "base_url must mirror chat_endpoint, got {:?}",
+        acct["base_url"]
+    );
+    assert_eq!(acct["chat_endpoint"], "http://127.0.0.1:9/v1");
 }
 
 

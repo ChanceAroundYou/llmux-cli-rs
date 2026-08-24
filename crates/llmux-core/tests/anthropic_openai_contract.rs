@@ -425,6 +425,10 @@ fn cache_usage_recognizes_multiple_spellings() {
         (30, 20)
     );
     assert_eq!(
+        cache_usage_from_openai(&json!({"input_tokens": 1000, "input_tokens_details": {"cached_tokens": 800}})),
+        (800, 200)
+    );
+    assert_eq!(
         cache_usage_from_openai(&json!({"cached_tokens": 9})),
         (9, 0)
     );
@@ -549,6 +553,25 @@ fn sse_state_machine_text_only_no_thinking() {
     let delta = text.iter().find(|s| s.starts_with("event: message_delta")).unwrap();
     assert!(delta.contains("\"stop_reason\":\"end_turn\""));
     assert_eq!(text.last().unwrap().trim().starts_with("event: message_stop"), true);
+}
+
+#[test]
+fn sse_state_machine_emits_anthropic_error_for_unknown_finish_reason() {
+    let mut conv = OpenAISseConverter::new("m");
+    let mut all = conv.feed(&json!({
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "network_error"}]
+    }));
+    all.extend(conv.finish());
+
+    let text: Vec<&str> = all.iter().map(|s| s.as_str()).collect();
+    assert!(
+        text.iter().any(|s| s.starts_with("event: error") && s.contains("\"type\":\"api_error\"")),
+        "unknown upstream finish reason must become an Anthropic error: {text:?}"
+    );
+    assert!(
+        text.iter().all(|s| !s.contains("\"stop_reason\":\"network_error\"")),
+        "vendor finish reason must not leak into Anthropic SSE: {text:?}"
+    );
 }
 
 #[test]
