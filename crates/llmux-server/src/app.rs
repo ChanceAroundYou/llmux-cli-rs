@@ -261,10 +261,12 @@ fn core_router() -> AppRouter {
             "/api/accounts/:id",
             put(accounts::update_account).delete(accounts::delete_account),
         )
+        .route("/api/accounts/:id/key", get(accounts::get_account_key))
         .route(
             "/api/accounts/:id/export",
             get(accounts::export_account_usage),
         )
+        .route("/api/models/summary", get(models::get_models_summary))
         .route("/api/models/available", get(models::get_available_models))
         .route("/api/models/available/stream", get(models::stream_available_models))
         .route(
