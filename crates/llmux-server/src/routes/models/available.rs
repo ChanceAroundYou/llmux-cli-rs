@@ -361,13 +361,19 @@ pub async fn fetch_provider_models(
         Err(e) => return (vec![], Some(format!("Failed to create HTTP client: {e}"))),
     };
 
+    // base_url is the single endpoint source (0012 unification; accounts store
+    // their base there). Guard against bare hostnames ("openrouter") which
+    // would make reqwest fail with a Builder error.
+    let base_from = |b: Option<&String>| -> Option<String> {
+        b.filter(|s| !s.trim().is_empty())
+            .map(|s| crate::routes::v1::helpers::normalize_base_url(s))
+    };
+
     let (url, headers): (String, std::collections::BTreeMap<String, String>) = match provider_type
     {
         "openai" => {
-            let base = account
-                .base_url
-                .as_deref()
-                .unwrap_or("https://api.openai.com/v1");
+            let base = base_from(account.base_url.as_ref())
+                .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
             let url = format!("{}/models", base.trim_end_matches('/'));
             let mut headers = std::collections::BTreeMap::new();
             headers.insert(
@@ -377,10 +383,10 @@ pub async fn fetch_provider_models(
             (url, headers)
         }
         "anthropic" => {
-            let base = account
-                .base_url
-                .as_deref()
-                .unwrap_or("https://api.anthropic.com/v1");
+            let base = base_from(account.base_url.as_ref())
+                .or_else(|| base_from(account.anthropic_base_url.as_ref()))
+                .or_else(|| base_from(account.messages_endpoint.as_ref()))
+                .unwrap_or_else(|| "https://api.anthropic.com/v1".to_string());
             let url = format!("{}/models", base.trim_end_matches('/'));
             let mut headers = std::collections::BTreeMap::new();
             headers.insert("x-api-key".to_string(), account.api_key.clone());
@@ -398,10 +404,8 @@ pub async fn fetch_provider_models(
         }
         _ => {
             // Custom / OpenAI-compatible
-            let base = account
-                .base_url
-                .as_deref()
-                .unwrap_or("https://api.openai.com/v1");
+            let base = base_from(account.base_url.as_ref())
+                .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
             let url = format!("{}/models", base.trim_end_matches('/'));
             let mut headers = std::collections::BTreeMap::new();
             headers.insert(
