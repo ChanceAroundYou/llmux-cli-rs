@@ -10,6 +10,8 @@ use llmux_core::crypto::decrypt_api_key;
 use llmux_core::dispatcher::{get_active_accounts, resolve_model, resolve_provider_type, ModelResolution};
 use llmux_core::proxy::build_anthropic_target_url;
 
+use crate::routes::v1::helpers::normalize_base_url;
+
 use crate::app::AppState;
 
 pub async fn get_test_queue_status(Extension(state): Extension<AppState>) -> Response {
@@ -67,7 +69,7 @@ pub async fn start_test_queue(
             // 若前端已指定 accountId，直接定向到该账户，避免同名模型串到 provider 的首账户
             let targeted_accounts: Option<Vec<llmux_core::adapters::Account>> = if let Some(acc_id) = account_id_override {
                 match sqlx::query(
-                    "SELECT id, alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight, openai_compatible FROM accounts WHERE id = ? AND is_active = 1",
+                    "SELECT id, alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight, openai_compatible, chat_endpoint, responses_endpoint, messages_endpoint, default_protocol FROM accounts WHERE id = ? AND is_active = 1",
                 )
                 .bind(acc_id)
                 .fetch_optional(&pool)
@@ -230,8 +232,10 @@ pub async fn start_test_queue(
                                         .base_url
                                         .as_deref()
                                         .unwrap_or("https://api.openai.com/v1");
-                                    let url =
-                                        format!("{}/chat/completions", base.trim_end_matches('/'));
+                                    let url = format!(
+                                        "{}/chat/completions",
+                                        normalize_base_url(base).trim_end_matches('/')
+                                    );
                                     let mut headers = std::collections::BTreeMap::new();
                                     headers.insert(
                                         "authorization".to_string(),
@@ -351,7 +355,7 @@ pub async fn test_model(
     let accounts = if let Some(acc_id) = account_id_override {
         // Directly fetch the specified account
         match sqlx::query(
-            "SELECT id, alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight \
+            "SELECT id, alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight, openai_compatible, chat_endpoint, responses_endpoint, messages_endpoint, default_protocol \
              FROM accounts WHERE id = ? AND is_active = 1",
         )
         .bind(acc_id)
@@ -492,7 +496,10 @@ pub async fn test_model(
                     .base_url
                     .as_deref()
                     .unwrap_or("https://api.openai.com/v1");
-                let url = format!("{}/chat/completions", base.trim_end_matches('/'));
+                let url = format!(
+                    "{}/chat/completions",
+                    normalize_base_url(base).trim_end_matches('/')
+                );
                 let mut headers = std::collections::BTreeMap::new();
                 headers.insert(
                     "authorization".to_string(),

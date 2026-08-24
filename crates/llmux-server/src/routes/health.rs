@@ -7,11 +7,23 @@ use sqlx::Row;
 use crate::app::AppState;
 
 pub async fn get_health_status(Extension(state): Extension<AppState>) -> Response {
-    let accounts = match sqlx::query("SELECT id, alias FROM accounts ORDER BY id")
-        .fetch_all(&state.pool)
-        .await
+    // Single GROUP BY — was N serial queries (one per account).
+    let rows = match sqlx::query(
+        "SELECT a.id, a.alias, \
+                COALESCE(s.total, 0) AS total, \
+                COALESCE(s.success, 0) AS success \
+         FROM accounts a \
+         LEFT JOIN ( \
+           SELECT account_id, COUNT(*) AS total, \
+                  SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) AS success \
+           FROM usage_logs GROUP BY account_id \
+         ) s ON s.account_id = a.id \
+         ORDER BY a.id",
+    )
+    .fetch_all(&state.pool)
+    .await
     {
-        Ok(rows) => rows,
+        Ok(r) => r,
         Err(e) => {
             return crate::error::simple_error(
                 format!("Failed to query accounts: {e}"),
@@ -20,64 +32,36 @@ pub async fn get_health_status(Extension(state): Extension<AppState>) -> Respons
         }
     };
 
-    tracing::info!("💚 Starting health check for {} accounts...", accounts.len());
+    tracing::info!("💚 Health check for {} accounts (single query)", rows.len());
 
-    let mut health_data: Vec<Value> = Vec::new();
-
-    for account in &accounts {
-        let acc_id: i64 = account.try_get("id").unwrap_or_default();
-        let alias: String = account.try_get("alias").unwrap_or_default();
-
-        // Query the last 50 usage logs for this account
-        let stats = sqlx::query(
-            "SELECT COUNT(*) as total,
-                    SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) as success
-             FROM usage_logs
-             WHERE account_id = ?
-             ORDER BY timestamp DESC
-             LIMIT 50",
-        )
-        .bind(acc_id)
-        .fetch_optional(&state.pool)
-        .await;
-
-        let (total, success_count) = match stats {
-            Ok(Some(row)) => {
-                let t: i64 = row.try_get("total").unwrap_or_default();
-                let s: i64 = row.try_get("success").unwrap_or_default();
-                (t, s)
-            }
-            _ => (0, 0),
-        };
-
-        let status = if total > 0 {
-            let rate = success_count as f64 / total as f64;
-            if rate > 0.9 {
-                "healthy"
-            } else if rate > 0.5 {
-                "degraded"
+    let health_data: Vec<Value> = rows
+        .iter()
+        .map(|row| {
+            let acc_id: i64 = row.try_get("id").unwrap_or_default();
+            let alias: String = row.try_get("alias").unwrap_or_default();
+            let total: i64 = row.try_get("total").unwrap_or_default();
+            let success_count: i64 = row.try_get("success").unwrap_or_default();
+            let status = if total > 0 {
+                let rate = success_count as f64 / total as f64;
+                if rate > 0.9 {
+                    "healthy"
+                } else if rate > 0.5 {
+                    "degraded"
+                } else {
+                    "down"
+                }
             } else {
-                "down"
-            }
-        } else {
-            "unknown"
-        };
-
-        tracing::info!(
-            "💚 Account {} ({}): {}",
-            acc_id,
-            alias,
-            status.to_uppercase()
-        );
-
-        health_data.push(json!({
-            "id": format!("acc_{acc_id}"),
-            "name": alias,
-            "status": status,
-            "lastSuccess": success_count,
-            "totalChecks": total,
-        }));
-    }
+                "unknown"
+            };
+            json!({
+                "id": format!("acc_{acc_id}"),
+                "name": alias,
+                "status": status,
+                "lastSuccess": success_count,
+                "totalChecks": total,
+            })
+        })
+        .collect();
 
     Json(Value::Array(health_data)).into_response()
 }

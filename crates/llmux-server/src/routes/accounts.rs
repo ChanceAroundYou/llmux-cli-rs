@@ -12,19 +12,31 @@ use crate::app::AppState;
 use crate::routes::models::fetch_provider_models;
 
 pub async fn list_accounts(Extension(state): Extension<AppState>) -> Response {
-    match sqlx::query_as::<_, AccountPublic>(
-        "SELECT id, alias, provider_id, base_url, anthropic_base_url, CAST(is_active AS INTEGER) as is_active, weight, notes, openai_compatible, created_at, chat_endpoint, responses_endpoint, messages_endpoint, default_protocol FROM accounts ORDER BY id DESC",
+    let accounts = match sqlx::query_as::<_, AccountPublic>(
+        "SELECT id, alias, provider_id, api_key, base_url, anthropic_base_url, CAST(is_active AS INTEGER) as is_active, weight, notes, openai_compatible, created_at, chat_endpoint, responses_endpoint, messages_endpoint, default_protocol FROM accounts ORDER BY id DESC",
     )
     .fetch_all(&state.pool)
     .await
     {
-        Ok(accounts) => Json(serde_json::to_value(accounts).unwrap_or(Value::Array(vec![])))
-            .into_response(),
-        Err(e) => crate::error::simple_error(
-            format!("Failed to list accounts: {e}"),
-            StatusCode::INTERNAL_SERVER_ERROR,
-        ),
-    }
+        Ok(a) => a,
+        Err(e) => {
+            return crate::error::simple_error(
+                format!("Failed to list accounts: {e}"),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            )
+        }
+    };
+    let accounts: Vec<AccountPublic> = accounts
+        .into_iter()
+        .map(|mut a| {
+            // UI key-reveal toggle: decrypt in place; on failure keep None.
+            if let Some(enc) = a.api_key.take() {
+                a.api_key = llmux_core::crypto::decrypt_api_key(&enc, &state.master_key).ok();
+            }
+            a
+        })
+        .collect();
+    Json(serde_json::to_value(accounts).unwrap_or(Value::Array(vec![]))).into_response()
 }
 
 pub async fn create_account(
@@ -44,13 +56,15 @@ pub async fn create_account(
     let alias = body["alias"].as_str().unwrap_or_default().to_string();
     let provider_id = body["provider_id"].as_str().unwrap_or_default().to_string();
     let api_key_plain = body["api_key"].as_str().unwrap_or_default().to_string();
-    let base_url = body["base_url"].as_str().map(|s| s.to_string());
+    let mut base_url = body["base_url"].as_str().map(|s| s.to_string());
     let anthropic_base_url = body["anthropic_base_url"].as_str().map(|s| s.to_string());
     let is_active = body["is_active"].as_i64().unwrap_or(1);
     let weight = body["weight"].as_i64().unwrap_or(1);
     let notes = body["notes"].as_str().map(|s| s.to_string());
     let openai_compatible = body["openai_compatible"].as_i64().unwrap_or(0);
-    let skip_validation = body["skip_validation"].as_bool().unwrap_or(false);
+    // UI removed the skip-validation checkbox (2026-08): validation never blocks
+    // creation anymore. Field kept for backwards compatibility with old clients.
+    let skip_validation = body["skip_validation"].as_bool().unwrap_or(true);
 
     if alias.is_empty() || provider_id.is_empty() || api_key_plain.is_empty() {
         return crate::error::simple_error(
@@ -67,6 +81,10 @@ pub async fn create_account(
     // base_url fallback already handled above; keep as-is if body didn't contain chat_endpoint
     if !body.as_object().map(|m| m.contains_key("chat_endpoint")).unwrap_or(false) {
         chat_endpoint = base_url.clone();
+    }
+    // 0012: chat_endpoint is the single write channel; base_url always mirrors it.
+    if let Some(ep) = &chat_endpoint {
+        base_url = Some(ep.clone());
     }
     let responses_endpoint = body
         .get("responses_endpoint")
@@ -248,7 +266,7 @@ pub async fn update_account(
         .unwrap_or(existing.provider_id);
     // Explicit null = clear (consistent with the *_endpoint columns below);
     // missing key = keep existing.
-    let base_url = if body.as_object().map(|m| m.contains_key("base_url")).unwrap_or(false) {
+    let mut base_url = if body.as_object().map(|m| m.contains_key("base_url")).unwrap_or(false) {
         body.get("base_url").and_then(parse_ep)
     } else {
         existing.base_url
@@ -287,6 +305,14 @@ pub async fn update_account(
     } else {
         existing.chat_endpoint.clone()
     };
+    // 0012: chat_endpoint is the single write channel; base_url mirrors it —
+    // unless the client explicitly manages base_url (legacy compat keeps the
+    // explicit value, e.g. clearing it while chat_endpoint stays).
+    if let Some(ep) = &chat_endpoint {
+        if !body.as_object().map(|m| m.contains_key("base_url")).unwrap_or(false) {
+            base_url = Some(ep.clone());
+        }
+    }
     let responses_endpoint = if has_resp_key {
         body.get("responses_endpoint").and_then(parse_ep)
     } else {
@@ -340,7 +366,7 @@ pub async fn update_account(
         .and_then(|v| v.as_str())
         .is_some_and(|s| !s.is_empty() && s != "********");
     let base_url_changed = body.get("base_url").is_some() || has_chat_key || has_msg_key;
-    let skip_validation = body["skip_validation"].as_bool().unwrap_or(false);
+    let skip_validation = body["skip_validation"].as_bool().unwrap_or(true);
 
     let api_key_ciphertext = if api_key_changed {
         let new_key = body["api_key"].as_str().unwrap_or_default();
