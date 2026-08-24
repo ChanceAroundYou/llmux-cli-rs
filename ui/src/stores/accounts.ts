@@ -5,6 +5,7 @@ export interface Account {
   id: number;
   alias: string;
   provider_id: string;
+  api_key?: string | null;
   base_url: string | null;
   is_active: number;
   weight: number;

@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { apiFetch } from "@/lib/api";
+import { applyTheme } from "@/lib/theme";
 
 interface SettingsState {
   config: Record<string, any>;
@@ -25,11 +26,7 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
       // 同步到 localStorage 用于防止闪白
       if (data.theme) {
         localStorage.setItem('llmux-theme', data.theme);
-        if (data.theme === 'dark') {
-          document.documentElement.classList.add('dark');
-        } else {
-          document.documentElement.classList.remove('dark');
-        }
+        applyTheme(data.theme);
       }
     } catch (err) {
       console.error('Failed to fetch settings:', err);
@@ -49,11 +46,7 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
       
       if (newConfig.theme) {
         localStorage.setItem('llmux-theme', newConfig.theme);
-        if (newConfig.theme === 'dark') {
-          document.documentElement.classList.add('dark');
-        } else {
-          document.documentElement.classList.remove('dark');
-        }
+        applyTheme(newConfig.theme);
       }
 
       set((state) => ({ config: { ...state.config, ...newConfig } }));

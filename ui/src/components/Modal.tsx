@@ -28,11 +28,11 @@ interface DialogProps {
 }
 
 const sizeMap: Record<DialogSize, string> = {
-  sm: 'max-w-sm',
-  md: 'max-w-lg',
-  lg: 'max-w-2xl',
-  xl: 'max-w-4xl',
-  full: 'max-w-[calc(100vw-2rem)]',
+  sm: 'w-full max-w-[calc(100vw-2rem)] sm:max-w-2xl',
+  md: 'w-full max-w-[calc(100vw-2rem)] sm:max-w-2xl',
+  lg: 'w-full max-w-[calc(100vw-2rem)] sm:max-w-2xl',
+  xl: 'w-full max-w-[calc(100vw-2rem)] sm:max-w-2xl',
+  full: 'w-full max-w-[calc(100vw-2rem)] sm:max-w-2xl',
 }
 
 const variantIcon: Record<DialogVariant, React.ReactNode | null> = {

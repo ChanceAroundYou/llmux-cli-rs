@@ -139,10 +139,10 @@ export default function KeysPage() {
             {t('keys.apiDesc')}
           </div>
         </div>
-        <div className="flex items-center gap-2 bg-muted/50 p-2 rounded-xl border border-border/50 relative">
+        <div className="flex items-center gap-2 bg-muted/50 p-2 rounded-xl border border-border/50 relative flex-wrap min-w-0">
           <span className="text-xs font-semibold uppercase text-muted-foreground/60 border-r border-border/50 pr-2 mr-1 ml-1">{t('keys.endpoint')}</span>
-          <code className="text-sm font-mono font-semibold select-all text-primary">{baseUrl}</code>
-          <CopyButton value={baseUrl} size={14} title={t('keys.copyBase')} />
+          <code className="text-sm font-mono font-semibold select-all text-primary flex-1 min-w-0 break-all">{baseUrl}</code>
+          <CopyButton value={baseUrl} size={14} title={t('keys.copyBase')} className="shrink-0" />
         </div>
       </div>
 
@@ -160,8 +160,8 @@ export default function KeysPage() {
                     })}
                   </span>
                 </div>
-                <div className="flex items-center gap-2 font-mono text-sm bg-muted/30 p-2 rounded-lg border border-border/50 group/key max-w-2xl">
-                  <span className="text-muted-foreground truncate">
+                <div className="flex items-center gap-2 font-mono text-sm bg-muted/30 p-2 rounded-lg border border-border/50 group/key max-w-2xl flex-wrap min-w-0">
+                  <span className="text-muted-foreground flex-1 min-w-0 break-all">
                     {visibleKeys[k.id] ? k.key : '••••••••••••••••••••••••'}
                   </span>
                   <div className="flex items-center gap-1 ml-auto shrink-0">
@@ -251,8 +251,8 @@ export default function KeysPage() {
                 <span className="text-xs font-semibold text-primary uppercase tracking-widest">{t('keys.secretKey')}</span>
                 <span className="text-xs text-warning font-semibold bg-warning/10 px-2 py-0.5 rounded">{t('keys.saveThisNow')}</span>
               </div>
-              <div className="flex items-center gap-3 bg-card p-3 rounded-xl border border-border shadow-sm">
-                <code className="text-sm font-mono flex-1 truncate">{generatedKey}</code>
+              <div className="flex items-center gap-3 bg-card p-3 rounded-xl border border-border shadow-sm flex-wrap min-w-0">
+                <code className="text-sm font-mono flex-1 min-w-0 break-all">{generatedKey}</code>
                 <CopyButton 
                   value={generatedKey} 
                   size={16} 

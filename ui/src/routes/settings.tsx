@@ -201,7 +201,7 @@ export default function Settings() {
            <SettingItem label={t('settings.theme')} description={t('settings.themeDesc')}>
              <div className="flex border border-border rounded-lg overflow-hidden">
                 <Button
-                  variant={localConfig.theme !== 'light' ? "default" : "ghost"}
+                  variant={localConfig.theme === 'dark' ? "default" : "ghost"}
                   size="sm"
                   onClick={() => handleAutoSave({...localConfig, theme: 'dark'})}
                   className="rounded-none h-auto py-1.5 text-xs font-semibold"
@@ -215,6 +215,14 @@ export default function Settings() {
                   className="rounded-none h-auto py-1.5 text-xs font-semibold"
                 >
                   {t('settings.themeLight')}
+                </Button>
+                <Button
+                  variant={!localConfig.theme || localConfig.theme === 'system' ? "default" : "ghost"}
+                  size="sm"
+                  onClick={() => handleAutoSave({...localConfig, theme: 'system'})}
+                  className="rounded-none h-auto py-1.5 text-xs font-semibold"
+                >
+                  {t('settings.themeSystem')}
                 </Button>
              </div>
            </SettingItem>

@@ -41,6 +41,8 @@ function formatContextLength(n: number): string {
 // 下游模式（downstreamMode）→ 协议；default 表示尽可能透传（不过滤账户）
 const DOWNSTREAM_MODES = ['default', 'chat', 'responses', 'messages'];
 const normalizeMode = (v: any): string => (DOWNSTREAM_MODES.includes(v) ? v : 'chat');
+const downstreamLabelKey = (mode: string) => `models.downstream.${mode}`;
+const downstreamHintKey = (mode: string) => `models.downstreamHint.${mode}`;
 // 账户是否支持某协议：default 不调用（调用方已跳过）
 const supports = (acc: any, proto: string) =>
   proto === 'chat' ? !!acc.chat_endpoint
@@ -49,13 +51,13 @@ const supports = (acc: any, proto: string) =>
 
 export default function Models() {
   const { t, i18n } = useTranslation();
-  const { availableModels, cachedAt, aliases, aggregateAliases, accounts, isLoading, streaming, fetchModels, streamModels, fetchAliases, fetchAggregateAliases, fetchAccounts, addAlias, deleteAlias, saveAggregateAlias, deleteAggregateAlias, setAggregateActive, testModel } = useModelsStore();
+  const { availableModels, aliases, aggregateAliases, accounts, isLoading, streaming, fetchModels, streamModels, fetchAliases, fetchAggregateAliases, fetchAccounts, addAlias, deleteAlias, saveAggregateAlias, deleteAggregateAlias, setAggregateActive, testModel } = useModelsStore();
   const safeModels = availableModels || [];
   const safeAccounts = accounts || [];
   const [search, setSearch] = useState('');
   const [activeProvider, setActiveProvider] = useState<string>('');
   const [isModalOpen, setIsModalOpen] = useState(false);
-  const [aliasForm, setAliasForm] = useState({ alias: '', target: '', provider: '', selectedAccountIds: [] as number[], preferredAccountId: null as number | null, downstreamMode: 'default' as string });
+  const [aliasForm, setAliasForm] = useState({ alias: '', target: '', provider: '', selectedAccountIds: [] as number[], preferredAccountId: null as number | null, downstreamMode: 'chat' as string });
   // 提交时若强制模式选中了不支持的账户，提示并高亮
   const [aliasModeNotice, setAliasModeNotice] = useState<string | null>(null);
   // 测速/健康按账户隔离：key = accountId:modelId（避免同名模型互串）
@@ -84,7 +86,7 @@ export default function Models() {
   const [editingAliasId, setEditingAliasId] = useState<number | null>(null);
   const [isAggregateModalOpen, setIsAggregateModalOpen] = useState(false);
   const [editingAggregateId, setEditingAggregateId] = useState<number | null>(null);
-  const [aggregateForm, setAggregateForm] = useState<{ alias: string; downstreamMode: string; candidates: { account_id: number | ''; model: string }[] }>({ alias: '', downstreamMode: 'default', candidates: [{ account_id: '', model: '' }] });
+  const [aggregateForm, setAggregateForm] = useState<{ alias: string; downstreamMode: string; candidates: { account_id: number | ''; model: string }[] }>({ alias: '', downstreamMode: 'chat', candidates: [{ account_id: '', model: '' }] });
 
   const handleTest = async (modelId: string, providerId: string, accountId?: number) => {
     let resolvedAccountId = accountId ?? null;
@@ -312,7 +314,7 @@ export default function Models() {
           </div>
           <div>
             <h1 className="text-2xl font-semibold tracking-tight">{t('common.models')}</h1>
-            <p className="text-sm text-muted-foreground">{t('models.subtitle')}{cachedAt ? t('models.cachedAt', { time: new Date(cachedAt * 1000).toLocaleString() }) : ''}</p>
+            <p className="text-sm text-muted-foreground">{t('models.subtitle')}</p>
           </div>
         </div>
         <div className="flex items-center gap-2">
@@ -328,40 +330,35 @@ export default function Models() {
              {queueStatus.isRunning ? t('models.testingQueue', { current: queueStatus.current, total: queueStatus.total }) : t('models.testAll')}
            </Button>
            <Button
-             variant="ghost"
-             size="icon"
-             onClick={() => { streamModels(true); fetchHealth(); }}
-             className="text-muted-foreground"
-             title={t('models.actions.refresh')}
-           >
-             <RefreshCcw size={18} className={cn((isLoading || streaming) && "animate-spin")} />
-           </Button>
-           <Button
-             size="sm"
-             onClick={() => { setEditingAliasId(null); setAliasForm({ alias: '', target: '', provider: '', selectedAccountIds: [], preferredAccountId: null, downstreamMode: 'default' }); setIsModalOpen(true); }}
-           >
-             <Plus size={16} />
-             {t('models.createAlias')}
-           </Button>
-           <Button
              variant="outline"
              size="sm"
-             onClick={() => openAggregateModal()}
+             onClick={() => { streamModels(true); fetchHealth(); }}
+             title={t('models.actions.refresh')}
            >
-             <Layers size={16} />
-             {'聚合别名'}
+             <RefreshCcw size={16} className={cn((isLoading || streaming) && "animate-spin")} />
+             {t('models.actions.refresh')}
            </Button>
         </div>
       </div>
 
       {/* Aliases Section (Condensed) */}
-      {aliases.length > 0 && (
-        <div className="space-y-4">
-           <h2 className="text-xs font-semibold text-muted-foreground uppercase tracking-[0.2em] px-1 flex items-center gap-2">
-              <Zap size={14} className="text-primary" />
-              {'别名'}
-           </h2>
-           <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3">
+      <div className="space-y-4">
+        <div className="flex items-center justify-between gap-2 px-1">
+          <h2 className="text-xs font-semibold text-muted-foreground uppercase tracking-[0.2em] flex items-center gap-2">
+            <Zap size={14} className="text-primary" />
+            {'别名'}
+          </h2>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => { setEditingAliasId(null); setAliasForm({ alias: '', target: '', provider: '', selectedAccountIds: [], preferredAccountId: null, downstreamMode: 'default' }); setIsModalOpen(true); }}
+          >
+            <Plus size={16} />
+            {t('models.createAlias')}
+          </Button>
+        </div>
+        {aliases.length > 0 && (
+        <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3">
               {aliases.map(a => {
                 let aliasAccountId: number | null = null;
                 if (a.account_ids) { try { const ids: number[] = JSON.parse(a.account_ids); if (ids.length) aliasAccountId = Number(ids[0]); } catch {} }
@@ -416,25 +413,35 @@ export default function Models() {
                       variant="ghost"
                       size="icon"
                       onClick={(e) => { e.stopPropagation(); setAliasToDelete({ id: a.id, name: a.alias }); }}
-                      className="h-6 w-6 text-muted-foreground hover:text-destructive opacity-0 group-hover:opacity-100 transition-all"
+                      className="h-6 w-6 text-muted-foreground hover:text-destructive transition-all"
                     >
                       <Trash2 size={12} />
                     </Button>
                   </div>
                 );
               })}
-           </div>
         </div>
-      )}
+        )}
+      </div>
 
       {/* Aggregate Aliases Section */}
-      {aggregateAliases.length > 0 && (
-        <div className="space-y-4">
-           <h2 className="text-xs font-semibold text-muted-foreground uppercase tracking-[0.2em] px-1 flex items-center gap-2">
-              <Layers size={14} className="text-primary" />
-              {'聚合别名'}
-           </h2>
-           <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3">
+      <div className="space-y-4">
+        <div className="flex items-center justify-between gap-2 px-1">
+          <h2 className="text-xs font-semibold text-muted-foreground uppercase tracking-[0.2em] flex items-center gap-2">
+            <Layers size={14} className="text-primary" />
+            {t('models.aggregateAlias')}
+          </h2>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => openAggregateModal()}
+          >
+            <Layers size={16} />
+            {t('models.aggregateAlias')}
+          </Button>
+        </div>
+        {aggregateAliases.length > 0 && (
+        <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3">
               {aggregateAliases.map(agg => {
                 const isActive = (idx: number) => agg.active === idx;
                 const statusDot = (idx: number) => {
@@ -456,7 +463,7 @@ export default function Models() {
                         <CopyButton value={agg.alias} size={10} className="p-1 opacity-0 group-hover:opacity-100 transition-opacity shrink-0" />
                         {pendingNote && <span className="text-xs text-warning font-bold truncate">{pendingNote}</span>}
                       </div>
-                      <Button variant="ghost" size="icon" onClick={(e) => { e.stopPropagation(); setAggregateToDelete({ id: agg.id, name: agg.alias }); }} className="h-6 w-6 shrink-0 text-muted-foreground hover:text-destructive opacity-0 group-hover:opacity-100 transition-all"><Trash2 size={12} /></Button>
+                      <Button variant="ghost" size="icon" onClick={(e) => { e.stopPropagation(); setAggregateToDelete({ id: agg.id, name: agg.alias }); }} className="h-6 w-6 shrink-0 text-muted-foreground hover:text-destructive transition-all"><Trash2 size={12} /></Button>
                     </div>
                     <div className="space-y-1">
                       {agg.candidates.map((c: any, idx: number) => {
@@ -477,9 +484,9 @@ export default function Models() {
                   </div>
                 );
               })}
-           </div>
         </div>
-      )}
+        )}
+      </div>
 
       {/* Filters & Tabs */}
       <div className="space-y-4">
@@ -492,17 +499,20 @@ export default function Models() {
                   </TabsTrigger>
                 ))}
                 {providers.length === 0 && <span className="px-4 py-1.5 text-xs text-muted-foreground italic">No providers</span>}
+                {providers.length > 0 && <span className="shrink-0 w-1.5" aria-hidden />}
               </TabsList>
            </Tabs>
 
-           <div className="relative flex-1 max-w-xs">
-              <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground z-10" size={14} />
+           <div className="relative flex-1 min-w-[110px] max-w-[170px]">
+              {search === '' && (
+                <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground z-10" size={14} />
+              )}
               <Input
                 type="text"
                 placeholder={t('models.filter.searchPlaceholder')}
                 value={search}
                 onChange={e => setSearch(e.target.value)}
-                className="pl-9"
+                className={search ? 'pl-3' : 'pl-9'}
               />
            </div>
         </div>
@@ -641,7 +651,7 @@ export default function Models() {
       )}
 
       {/* Add Alias Modal */}
-      <Dialog isOpen={isModalOpen} onClose={closeAliasModal} title={editingAliasId !== null ? t('models.editAlias') : t('models.createAlias')}>
+      <Dialog isOpen={isModalOpen} onClose={closeAliasModal} title={editingAliasId !== null ? t('models.editAlias') : t('models.createAlias')} size="lg">
         <form onSubmit={handleAddAlias} className="space-y-4">
           <div className="space-y-1.5">
             <label className="text-xs font-bold text-muted-foreground uppercase">{t('models.aliasName')}</label>
@@ -685,9 +695,9 @@ export default function Models() {
               ? accts.filter(a => a.is_active === 1 && safeModels.some(m => m.id === aliasForm.target && m.owned_by === a.alias))
               : [];
             const otherAccounts = accts.filter(a => !matchingAccounts.some(m => m.id === a.id) && a.is_active === 1);
-            const filtered = aliasForm.downstreamMode === 'default'
-              ? matchingAccounts
-              : matchingAccounts.filter(a => supports(a, aliasForm.downstreamMode));
+            // Unsupported accounts stay visible (with a per-row warning); the
+            // runtime skips them for forced modes.
+            const filtered = matchingAccounts;
             if (!aliasForm.target) return null;
             return (
               <div className="space-y-1.5 border-t border-border pt-3">
@@ -719,8 +729,10 @@ export default function Models() {
                   </div>
                 )}
                 <div className="max-h-32 overflow-y-auto space-y-1 border border-border rounded-lg p-2 bg-muted/30">
-                  {filtered.map(a => (
-                <label key={a.id} className="flex items-center gap-2 px-2 py-1 hover:bg-muted/50 rounded cursor-pointer">
+                  {filtered.map(a => {
+                    const unsupported = aliasForm.downstreamMode !== 'default' && !supports(a, aliasForm.downstreamMode);
+                    return (
+                <label key={a.id} className={cn("flex items-center gap-2 px-2 py-1 rounded cursor-pointer", unsupported ? "bg-destructive/5 ring-1 ring-destructive/30" : "hover:bg-muted/50")}>
                   <input
                     type="checkbox"
                     checked={aliasForm.selectedAccountIds.includes(a.id)}
@@ -734,8 +746,11 @@ export default function Models() {
                     className="w-3.5 h-3.5 rounded accent-primary"
                   />
                   <span className="text-xs">[{a.provider_id}] {a.alias}</span>
+                  {unsupported && (
+                    <span className="text-[10px] text-destructive font-medium">{t('models.downstreamUnsupportedBadge', { mode: t(downstreamLabelKey(aliasForm.downstreamMode)) })}</span>
+                  )}
                 </label>
-              ))}
+              )})}
                   {filtered.length === 0 && (
                     <p className="text-xs text-muted-foreground p-2">{t('accounts.noAccounts')}</p>
                   )}
@@ -762,8 +777,8 @@ export default function Models() {
             );
           })()}
           <div className="space-y-1.5 border-t border-border pt-3">
-            <label className="text-xs font-bold text-muted-foreground uppercase">下游模式</label>
-            <p className="text-xs text-muted-foreground">默认（尽可能透传，不限制账户）；强制 Chat / Responses / Messages 仅允许具备对应接口上游的账户。</p>
+            <label className="text-xs font-bold text-muted-foreground uppercase">{t('models.downstreamMode')}</label>
+            <p className="text-xs text-muted-foreground">{t(downstreamHintKey(aliasForm.downstreamMode))}</p>
             <select
               value={aliasForm.downstreamMode}
               onChange={e => {
@@ -779,10 +794,9 @@ export default function Models() {
               }}
               className="w-full h-10 px-3 py-2 rounded-md border border-input bg-background text-sm"
             >
-              <option value="default">默认（尽可能透传）</option>
-              <option value="chat">强制 Chat</option>
-              <option value="responses">强制 Responses</option>
-              <option value="messages">强制 Messages</option>
+              {DOWNSTREAM_MODES.map(m => (
+                <option key={m} value={m}>{t(downstreamLabelKey(m))}</option>
+              ))}
             </select>
             {aliasModeNotice && (
               <p className="text-xs text-destructive font-medium bg-destructive/10 border border-destructive/30 rounded px-2 py-1.5">{aliasModeNotice}</p>
@@ -798,7 +812,7 @@ export default function Models() {
       </Dialog>
 
       {/* Aggregate Alias Modal */}
-      <Dialog isOpen={isAggregateModalOpen} onClose={closeAggregateModal} title={editingAggregateId !== null ? t('models.editAlias' as any) : (t('models.aggregateAlias' as any) as string) ?? '聚合别名'}>
+      <Dialog isOpen={isAggregateModalOpen} onClose={closeAggregateModal} title={editingAggregateId !== null ? t('models.editAlias') : t('models.aggregateAlias')}>
         <form onSubmit={handleSaveAggregate} className="space-y-4">
           <div className="space-y-1.5">
             <label className="text-xs font-bold text-muted-foreground uppercase">{t('models.aliasName')}</label>
@@ -809,7 +823,7 @@ export default function Models() {
               <label className="text-xs font-bold text-muted-foreground uppercase">候选列表（顶部为默认）</label>
               <Button type="button" variant="outline" size="sm" onClick={() => setAggregateForm({ ...aggregateForm, candidates: [...aggregateForm.candidates, { account_id: '', model: '' }] })}>+ 添加候选</Button>
             </div>
-            <div className="space-y-2 max-h-72 overflow-y-auto border border-border rounded-lg p-2 bg-muted/30">
+            <div className="space-y-2 max-h-72 overflow-y-auto overflow-x-hidden border border-border rounded-lg p-2 bg-muted/30">
               {aggregateForm.candidates.map((c, idx) => (
                 <div key={idx} className="flex items-start gap-2 p-2 bg-card border border-border rounded-lg min-w-0">
                   <span className="text-xs font-bold w-5 shrink-0 pt-2">#{idx+1}</span>
@@ -821,10 +835,10 @@ export default function Models() {
                         next[idx] = { ...next[idx], account_id: e.target.value ? Number(e.target.value) : '' };
                         setAggregateForm({ ...aggregateForm, candidates: next });
                       }}
-                      className="w-full h-8 px-2 rounded-md border border-input bg-background text-sm"
+                      className="w-full min-w-0 h-8 px-2 rounded-md border border-input bg-background text-sm"
                     >
                       <option value="">选择账户</option>
-                      {safeAccounts.filter(a => a.is_active === 1 && (aggregateForm.downstreamMode === 'default' || supports(a, aggregateForm.downstreamMode))).map(a => (
+                      {safeAccounts.filter(a => a.is_active === 1).map(a => (
                         <option key={a.id} value={a.id}>[{a.provider_id}] {a.alias}</option>
                       ))}
                     </select>
@@ -842,7 +856,7 @@ export default function Models() {
                             next[idx] = { ...next[idx], model: e.target.value };
                             setAggregateForm({ ...aggregateForm, candidates: next });
                           }}
-                          className="w-full h-8 px-2 rounded-md border border-input bg-background text-sm disabled:opacity-50"
+                          className="w-full min-w-0 h-8 px-2 rounded-md border border-input bg-background text-sm disabled:opacity-50"
                         >
                           <option value="">{!c.account_id ? "请先选择账户" : hasModels ? "选择模型" : "暂无可用模型"}</option>
                           {modelsForAccount.map(m => (
@@ -856,7 +870,7 @@ export default function Models() {
                       if (aggregateForm.downstreamMode === 'default' || c.account_id === '') return null;
                       const acc = safeAccounts.find(a => a.id === c.account_id);
                       if (acc && !supports(acc, aggregateForm.downstreamMode)) {
-                        return <p className="text-xs text-destructive font-medium bg-destructive/10 border border-destructive/30 rounded px-2 py-1">该账户不支持「{aggregateForm.downstreamMode}」下游模式，请更换账户或切换模式。</p>;
+                        return <p className="text-xs text-destructive font-medium bg-destructive/10 border border-destructive/30 rounded px-2 py-1">{t('models.accountUnsupportedMode', { mode: t(downstreamLabelKey(aggregateForm.downstreamMode)) })}</p>;
                       }
                       return null;
                     })()}
@@ -883,17 +897,16 @@ export default function Models() {
             <p className="text-xs text-muted-foreground">顶部候选为默认模型，拖动排序即改默认/顺序。每行独立账户+模型。</p>
           </div>
           <div className="space-y-1.5 border-t border-border pt-3">
-            <label className="text-xs font-bold text-muted-foreground uppercase">下游模式</label>
-            <p className="text-xs text-muted-foreground">默认（尽可能透传，不限制账户）；强制 Chat / Responses / Messages 仅允许具备对应接口上游的账户。切换后将即时校验每个候选账户。</p>
+            <label className="text-xs font-bold text-muted-foreground uppercase">{t('models.downstreamMode')}</label>
+            <p className="text-xs text-muted-foreground">{t(downstreamHintKey(aggregateForm.downstreamMode))}{aggregateForm.downstreamMode !== 'default' && t('models.downstreamHintValidate')}</p>
             <select
               value={aggregateForm.downstreamMode}
               onChange={e => setAggregateForm({...aggregateForm, downstreamMode: e.target.value})}
               className="w-full h-10 px-3 py-2 rounded-md border border-input bg-background text-sm"
             >
-              <option value="default">默认（尽可能透传）</option>
-              <option value="chat">强制 Chat</option>
-              <option value="responses">强制 Responses</option>
-              <option value="messages">强制 Messages</option>
+              {DOWNSTREAM_MODES.map(m => (
+                <option key={m} value={m}>{t(downstreamLabelKey(m))}</option>
+              ))}
             </select>
           </div>
           <div className="pt-4 flex gap-3">
