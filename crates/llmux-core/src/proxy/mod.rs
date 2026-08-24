@@ -2,7 +2,7 @@ pub mod anthropic_openai;
 pub mod openai_anthropic;
 pub mod responses;
 
-use crate::adapters::{Account, ProviderRequest};
+use crate::adapters::{join_upstream_url, Account, ProviderRequest};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
@@ -15,9 +15,7 @@ pub struct AnthropicUsage {
 }
 
 pub fn build_anthropic_target_url(provider_base_url: &str) -> String {
-    let base = provider_base_url.trim_end_matches('/');
-    let prefix = if base.ends_with("/v1") { "" } else { "/v1" };
-    format!("{base}{prefix}/messages")
+    join_upstream_url(provider_base_url, "v1/messages")
 }
 
 pub fn build_anthropic_passthrough_request(

@@ -20,6 +20,9 @@ use crate::middleware::AuthContext;
 
 pub const HOT_CACHE_TTL: Duration = Duration::from_secs(60);
 // ponytail: simple TTL caches for hot-path SQL — avoid 2 RTT per request (auth + alias)
+tokio::task_local! {
+    pub static CLIENT_IP: String;
+}
 
 #[derive(Debug, Clone)]
 pub struct CachedAuth {
@@ -41,7 +44,7 @@ use tower_http::{
     trace::TraceLayer,
 };
 
-use crate::routes::{accounts, auth, health, keys, models, settings, stats, system, usage, v1};
+use crate::routes::{accounts, auth, dashboard, health, keys, models, settings, stats, system, usage, v1};
 
 static TIME_FMT: LazyLock<Vec<time::format_description::BorrowedFormatItem<'static>>> =
     LazyLock::new(|| time::format_description::parse_borrowed::<1>("[hour]:[minute]:[second]").unwrap());
@@ -147,9 +150,23 @@ where
         // Skip logging for dev static files
         let is_static = path.ends_with(".svg") || path.ends_with(".ico") || path.ends_with(".png");
 
+        // Capture the client IP (nginx sits in front — trust XFF/X-Real-IP).
+        let client_ip = req
+            .headers()
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.split(',').next().map(str::trim).map(String::from))
+            .or_else(|| {
+                req.headers()
+                    .get("x-real-ip")
+                    .and_then(|v| v.to_str().ok())
+                    .map(String::from)
+            })
+            .unwrap_or_default();
+
         let fut = self.inner.call(req);
         Box::pin(async move {
-            let res = fut.await?;
+            let res = CLIENT_IP.scope(client_ip, fut).await?;
             let status = res.status();
             let code = status.as_u16();
             let latency_ms = start.elapsed().as_millis() as i64;
@@ -270,6 +287,7 @@ fn core_router() -> AppRouter {
             "/api/aggregate-aliases/:id",
             delete(models::delete_aggregate_alias),
         )
+        .route("/api/dashboard", get(dashboard::get_dashboard))
         .route("/api/models/health", get(models::get_models_health))
         .route(
             "/api/models/test-queue/status",
@@ -278,6 +296,7 @@ fn core_router() -> AppRouter {
         .route("/api/models/test-all", post(models::start_test_queue))
         .route("/api/models/test", post(models::test_model))
         .route("/api/activity", get(usage::get_activity))
+        .route("/api/activity/:id", get(usage::get_activity_detail))
         .route("/api/stats", get(stats::get_stats))
         .route("/api/stats/logs", get(stats::get_stats_logs))
         .route("/api/health", get(health::get_health_status))

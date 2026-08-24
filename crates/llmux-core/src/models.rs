@@ -65,6 +65,9 @@ pub struct AccountPublic {
     pub id: Option<i64>,
     pub alias: String,
     pub provider_id: String,
+    /// Decrypted upstream key; only populated by the accounts list endpoint
+    /// (UI key-reveal toggle). Other consumers see `None`.
+    pub api_key: Option<String>,
     pub base_url: Option<String>,
     pub anthropic_base_url: Option<String>,
     pub is_active: i64,
