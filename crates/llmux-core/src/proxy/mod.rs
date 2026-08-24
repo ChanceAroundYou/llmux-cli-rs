@@ -61,6 +61,22 @@ pub fn extract_anthropic_usage_from_json(data: &Value) -> AnthropicUsage {
     }
 }
 
+/// OpenAI chat 请求体清洗：assistant 消息上的 `tool_calls: []` 空数组会被严格
+/// 上游（DeepSeek、Console Go 等）以 minLength 1 拒绝 → 400 → 网关 502。
+/// 空数组语义等价于"无工具调用"，直接删字段对任何上游都安全。
+pub fn strip_empty_tool_calls(body: &mut Value) {
+    let Some(msgs) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for m in msgs {
+        if let Some(obj) = m.as_object_mut() {
+            if obj.get("tool_calls").and_then(Value::as_array).is_some_and(Vec::is_empty) {
+                obj.remove("tool_calls");
+            }
+        }
+    }
+}
+
 pub fn extract_anthropic_usage_from_sse(stream_text: &str) -> AnthropicUsage {
     let mut usage = AnthropicUsage::default();
     for line in stream_text.lines() {
@@ -96,5 +112,39 @@ fn merge_usage_max(usage: &mut AnthropicUsage, source: &Value) {
     }
     if let Some(value) = source["cache_creation_input_tokens"].as_i64() {
         usage.cache_creation_input_tokens = usage.cache_creation_input_tokens.max(value);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strip_empty_tool_calls_removes_only_empty_arrays() {
+        let mut body = json!({
+            "model": "od",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "text", "tool_calls": []},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "call_1", "type": "function", "function": {"name": "f", "arguments": "{}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "ok"}
+            ]
+        });
+        strip_empty_tool_calls(&mut body);
+        let msgs = body["messages"].as_array().unwrap();
+        assert!(msgs[1].get("tool_calls").is_none(), "空数组应被删除");
+        assert!(msgs[2]["tool_calls"].is_array(), "非空 tool_calls 应保留");
+        assert_eq!(msgs[2]["tool_calls"].as_array().unwrap().len(), 1);
+        assert!(msgs[0].get("tool_calls").is_none(), "无字段消息不应新增字段");
+        assert!(msgs[3].get("tool_calls").is_none(), "tool 消息无字段");
+    }
+
+    #[test]
+    fn strip_empty_tool_calls_noop_without_messages() {
+        let mut body = json!({"model": "m", "max_tokens": 10});
+        strip_empty_tool_calls(&mut body);
+        assert_eq!(body["model"], "m");
     }
 }
