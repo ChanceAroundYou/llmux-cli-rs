@@ -59,24 +59,30 @@ pub fn supports(a: &Account, p: Protocol) -> bool {
 }
 
 pub fn endpoint_for(a: &Account, p: Protocol) -> Option<&str> {
-    let direct = match p {
-        Protocol::Chat => a.chat_endpoint.as_deref(),
-        Protocol::Responses => a.responses_endpoint.as_deref(),
-        Protocol::Messages => a.messages_endpoint.as_deref(),
-    }
-    .filter(|s| !s.is_empty());
-    if direct.is_some() {
-        return direct;
-    }
-    // Migration compat: fall back to legacy columns when new *_endpoint is still NULL.
+    // Since 0012 every write keeps base_url = chat_endpoint, so base_url is the
+    // chat source of truth; chat_endpoint remains as legacy-compat fallback
+    // (e.g. clients explicitly clearing base_url while keeping chat_endpoint).
     match p {
-        Protocol::Chat => a.base_url.as_deref().filter(|s| !s.is_empty()),
-        Protocol::Responses => a.base_url.as_deref().filter(|s| !s.is_empty()),
-        Protocol::Messages => a
-            .anthropic_base_url
+        Protocol::Chat => a
+            .base_url
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .or_else(|| a.chat_endpoint.as_deref().filter(|s| !s.is_empty())),
+        Protocol::Responses => a
+            .responses_endpoint
             .as_deref()
             .filter(|s| !s.is_empty())
             .or_else(|| a.base_url.as_deref().filter(|s| !s.is_empty())),
+        // Messages deliberately does NOT fall back to base_url: base_url is an
+        // OpenAI-compatible endpoint (e.g. opencode.ai/zen/go/v1) whose /v1/messages
+        // Anthropic route often doesn't exist or is broken. Accounts without an
+        // explicit Anthropic endpoint are treated as chat-only and their messages
+        // ingress gets protocol-converted instead of blindly POSTing to /v1/messages.
+        Protocol::Messages => a
+            .messages_endpoint
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .or_else(|| a.anthropic_base_url.as_deref().filter(|s| !s.is_empty())),
     }
 }
 

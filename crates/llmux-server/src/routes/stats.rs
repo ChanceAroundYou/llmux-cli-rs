@@ -34,9 +34,20 @@ pub struct LogsQuery {
     pub end: Option<i64>,
     pub model: Option<String>,
     pub provider: Option<String>,
-    pub success: Option<bool>,
+    /// Accepts 1/0 or true/false (the UI sends 1/0; serde bool would 400).
+    pub success: Option<String>,
+    /// Accepts 1/0 or true/false (the UI sends 1/0; serde bool would 400).
+    pub is_stream: Option<String>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
+}
+
+fn parse_flag(v: &Option<String>) -> Option<bool> {
+    match v.as_deref() {
+        Some("1") | Some("true") => Some(true),
+        Some("0") | Some("false") => Some(false),
+        _ => None,
+    }
 }
 
 /// Aggregate stats over a time window: summary + breakdowns by model/account/provider.
@@ -110,6 +121,26 @@ pub async fn get_stats_logs(
 ) -> Response {
     let limit = params.limit.unwrap_or(50).clamp(0, 200);
     let offset = params.offset.unwrap_or(0).max(0);
+    let success_flag = parse_flag(&params.success);
+    let stream_flag = parse_flag(&params.is_stream);
+
+    // Count first (params fields are consumed by the logs query below).
+    let total = match UsageService::new(state.pool.clone())
+        .count_detailed_logs(llmux_core::usage::DetailedLogQuery {
+            start_time: params.start,
+            end_time: params.end,
+            model: params.model.clone(),
+            provider: params.provider.clone(),
+            success: success_flag,
+            is_stream: stream_flag,
+            limit: None,
+            offset: None,
+        })
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => return simple_error(format!("Failed to count logs: {e}"), StatusCode::INTERNAL_SERVER_ERROR),
+    };
 
     let logs = match UsageService::new(state.pool.clone())
         .get_detailed_logs(llmux_core::usage::DetailedLogQuery {
@@ -117,7 +148,8 @@ pub async fn get_stats_logs(
             end_time: params.end,
             model: params.model,
             provider: params.provider,
-            success: params.success,
+            success: success_flag,
+            is_stream: stream_flag,
             limit: Some(limit),
             offset: Some(offset),
         })
@@ -130,6 +162,9 @@ pub async fn get_stats_logs(
     let entries: Vec<Value> = logs
         .into_iter()
         .map(|r| {
+            // tps = output_tokens*1000 / max(1, latency_ms - ttft_ms) (uses full latency when ttft absent).
+            let gen_ms = (r.latency_ms - r.ttft_ms.unwrap_or(0)).max(1);
+            let tps = (r.output_tokens * 1000) as f64 / gen_ms as f64;
             json!({
                 "id": r.id,
                 "timestamp": r.timestamp,
@@ -141,13 +176,17 @@ pub async fn get_stats_logs(
                 "cacheReadInputTokens": r.cache_read_input_tokens,
                 "cacheCreationInputTokens": r.cache_creation_input_tokens,
                 "latencyMs": r.latency_ms,
+                "ttftMs": r.ttft_ms,
+                "isStream": r.is_stream,
+                "tps": tps,
                 "success": r.success,
                 "errorMessage": r.error_message,
                 "isTest": r.is_test,
                 "accountName": r.account_name,
+                "clientIp": r.client_ip,
             })
         })
         .collect();
 
-    Json(json!({ "logs": entries })).into_response()
+    Json(json!({ "logs": entries, "total": total })).into_response()
 }

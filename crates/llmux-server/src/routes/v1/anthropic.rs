@@ -16,7 +16,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
-use llmux_core::adapters::{self, execute_provider_request, ProviderRequest};
+use llmux_core::adapters::{self, execute_provider_request, join_upstream_url, ProviderRequest};
 use llmux_core::aggregate::get_account_by_id;
 use llmux_core::dispatcher::{self, get_accounts_by_ids, get_active_accounts, is_retryable_status};
 use llmux_core::proxy::anthropic_openai::{
@@ -28,7 +28,7 @@ use llmux_core::proxy::{build_anthropic_passthrough_request, extract_anthropic_u
 use crate::app::{AppState, TuiEvent};
 use crate::middleware::{self, AuthContext};
 
-use super::helpers::{spawn_log_usage, send_tui_request};
+use super::helpers::{spawn_log_usage, spawn_log_usage_ip, send_tui_request};
 
 // ---------------------------------------------------------------------------
 // /v1/messages  (Anthropic Messages API)
@@ -52,7 +52,7 @@ pub async fn messages(
     // Aggregate aliases keep their dedicated paths (V-anchored failover).
     if let Ok(Some(agg)) = state.resolve_aggregate_cached(&raw_model).await {
         if agg.upstream_api.wants_responses() {
-            return dispatch_aggregate_anthropic_via_responses(state, auth, headers, body, agg).await;
+            return dispatch_aggregate_anthropic_via_responses(state, auth, uri, headers, body, agg).await;
         }
         return dispatch_aggregate_anthropic(state, auth, headers, body, agg).await;
     }
@@ -165,9 +165,8 @@ pub async fn messages(
     let mut last_error: Option<String> = None;
 
     for account in &ordered_accounts {
-        // Endpoint resolution via new *_endpoint columns (legacy fallback inside
-        // protocol::endpoint_for): Messages prefers messages_endpoint/
-        // anthropic_base_url; Chat prefers chat_endpoint/base_url.
+        // Endpoint resolution via protocol::endpoint_for: Messages prefers
+        // messages_endpoint/anthropic_base_url; Chat reads base_url (0012).
         let anthropic_base = llmux_core::protocol::endpoint_for(
             account,
             llmux_core::protocol::Protocol::Messages,
@@ -360,6 +359,7 @@ pub async fn messages(
                     state.pool.clone(),
                     &model_resolution.provider_id,
                     start,
+                    Some(body.to_string()),
                 )
                 .await;
             }
@@ -370,6 +370,7 @@ pub async fn messages(
                 state.pool.clone(),
                 &model_resolution.provider_id,
                 start,
+                Some(body.to_string()),
             )
             .await;
         }
@@ -410,7 +411,8 @@ pub async fn messages(
                 latency_ms,
                 true,
                 None,
-            );
+                Some(body.to_string()),
+                Some(anthropic_resp.to_string()), Some(latency_ms), false);
             {
                 let mut router = state.dispatch_router.lock().unwrap();
                 router.record_result(&dispatch_key, &dispatch_meta, Some(account.id), true);
@@ -449,8 +451,8 @@ pub async fn messages(
             latency_ms,
             true,
             None,
-        );
-
+            Some(body.to_string()),
+            Some(data.to_string()), Some(latency_ms), false);
         {
             let mut router = state.dispatch_router.lock().unwrap();
             router.record_result(&dispatch_key, &dispatch_meta, Some(account.id), true);
@@ -480,7 +482,8 @@ pub async fn messages(
             latency_ms,
             false,
             Some(error_msg.clone()),
-        );
+            Some(body.to_string()),
+            None, Some(latency_ms), false);
     }
     send_tui_request(&state.tui_tx, "/v1/messages", 502, start, &model_resolution.target_model);
     middleware::send_error(&error_msg, "upstream_error", StatusCode::BAD_GATEWAY, is_anthropic)
@@ -531,6 +534,10 @@ async fn dispatch_aggregate_anthropic(
         }
 
         // New *_endpoint columns first (legacy fallback inside protocol::endpoint_for).
+        // Forced routing modes (agg.upstream_api) override the per-account
+        // endpoint choice: Chat forces the OpenAI chat path, Messages forces the
+        // Anthropic passthrough, Default keeps auto selection.
+        let agg_mode = llmux_core::protocol::DownstreamMode::from_str(agg.upstream_api.as_str());
         let anthropic_base =
             llmux_core::protocol::endpoint_for(&account, llmux_core::protocol::Protocol::Messages)
                 .map(str::trim);
@@ -538,20 +545,46 @@ async fn dispatch_aggregate_anthropic(
             llmux_core::protocol::endpoint_for(&account, llmux_core::protocol::Protocol::Chat)
                 .map(str::trim);
 
-        let (provider_request, is_conversion) = if let Some(anthropic_base) = anthropic_base {
-            (build_anthropic_passthrough_request(&patched_body, &account, anthropic_base, &cand.model, anthropic_beta.as_deref()), false)
-        } else if let Some(openai_base) = openai_base {
-            match anthropic_to_openai_request(&patched_body, &cand.model) {
-                Ok(openai_body) => {
-                    let mut req_headers = BTreeMap::new();
-                    req_headers.insert("content-type".to_string(), "application/json".to_string());
-                    req_headers.insert("authorization".to_string(), format!("Bearer {}", account.api_key));
-                    (Ok(ProviderRequest { method: "POST".to_string(), url: format!("{}/chat/completions", openai_base.trim_end_matches('/')), headers: req_headers, body: openai_body }), true)
+        let (provider_request, is_conversion) = match agg_mode {
+            llmux_core::protocol::DownstreamMode::Chat => {
+                match openai_base {
+                    Some(openai_base) => {
+                        match anthropic_to_openai_request(&patched_body, &cand.model) {
+                            Ok(openai_body) => {
+                                let mut req_headers = BTreeMap::new();
+                                req_headers.insert("content-type".to_string(), "application/json".to_string());
+                                req_headers.insert("authorization".to_string(), format!("Bearer {}", account.api_key));
+                                (Ok(ProviderRequest { method: "POST".to_string(), url: join_upstream_url(openai_base, "chat/completions"), headers: req_headers, body: openai_body }), true)
+                            }
+                            Err(e) => (Err(e), true),
+                        }
+                    }
+                    None => (Err(anyhow::anyhow!("Account has no chat endpoint")), true),
                 }
-                Err(e) => (Err(e), true),
             }
-        } else {
-            (build_anthropic_passthrough_request(&patched_body, &account, "https://api.anthropic.com/v1", &cand.model, anthropic_beta.as_deref()), false)
+            llmux_core::protocol::DownstreamMode::Messages => {
+                let base = anthropic_base.unwrap_or("https://api.anthropic.com/v1");
+                (build_anthropic_passthrough_request(&patched_body, &account, base, &cand.model, anthropic_beta.as_deref()), false)
+            }
+            // Default (and Responses, which is routed to dispatch_aggregate_with_conversion)
+            llmux_core::protocol::DownstreamMode::Default
+            | llmux_core::protocol::DownstreamMode::Responses => {
+                if let Some(anthropic_base) = anthropic_base {
+                    (build_anthropic_passthrough_request(&patched_body, &account, anthropic_base, &cand.model, anthropic_beta.as_deref()), false)
+                } else if let Some(openai_base) = openai_base {
+                    match anthropic_to_openai_request(&patched_body, &cand.model) {
+                        Ok(openai_body) => {
+                            let mut req_headers = BTreeMap::new();
+                            req_headers.insert("content-type".to_string(), "application/json".to_string());
+                            req_headers.insert("authorization".to_string(), format!("Bearer {}", account.api_key));
+                            (Ok(ProviderRequest { method: "POST".to_string(), url: join_upstream_url(openai_base, "chat/completions"), headers: req_headers, body: openai_body }), true)
+                        }
+                        Err(e) => (Err(e), true),
+                    }
+                } else {
+                    (build_anthropic_passthrough_request(&patched_body, &account, "https://api.anthropic.com/v1", &cand.model, anthropic_beta.as_deref()), false)
+                }
+            }
         };
 
         let provider_request = match provider_request { Ok(r) => r, Err(e) => { tracing::error!("📡 [agg:{}] build request failed: {e}", alias); last_error = Some(format!("Failed to build provider request: {e}")); state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); continue; } };
@@ -574,6 +607,7 @@ async fn dispatch_aggregate_anthropic(
                 continue;
             }
             // non-retryable — try next candidate as well (failover down the chain)
+            tracing::warn!("🔀 [agg:{}] Account {} failed ({}) — trying next (non-retryable): {}", alias, account.alias, status.as_u16(), error_body.chars().take(200).collect::<String>());
             state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len);
             continue;
         }
@@ -594,7 +628,7 @@ async fn dispatch_aggregate_anthropic(
             let anthropic_resp = openai_to_anthropic_response(&data, &cand.model);
             let usage = &data["usage"];
             let (cache_read, cache_create) = cache_usage_from_openai(usage);
-            crate::routes::v1::helpers::spawn_log_usage(state.pool.clone(), account.clone(), cand.model.clone(), account.provider_id.clone(), usage["prompt_tokens"].as_i64().unwrap_or(0), usage["completion_tokens"].as_i64().unwrap_or(0), cache_read, cache_create, latency_ms, true, None);
+            crate::routes::v1::helpers::spawn_log_usage(state.pool.clone(), account.clone(), cand.model.clone(), account.provider_id.clone(), usage["prompt_tokens"].as_i64().unwrap_or(0), usage["completion_tokens"].as_i64().unwrap_or(0), cache_read, cache_create, latency_ms, true, None, Some(body.to_string()), Some(anthropic_resp.to_string()), Some(latency_ms), false);
             state.aggregate_router.lock().unwrap().note_candidate_success(&alias, i, len);
             hit = Some(i);
             hit_account = Some(account);
@@ -603,7 +637,7 @@ async fn dispatch_aggregate_anthropic(
         }
 
         let usage = extract_anthropic_usage_from_sse(&String::from_utf8_lossy(&body_bytes));
-        crate::routes::v1::helpers::spawn_log_usage(state.pool.clone(), account.clone(), cand.model.clone(), account.provider_id.clone(), usage.input_tokens, usage.output_tokens, usage.cache_read_input_tokens, usage.cache_creation_input_tokens, latency_ms, true, None);
+        crate::routes::v1::helpers::spawn_log_usage(state.pool.clone(), account.clone(), cand.model.clone(), account.provider_id.clone(), usage.input_tokens, usage.output_tokens, usage.cache_read_input_tokens, usage.cache_creation_input_tokens, latency_ms, true, None, Some(body.to_string()), Some(data.to_string()), Some(latency_ms), false);
         state.aggregate_router.lock().unwrap().note_candidate_success(&alias, i, len);
         hit = Some(i);
         hit_account = Some(account);
@@ -618,9 +652,9 @@ async fn dispatch_aggregate_anthropic(
         if let Some((resp, model, account, provider_id, is_conv)) = hit_stream {
             send_tui_request(&state.tui_tx, "/v1/messages", 200, start, &cand_model);
             if is_conv {
-                return anthropic_to_openai_streaming(resp, &model, &account, state.pool.clone(), &provider_id, start).await;
+                return anthropic_to_openai_streaming(resp, &model, &account, state.pool.clone(), &provider_id, start, Some(body.to_string())).await;
             }
-            return anthropic_streaming_passthrough(resp, &model, &account, state.pool.clone(), &provider_id, start).await;
+            return anthropic_streaming_passthrough(resp, &model, &account, state.pool.clone(), &provider_id, start, Some(body.to_string())).await;
         }
         if let Some(data) = hit_json {
             send_tui_request(&state.tui_tx, "/v1/messages", 200, start, &cand_model);
@@ -633,17 +667,17 @@ async fn dispatch_aggregate_anthropic(
     let latency_ms = start.elapsed().as_millis() as i64;
     let error_msg = last_error.unwrap_or_else(|| "All aggregate candidates exhausted".to_string());
     if let Some(acc) = hit_account {
-        crate::routes::v1::helpers::spawn_log_usage(state.pool.clone(), acc, agg.candidates[0].model.clone(), String::new(), 0, 0, 0, 0, latency_ms, false, Some(error_msg.clone()));
+        crate::routes::v1::helpers::spawn_log_usage(state.pool.clone(), acc, agg.candidates[0].model.clone(), String::new(), 0, 0, 0, 0, latency_ms, false, Some(error_msg.clone()), Some(body.to_string()), None, Some(latency_ms), false);
     } else if let Ok(Some(acc)) = get_account_by_id(&state.pool, agg.candidates[0].account_id, &state.master_key).await {
-        crate::routes::v1::helpers::spawn_log_usage(state.pool.clone(), acc, agg.candidates[0].model.clone(), String::new(), 0, 0, 0, 0, latency_ms, false, Some(error_msg.clone()));
+        crate::routes::v1::helpers::spawn_log_usage(state.pool.clone(), acc, agg.candidates[0].model.clone(), String::new(), 0, 0, 0, 0, latency_ms, false, Some(error_msg.clone()), Some(body.to_string()), None, Some(latency_ms), false);
     }
     send_tui_request(&state.tui_tx, "/v1/messages", 502, start, &agg.alias);
     middleware::send_error(&error_msg, "upstream_error", StatusCode::BAD_GATEWAY, is_anthropic)
 }
 
-/// Streaming passthrough for Anthropic responses.
-/// Bytes are forwarded as-is. Usage is not captured (requires SSE parsing —
-/// a future improvement would parse the stream inline like Bun's wrapStreamWithUsage).
+/// Streaming passthrough for Anthropic responses. Bytes are forwarded as-is;
+/// usage is extracted from the buffered stream at EOF (message_start carries
+/// the cache breakdown, message_delta the output) and logged with real values.
 pub(crate) async fn anthropic_streaming_passthrough(
     response: reqwest::Response,
     model: &str,
@@ -651,6 +685,7 @@ pub(crate) async fn anthropic_streaming_passthrough(
     pool: sqlx::SqlitePool,
     provider_id: &str,
     start: Instant,
+    request_body: Option<String>,
 ) -> Response {
     let model = model.to_string();
     let account = account.clone();
@@ -662,30 +697,60 @@ pub(crate) async fn anthropic_streaming_passthrough(
         model,
     );
 
-    let stream = response.bytes_stream().map(move |chunk| {
-        chunk.map_err(axum::Error::new)
-    });
+    let (tx, rx) = mpsc::channel::<Result<Bytes, axum::Error>>(64);
+    let client_ip = crate::routes::v1::helpers::current_client_ip();
 
-    let pool_clone = pool.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let mut received: Vec<u8> = Vec::with_capacity(4096);
+        let mut sse = response.bytes_stream();
+        let mut ttft_ms: Option<i64> = None;
+        while let Some(chunk) = sse.next().await {
+            let chunk = match chunk {
+                Ok(c) => {
+                    if ttft_ms.is_none() {
+                        ttft_ms = Some(start.elapsed().as_millis() as i64);
+                    }
+                    c
+                }
+                Err(e) => {
+                    tracing::warn!("[stream:{model}] upstream stream read error: {e}");
+                    break;
+                }
+            };
+            received.extend_from_slice(&chunk);
+            if tx.send(Ok(chunk)).await.is_err() {
+                return; // client gone
+            }
+        }
+
         let latency_ms = start.elapsed().as_millis() as i64;
-        spawn_log_usage(
-            pool_clone.clone(),
+        let resp_body = String::from_utf8_lossy(&received).into_owned();
+        let usage = extract_anthropic_usage_from_sse(&resp_body);
+        // message_stop is the terminal event: success only when it was seen.
+        let done = resp_body.contains("message_stop");
+        spawn_log_usage_ip(
+            pool.clone(),
             account.clone(),
             model.clone(),
             provider_id.clone(),
-            0,
-            0,
-            0,
-            0,
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.cache_read_input_tokens,
+            usage.cache_creation_input_tokens,
             latency_ms,
-            true,
-            None,
-        );
+            done,
+            if done {
+                None
+            } else {
+                Some("upstream stream ended without message_stop".to_string())
+            },
+            request_body,
+            Some(resp_body),
+            ttft_ms, true, client_ip,
+        )
     });
 
-    let body = Body::from_stream(stream);
+    let body = Body::from_stream(ReceiverStream::new(rx));
     Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "text/event-stream")
@@ -707,6 +772,7 @@ pub(crate) async fn anthropic_to_openai_streaming(
     pool: sqlx::SqlitePool,
     provider_id: &str,
     start: Instant,
+    request_body: Option<String>,
 ) -> Response {
     let model = model.to_string();
     let account = account.clone();
@@ -714,15 +780,17 @@ pub(crate) async fn anthropic_to_openai_streaming(
 
     let (tx, rx) = mpsc::channel::<Result<Bytes, axum::Error>>(64);
     let mut converter = OpenAISseConverter::new(&model);
+    let client_ip = crate::routes::v1::helpers::current_client_ip();
 
     tokio::spawn(async move {
         let mut buffer: Vec<u8> = Vec::with_capacity(4096);
+        let mut received: Vec<u8> = Vec::with_capacity(4096);
         let mut sse = response.bytes_stream();
         let mut done = false;
         let mut chunks_received: u64 = 0;
+        let mut ttft_ms: Option<i64> = None;
 
         tracing::debug!("[stream:{model}] upstream stream started");
-
         while !done {
             let chunk = match sse.next().await {
                 Some(Ok(c)) => c,
@@ -737,6 +805,7 @@ pub(crate) async fn anthropic_to_openai_streaming(
             };
             chunks_received += 1;
             buffer.extend_from_slice(&chunk);
+            received.extend_from_slice(&chunk);
 
             for event_text in parse_sse_chunks(&mut buffer, 0) {
                 let Some(payload) = sse_data_payload(&event_text) else {
@@ -751,6 +820,9 @@ pub(crate) async fn anthropic_to_openai_streaming(
                     continue;
                 };
                 for ev in converter.feed(&parsed) {
+                    if ttft_ms.is_none() {
+                        ttft_ms = Some(start.elapsed().as_millis() as i64);
+                    }
                     if tx.send(Ok(Bytes::from(ev))).await.is_err() {
                         return; // client gone
                     }
@@ -830,7 +902,7 @@ pub(crate) async fn anthropic_to_openai_streaming(
             tracing::warn!("[stream:{model}] stream truncated: account={} chunks={chunks_received} empty={empty_content} overflow={overflow}", account.alias);
         }
         let latency_ms = start.elapsed().as_millis() as i64;
-        spawn_log_usage(
+        spawn_log_usage_ip(
             pool.clone(),
             account.clone(),
             model.clone(),
@@ -846,7 +918,10 @@ pub(crate) async fn anthropic_to_openai_streaming(
             } else {
                 None
             },
-        );
+            request_body,
+            Some(String::from_utf8_lossy(&received).into_owned()),
+            ttft_ms, true, client_ip,
+        )
     });
 
     let body = Body::from_stream(ReceiverStream::new(rx));
@@ -860,189 +935,29 @@ pub(crate) async fn anthropic_to_openai_streaming(
         .into_response()
 }
 
-// --- messages -> responses routing (upstream_api = responses/auto) ---
-async fn messages_via_responses(
-    state: AppState,
-    auth: AuthContext,
-    headers: HeaderMap,
-    body: Value,
-    res: llmux_core::dispatcher::ModelResolution,
-) -> Response {
-    let streaming = body["stream"].as_bool().unwrap_or(false);
-    let target = res.target_model.clone();
-    let translated = llmux_core::proxy::responses::anthropic_to_responses(&body, &target);
-    // Dispatch to responses endpoint; back-translate to anthropic SSE/JSON
-    let resp = dispatch_via_responses(state.clone(), auth.clone(), headers.clone(), translated, &target, &res, streaming).await;
-    if res.upstream_api == llmux_core::upstream_api::UpstreamApi::Auto && is_responses_unsupported_resp(&resp) {
-        tracing::warn!("[messages_via_responses] {} responses unsupported, fallback to chat/messages", target);
-        // fallback: retry as normal messages (re-enter messages without loop)
-        return fallback_messages(state, auth, headers, body).await;
-    }
-    resp
-}
-
 async fn dispatch_aggregate_anthropic_via_responses(
     state: AppState,
     auth: AuthContext,
+    uri: axum::http::Uri,
     headers: HeaderMap,
     body: Value,
     agg: llmux_core::aggregate::AggregateResolution,
 ) -> Response {
-    // Minimal: translate each candidate via responses; for now delegate to normal aggregate anthropic
-    // Full per-candidate translation is a follow-up; keep dispatch chain alive.
-    dispatch_aggregate_anthropic(state, auth, headers, body, agg).await
-}
-
-async fn dispatch_via_responses(
-    state: AppState,
-    _auth: AuthContext,
-    _headers: HeaderMap,
-    body: Value,
-    model: &str,
-    res: &llmux_core::dispatcher::ModelResolution,
-    streaming: bool,
-) -> Response {
-    // Find an account for this alias to POST /responses
-    let accounts = if !res.account_ids.is_empty() {
-        match llmux_core::dispatcher::get_accounts_by_ids(&state.pool, &res.account_ids, &state.master_key).await { Ok(a) => a, Err(_) => vec![] }
-    } else {
-        match llmux_core::dispatcher::get_active_accounts(&state.pool, Some(&res.provider_id), &state.master_key).await { Ok(a) => a, Err(_) => vec![] }
-    };
-    let Some(account) = accounts.into_iter().next() else {
-        return crate::middleware::send_error("No active accounts", "server_error", StatusCode::SERVICE_UNAVAILABLE, true);
-    };
-    // Honor responses_endpoint (legacy base_url fallback inside endpoint_for).
-    let base = llmux_core::protocol::endpoint_for(
-        &account,
-        llmux_core::protocol::Protocol::Responses,
+    // Aggregate Messages ingress → Responses upstream: reuse the per-candidate
+    // conversion dispatcher (anthropic_to_responses → responses_to_anthropic,
+    // streaming included). Previously a placeholder that just delegated to the
+    // plain aggregate path — which POSTs /v1/messages even when the aggregate
+    // targets the Responses protocol.
+    super::openai::dispatch_aggregate_with_conversion(
+        llmux_core::protocol::Protocol::Messages,
+        state,
+        auth,
+        uri,
+        headers,
+        body,
+        agg,
     )
-    .unwrap_or("https://api.openai.com/v1")
-    .trim_end_matches('/');
-    let url = format!("{}/responses", base);
-    let mut req_headers = std::collections::BTreeMap::new();
-    req_headers.insert("content-type".to_string(), "application/json".to_string());
-    req_headers.insert("authorization".to_string(), format!("Bearer {}", account.api_key));
-    let provider_req = llmux_core::adapters::ProviderRequest { method: "POST".to_string(), url, headers: req_headers, body };
-    let start = Instant::now();
-    let resp = match llmux_core::adapters::execute_provider_request(&provider_req).await { Ok(r) => r, Err(e) => return crate::middleware::send_error(&format!("Provider request failed: {e}"), "server_error", StatusCode::BAD_GATEWAY, true) };
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        if llmux_core::proxy::responses::is_responses_unsupported(&body) {
-            // Signal Auto fallback via 404 responses_unsupported — caller checks via is_responses_unsupported_resp
-            return crate::middleware::send_error(&body, "responses_unsupported", StatusCode::NOT_FOUND, true);
-        }
-        return (status, axum::Json(serde_json::json!({"error": body}))).into_response();
-    }
-    if streaming {
-        return responses_to_anthropic_streaming(resp, model, &account, state.pool.clone(), &account.provider_id, start).await;
-    }
-    let bytes = match resp.bytes().await { Ok(b) => b, Err(e) => return crate::middleware::send_error(&format!("Read failed: {e}"), "server_error", StatusCode::BAD_GATEWAY, true) };
-    let data: Value = match serde_json::from_slice(&bytes) { Ok(v) => v, Err(e) => return crate::middleware::send_error(&format!("Parse failed: {e}"), "server_error", StatusCode::BAD_GATEWAY, true) };
-    let anth = llmux_core::proxy::responses::responses_to_anthropic(&data, model);
-    let input = anth["usage"]["input_tokens"].as_i64().unwrap_or(0);
-    let output = anth["usage"]["output_tokens"].as_i64().unwrap_or(0);
-    crate::routes::v1::helpers::spawn_log_usage(state.pool.clone(), account.clone(), model.to_string(), account.provider_id.clone(), input, output, 0, 0, start.elapsed().as_millis() as i64, true, None);
-    axum::Json(anth).into_response()
-}
-
-fn is_responses_unsupported_resp(resp: &Response) -> bool {
-    matches!(
-        resp.status(),
-        StatusCode::NOT_FOUND | StatusCode::NOT_IMPLEMENTED | StatusCode::METHOD_NOT_ALLOWED
-    )
-}
-
-async fn fallback_messages(state: AppState, auth: AuthContext, headers: HeaderMap, body: Value) -> Response {
-    // Re-enter normal /v1/messages dispatch without responses routing (no recursion via messages_via_responses).
-    // Reuse helpers so Auto truly falls back to passthrough/openai conversion.
-    let is_anthropic = true;
-    let model_name = dispatcher::sanitize_model_name(body.get("model").and_then(Value::as_str).unwrap_or(""));
-    if model_name.is_empty() {
-        return crate::middleware::send_error("Missing required field: model", "invalid_request_error", StatusCode::BAD_REQUEST, true);
-    }
-    if !crate::middleware::is_model_allowed(&auth.allowed_models, &model_name) {
-        return crate::middleware::send_error(&format!("Model '{}' is not allowed for this API key", model_name), "permission_error", StatusCode::UNAUTHORIZED, true);
-    }
-    let streaming = body["stream"].as_bool().unwrap_or(false);
-    let anthropic_beta = headers.get("anthropic-beta").and_then(|v| v.to_str().ok()).map(|s| s.to_string());
-    let model_resolution = match state.resolve_model_cached(&model_name).await {
-        Ok(r) => r,
-        Err(e) => return crate::middleware::send_error(&format!("Model resolution failed: {e}"), "server_error", StatusCode::INTERNAL_SERVER_ERROR, true),
-    };
-    // Force chat protocol for fallback (ignore stored upstream_api)
-    let accounts = if !model_resolution.account_ids.is_empty() {
-        match get_accounts_by_ids(&state.pool, &model_resolution.account_ids, &state.master_key).await {
-            Ok(a) => a, Err(e) => return crate::middleware::send_error(&format!("Failed to load accounts: {e}"), "server_error", StatusCode::INTERNAL_SERVER_ERROR, true),
-        }
-    } else {
-        match get_active_accounts(&state.pool, Some(&model_resolution.provider_id), &state.master_key).await {
-            Ok(a) => a, Err(e) => return crate::middleware::send_error(&format!("Failed to load accounts: {e}"), "server_error", StatusCode::INTERNAL_SERVER_ERROR, true),
-        }
-    };
-    if accounts.is_empty() {
-        return crate::middleware::send_error(&format!("No active accounts available for model '{}'", model_resolution.target_model), "server_error", StatusCode::SERVICE_UNAVAILABLE, true);
-    }
-    let dispatch_key = model_resolution.alias_name.as_deref().map(|n| format!("alias:{}", n)).unwrap_or_else(|| format!("provider:{}", model_resolution.provider_id));
-    let preferred_id = model_resolution.preferred_account_id.unwrap_or_else(|| accounts.first().map(|a| a.id).unwrap_or(0));
-    let (ordered_accounts, dispatch_meta) = { let mut r = state.dispatch_router.lock().unwrap(); r.select(&dispatch_key, &accounts, preferred_id) };
-    let start = Instant::now();
-    let mut last_error: Option<String> = None;
-    for account in &ordered_accounts {
-        // New *_endpoint columns first (legacy fallback inside protocol::endpoint_for).
-        let anthropic_base =
-            llmux_core::protocol::endpoint_for(account, llmux_core::protocol::Protocol::Messages)
-                .map(str::trim);
-        let openai_base =
-            llmux_core::protocol::endpoint_for(account, llmux_core::protocol::Protocol::Chat)
-                .map(str::trim);
-        let (provider_request, is_conversion) = if let Some(anthropic_base) = anthropic_base {
-            (build_anthropic_passthrough_request(&body, account, anthropic_base, &model_resolution.target_model, anthropic_beta.as_deref()), false)
-        } else if let Some(openai_base) = openai_base {
-            match anthropic_to_openai_request(&body, &model_resolution.target_model) {
-                Ok(openai_body) => {
-                    let mut h = BTreeMap::new(); h.insert("content-type".to_string(), "application/json".to_string()); h.insert("authorization".to_string(), format!("Bearer {}", account.api_key));
-                    (Ok(ProviderRequest{ method:"POST".to_string(), url: format!("{}/chat/completions", openai_base.trim_end_matches('/')), headers: h, body: openai_body }), true)
-                }
-                Err(e) => (Err(e), true),
-            }
-        } else {
-            (build_anthropic_passthrough_request(&body, account, "https://api.anthropic.com/v1", &model_resolution.target_model, anthropic_beta.as_deref()), false)
-        };
-        let provider_request = match provider_request { Ok(r) => r, Err(e) => { last_error = Some(format!("Failed to build provider request: {e}")); if account.id == preferred_id { let mut r = state.dispatch_router.lock().unwrap(); r.record_result(&dispatch_key, &dispatch_meta, None, false); } continue; } };
-        let response = match execute_provider_request(&provider_request).await { Ok(r) => r, Err(e) => { last_error = Some(format!("Provider request failed: {e}")); if account.id == preferred_id { let mut r = state.dispatch_router.lock().unwrap(); r.record_result(&dispatch_key, &dispatch_meta, None, false); } continue; } };
-        let status = response.status();
-        if !status.is_success() {
-            let error_body = response.text().await.unwrap_or_default();
-            last_error = Some(format!("Provider returned {status}: {error_body}"));
-            if is_retryable_status(status.as_u16()) { if account.id == preferred_id { let mut r = state.dispatch_router.lock().unwrap(); r.record_result(&dispatch_key, &dispatch_meta, None, false); } continue; }
-            let error_type = if status == StatusCode::UNAUTHORIZED { "authentication_error" } else { "api_error" };
-            let message = serde_json::from_str::<Value>(&error_body).ok().and_then(|v| v["error"]["message"].as_str().or_else(|| v["error"].as_str()).map(str::to_string)).unwrap_or_else(|| error_body.clone());
-            return (status, Json(serde_json::json!({"type":"error","error":{"type": error_type, "message": message}}))).into_response();
-        }
-        if streaming {
-            { let mut r = state.dispatch_router.lock().unwrap(); r.record_result(&dispatch_key, &dispatch_meta, Some(account.id), true); }
-            if is_conversion { return anthropic_to_openai_streaming(response, &model_resolution.target_model, account, state.pool.clone(), &model_resolution.provider_id, start).await; }
-            return anthropic_streaming_passthrough(response, &model_resolution.target_model, account, state.pool.clone(), &model_resolution.provider_id, start).await;
-        }
-        let body_bytes = match response.bytes().await { Ok(b) => b, Err(e) => { last_error = Some(format!("Failed to read response: {e}")); continue; } };
-        let data: Value = match serde_json::from_slice(&body_bytes) { Ok(v) => v, Err(e) => { last_error = Some(format!("Failed to parse response: {e}")); continue; } };
-        let latency_ms = start.elapsed().as_millis() as i64;
-        if is_conversion {
-            let anthropic_resp = openai_to_anthropic_response(&data, &model_resolution.target_model);
-            let usage = &data["usage"]; let (cr, cc) = cache_usage_from_openai(usage);
-            spawn_log_usage(state.pool.clone(), (*account).clone(), model_resolution.target_model.clone(), model_resolution.provider_id.clone(), usage["prompt_tokens"].as_i64().unwrap_or(0), usage["completion_tokens"].as_i64().unwrap_or(0), cr, cc, latency_ms, true, None);
-            { let mut r = state.dispatch_router.lock().unwrap(); r.record_result(&dispatch_key, &dispatch_meta, Some(account.id), true); }
-            return Json(anthropic_resp).into_response();
-        }
-        let usage = extract_anthropic_usage_from_sse(&String::from_utf8_lossy(&body_bytes));
-        spawn_log_usage(state.pool.clone(), (*account).clone(), model_resolution.target_model.clone(), model_resolution.provider_id.clone(), usage.input_tokens, usage.output_tokens, usage.cache_read_input_tokens, usage.cache_creation_input_tokens, latency_ms, true, None);
-        { let mut r = state.dispatch_router.lock().unwrap(); r.record_result(&dispatch_key, &dispatch_meta, Some(account.id), true); }
-        return Json(data).into_response();
-    }
-    { let mut r = state.dispatch_router.lock().unwrap(); r.record_result(&dispatch_key, &dispatch_meta, None, false); }
-    let error_msg = last_error.unwrap_or_else(|| "All accounts exhausted".to_string());
-    crate::middleware::send_error(&error_msg, "upstream_error", StatusCode::BAD_GATEWAY, is_anthropic)
+    .await
 }
 
 pub(crate) async fn responses_to_anthropic_streaming(
@@ -1052,20 +967,25 @@ pub(crate) async fn responses_to_anthropic_streaming(
     pool: sqlx::SqlitePool,
     provider_id: &str,
     start: Instant,
+    request_body: Option<String>,
 ) -> Response {
     let model = model.to_string();
     let account = account.clone();
     let provider_id = provider_id.to_string();
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, axum::Error>>(64);
+    let client_ip = crate::routes::v1::helpers::current_client_ip();
     tokio::spawn(async move {
         let mut buffer: Vec<u8> = Vec::with_capacity(4096);
+        let mut received: Vec<u8> = Vec::with_capacity(4096);
         let mut conv = llmux_core::proxy::responses::ResponsesToAnthropicConverter::new(&model);
         let mut sse = response.bytes_stream();
+        let mut ttft_ms: Option<i64> = None;
         while let Some(chunk) = sse.next().await {
             let c = match chunk { Ok(c) => c, Err(_) => break };
             buffer.extend_from_slice(&c);
+            received.extend_from_slice(&c);
             for ev in llmux_core::proxy::anthropic_openai::parse_sse_chunks(&mut buffer, 0) {
-                for out in conv.feed(&ev) { if tx.send(Ok(Bytes::from(out))).await.is_err() { return; } }
+                for out in conv.feed(&ev) { if ttft_ms.is_none() { ttft_ms = Some(start.elapsed().as_millis() as i64); } if tx.send(Ok(Bytes::from(out))).await.is_err() { return; } }
                 if conv.is_done() { break; }
             }
             if conv.is_done() { break; }
@@ -1079,10 +999,10 @@ pub(crate) async fn responses_to_anthropic_streaming(
         }
         for out in conv.finish() { let _ = tx.send(Ok(Bytes::from(out))).await; }
         let (input_tokens, output_tokens) = conv.usage_tokens();
+        let (cache_read, cache_create) = conv.usage_cache();
         let latency_ms = start.elapsed().as_millis() as i64;
-        crate::routes::v1::helpers::spawn_log_usage(pool.clone(), account.clone(), model.clone(), provider_id.clone(), input_tokens, output_tokens, 0, 0, latency_ms, conv.is_done(), if conv.is_done() { None } else { Some("Responses upstream ended without terminal event".to_string()) });
+        crate::routes::v1::helpers::spawn_log_usage_ip(pool.clone(), account.clone(), model.clone(), provider_id.clone(), input_tokens, output_tokens, cache_read, cache_create, latency_ms, conv.is_done(), if conv.is_done() { None } else { Some("Responses upstream ended without terminal event".to_string()) }, request_body, Some(String::from_utf8_lossy(&received).into_owned()), ttft_ms, true, client_ip)
     });
     let body = Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx));
     Response::builder().status(StatusCode::OK).header("content-type", "text/event-stream").header("cache-control", "no-cache").header("connection", "keep-alive").body(body).unwrap().into_response()
 }
-

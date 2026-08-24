@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 use serde::{Deserialize, Serialize};
 
 /// Upstream API preference for an alias/aggregate alias.
@@ -31,10 +32,11 @@ impl UpstreamApi {
             Self::Responses => "responses",
             Self::Messages => "messages",
             Self::Default => "default",
-            Self::Auto => "auto",
+            #[allow(deprecated)] Self::Auto => "auto",
         }
     }
 
+    #[allow(deprecated)]
     pub fn wants_responses(self) -> bool {
         matches!(self, Self::Responses | Self::Auto)
     }

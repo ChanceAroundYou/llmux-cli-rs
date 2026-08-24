@@ -400,17 +400,12 @@ fn map_stop_reason(finish: &str) -> &str {
 ///
 /// Recognizes several vendor spellings: DeepSeek's `prompt_cache_hit_tokens` /
 /// `prompt_cache_miss_tokens`, OpenAI's `prompt_tokens_details.cached_tokens`,
-/// and a top-level `cached_tokens`.
+/// the /responses `input_tokens_details.cached_tokens`, and a top-level `cached_tokens`.
 pub fn cache_usage_from_openai(usage: &Value) -> (i64, i64) {
     let cache_read = usage
         .get("prompt_cache_hit_tokens")
         .and_then(Value::as_i64)
-        .or_else(|| {
-            usage
-                .get("prompt_tokens_details")
-                .and_then(|d| d.get("cached_tokens"))
-                .and_then(Value::as_i64)
-        })
+        .or_else(|| detail_cached_tokens(usage))
         .or_else(|| usage.get("cached_tokens").and_then(Value::as_i64))
         .unwrap_or(0);
 
@@ -418,20 +413,29 @@ pub fn cache_usage_from_openai(usage: &Value) -> (i64, i64) {
         .get("prompt_cache_miss_tokens")
         .and_then(Value::as_i64)
         .or_else(|| {
-            usage
-                .get("prompt_tokens_details")
-                .and_then(|d| d.get("cached_tokens"))
-                .and_then(Value::as_i64)
-                .and_then(|cached| {
-                    usage
-                        .get("prompt_tokens")
-                        .and_then(Value::as_i64)
-                        .map(|prompt| (prompt - cached).max(0))
-                })
+            detail_cached_tokens(usage).and_then(|cached| {
+                base_input_tokens(usage).map(|prompt| (prompt - cached).max(0))
+            })
         })
         .unwrap_or(0);
 
     (cache_read, cache_create)
+}
+
+/// `cached_tokens` under either the chat-completions `prompt_tokens_details` or
+/// the /responses `input_tokens_details` object.
+fn detail_cached_tokens(usage: &Value) -> Option<i64> {
+    ["prompt_tokens_details", "input_tokens_details"]
+        .iter()
+        .find_map(|k| usage.get(k).and_then(|d| d.get("cached_tokens")).and_then(Value::as_i64))
+}
+
+/// Fresh-input token base: chat-completions `prompt_tokens` or /responses `input_tokens`.
+fn base_input_tokens(usage: &Value) -> Option<i64> {
+    usage
+        .get("prompt_tokens")
+        .and_then(Value::as_i64)
+        .or_else(|| usage.get("input_tokens").and_then(Value::as_i64))
 }
 
 // ---------------------------------------------------------------------------
@@ -451,6 +455,7 @@ pub struct OpenAISseConverter {
     message_id: String,
     model: String,
     pending_stop_reason: Option<String>,
+    terminal_error: Option<String>,
     last_usage: Option<Value>,
     finished: bool,
 }
@@ -466,6 +471,7 @@ impl OpenAISseConverter {
             message_id,
             model: model.to_string(),
             pending_stop_reason: None,
+            terminal_error: None,
             last_usage: None,
             finished: false,
         }
@@ -474,6 +480,9 @@ impl OpenAISseConverter {
     /// Feed one OpenAI SSE `data:` payload (parsed JSON). Returns the Anthropic
     /// SSE event strings to emit, in order.
     pub fn feed(&mut self, chunk: &Value) -> Vec<String> {
+        if self.finished {
+            return Vec::new();
+        }
         let mut events = Vec::new();
 
         if tracing::enabled!(tracing::Level::TRACE) {
@@ -646,7 +655,12 @@ impl OpenAISseConverter {
         // Finish reason (may arrive in the final content chunk).
         if let Some(fr) = choice.get("finish_reason").and_then(Value::as_str) {
             if !fr.is_empty() && self.pending_stop_reason.is_none() {
-                self.pending_stop_reason = Some(map_stop_reason(fr).to_string());
+                match fr {
+                    "tool_calls" | "stop" | "length" => {
+                        self.pending_stop_reason = Some(map_stop_reason(fr).to_string());
+                    }
+                    _ => self.terminal_error = Some(format!("Upstream stream ended with {fr}")),
+                }
             }
         }
 
@@ -661,6 +675,13 @@ impl OpenAISseConverter {
             return Vec::new();
         }
         self.finished = true;
+
+        if let Some(message) = self.terminal_error.take() {
+            return vec![sse_event(
+                "error",
+                json!({"type":"error","error":{"type":"api_error","message":message}}),
+            )];
+        }
 
         let stop_reason = self
             .pending_stop_reason

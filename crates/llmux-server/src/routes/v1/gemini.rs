@@ -11,8 +11,11 @@ use axum::{
     response::{IntoResponse, Response},
     Extension, Json,
 };
+use bytes::Bytes;
 use futures_util::StreamExt;
 use serde_json::Value;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 
 use llmux_core::adapters::{self, execute_provider_request, ProviderRequest};
 use llmux_core::dispatcher::{self, get_accounts_by_ids, get_active_accounts, is_retryable_status};
@@ -263,7 +266,8 @@ pub async fn gemini(
                 latency_ms,
                 false,
                 last_error.clone(),
-            );
+                Some(body.to_string()),
+                None, Some(latency_ms), false);
             send_tui_request(&state.tui_tx, uri.path(), status.as_u16(), start, &model_resolution.target_model);
             return (status, Json(serde_json::from_str::<Value>(&error_body)
                 .unwrap_or(Value::String(error_body))))
@@ -291,6 +295,7 @@ pub async fn gemini(
                 state.pool.clone(),
                 &model_resolution.provider_id,
                 start,
+                Some(body.to_string()),
             )
             .await;
         }
@@ -327,8 +332,8 @@ pub async fn gemini(
             latency_ms,
             true,
             None,
-        );
-
+            Some(body.to_string()),
+            Some(data.to_string()), Some(latency_ms), false);
         {
             let mut router = state.dispatch_router.lock().unwrap();
             router.record_result(&dispatch_key, &dispatch_meta, Some(account.id), true);
@@ -357,7 +362,8 @@ pub async fn gemini(
             latency_ms,
             false,
             Some(error_msg.clone()),
-        );
+            Some(body.to_string()),
+            None, Some(latency_ms), false);
     }
     send_tui_request(&state.tui_tx, "/v1beta/models/...", 502, start, &model_resolution.target_model);
     middleware::send_error(
@@ -391,6 +397,7 @@ async fn gemini_streaming_passthrough(
     pool: sqlx::SqlitePool,
     provider_id: &str,
     start: Instant,
+    request_body: Option<String>,
 ) -> Response {
     let model = model.to_string();
     let account = account.clone();
@@ -402,16 +409,34 @@ async fn gemini_streaming_passthrough(
         model,
     );
 
-    let stream = response.bytes_stream().map(move |chunk| {
-        chunk.map_err(axum::Error::new)
-    });
-
-    let pool_clone = pool.clone();
+    let (tx, rx) = mpsc::channel::<Result<Bytes, axum::Error>>(64);
+    let client_ip = super::helpers::current_client_ip();
     tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let mut received: Vec<u8> = Vec::with_capacity(4096);
+        let mut sse = response.bytes_stream();
+        let mut ttft_ms: Option<i64> = None;
+        while let Some(chunk) = sse.next().await {
+            let chunk = match chunk {
+                Ok(c) => {
+                    if ttft_ms.is_none() {
+                        ttft_ms = Some(start.elapsed().as_millis() as i64);
+                    }
+                    c
+                }
+                Err(e) => {
+                    tracing::warn!("[gemini:{model}] upstream stream read error: {e}");
+                    break;
+                }
+            };
+            received.extend_from_slice(&chunk);
+            if tx.send(Ok(chunk)).await.is_err() {
+                return;
+            }
+        }
         let latency_ms = start.elapsed().as_millis() as i64;
-        spawn_log_usage(
-            pool_clone.clone(),
+        let resp_body = String::from_utf8_lossy(&received).into_owned();
+        super::helpers::spawn_log_usage_ip(
+            pool.clone(),
             account.clone(),
             model.clone(),
             provider_id.clone(),
@@ -422,10 +447,13 @@ async fn gemini_streaming_passthrough(
             latency_ms,
             true,
             None,
-        );
+            request_body,
+            Some(resp_body),
+            ttft_ms, true, client_ip,
+        )
     });
 
-    let body = Body::from_stream(stream);
+    let body = Body::from_stream(ReceiverStream::new(rx));
     Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "text/event-stream")

@@ -365,6 +365,7 @@ pub fn responses_to_anthropic(resp: &Value, model: &str) -> Value {
     let usage = resp.get("usage").cloned().unwrap_or_else(|| json!({}));
     let input = usage.get("input_tokens").or_else(|| usage.get("prompt_tokens")).and_then(Value::as_i64).unwrap_or(0);
     let output = usage.get("output_tokens").or_else(|| usage.get("completion_tokens")).and_then(Value::as_i64).unwrap_or(0);
+    let (cache_read, cache_create) = super::anthropic_openai::cache_usage_from_openai(&usage);
     json!({
         "id": resp.get("id").cloned().unwrap_or_else(|| json!(format!("msg_{}", uuid_simple()))),
         "type": "message",
@@ -373,7 +374,7 @@ pub fn responses_to_anthropic(resp: &Value, model: &str) -> Value {
         "content": content,
         "stop_reason": if calls.is_empty() { "end_turn" } else { "tool_use" },
         "stop_sequence": null,
-        "usage": {"input_tokens": input, "output_tokens": output},
+        "usage": {"input_tokens": input, "output_tokens": output, "cache_read_input_tokens": cache_read, "cache_creation_input_tokens": cache_create},
     })
 }
 
@@ -874,6 +875,11 @@ impl ResponsesToChatConverter {
         )
     }
 
+    /// Cache token counts carried by the upstream /responses usage event, if any.
+    pub fn usage_cache(&self) -> (i64, i64) {
+        self.last_usage.as_ref().map(super::anthropic_openai::cache_usage_from_openai).unwrap_or((0, 0))
+    }
+
     pub fn feed(&mut self, event_text: &str) -> Vec<String> {
         let mut out = Vec::new();
         let etype = parse_event_type(event_text);
@@ -1022,6 +1028,11 @@ impl ResponsesToAnthropicConverter {
             usage.and_then(|u| u.get("input_tokens").or_else(|| u.get("prompt_tokens"))).and_then(Value::as_i64).unwrap_or(0),
             usage.and_then(|u| u.get("output_tokens").or_else(|| u.get("completion_tokens"))).and_then(Value::as_i64).unwrap_or(0),
         )
+    }
+
+    /// Cache token counts carried by the upstream /responses usage event, if any.
+    pub fn usage_cache(&self) -> (i64, i64) {
+        self.last_usage.as_ref().map(super::anthropic_openai::cache_usage_from_openai).unwrap_or((0, 0))
     }
 
     pub fn feed(&mut self, event_text: &str) -> Vec<String> {

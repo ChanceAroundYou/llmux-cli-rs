@@ -197,7 +197,7 @@ pub fn build_openai_passthrough(
     );
     ProviderRequest {
         method: "POST".to_string(),
-        url: format!("{base_url}/{endpoint}"),
+        url: join_upstream_url(&base_url, endpoint),
         headers,
         body: chat_request_to_value(request),
     }
@@ -233,11 +233,7 @@ pub fn build_passthrough_with_beta(
         crate::protocol::Protocol::Responses => "responses",
         crate::protocol::Protocol::Messages => "v1/messages",
     };
-    let url = if base.ends_with("/v1") && suffix.starts_with("v1/") {
-        format!("{}/{}", base, &suffix[3..])
-    } else {
-        format!("{base}/{suffix}")
-    };
+    let url = join_upstream_url(&base, suffix);
     let mut headers = json_headers();
     if proto == crate::protocol::Protocol::Messages {
         headers.insert("x-api-key".to_string(), account.api_key.clone());
@@ -275,6 +271,30 @@ fn json_headers() -> BTreeMap<String, String> {
 
 fn normalize_base_url(value: &str) -> String {
     value.trim_end_matches('/').to_string()
+}
+
+/// Join an upstream base URL with an endpoint path without allowing duplicate
+/// API-version path segments to survive configuration or call-site mistakes.
+pub fn join_upstream_url(base: &str, endpoint: &str) -> String {
+    let mut url = url::Url::parse(base).unwrap_or_else(|_| {
+        let base = base.trim_end_matches('/');
+        url::Url::parse(&format!("https://invalid.local/{base}")).expect("static URL")
+    });
+    let mut segments: Vec<&str> = Vec::new();
+    for segment in url.path().split('/').filter(|segment| !segment.is_empty()) {
+        if segment == "v1" && segments.last() == Some(&"v1") {
+            continue;
+        }
+        segments.push(segment);
+    }
+    for segment in endpoint.split('/').filter(|segment| !segment.is_empty()) {
+        if segment == "v1" && segments.last() == Some(&"v1") {
+            continue;
+        }
+        segments.push(segment);
+    }
+    url.set_path(&format!("/{}", segments.join("/")));
+    url.to_string().trim_end_matches('/').to_string()
 }
 
 fn chat_request_to_value(request: &ChatRequest) -> Value {

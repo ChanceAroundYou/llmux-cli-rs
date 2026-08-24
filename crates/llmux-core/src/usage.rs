@@ -17,6 +17,12 @@ pub struct UsageSummary {
     pub total_cache_create: i64,
     pub cache_hit_rate: f64,
     pub avg_latency: f64,
+    pub p50_latency: f64,
+    pub p95_latency: f64,
+    pub avg_ttft: f64,
+    pub p50_ttft: f64,
+    pub p95_ttft: f64,
+    pub avg_tps: f64,
     pub total_requests: i64,
     pub success_requests: i64,
 }
@@ -36,7 +42,10 @@ pub struct UsageLogRecord {
     pub success: bool,
     pub error_message: Option<String>,
     pub is_test: bool,
+    pub ttft_ms: Option<i64>,
+    pub is_stream: bool,
     pub account_name: Option<String>,
+    pub client_ip: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -52,6 +61,9 @@ pub struct ProviderBreakdown {
     pub requests: i64,
     pub success_count: i64,
     pub avg_latency: f64,
+    pub avg_ttft: f64,
+    pub p95_ttft: f64,
+    pub avg_tps: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -66,6 +78,9 @@ pub struct ModelBreakdown {
     pub requests: i64,
     pub success_count: i64,
     pub avg_latency: f64,
+    pub avg_ttft: f64,
+    pub p95_ttft: f64,
+    pub avg_tps: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -83,6 +98,9 @@ pub struct AccountBreakdown {
     pub requests: i64,
     pub success_count: i64,
     pub avg_latency: f64,
+    pub avg_ttft: f64,
+    pub p95_ttft: f64,
+    pub avg_tps: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -94,6 +112,11 @@ pub struct TimeseriesPoint {
     pub cache_read: i64,
     pub cache_create: i64,
     pub requests: i64,
+    pub avg_latency: f64,
+    pub p95_latency: f64,
+    pub avg_ttft: f64,
+    pub p95_ttft: f64,
+    pub avg_tps: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -110,6 +133,7 @@ pub struct DetailedLogQuery {
     pub model: Option<String>,
     pub provider: Option<String>,
     pub success: Option<bool>,
+    pub is_stream: Option<bool>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
 }
@@ -207,15 +231,66 @@ impl UsageService {
         } else {
             0.0
         };
+        let avg_latency: f64 = row.try_get("avg_latency")?;
+        let total_requests: i64 = row.try_get("total_requests")?;
+        let success_requests: i64 = row.try_get("success_requests")?;
+        let total_output: i64 = row.try_get("total_output")?;
+
+        // Percentiles + tps require raw per-row values.
+        let mut raw_sql = String::from(
+            "SELECT latency_ms, ttft_ms, output_tokens
+             FROM usage_logs
+             WHERE is_test = 0",
+        );
+        append_time_filter(&mut raw_sql, "", start_time, end_time);
+        let mut raw_query = sqlx::query(&raw_sql);
+        raw_query = bind_time_filter(raw_query, start_time, end_time);
+        let raw_rows = raw_query.fetch_all(&self.pool).await?;
+        let mut latencies: Vec<i64> = Vec::with_capacity(raw_rows.len());
+        let mut ttfts: Vec<i64> = Vec::new();
+        let mut out_total = 0i64;
+        let mut lat_total = 0i64;
+        for r in &raw_rows {
+            let lat: i64 = r.try_get("latency_ms")?;
+            let ttft: Option<i64> = r.try_get("ttft_ms")?;
+            let out: i64 = r.try_get("output_tokens")?;
+            latencies.push(lat);
+            lat_total += lat;
+            out_total += out;
+            if let Some(t) = ttft {
+                ttfts.push(t);
+            }
+        }
+        let p50_latency = percentile(&mut latencies, 50.0);
+        let p95_latency = percentile(&mut latencies, 95.0);
+        let avg_ttft = if ttfts.is_empty() {
+            0.0
+        } else {
+            ttfts.iter().sum::<i64>() as f64 / ttfts.len() as f64
+        };
+        let p50_ttft = percentile(&mut ttfts, 50.0);
+        let p95_tt = percentile(&mut ttfts, 95.0);
+        let avg_tps = if lat_total > 0 {
+            out_total as f64 / (lat_total as f64 / 1000.0)
+        } else {
+            0.0
+        };
+
         Ok(UsageSummary {
             total_input,
-            total_output: row.try_get("total_output")?,
+            total_output,
             total_cache_read,
             total_cache_create,
             cache_hit_rate,
-            avg_latency: row.try_get("avg_latency")?,
-            total_requests: row.try_get("total_requests")?,
-            success_requests: row.try_get("success_requests")?,
+            avg_latency,
+            p50_latency,
+            p95_latency,
+            avg_ttft,
+            p50_ttft,
+            p95_ttft: p95_tt,
+            avg_tps,
+            total_requests,
+            success_requests,
         })
     }
 
@@ -260,43 +335,61 @@ impl UsageService {
     ) -> Result<Vec<ProviderBreakdown>> {
         let mut sql = String::from(
             "SELECT provider_id AS id,
-                    IFNULL(SUM(input_tokens), 0) AS input,
-                    IFNULL(SUM(output_tokens), 0) AS output,
-                    IFNULL(SUM(cache_read_input_tokens), 0) AS cache_read,
-                    IFNULL(SUM(cache_creation_input_tokens), 0) AS cache_create,
-                    IFNULL(SUM(input_tokens + output_tokens), 0) AS total_tokens,
-                    COUNT(*) AS requests,
-                    IFNULL(SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END), 0) AS success_count,
-                    CAST(IFNULL(AVG(latency_ms), 0) AS REAL) AS avg_latency
+                    IFNULL(input_tokens, 0) AS input_tokens,
+                    IFNULL(output_tokens, 0) AS output_tokens,
+                    IFNULL(cache_read_input_tokens, 0) AS cache_read,
+                    IFNULL(cache_creation_input_tokens, 0) AS cache_create,
+                    latency_ms, ttft_ms,
+                    CASE WHEN success = 1 THEN 1 ELSE 0 END AS success
              FROM usage_logs
              WHERE is_test = 0",
         );
         append_time_filter(&mut sql, "", start_time, end_time);
-        sql.push_str(" GROUP BY provider_id");
         let mut query = sqlx::query(&sql);
         query = bind_time_filter(query, start_time, end_time);
         let rows = query.fetch_all(&self.pool).await?;
-        rows.into_iter()
-            .map(|row| {
-                let input: i64 = row.try_get("input")?;
-                let cache_read: i64 = row.try_get("cache_read")?;
-                let cache_create: i64 = row.try_get("cache_create")?;
-                let denom = (input + cache_read + cache_create) as f64;
-                let cache_hit_rate = if denom > 0.0 { (cache_read as f64 / denom) * 100.0 } else { 0.0 };
+
+        use std::collections::HashMap;
+        let mut groups: HashMap<Option<String>, GroupAcc> = HashMap::new();
+        for row in rows {
+            let id: Option<String> = row.try_get("id")?;
+            let acc = groups.entry(id.clone()).or_default();
+            acc.input += row.try_get::<i64, _>("input_tokens")?;
+            acc.output += row.try_get::<i64, _>("output_tokens")?;
+            acc.cache_read += row.try_get::<i64, _>("cache_read")?;
+            acc.cache_create += row.try_get::<i64, _>("cache_create")?;
+            acc.requests += 1;
+            acc.success_count += row.try_get::<i64, _>("success")?;
+            acc.latencies.push(row.try_get::<i64, _>("latency_ms")?);
+            if let Some(t) = row.try_get::<Option<i64>, _>("ttft_ms")? {
+                acc.ttfts.push(t);
+            }
+        }
+
+        let mut out: Vec<ProviderBreakdown> = groups
+            .into_iter()
+            .map(|(id, acc)| {
+                let (avg_latency, _p50l, _p95l, avg_ttft, _p50t, p95_ttft, avg_tps, cache_hit_rate) =
+                    finalize_group(&acc);
                 Ok(ProviderBreakdown {
-                    id: row.try_get("id")?,
-                    input,
-                    output: row.try_get("output")?,
-                    cache_read,
-                    cache_create,
+                    id,
+                    input: acc.input,
+                    output: acc.output,
+                    cache_read: acc.cache_read,
+                    cache_create: acc.cache_create,
                     cache_hit_rate,
-                    total_tokens: row.try_get("total_tokens")?,
-                    requests: row.try_get("requests")?,
-                    success_count: row.try_get("success_count")?,
-                    avg_latency: row.try_get("avg_latency")?,
+                    total_tokens: acc.input + acc.output,
+                    requests: acc.requests,
+                    success_count: acc.success_count,
+                    avg_latency,
+                    avg_ttft,
+                    p95_ttft,
+                    avg_tps,
                 })
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        out.sort_by(|a, b| (b.input + b.output).cmp(&(a.input + a.output)));
+        Ok(out)
     }
 
     pub async fn get_breakdown_by_model(
@@ -306,41 +399,60 @@ impl UsageService {
     ) -> Result<Vec<ModelBreakdown>> {
         let mut sql = String::from(
             "SELECT model,
-                    IFNULL(SUM(input_tokens), 0) AS input,
-                    IFNULL(SUM(output_tokens), 0) AS output,
-                    IFNULL(SUM(cache_read_input_tokens), 0) AS cache_read,
-                    IFNULL(SUM(cache_creation_input_tokens), 0) AS cache_create,
-                    COUNT(*) AS requests,
-                    IFNULL(SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END), 0) AS success_count,
-                    CAST(IFNULL(AVG(latency_ms), 0) AS REAL) AS avg_latency
+                    IFNULL(input_tokens, 0) AS input_tokens,
+                    IFNULL(output_tokens, 0) AS output_tokens,
+                    IFNULL(cache_read_input_tokens, 0) AS cache_read,
+                    IFNULL(cache_creation_input_tokens, 0) AS cache_create,
+                    latency_ms, ttft_ms,
+                    CASE WHEN success = 1 THEN 1 ELSE 0 END AS success
              FROM usage_logs
              WHERE is_test = 0",
         );
         append_time_filter(&mut sql, "", start_time, end_time);
-        sql.push_str(" GROUP BY model ORDER BY (input + output) DESC");
         let mut query = sqlx::query(&sql);
         query = bind_time_filter(query, start_time, end_time);
         let rows = query.fetch_all(&self.pool).await?;
-        rows.into_iter()
-            .map(|row| {
-                let input: i64 = row.try_get("input")?;
-                let cache_read: i64 = row.try_get("cache_read")?;
-                let cache_create: i64 = row.try_get("cache_create")?;
-                let denom = (input + cache_read + cache_create) as f64;
-                let cache_hit_rate = if denom > 0.0 { (cache_read as f64 / denom) * 100.0 } else { 0.0 };
+
+        use std::collections::HashMap;
+        let mut groups: HashMap<Option<String>, GroupAcc> = HashMap::new();
+        for row in rows {
+            let model: Option<String> = row.try_get("model")?;
+            let acc = groups.entry(model.clone()).or_default();
+            acc.input += row.try_get::<i64, _>("input_tokens")?;
+            acc.output += row.try_get::<i64, _>("output_tokens")?;
+            acc.cache_read += row.try_get::<i64, _>("cache_read")?;
+            acc.cache_create += row.try_get::<i64, _>("cache_create")?;
+            acc.requests += 1;
+            acc.success_count += row.try_get::<i64, _>("success")?;
+            acc.latencies.push(row.try_get::<i64, _>("latency_ms")?);
+            if let Some(t) = row.try_get::<Option<i64>, _>("ttft_ms")? {
+                acc.ttfts.push(t);
+            }
+        }
+
+        let mut out: Vec<ModelBreakdown> = groups
+            .into_iter()
+            .map(|(model, acc)| {
+                let (avg_latency, _p50l, _p95l, avg_ttft, _p50t, p95_ttft, avg_tps, cache_hit_rate) =
+                    finalize_group(&acc);
                 Ok(ModelBreakdown {
-                    model: row.try_get("model")?,
-                    input,
-                    output: row.try_get("output")?,
-                    cache_read,
-                    cache_create,
+                    model,
+                    input: acc.input,
+                    output: acc.output,
+                    cache_read: acc.cache_read,
+                    cache_create: acc.cache_create,
                     cache_hit_rate,
-                    requests: row.try_get("requests")?,
-                    success_count: row.try_get("success_count")?,
-                    avg_latency: row.try_get("avg_latency")?,
+                    requests: acc.requests,
+                    success_count: acc.success_count,
+                    avg_latency,
+                    avg_ttft,
+                    p95_ttft,
+                    avg_tps,
                 })
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        out.sort_by(|a, b| (b.input + b.output).cmp(&(a.input + a.output)));
+        Ok(out)
     }
 
     pub async fn get_breakdown_by_account(
@@ -349,49 +461,77 @@ impl UsageService {
         end_time: Option<i64>,
     ) -> Result<Vec<AccountBreakdown>> {
         let mut sql = String::from(
-            "SELECT a.id AS id,
+            "SELECT l.account_id AS id,
                     a.alias AS name,
                     a.provider_id AS provider,
-                    IFNULL(SUM(l.input_tokens), 0) AS input,
-                    IFNULL(SUM(l.output_tokens), 0) AS output,
-                    IFNULL(SUM(l.cache_read_input_tokens), 0) AS cache_read,
-                    IFNULL(SUM(l.cache_creation_input_tokens), 0) AS cache_create,
-                    IFNULL(SUM(l.input_tokens + l.output_tokens), 0) AS total_tokens,
-                    COUNT(*) AS requests,
-                    IFNULL(SUM(CASE WHEN l.success = 1 THEN 1 ELSE 0 END), 0) AS success_count,
-                    CAST(IFNULL(AVG(l.latency_ms), 0) AS REAL) AS avg_latency
+                    IFNULL(l.input_tokens, 0) AS input_tokens,
+                    IFNULL(l.output_tokens, 0) AS output_tokens,
+                    IFNULL(l.cache_read_input_tokens, 0) AS cache_read,
+                    IFNULL(l.cache_creation_input_tokens, 0) AS cache_create,
+                    l.latency_ms, l.ttft_ms,
+                    CASE WHEN l.success = 1 THEN 1 ELSE 0 END AS success
              FROM usage_logs l
              JOIN accounts a ON l.account_id = a.id
              WHERE l.is_test = 0",
         );
         append_time_filter(&mut sql, "l", start_time, end_time);
-        sql.push_str(" GROUP BY a.id, a.alias");
         let mut query = sqlx::query(&sql);
         query = bind_time_filter(query, start_time, end_time);
         let rows = query.fetch_all(&self.pool).await?;
-        rows.into_iter()
-            .map(|row| {
-                let input: i64 = row.try_get("input")?;
-                let cache_read: i64 = row.try_get("cache_read")?;
-                let cache_create: i64 = row.try_get("cache_create")?;
-                let denom = (input + cache_read + cache_create) as f64;
-                let cache_hit_rate = if denom > 0.0 { (cache_read as f64 / denom) * 100.0 } else { 0.0 };
+
+        use std::collections::HashMap;
+        #[derive(Default)]
+        struct AccountGroup {
+            name: String,
+            provider: String,
+            acc: GroupAcc,
+        }
+        let mut groups: HashMap<i64, AccountGroup> = HashMap::new();
+        for row in rows {
+            let id: i64 = row.try_get("id")?;
+            let entry = groups.entry(id).or_default();
+            if entry.name.is_empty() {
+                entry.name = row.try_get::<String, _>("name")?;
+                entry.provider = row.try_get::<String, _>("provider")?;
+            }
+            entry.acc.input += row.try_get::<i64, _>("input_tokens")?;
+            entry.acc.output += row.try_get::<i64, _>("output_tokens")?;
+            entry.acc.cache_read += row.try_get::<i64, _>("cache_read")?;
+            entry.acc.cache_create += row.try_get::<i64, _>("cache_create")?;
+            entry.acc.requests += 1;
+            entry.acc.success_count += row.try_get::<i64, _>("success")?;
+            entry.acc.latencies.push(row.try_get::<i64, _>("latency_ms")?);
+            if let Some(t) = row.try_get::<Option<i64>, _>("ttft_ms")? {
+                entry.acc.ttfts.push(t);
+            }
+        }
+
+        let mut out: Vec<AccountBreakdown> = groups
+            .into_iter()
+            .map(|(id, g)| {
+                let (avg_latency, _p50l, _p95l, avg_ttft, _p50t, p95_ttft, avg_tps, cache_hit_rate) =
+                    finalize_group(&g.acc);
                 Ok(AccountBreakdown {
-                    id: row.try_get("id")?,
-                    name: row.try_get("name")?,
-                    provider: row.try_get("provider")?,
-                    input,
-                    output: row.try_get("output")?,
-                    cache_read,
-                    cache_create,
+                    id,
+                    name: g.name,
+                    provider: g.provider,
+                    input: g.acc.input,
+                    output: g.acc.output,
+                    cache_read: g.acc.cache_read,
+                    cache_create: g.acc.cache_create,
                     cache_hit_rate,
-                    total_tokens: row.try_get("total_tokens")?,
-                    requests: row.try_get("requests")?,
-                    success_count: row.try_get("success_count")?,
-                    avg_latency: row.try_get("avg_latency")?,
+                    total_tokens: g.acc.input + g.acc.output,
+                    requests: g.acc.requests,
+                    success_count: g.acc.success_count,
+                    avg_latency,
+                    avg_ttft,
+                    p95_ttft,
+                    avg_tps,
                 })
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        out.sort_by(|a, b| (b.input + b.output).cmp(&(a.input + a.output)));
+        Ok(out)
     }
 
     /// Time-bucketed token timeseries (stacked-line ready).
@@ -405,32 +545,58 @@ impl UsageService {
         let gran = granularity_ms.max(60_000);
         let mut sql = String::from(
             "SELECT CAST(timestamp / ? AS INTEGER) * ? AS bucket,
-                    IFNULL(SUM(input_tokens), 0) AS input,
-                    IFNULL(SUM(output_tokens), 0) AS output,
-                    IFNULL(SUM(cache_read_input_tokens), 0) AS cache_read,
-                    IFNULL(SUM(cache_creation_input_tokens), 0) AS cache_create,
-                    COUNT(*) AS requests
+                    IFNULL(input_tokens, 0) AS input_tokens,
+                    IFNULL(output_tokens, 0) AS output_tokens,
+                    IFNULL(cache_read_input_tokens, 0) AS cache_read,
+                    IFNULL(cache_creation_input_tokens, 0) AS cache_create,
+                    latency_ms, ttft_ms
              FROM usage_logs
              WHERE is_test = 0",
         );
         append_time_filter(&mut sql, "", start_time, end_time);
-        sql.push_str(" GROUP BY bucket ORDER BY bucket");
         let mut query = sqlx::query(&sql);
         query = query.bind(gran).bind(gran);
         query = bind_time_filter(query, start_time, end_time);
         let rows = query.fetch_all(&self.pool).await?;
-        rows.into_iter()
-            .map(|row| {
+
+        use std::collections::HashMap;
+        let mut groups: HashMap<i64, GroupAcc> = HashMap::new();
+        for row in rows {
+            let bucket: i64 = row.try_get("bucket")?;
+            let acc = groups.entry(bucket).or_default();
+            acc.input += row.try_get::<i64, _>("input_tokens")?;
+            acc.output += row.try_get::<i64, _>("output_tokens")?;
+            acc.cache_read += row.try_get::<i64, _>("cache_read")?;
+            acc.cache_create += row.try_get::<i64, _>("cache_create")?;
+            acc.requests += 1;
+            acc.latencies.push(row.try_get::<i64, _>("latency_ms")?);
+            if let Some(t) = row.try_get::<Option<i64>, _>("ttft_ms")? {
+                acc.ttfts.push(t);
+            }
+        }
+
+        let mut out: Vec<TimeseriesPoint> = groups
+            .into_iter()
+            .map(|(bucket, acc)| {
+                let (avg_latency, _p50l, p95_latency, avg_ttft, _p50t, p95_ttft, avg_tps, _chr) =
+                    finalize_group(&acc);
                 Ok(TimeseriesPoint {
-                    bucket: row.try_get("bucket")?,
-                    input: row.try_get("input")?,
-                    output: row.try_get("output")?,
-                    cache_read: row.try_get("cache_read")?,
-                    cache_create: row.try_get("cache_create")?,
-                    requests: row.try_get("requests")?,
+                    bucket,
+                    input: acc.input,
+                    output: acc.output,
+                    cache_read: acc.cache_read,
+                    cache_create: acc.cache_create,
+                    requests: acc.requests,
+                    avg_latency,
+                    p95_latency,
+                    avg_ttft,
+                    p95_ttft,
+                    avg_tps,
                 })
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        out.sort_by_key(|p| p.bucket);
+        Ok(out)
     }
 
     pub async fn get_detailed_logs(
@@ -452,6 +618,9 @@ impl UsageService {
         }
         if options.success.is_some() {
             sql.push_str(" AND l.success = ?");
+        }
+        if options.is_stream.is_some() {
+            sql.push_str(" AND l.is_stream = ?");
         }
         sql.push_str(" ORDER BY l.timestamp DESC");
         if options.limit.is_some() {
@@ -477,6 +646,9 @@ impl UsageService {
         if let Some(success) = options.success {
             query = query.bind(bool_to_i64(success));
         }
+        if let Some(is_stream) = options.is_stream {
+            query = query.bind(bool_to_i64(is_stream));
+        }
         if let Some(limit) = options.limit {
             query = query.bind(limit);
         }
@@ -485,6 +657,50 @@ impl UsageService {
         }
 
         rows_to_logs(query.fetch_all(&self.pool).await?)
+    }
+
+    /// Same filters as get_detailed_logs (no LIMIT/OFFSET) — feeds the paginator.
+    pub async fn count_detailed_logs(&self, options: DetailedLogQuery) -> Result<i64> {
+        let mut sql = String::from("SELECT COUNT(*) FROM usage_logs l WHERE 1=1");
+        if options.start_time.is_some() {
+            sql.push_str(" AND l.timestamp >= ?");
+        }
+        if options.end_time.is_some() {
+            sql.push_str(" AND l.timestamp <= ?");
+        }
+        if options.model.is_some() {
+            sql.push_str(" AND l.model LIKE ?");
+        }
+        if options.provider.is_some() {
+            sql.push_str(" AND l.provider_id = ?");
+        }
+        if options.success.is_some() {
+            sql.push_str(" AND l.success = ?");
+        }
+        if options.is_stream.is_some() {
+            sql.push_str(" AND l.is_stream = ?");
+        }
+
+        let mut query = sqlx::query(&sql);
+        if let Some(start_time) = options.start_time {
+            query = query.bind(start_time);
+        }
+        if let Some(end_time) = options.end_time {
+            query = query.bind(end_time);
+        }
+        if let Some(model) = options.model {
+            query = query.bind(format!("%{model}%"));
+        }
+        if let Some(provider) = options.provider {
+            query = query.bind(provider);
+        }
+        if let Some(success) = options.success {
+            query = query.bind(bool_to_i64(success));
+        }
+        if let Some(is_stream) = options.is_stream {
+            query = query.bind(bool_to_i64(is_stream));
+        }
+        Ok(query.fetch_one(&self.pool).await?.try_get("COUNT(*)")?)
     }
 }
 
@@ -503,12 +719,93 @@ fn bool_to_i64(value: bool) -> i64 {
     }
 }
 
+/// Percentile over a sample (linear interpolation between closest ranks).
+/// `values` is sorted in place. Returns 0.0 for an empty sample.
+fn percentile(values: &mut Vec<i64>, p: f64) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.sort_unstable();
+    let n = values.len();
+    if n == 1 {
+        return values[0] as f64;
+    }
+    let rank = (p / 100.0) * (n as f64 - 1.0);
+    let lo = rank.floor() as usize;
+    let hi = rank.ceil() as usize;
+    let frac = rank - lo as f64;
+    if lo == hi {
+        values[lo] as f64
+    } else {
+        let a = values[lo] as f64;
+        let b = values[hi] as f64;
+        a + (b - a) * frac
+    }
+}
+
+/// Running accumulator for a single grouped breakdown / timeseries bucket.
+#[derive(Default)]
+struct GroupAcc {
+    input: i64,
+    output: i64,
+    cache_read: i64,
+    cache_create: i64,
+    requests: i64,
+    success_count: i64,
+    latencies: Vec<i64>,
+    ttfts: Vec<i64>,
+}
+
+/// Fold an accumulator into the derived timing/cache metrics.
+fn finalize_group(acc: &GroupAcc) -> (f64, f64, f64, f64, f64, f64, f64, f64) {
+    // (avg_latency, p50_latency, p95_latency, avg_ttft, p50_ttft, p95_ttft, avg_tps, cache_hit_rate) — all f64
+    let mut lat = acc.latencies.clone();
+    let mut tt = acc.ttfts.clone();
+    let avg_latency = if acc.requests > 0 {
+        acc.latencies.iter().sum::<i64>() as f64 / acc.requests as f64
+    } else {
+        0.0
+    };
+    let p50_latency = percentile(&mut lat, 50.0);
+    let p95_latency = percentile(&mut lat, 95.0);
+    let avg_ttft = if tt.is_empty() {
+        0.0
+    } else {
+        tt.iter().sum::<i64>() as f64 / tt.len() as f64
+    };
+    let p50_ttft = percentile(&mut tt, 50.0);
+    let p95_ttft = percentile(&mut tt, 95.0);
+    let lat_total: i64 = acc.latencies.iter().sum();
+    let avg_tps = if lat_total > 0 {
+        acc.output as f64 / (lat_total as f64 / 1000.0)
+    } else {
+        0.0
+    };
+    let denom = (acc.input + acc.cache_read + acc.cache_create) as f64;
+    let cache_hit_rate = if denom > 0.0 {
+        (acc.cache_read as f64 / denom) * 100.0
+    } else {
+        0.0
+    };
+    (
+        avg_latency,
+        p50_latency,
+        p95_latency,
+        avg_ttft,
+        p50_ttft,
+        p95_ttft,
+        avg_tps,
+        cache_hit_rate,
+    )
+}
+
 fn base_log_select(where_clause: &str) -> String {
     format!(
         "SELECT l.id, l.timestamp, l.account_id, l.provider_id, l.model,
                 l.input_tokens, l.output_tokens, l.cache_read_input_tokens,
                 l.cache_creation_input_tokens, l.latency_ms, l.success,
-                l.error_message, l.is_test, a.alias AS account_name
+                l.error_message, l.is_test, l.ttft_ms, l.is_stream,
+                l.client_ip, a.alias AS account_name
          FROM usage_logs l
          LEFT JOIN accounts a ON l.account_id = a.id
          {where_clause}"
@@ -566,7 +863,10 @@ fn rows_to_logs(rows: Vec<sqlx::sqlite::SqliteRow>) -> Result<Vec<UsageLogRecord
                 success: row.try_get::<i64, _>("success")? != 0,
                 error_message: row.try_get("error_message")?,
                 is_test: row.try_get::<i64, _>("is_test")? != 0,
+                ttft_ms: row.try_get("ttft_ms")?,
+                is_stream: row.try_get::<i64, _>("is_stream")? != 0,
                 account_name: row.try_get("account_name")?,
+                client_ip: row.try_get("client_ip")?,
             })
         })
         .collect()
