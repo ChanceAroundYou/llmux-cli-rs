@@ -46,8 +46,11 @@ pub async fn chat_completions(
     Extension(auth): Extension<AuthContext>,
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
-    Json(body): Json<Value>,
+    Json(mut body): Json<Value>,
 ) -> Response {
+    // 客户端历史消息可能带 `tool_calls: []`（hermes 曾踩中，DeepSeek/
+    // Console Go 上游以 minLength 1 拒绝 → 400 → 502）。透传前统一清洗。
+    llmux_core::proxy::strip_empty_tool_calls(&mut body);
     // Resolve early to check upstream_api — chat ingress may be routed to responses upstream
     let raw_model = body.get("model").and_then(Value::as_str).unwrap_or("");
     // Aggregate alias takes precedence over ordinary alias/prefix
