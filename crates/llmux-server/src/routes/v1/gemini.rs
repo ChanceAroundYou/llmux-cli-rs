@@ -417,21 +417,18 @@ async fn gemini_streaming_passthrough(
         let mut ttft_ms: Option<i64> = None;
         while let Some(chunk) = sse.next().await {
             let chunk = match chunk {
-                Ok(c) => {
-                    if ttft_ms.is_none() {
-                        ttft_ms = Some(start.elapsed().as_millis() as i64);
-                    }
-                    c
-                }
+                Ok(c) => c,
                 Err(e) => {
                     tracing::warn!("[gemini:{model}] upstream stream read error: {e}");
                     break;
                 }
             };
             received.extend_from_slice(&chunk);
-            if tx.send(Ok(chunk)).await.is_err() {
-                return;
+            let sent = tx.send(Ok(chunk)).await.is_ok();
+            if sent && ttft_ms.is_none() {
+                ttft_ms = Some(start.elapsed().as_millis() as i64);
             }
+            if !sent { return; }
         }
         let latency_ms = start.elapsed().as_millis() as i64;
         let resp_body = String::from_utf8_lossy(&received).into_owned();

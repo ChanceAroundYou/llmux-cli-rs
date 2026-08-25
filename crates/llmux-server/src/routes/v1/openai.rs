@@ -321,8 +321,10 @@ pub(crate) async fn dispatch_with_conversion(
                 let body_bytes = match response.bytes().await { Ok(b) => b, Err(e) => { last_error = Some(format!("Failed to read response: {e}")); continue; } };
                 let data: Value = match serde_json::from_slice(&body_bytes) { Ok(v) => v, Err(e) => { last_error = Some(format!("Failed to parse response: {e}")); continue; } };
                 let chat_resp = responses_to_chat(&data, &model_name);
-                let (prompt_tokens, completion_tokens) = adapters::usage_from_openai_response_body(&chat_resp);
-                let (cache_read, cache_create) = cache_usage_from_openai(&data["usage"]);
+                let (raw_prompt, completion_tokens) = adapters::usage_from_openai_response_body(&chat_resp);
+                let (cache_read, _) = cache_usage_from_openai(&data["usage"]);
+                let prompt_tokens = (raw_prompt - cache_read).max(0);
+                let cache_create = 0;
                 let latency_ms = start.elapsed().as_millis() as i64;
                 spawn_log_usage(state.pool.clone(), (*account).clone(), model_name.clone(), res.provider_id.clone(), prompt_tokens, completion_tokens, cache_read, cache_create, latency_ms, true, None, Some(forward_body.to_string()), Some(chat_resp.to_string()), Some(latency_ms), false);
                 { let mut r = state.dispatch_router.lock().unwrap(); r.record_result(&dispatch_key, &dispatch_meta, Some(account.id), true); }
@@ -337,8 +339,10 @@ pub(crate) async fn dispatch_with_conversion(
                 let body_bytes = match response.bytes().await { Ok(b) => b, Err(e) => { last_error = Some(format!("Failed to read response: {e}")); continue; } };
                 let data: Value = match serde_json::from_slice(&body_bytes) { Ok(v) => v, Err(e) => { last_error = Some(format!("Failed to parse response: {e}")); continue; } };
                 let resp_body = chat_resp_to_responses_resp(&data, &model_name);
-                let (prompt_tokens, completion_tokens) = adapters::usage_from_openai_response_body(&data);
-                let (cache_read, cache_create) = cache_usage_from_openai(&data["usage"]);
+                let (raw_prompt, completion_tokens) = adapters::usage_from_openai_response_body(&data);
+                let (cache_read, _) = cache_usage_from_openai(&data["usage"]);
+                let prompt_tokens = (raw_prompt - cache_read).max(0);
+                let cache_create = 0;
                 let latency_ms = start.elapsed().as_millis() as i64;
                 spawn_log_usage(state.pool.clone(), (*account).clone(), model_name.clone(), res.provider_id.clone(), prompt_tokens, completion_tokens, cache_read, cache_create, latency_ms, true, None, Some(forward_body.to_string()), Some(resp_body.to_string()), Some(latency_ms), false);
                 { let mut r = state.dispatch_router.lock().unwrap(); r.record_result(&dispatch_key, &dispatch_meta, Some(account.id), true); }
@@ -367,8 +371,10 @@ pub(crate) async fn dispatch_with_conversion(
                 let body_bytes = match response.bytes().await { Ok(b) => b, Err(e) => { last_error = Some(format!("Failed to read response: {e}")); continue; } };
                 let data: Value = match serde_json::from_slice(&body_bytes) { Ok(v) => v, Err(e) => { last_error = Some(format!("Failed to parse response: {e}")); continue; } };
                 let chat_resp = anthropic_to_openai_response(&data, &model_name);
-                let (prompt_tokens, completion_tokens) = adapters::usage_from_openai_response_body(&chat_resp);
-                let (cache_read, cache_create) = cache_usage_from_openai(&chat_resp["usage"]);
+                let (raw_prompt, completion_tokens) = adapters::usage_from_openai_response_body(&chat_resp);
+                let (cache_read, _) = cache_usage_from_openai(&chat_resp["usage"]);
+                let prompt_tokens = (raw_prompt - cache_read).max(0);
+                let cache_create = 0;
                 let latency_ms = start.elapsed().as_millis() as i64;
                 spawn_log_usage(state.pool.clone(), (*account).clone(), model_name.clone(), res.provider_id.clone(), prompt_tokens, completion_tokens, cache_read, cache_create, latency_ms, true, None, Some(forward_body.to_string()), Some(chat_resp.to_string()), Some(latency_ms), false);
                 { let mut r = state.dispatch_router.lock().unwrap(); r.record_result(&dispatch_key, &dispatch_meta, Some(account.id), true); }
@@ -400,8 +406,10 @@ pub(crate) async fn dispatch_with_conversion(
                 let body_bytes = match response.bytes().await { Ok(b) => b, Err(e) => { last_error = Some(format!("Failed to read response: {e}")); continue; } };
                 let data: Value = match serde_json::from_slice(&body_bytes) { Ok(v) => v, Err(e) => { last_error = Some(format!("Failed to parse response: {e}")); continue; } };
                 let anth_resp = openai_to_anthropic_response(&data, &model_name);
-                let (prompt_tokens, completion_tokens) = adapters::usage_from_openai_response_body(&data);
-                let (cache_read, cache_create) = cache_usage_from_openai(&data["usage"]);
+                let (raw_prompt, completion_tokens) = adapters::usage_from_openai_response_body(&data);
+                let (cache_read, _) = cache_usage_from_openai(&data["usage"]);
+                let prompt_tokens = (raw_prompt - cache_read).max(0);
+                let cache_create = 0;
                 let latency_ms = start.elapsed().as_millis() as i64;
                 spawn_log_usage(state.pool.clone(), (*account).clone(), model_name.clone(), res.provider_id.clone(), prompt_tokens, completion_tokens, cache_read, cache_create, latency_ms, true, None, Some(forward_body.to_string()), Some(anth_resp.to_string()), Some(latency_ms), false);
                 { let mut r = state.dispatch_router.lock().unwrap(); r.record_result(&dispatch_key, &dispatch_meta, Some(account.id), true); }
@@ -451,24 +459,30 @@ fn passthrough_usage(data: &Value) -> (i64, i64, i64, i64) {
     if !usage.is_object() {
         return (0, 0, 0, 0);
     }
-    // Anthropic / Responses both carry `input_tokens`; OpenAI chat carries
-    // `prompt_tokens`. Try the former first (covers responses cache via
-    // `input_tokens_details.cached_tokens` as well as native Anthropic cache).
-    if usage.get("input_tokens").is_some() {
-        let (cr, cc) = cache_usage_from_openai(usage);
-        let ar = usage["cache_read_input_tokens"].as_i64().unwrap_or(0);
-        let ac = usage["cache_creation_input_tokens"].as_i64().unwrap_or(0);
-        let (cache_read, cache_create) = if cr != 0 || cc != 0 { (cr, cc) } else { (ar, ac) };
+    // 4-store-3-display: Anthropic native already orthogonal (has cache_*
+    // fields) — trust directly. OpenAI/Responses: fresh = prompt - read,
+    // creation always 0 for non-Anthropic.
+    if usage.get("cache_read_input_tokens").is_some()
+        || usage.get("cache_creation_input_tokens").is_some()
+    {
         return (
             usage["input_tokens"].as_i64().unwrap_or(0),
             usage["output_tokens"].as_i64().unwrap_or(0),
-            cache_read,
-            cache_create,
+            usage["cache_read_input_tokens"].as_i64().unwrap_or(0),
+            usage["cache_creation_input_tokens"].as_i64().unwrap_or(0),
         );
     }
-    let (prompt_tokens, completion_tokens) = adapters::usage_from_openai_response_body(data);
-    let (cache_read, cache_create) = cache_usage_from_openai(usage);
-    (prompt_tokens, completion_tokens, cache_read, cache_create)
+    if usage.get("input_tokens").is_some() {
+        let raw = usage["input_tokens"].as_i64().unwrap_or(0);
+        let out = usage["output_tokens"].as_i64().unwrap_or(0);
+        let (read, _) = cache_usage_from_openai(usage);
+        let fresh = (raw - read).max(0);
+        return (fresh, out, read, 0);
+    }
+    let (raw_prompt, completion_tokens) = adapters::usage_from_openai_response_body(data);
+    let (read, _) = cache_usage_from_openai(usage);
+    let fresh = (raw_prompt - read).max(0);
+    (fresh, completion_tokens, read, 0)
 }
 
 /// Unified aggregate dispatch with per-candidate target computation (Task 6).
@@ -553,8 +567,10 @@ pub(crate) async fn dispatch_aggregate_with_conversion(
         let (converted, pt, ct, cr, cc) = match ingress {
             Protocol::Chat => {
                 let chat_resp = responses_to_chat(&data, &cand.model);
-                let (p, c) = adapters::usage_from_openai_response_body(&chat_resp);
-                let (r, k) = cache_usage_from_openai(&data["usage"]);
+                let (raw_p, c) = adapters::usage_from_openai_response_body(&chat_resp);
+                let (r, _) = cache_usage_from_openai(&data["usage"]);
+                let p = (raw_p - r).max(0);
+                let k = 0;
                 (chat_resp, p, c, r, k)
             }
             Protocol::Messages => {
@@ -614,14 +630,15 @@ async fn responses_to_chat_streaming(
             match chunk {
                 Ok(c) => {
                     chunks += 1;
-                    if ttft_ms.is_none() {
-                        ttft_ms = Some(start.elapsed().as_millis() as i64);
-                    }
                     buffer.extend_from_slice(&c);
                     received.extend_from_slice(&c);
                     for event_text in parse_sse_chunks(&mut buffer, 0) {
                         for out in converter.feed(&event_text) {
-                            if tx.send(Ok(Bytes::from(out))).await.is_err() { return; }
+                            let sent = tx.send(Ok(Bytes::from(out))).await.is_ok();
+                            if sent && ttft_ms.is_none() {
+                                ttft_ms = Some(start.elapsed().as_millis() as i64);
+                            }
+                            if !sent { return; }
                         }
                         if converter.is_done() { break; }
                     }
@@ -636,7 +653,11 @@ async fn responses_to_chat_streaming(
                 if events.is_empty() { break; }
                 for event_text in events {
                     for out in converter.feed(&event_text) {
-                        if tx.send(Ok(Bytes::from(out))).await.is_err() { return; }
+                        let sent = tx.send(Ok(Bytes::from(out))).await.is_ok();
+                        if sent && ttft_ms.is_none() {
+                            ttft_ms = Some(start.elapsed().as_millis() as i64);
+                        }
+                        if !sent { return; }
                     }
                     if converter.is_done() { break; }
                 }
@@ -644,7 +665,11 @@ async fn responses_to_chat_streaming(
             }
         }
         for out in converter.finish() {
-            if tx.send(Ok(Bytes::from(out))).await.is_err() { return; }
+            let sent = tx.send(Ok(Bytes::from(out))).await.is_ok();
+            if sent && ttft_ms.is_none() {
+                ttft_ms = Some(start.elapsed().as_millis() as i64);
+            }
+            if !sent { return; }
         }
         let (prompt_tokens, completion_tokens) = converter.usage_tokens();
         let (cache_read, cache_create) = converter.usage_cache();
@@ -1000,9 +1025,11 @@ async fn openai_dispatch(
             }
         };
 
-        let (prompt_tokens, completion_tokens) =
+        let (raw_prompt, completion_tokens) =
             adapters::usage_from_openai_response_body(&data);
-        let (cache_read, cache_create) = cache_usage_from_openai(&data["usage"]);
+        let (cache_read, _) = cache_usage_from_openai(&data["usage"]);
+        let prompt_tokens = (raw_prompt - cache_read).max(0);
+        let cache_create = 0;
         let latency_ms = start.elapsed().as_millis() as i64;
         spawn_log_usage(
             state.pool.clone(),
@@ -1289,11 +1316,12 @@ async fn openai_streaming_passthrough(
             match chunk {
                 Ok(c) => {
                     chunks += 1;
-                    if ttft_ms.is_none() {
+                    // forward raw bytes to client before parsing
+                    let sent = tx.send(Ok(Bytes::from(c.to_vec()))).await.is_ok();
+                    if sent && ttft_ms.is_none() {
                         ttft_ms = Some(start.elapsed().as_millis() as i64);
                     }
-                    // forward raw bytes to client before parsing
-                    if tx.send(Ok(Bytes::from(c.to_vec()))).await.is_err() {
+                    if !sent {
                         return;
                     }
                     buffer.extend_from_slice(&c);
@@ -1409,17 +1437,19 @@ async fn openai_streaming_passthrough(
             }
         }
 
-        let (prompt_tokens, completion_tokens) = match &last_usage {
+        let (raw_prompt, completion_tokens) = match &last_usage {
             Some(u) => (
                 u.get("prompt_tokens").and_then(Value::as_i64).unwrap_or(0),
                 u.get("completion_tokens").and_then(Value::as_i64).unwrap_or(0),
             ),
             None => (0, 0),
         };
-        let (cache_read, cache_create) = last_usage
+        let (cache_read, _) = last_usage
             .as_ref()
             .map(cache_usage_from_openai)
             .unwrap_or((0, 0));
+        let prompt_tokens = (raw_prompt - cache_read).max(0);
+        let cache_create = 0;
         // ponytail: truncation = no [DONE]/finish_reason; empty stream with 0 tokens also truncated
         let done = saw_done || last_finish.as_deref().is_some_and(|s| !s.is_empty());
         let truncated = !done;
@@ -1593,12 +1623,7 @@ async fn anthropic_fallback_streaming(
 
         while let Some(chunk) = sse.next().await {
             let chunk = match chunk {
-                Ok(c) => {
-                    if ttft_ms.is_none() {
-                        ttft_ms = Some(start.elapsed().as_millis() as i64);
-                    }
-                    c
-                }
+                Ok(c) => c,
                 Err(e) => {
                     tracing::warn!("↩️ upstream stream read error: {e}");
                     break;
@@ -1634,9 +1659,11 @@ async fn anthropic_fallback_streaming(
                     Some("message_stop") => {
                         // End of the Anthropic stream.
                         for line in converter.finish(usage.as_ref()) {
-                            if tx.send(Ok(Bytes::from(format!("{line}\n\n")))).await.is_err() {
-                                return;
+                            let sent = tx.send(Ok(Bytes::from(format!("{line}\n\n")))).await.is_ok();
+                            if sent && ttft_ms.is_none() {
+                                ttft_ms = Some(start.elapsed().as_millis() as i64);
                             }
+                            if !sent { return; }
                         }
                         let (prompt, completion) = {
                             let u = usage.unwrap_or_default();
@@ -1666,9 +1693,9 @@ async fn anthropic_fallback_streaming(
                     _ => {}
                 }
                 for line in converter.feed(&parsed) {
-                    if tx.send(Ok(Bytes::from(format!("{line}\n\n")))).await.is_err() {
-                        return;
-                    }
+                    let sent = tx.send(Ok(Bytes::from(format!("{line}\n\n")))).await.is_ok();
+                    if sent && ttft_ms.is_none() { ttft_ms = Some(start.elapsed().as_millis() as i64); }
+                    if !sent { return; }
                 }
             }
         }
@@ -1690,13 +1717,14 @@ async fn anthropic_fallback_streaming(
                     continue;
                 };
                 for line in converter.feed(&parsed) {
-                    if tx.send(Ok(Bytes::from(format!("{line}\n\n")))).await.is_err() {
-                        return;
-                    }
+                    let sent = tx.send(Ok(Bytes::from(format!("{line}\n\n")))).await.is_ok();
+                    if sent && ttft_ms.is_none() { ttft_ms = Some(start.elapsed().as_millis() as i64); }
+                    if !sent { return; }
                 }
             }
         }
         for line in converter.finish(usage.as_ref()) {
+            // terminal — not counted as TTFT
             if tx.send(Ok(Bytes::from(format!("{line}\n\n")))).await.is_err() {
                 return;
             }

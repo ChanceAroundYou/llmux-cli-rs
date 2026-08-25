@@ -363,11 +363,11 @@ pub fn openai_to_anthropic_response(openai_body: &Value, resolved_model: &str) -
     let stop_reason = map_stop_reason(finish).to_string();
 
     let usage = &openai_body["usage"];
-    let (input_tokens, output_tokens) = (
-        usage.get("prompt_tokens").and_then(Value::as_i64).unwrap_or(0),
-        usage.get("completion_tokens").and_then(Value::as_i64).unwrap_or(0),
-    );
+    let raw_prompt = usage.get("prompt_tokens").and_then(Value::as_i64).unwrap_or(0);
+    let output_tokens = usage.get("completion_tokens").and_then(Value::as_i64).unwrap_or(0);
     let (cache_read, cache_create) = cache_usage_from_openai(usage);
+    // 4-store-3-display: fresh input = prompt - read (creation always 0 for OpenAI)
+    let input_tokens = (raw_prompt - cache_read).max(0);
 
     json!({
         "id": openai_body.get("id").cloned().unwrap_or_else(|| json!("msg_unset")),
@@ -398,9 +398,15 @@ fn map_stop_reason(finish: &str) -> &str {
 
 /// Extract cache token counts from an OpenAI usage object.
 ///
-/// Recognizes several vendor spellings: DeepSeek's `prompt_cache_hit_tokens` /
-/// `prompt_cache_miss_tokens`, OpenAI's `prompt_tokens_details.cached_tokens`,
-/// the /responses `input_tokens_details.cached_tokens`, and a top-level `cached_tokens`.
+/// Recognizes several vendor spellings: DeepSeek's `prompt_cache_hit_tokens`,
+/// OpenAI's `prompt_tokens_details.cached_tokens`, the /responses
+/// `input_tokens_details.cached_tokens`, and a top-level `cached_tokens`.
+///
+/// 4-store-3-display contract: `cache_creation` is only meaningful for
+/// Anthropic native (`cache_creation_input_tokens`). For all OpenAI-compatible
+/// upstreams `creation` is always 0 — the uncached portion is `input` (fresh),
+/// i.e. `input = prompt - read`. DeepSeek's `prompt_cache_miss_tokens` is
+/// therefore *not* a creation count but the fresh input itself.
 pub fn cache_usage_from_openai(usage: &Value) -> (i64, i64) {
     let cache_read = usage
         .get("prompt_cache_hit_tokens")
@@ -409,15 +415,9 @@ pub fn cache_usage_from_openai(usage: &Value) -> (i64, i64) {
         .or_else(|| usage.get("cached_tokens").and_then(Value::as_i64))
         .unwrap_or(0);
 
-    let cache_create = usage
-        .get("prompt_cache_miss_tokens")
-        .and_then(Value::as_i64)
-        .or_else(|| {
-            detail_cached_tokens(usage).and_then(|cached| {
-                base_input_tokens(usage).map(|prompt| (prompt - cached).max(0))
-            })
-        })
-        .unwrap_or(0);
+    // creation is only valid for Anthropic native; for OpenAI-compatible
+    // upstreams it is always 0 (uncached tokens belong to `input`).
+    let cache_create = 0;
 
     (cache_read, cache_create)
 }
@@ -428,14 +428,6 @@ fn detail_cached_tokens(usage: &Value) -> Option<i64> {
     ["prompt_tokens_details", "input_tokens_details"]
         .iter()
         .find_map(|k| usage.get(k).and_then(|d| d.get("cached_tokens")).and_then(Value::as_i64))
-}
-
-/// Fresh-input token base: chat-completions `prompt_tokens` or /responses `input_tokens`.
-fn base_input_tokens(usage: &Value) -> Option<i64> {
-    usage
-        .get("prompt_tokens")
-        .and_then(Value::as_i64)
-        .or_else(|| usage.get("input_tokens").and_then(Value::as_i64))
 }
 
 // ---------------------------------------------------------------------------
@@ -746,13 +738,15 @@ impl OpenAISseConverter {
 
     /// Tokens seen during streaming, from the include_usage tail chunk.
     /// Returns `(input, output, cache_read, cache_create)`.
+    /// 4-store-3-display: for OpenAI-compatible tails `cache_create` is always 0.
     pub fn usage_tokens(&self) -> (i64, i64, i64, i64) {
         let Some(usage) = &self.last_usage else {
             return (0, 0, 0, 0);
         };
-        let input = usage.get("prompt_tokens").and_then(Value::as_i64).unwrap_or(0);
+        let raw_prompt = usage.get("prompt_tokens").and_then(Value::as_i64).unwrap_or(0);
         let output = usage.get("completion_tokens").and_then(Value::as_i64).unwrap_or(0);
         let (cache_read, cache_create) = cache_usage_from_openai(usage);
+        let input = (raw_prompt - cache_read).max(0);
         (input, output, cache_read, cache_create)
     }
 }

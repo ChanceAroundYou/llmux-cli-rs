@@ -1,4 +1,5 @@
 import { Zap, ArrowRight } from 'lucide-react';
+import { fmtSec } from '../../utils/format';
 import { TFunction } from 'i18next';
 import { cn } from '../../lib/utils';
 
@@ -62,7 +63,7 @@ export const AliasHealthList = ({ aliases, t }: AliasHealthListProps) => {
               <div className="text-right shrink-0 ml-2">
                 {a.latency !== null ? (
                   <div className={cn("text-sm font-semibold tabular-nums", a.success ? "text-success" : "text-destructive")}>
-                    {a.success ? `${(a.latency / 1000).toFixed(1)}s` : 'ERR'}
+                    {a.success ? fmtSec(a.latency) : 'ERR'}
                   </div>
                 ) : a.lastChecked ? (
                   <div className="text-sm font-semibold text-destructive">ERR</div>

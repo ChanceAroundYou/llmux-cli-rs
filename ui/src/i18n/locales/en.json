@@ -34,7 +34,8 @@
     "degraded": "Degraded",
     "down": "Down",
     "alias": "Alias",
-    "logs": "Logs"
+    "logs": "Logs",
+    "copy": "Copy"
   },
   "dashboard": {
     "overview": "System Overview",
@@ -85,15 +86,16 @@
     "noErrors": "No errors",
     "noDataTrend": "Start testing or connect clients to collect data...",
     "monitor": {
-      "latencyPulse": "Latency Pulse",
-      "avgLag": "Avg Lag",
+      "latencyPulse": "Elapsed Pulse",
+      "avgLag": "Total Time",
       "successRate": "Success Rate",
       "liveFeed": "Live Feed",
       "reqs": "reqs",
-      "avgTtft": "Avg TTFT",
-      "p95Latency": "P95 Latency",
-      "avgTps": "Avg TPS",
-      "ttftPulse": "TTFT Pulse"
+      "avgTtft": "TTFT",
+      "p95Latency": "Total Time",
+      "avgTps": "Token/s",
+      "ttftPulse": "TTFT Pulse",
+      "avgLabel": "Avg"
     }
   },
   "usage": {
@@ -108,7 +110,7 @@
     "downloadCsv": "Export Data (CSV)",
     "input": "Input",
     "output": "Output",
-    "cacheHit": "Cache Hit",
+    "cacheHit": "Cache",
     "cacheCreate": "Cache Write",
     "day": "Day",
     "month": "Month",
@@ -139,15 +141,24 @@
     "statsCards": {
       "totalTokens": "Total Tokens",
       "cacheHit": "Cache Hit",
-      "effectiveTokens": "Effective Tokens",
       "requests": "Requests",
-      "cacheDetail": "read {{read}} · write {{write}} — read / total input (incl. cache)",
-      "effectiveHint": "input + cache read + cache create",
-      "inputOutput": "input {{input}} / output {{output}}"
+      "p95Latency": "P95 Elapsed",
+      "latencyHint": "P95 {{value}}",
+      "ttftHint": "P95 {{value}}",
+      "tpsHint": "{{value}} Token/s",
+      "avgLatency": "Avg Elapsed",
+      "avgTtft": "Avg TTFT",
+      "avgTps": "Avg Token/s"
     },
     "charts": {
       "byModelTop": "Top by Model",
-      "byAccountTop": "Top by Account"
+      "byAccountTop": "Top by Account",
+      "tokenTimeseries": "Tokens",
+      "token": "Tokens",
+      "latencyDual": "Elapsed & TTFT",
+      "throughput": "Token/s",
+      "netElapsed": "Net Elapsed (s)",
+      "ttftAxis": "TTFT (s)"
     },
     "tables": {
       "byModel": "By Model",
@@ -157,13 +168,15 @@
         "input": "Input",
         "output": "Output",
         "total": "Total",
-        "cacheHit": "Cache Hit",
+        "cacheHit": "Cache",
         "hitRate": "Hit Rate",
         "requests": "Requests",
         "successRate": "Success",
-        "avgLatency": "Avg Latency",
+        "avgLatency": "Elapsed",
         "account": "Account",
-        "provider": "Provider"
+        "provider": "Provider",
+        "avgTtft": "TTFT",
+        "avgTps": "Token/s"
       }
     },
     "filter": {
@@ -187,7 +200,7 @@
     "activeVendors": "{{count}} ACTIVE VENDORS",
     "activeAccounts": "{{count}} ACTIVE CHANNELS",
     "processed": "PROCESSED",
-    "avgLatencyLabel": "Avg Latency (ms)",
+    "avgLatencyLabel": "Avg Elapsed (s)",
     "usageIo": "USAGE (I/O)",
     "captureTraffic": "Capture traffic to see insights"
   },
@@ -433,7 +446,7 @@
     "tokens": "Tokens",
     "input": "In",
     "output": "Out",
-    "latency": "Latency",
+    "latency": "Total Time",
     "status": "Status",
     "error": "Error",
     "all": "All",
@@ -451,11 +464,13 @@
     "last7d": "Last 7 days",
     "allTime": "All time",
     "ttft": "TTFT",
-    "throughput": "Throughput (t/s)",
-    "total": "Total",
+    "throughput": "Token/s",
+    "total": "Total Time",
     "stream": "Stream",
     "nonStream": "Non-stream",
     "streamOnly": "Stream only",
-    "slowOnly": "Slow queries"
+    "slowOnly": "Slow queries",
+    "cacheTokens": "Cache",
+    "elapsed": "Elapsed"
   }
 }

@@ -8,6 +8,7 @@ import {
 import { CopyButton } from '../CopyButton';
 import { cn } from '@/lib/utils';
 import { parseServerDate } from '@/utils/date';
+import { fmtSec } from '@/utils/format';
 import { TFunction } from 'i18next';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
@@ -125,7 +126,7 @@ export const ModelCard: React.FC<ModelCardProps> = ({
               "text-[10px] font-black border-none px-1.5 py-0.5",
               testResult.success ? "bg-success/5 text-success" : "bg-destructive/5 text-destructive"
             )}>
-              {(testResult.latency / 1000).toFixed(2)}s
+              {fmtSec(testResult.latency)}
             </Badge>
           )}
           {testResult?.lastChecked && (

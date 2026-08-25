@@ -187,7 +187,7 @@ async fn fetch_model_health(state: &AppState) -> anyhow::Result<Value> {
 
 async fn fetch_activity(state: &AppState) -> anyhow::Result<Value> {
     let rows = sqlx::query(
-        "SELECT l.id, l.timestamp, l.model, l.success, l.latency_ms, l.error_message, l.output_tokens, l.ttft_ms, l.is_stream, a.alias AS account_name, a.provider_id \
+        "SELECT l.id, l.timestamp, l.model, l.success, l.latency_ms, l.error_message, l.input_tokens, l.output_tokens, l.cache_read_input_tokens, l.cache_creation_input_tokens, l.ttft_ms, l.is_stream, a.alias AS account_name, a.provider_id \
          FROM usage_logs l LEFT JOIN accounts a ON l.account_id = a.id WHERE l.is_test = 0 ORDER BY l.timestamp DESC LIMIT 100",
     )
     .fetch_all(&state.pool)
@@ -195,13 +195,16 @@ async fn fetch_activity(state: &AppState) -> anyhow::Result<Value> {
     let entries: Vec<Value> = rows
         .iter()
         .map(|r| {
+            let cache = r.try_get::<i64, _>("cache_read_input_tokens").unwrap_or_default();
             json!({
                 "id": r.try_get::<i64, _>("id").unwrap_or_default(),
                 "timestamp": r.try_get::<i64, _>("timestamp").unwrap_or_default(),
                 "model": r.try_get::<String, _>("model").unwrap_or_default(),
                 "success": r.try_get::<i64, _>("success").unwrap_or_default(),
                 "latency_ms": r.try_get::<i64, _>("latency_ms").unwrap_or_default(),
+                "input_tokens": r.try_get::<i64, _>("input_tokens").unwrap_or_default(),
                 "output_tokens": r.try_get::<i64, _>("output_tokens").unwrap_or_default(),
+                "cache_tokens": cache,
                 "ttft_ms": r.try_get::<Option<i64>, _>("ttft_ms").unwrap_or_default(),
                 "is_stream": r.try_get::<i64, _>("is_stream").unwrap_or_default(),
                 "error_message": r.try_get::<Option<String>, _>("error_message").unwrap_or_default(),

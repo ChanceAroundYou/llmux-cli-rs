@@ -363,9 +363,10 @@ pub fn responses_to_anthropic(resp: &Value, model: &str) -> Value {
         }));
     }
     let usage = resp.get("usage").cloned().unwrap_or_else(|| json!({}));
-    let input = usage.get("input_tokens").or_else(|| usage.get("prompt_tokens")).and_then(Value::as_i64).unwrap_or(0);
+    let raw_input = usage.get("input_tokens").or_else(|| usage.get("prompt_tokens")).and_then(Value::as_i64).unwrap_or(0);
     let output = usage.get("output_tokens").or_else(|| usage.get("completion_tokens")).and_then(Value::as_i64).unwrap_or(0);
     let (cache_read, cache_create) = super::anthropic_openai::cache_usage_from_openai(&usage);
+    let input = (raw_input - cache_read).max(0);
     json!({
         "id": resp.get("id").cloned().unwrap_or_else(|| json!(format!("msg_{}", uuid_simple()))),
         "type": "message",
@@ -869,13 +870,16 @@ impl ResponsesToChatConverter {
 
     pub fn usage_tokens(&self) -> (i64, i64) {
         let usage = self.last_usage.as_ref();
+        let raw = usage.and_then(|u| u.get("input_tokens").or_else(|| u.get("prompt_tokens"))).and_then(Value::as_i64).unwrap_or(0);
+        let (read, _) = self.usage_cache();
+        let fresh = (raw - read).max(0);
         (
-            usage.and_then(|u| u.get("input_tokens").or_else(|| u.get("prompt_tokens"))).and_then(Value::as_i64).unwrap_or(0),
+            fresh,
             usage.and_then(|u| u.get("output_tokens").or_else(|| u.get("completion_tokens"))).and_then(Value::as_i64).unwrap_or(0),
         )
     }
 
-    /// Cache token counts carried by the upstream /responses usage event, if any.
+    /// Cache token counts — 4-store-3-display: creation always 0 for /responses.
     pub fn usage_cache(&self) -> (i64, i64) {
         self.last_usage.as_ref().map(super::anthropic_openai::cache_usage_from_openai).unwrap_or((0, 0))
     }
@@ -1024,13 +1028,16 @@ impl ResponsesToAnthropicConverter {
 
     pub fn usage_tokens(&self) -> (i64, i64) {
         let usage = self.last_usage.as_ref();
+        let raw = usage.and_then(|u| u.get("input_tokens").or_else(|| u.get("prompt_tokens"))).and_then(Value::as_i64).unwrap_or(0);
+        let (read, _) = self.usage_cache();
+        let fresh = (raw - read).max(0);
         (
-            usage.and_then(|u| u.get("input_tokens").or_else(|| u.get("prompt_tokens"))).and_then(Value::as_i64).unwrap_or(0),
+            fresh,
             usage.and_then(|u| u.get("output_tokens").or_else(|| u.get("completion_tokens"))).and_then(Value::as_i64).unwrap_or(0),
         )
     }
 
-    /// Cache token counts carried by the upstream /responses usage event, if any.
+    /// Cache token counts — 4-store-3-display: creation always 0 for /responses.
     pub fn usage_cache(&self) -> (i64, i64) {
         self.last_usage.as_ref().map(super::anthropic_openai::cache_usage_from_openai).unwrap_or((0, 0))
     }

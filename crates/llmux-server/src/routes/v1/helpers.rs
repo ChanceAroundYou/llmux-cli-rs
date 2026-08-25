@@ -321,7 +321,7 @@ pub fn spawn_log_usage_ip(
             .bind(input_tokens).bind(output_tokens).bind(cache_read_input_tokens).bind(cache_creation_input_tokens)
             .bind(latency_ms).bind(if success {1} else {0}).bind(error_message.as_deref())
             .bind(request_body.as_deref()).bind(response_body.as_deref())
-            .bind(if is_stream {1} else {0}).bind(ttft_ms).bind(client_ip.as_deref()).bind(0)
+            .bind(ttft_ms).bind(if is_stream {1} else {0}).bind(client_ip.as_deref()).bind(0)
             .execute(&pool).await;
         if let Err(e) = res { tracing::error!("📊 Failed to insert usage log: {e}"); }
         prune_old_bodies(&pool).await;

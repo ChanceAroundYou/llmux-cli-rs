@@ -162,8 +162,11 @@ pub async fn get_stats_logs(
     let entries: Vec<Value> = logs
         .into_iter()
         .map(|r| {
-            // tps = output_tokens*1000 / max(1, latency_ms - ttft_ms) (uses full latency when ttft absent).
-            let gen_ms = (r.latency_ms - r.ttft_ms.unwrap_or(0)).max(1);
+            // t/s：流式按生成段计时，非流式/无 TTFT 按总耗时。
+            let gen_ms = match r.ttft_ms {
+                Some(tt) if r.is_stream && tt < r.latency_ms => (r.latency_ms - tt).max(1),
+                _ => r.latency_ms.max(1),
+            };
             let tps = (r.output_tokens * 1000) as f64 / gen_ms as f64;
             json!({
                 "id": r.id,

@@ -378,7 +378,7 @@ impl UsageService {
                     cache_read: acc.cache_read,
                     cache_create: acc.cache_create,
                     cache_hit_rate,
-                    total_tokens: acc.input + acc.output,
+                    total_tokens: acc.input + acc.output + acc.cache_read + acc.cache_create,
                     requests: acc.requests,
                     success_count: acc.success_count,
                     avg_latency,
@@ -388,7 +388,11 @@ impl UsageService {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        out.sort_by(|a, b| (b.input + b.output).cmp(&(a.input + a.output)));
+        out.sort_by(|a, b| {
+            let ta = a.input + a.output + a.cache_read + a.cache_create;
+            let tb = b.input + b.output + b.cache_read + b.cache_create;
+            tb.cmp(&ta)
+        });
         Ok(out)
     }
 
@@ -451,7 +455,11 @@ impl UsageService {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        out.sort_by(|a, b| (b.input + b.output).cmp(&(a.input + a.output)));
+        out.sort_by(|a, b| {
+            let ta = a.input + a.output + a.cache_read + a.cache_create;
+            let tb = b.input + b.output + b.cache_read + b.cache_create;
+            tb.cmp(&ta)
+        });
         Ok(out)
     }
 
@@ -520,7 +528,7 @@ impl UsageService {
                     cache_read: g.acc.cache_read,
                     cache_create: g.acc.cache_create,
                     cache_hit_rate,
-                    total_tokens: g.acc.input + g.acc.output,
+                    total_tokens: g.acc.input + g.acc.output + g.acc.cache_read + g.acc.cache_create,
                     requests: g.acc.requests,
                     success_count: g.acc.success_count,
                     avg_latency,
@@ -530,7 +538,11 @@ impl UsageService {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        out.sort_by(|a, b| (b.input + b.output).cmp(&(a.input + a.output)));
+        out.sort_by(|a, b| {
+            let ta = a.input + a.output + a.cache_read + a.cache_create;
+            let tb = b.input + b.output + b.cache_read + b.cache_create;
+            tb.cmp(&ta)
+        });
         Ok(out)
     }
 
