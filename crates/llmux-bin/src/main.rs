@@ -202,7 +202,7 @@ fn cleanup_old_logs(dir: &std::path::Path) {
     let retain: i64 = std::env::var("LOG_RETAIN_DAYS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(3);
+        .unwrap_or(7);
     if retain <= 0 {
         return;
     }
