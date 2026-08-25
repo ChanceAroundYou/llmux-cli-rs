@@ -4,6 +4,7 @@ import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router-dom';
 import { AlertTriangle, Database, Users, Zap, Key, Shield, Activity, LayoutDashboard, ChevronDown, Search } from 'lucide-react';
 import { parseServerDate } from '../utils/date';
+import { fmtSec } from '../utils/format';
 import { cn } from '../lib/utils'
 import { StatusDot } from '../components/shared/StatusDot'
 import { PageHeader } from '../components/shared/PageHeader'
@@ -17,15 +18,22 @@ import type { ChartData, ChartOptions } from 'chart.js'
 const PulseChart = lazy(() => import('@/components/Dashboard/PulseChart'))
 
 interface ProviderHealth { id: string; name?: string; status: string; totalChecks: number; }
-interface ActivityEntry { id: number; timestamp: number; model: string; success: number; latency_ms: number; error_message: string | null; account_name: string; output_tokens: number; ttft_ms: number | null; is_stream: number; }
+interface ActivityEntry { id: number; timestamp: number; model: string; success: number; latency_ms: number; error_message: string | null; account_name: string; input_tokens: number; output_tokens: number; cache_tokens: number; ttft_ms: number | null; is_stream: number; }
 interface ModelHealthEntry { model: string; success: number; latency: number; error: string | null; last_checked: number; account_name: string; account_id: number; provider_id: string; }
 interface ModelAlias { id: number; alias: string; target_model: string; provider_id: string | null; }
 interface AggregateAlias { id: number; alias: string; candidates: { account_id: number; model: string }[]; interval_secs: number; active: number; last_status: (boolean | null)[]; pending_target: number | null; confirm_count: number; }
 
-// t/s = output*1000 / (latency - ttft); falls back to full latency when ttft is absent.
+// t/s：流式按生成段(总耗时-首字时间)，非流式按总耗时。
 const calcTps = (outputTokens: number, latencyMs: number, ttftMs: number | null | undefined): number => {
-  const gen = Math.max(1, (latencyMs || 0) - (ttftMs ?? 0));
+  const total = latencyMs || 0;
+  const ttft = typeof ttftMs === 'number' && ttftMs > 0 && ttftMs < total ? ttftMs : 0;
+  const gen = Math.max(1, ttft ? total - ttft : total);
   return ((outputTokens || 0) * 1000) / gen;
+};
+const formatK = (n: number): string => {
+  const v = Math.round(n);
+  if (v >= 1000) return `${(v / 1000).toFixed(1).replace(/\.0$/, '')}k`;
+  return `${v}`;
 };
 
 export default function Dashboard() {
@@ -227,7 +235,7 @@ export default function Dashboard() {
             const log = logs[context.dataIndex];
             if (!log) return '';
             if (log.success !== 1) return ` Error: ${log.error_message || 'ERR'}`;
-            return ` ${log.latency_ms}ms`;
+            return ` ${fmtSec(log.latency_ms)}`;
           }
         }
       }
@@ -281,8 +289,8 @@ export default function Dashboard() {
             const log = logs[context.dataIndex];
             if (!log) return '';
             if (log.success !== 1) return ` Error: ${log.error_message || 'ERR'}`;
-            const ttft = typeof log.ttft_ms === 'number' ? log.ttft_ms : 0;
-            return ` TTFT: ${ttft}ms`;
+            const ttft = typeof log.ttft_ms === 'number' ? log.ttft_ms : null;
+            return ` TTFT: ${fmtSec(ttft)}`;
           }
         }
       }
@@ -413,7 +421,7 @@ export default function Dashboard() {
                           : 'bg-destructive/10 text-destructive border-destructive/20'
                       )}
                     >
-                      {a.success ? `${(a.latency / 1000).toFixed(1)}s` : 'ERR'}
+                      {a.success ? fmtSec(a.latency) : 'ERR'}
                     </Badge>
                   ) : a.lastChecked ? (
                     <Badge variant="destructive" className="bg-destructive/10 text-destructive border-destructive/20 font-mono">ERR</Badge>
@@ -435,17 +443,17 @@ export default function Dashboard() {
         {/* Right: Activity Log — 5 cols */}
         <section className={cn("lg:col-span-5 bg-card border border-border rounded-xl shadow-sm lg:overflow-hidden lg:flex lg:flex-col", logsCollapsed && "lg:self-start")}>
           <div className="p-6 border-b border-border/50">
-            <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3">
-              <div className="flex items-center gap-2">
-                <Activity size={16} className="text-muted-foreground" />
-                <h2 className="text-lg font-bold text-foreground">{t('dashboard.recentLogs')}</h2>
+            <div className="flex justify-between items-center gap-2">
+              <div className="flex items-center gap-2 min-w-0">
+                <Activity size={16} className="text-muted-foreground shrink-0" />
+                <h2 className="text-lg font-bold text-foreground truncate">{t('dashboard.recentLogs')}</h2>
               </div>
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-2 shrink-0">
                 <button
                   type="button"
                   onClick={() => setOnlyShowErrors(!onlyShowErrors)}
                   className={cn(
-                    "inline-flex items-center rounded-full border px-2.5 py-0.5 text-xs font-semibold transition-colors focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2",
+                    "inline-flex items-center rounded-full border px-2.5 py-0.5 text-xs font-semibold whitespace-nowrap transition-colors focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2",
                     onlyShowErrors
                       ? "bg-destructive/10 text-destructive border-destructive/20 hover:bg-destructive/20"
                       : "bg-muted text-muted-foreground border-border hover:bg-muted/80"
@@ -470,19 +478,19 @@ export default function Dashboard() {
               <div>
                 <span className="text-[10px] font-medium text-muted-foreground block uppercase tracking-wider">{t('dashboard.monitor.avgTtft')}</span>
                 <div className="flex items-baseline gap-1 mt-1">
-                  <span className="text-xl font-bold text-foreground tracking-tight">{logMetrics.avgTtft}ms</span>
+                  <span className="text-xl font-bold text-foreground tracking-tight">{fmtSec(logMetrics.avgTtft)}</span>
                 </div>
               </div>
               <div>
                 <span className="text-[10px] font-medium text-muted-foreground block uppercase tracking-wider">{t('dashboard.monitor.p95Latency')}</span>
                 <div className="flex items-baseline gap-1 mt-1">
-                  <span className="text-xl font-bold text-foreground tracking-tight">{logMetrics.p95}ms</span>
+                  <span className="text-xl font-bold text-foreground tracking-tight">{fmtSec(logMetrics.avg)}</span>
                 </div>
               </div>
               <div>
                 <span className="text-[10px] font-medium text-muted-foreground block uppercase tracking-wider">{t('dashboard.monitor.avgTps')}</span>
                 <div className="flex items-baseline gap-1 mt-1">
-                  <span className="text-xl font-bold text-foreground tracking-tight">{logMetrics.avgTps}<span className="text-xs font-normal text-muted-foreground ml-0.5">t/s</span></span>
+                  <span className="text-xl font-bold text-foreground tracking-tight">{logMetrics.avgTps}<span className="text-xs font-normal text-muted-foreground ml-0.5">Token/s</span></span>
                 </div>
               </div>
             </div>
@@ -497,7 +505,7 @@ export default function Dashboard() {
               <div>
                 <span className="text-xs font-medium text-muted-foreground block uppercase tracking-wider">{t('dashboard.monitor.avgLag')}</span>
                 <div className="flex items-baseline gap-1 mt-1">
-                  <span className="text-xl font-bold text-foreground tracking-tight">{(logMetrics.avg / 1000).toFixed(1)}s</span>
+                  <span className="text-xl font-bold text-foreground tracking-tight">{fmtSec(logMetrics.avg)}</span>
                 </div>
               </div>
             </div>
@@ -506,7 +514,7 @@ export default function Dashboard() {
             <div className="mt-4 space-y-2">
               <div className="flex items-center justify-between">
                 <span className="text-[10px] font-bold text-muted-foreground uppercase tracking-widest">{t('dashboard.monitor.latencyPulse')}</span>
-                <span className="text-[10px] font-mono text-muted-foreground/60">{activityLogs.length} {t('dashboard.monitor.reqs')}</span>
+                <span className="text-[10px] font-mono text-muted-foreground/60">{t('dashboard.monitor.avgLabel', { defaultValue: '平均' })} {fmtSec(logMetrics.avg)}</span>
               </div>
               <div className="h-16 w-full bg-muted/20 rounded-lg p-2 border border-border/40 relative">
                 {activityLogs.length > 0 ? (
@@ -523,7 +531,7 @@ export default function Dashboard() {
             <div className="mt-4 space-y-2">
               <div className="flex items-center justify-between">
                 <span className="text-[10px] font-bold text-muted-foreground uppercase tracking-widest">{t('dashboard.monitor.ttftPulse')}</span>
-                <span className="text-[10px] font-mono text-muted-foreground/60">&lt;800ms #22c55e · 800–1500ms #f59e0b · &gt;1500ms #ef4444</span>
+                <span className="text-[10px] font-mono text-muted-foreground/60">{t('dashboard.monitor.avgLabel', { defaultValue: '平均' })} {fmtSec(logMetrics.avgTtft)}</span>
               </div>
               <div className="h-16 w-full bg-muted/20 rounded-lg p-2 border border-border/40 relative">
                 {activityLogs.length > 0 ? (
@@ -545,33 +553,18 @@ export default function Dashboard() {
             ) : filteredLogs.map(log => (
               <div key={log.id}
                 onClick={() => navigate(`/logs?log=${log.id}`)}
+                title={log.success !== 1 && log.error_message ? log.error_message : undefined}
                 className={`p-3 rounded-xl border text-xs transition-colors duration-150 cursor-pointer hover:border-primary/30 ${log.success !== 1
                   ? 'bg-destructive/5 border-destructive/10 hover:bg-destructive/10'
                   : 'bg-muted border-border/50 hover:bg-muted/80'}`}
               >
-                <div className="flex items-center gap-2 min-w-0 whitespace-nowrap">
-                  <span className="text-muted-foreground/60 shrink-0">
+                <div className="flex items-center gap-2 min-w-0">
+                  <span className="text-muted-foreground/60 shrink-0 font-mono">
                     {parseServerDate(log.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false })}
                   </span>
-                  <span className="font-semibold text-foreground truncate">{log.model}</span>
-                  {log.account_name && <span className="text-muted-foreground/60 truncate">{log.account_name}</span>}
-                  {log.success !== 1 && log.error_message && (
-                    <span className="text-destructive truncate" title={log.error_message}>{log.error_message}</span>
-                  )}
-                  {typeof log.ttft_ms === 'number' && (
-                    <span className={cn("font-mono shrink-0", log.ttft_ms > 1500 ? "text-destructive" : log.ttft_ms > 800 ? "text-warning" : "text-muted-foreground/60")} title="time to first token">
-                      TTFT {log.ttft_ms}ms
-                    </span>
-                  )}
-                  {log.success === 1 && log.output_tokens > 0 && (
-                    <span className="font-mono text-muted-foreground/60 shrink-0" title="tokens per second">
-                      {calcTps(log.output_tokens, log.latency_ms, log.ttft_ms).toFixed(0)} t/s
-                    </span>
-                  )}
-                  <span className="text-muted-foreground shrink-0 ml-auto">{log.latency_ms ? `${(log.latency_ms / 1000).toFixed(1)}s` : '--'}</span>
-                  <Badge variant={log.success === 1 ? "secondary" : "destructive"} className={log.success === 1 ? 'bg-success/20 text-success border-success/20' : 'bg-destructive/20 text-destructive border-destructive/20'}>
-                    {log.success === 1 ? '200' : 'ERR'}
-                  </Badge>
+                  <span className="font-semibold text-foreground truncate flex-1 min-w-0" title={log.model}>{log.model}</span>
+                  <span className="font-mono text-muted-foreground shrink-0" title={`输入 ${log.input_tokens} / 输出 ${log.output_tokens} / 缓存 ${log.cache_tokens}`}>{formatK((log.input_tokens||0)+(log.output_tokens||0)+(log.cache_tokens||0))}</span>
+                  <span className="font-mono text-muted-foreground shrink-0">{log.latency_ms ? fmtSec(log.latency_ms) : '--'}</span>
                 </div>
               </div>
             ))}

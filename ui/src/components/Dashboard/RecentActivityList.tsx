@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { History, AlertTriangle } from 'lucide-react';
 import { parseServerDate } from '../../utils/date';
+import { fmtSec } from '../../utils/format';
 import { TFunction } from 'i18next';
 import { cn } from '../../lib/utils';
 
@@ -80,7 +81,7 @@ export const RecentActivityList = ({ recentLogs, t }: RecentActivityListProps) =
         <div className="flex items-center gap-3">
           <div className="flex items-center gap-3 text-xs text-muted-foreground">
             <span>{successRate}% {t('dashboard.monitor.successRate')}</span>
-            <span>{(avgLatency / 1000).toFixed(1)}s {t('dashboard.monitor.avgLag')}</span>
+            <span>{fmtSec(avgLatency)} {t('dashboard.monitor.avgLag')}</span>
           </div>
           <button
             onClick={() => setShowErrorsOnly(!showErrorsOnly)}
@@ -105,7 +106,7 @@ export const RecentActivityList = ({ recentLogs, t }: RecentActivityListProps) =
               model={log.model}
               time={parseServerDate(log.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false })}
               status={log.success === 1 ? 'success' : 'error'}
-              latency={`${((log.latency_ms || 0) / 1000).toFixed(1)}s`}
+              latency={fmtSec(log.latency_ms || 0)}
               accountName={log.account_name}
               errorMessage={log.error_message}
             />

@@ -408,25 +408,26 @@ fn response_maps_cache_usage_fields() {
         "m",
     );
 
-    assert_eq!(resp["usage"]["input_tokens"], 100);
+    // 4-store-3-display: fresh input = prompt - read, creation always 0 for OpenAI
+    assert_eq!(resp["usage"]["input_tokens"], 20);
     assert_eq!(resp["usage"]["output_tokens"], 10);
     assert_eq!(resp["usage"]["cache_read_input_tokens"], 80);
-    assert_eq!(resp["usage"]["cache_creation_input_tokens"], 20);
+    assert_eq!(resp["usage"]["cache_creation_input_tokens"], 0);
 }
 
 #[test]
 fn cache_usage_recognizes_multiple_spellings() {
     assert_eq!(
         cache_usage_from_openai(&json!({"prompt_cache_hit_tokens": 7, "prompt_cache_miss_tokens": 3})),
-        (7, 3)
+        (7, 0)
     );
     assert_eq!(
         cache_usage_from_openai(&json!({"prompt_tokens": 50, "prompt_tokens_details": {"cached_tokens": 30}})),
-        (30, 20)
+        (30, 0)
     );
     assert_eq!(
         cache_usage_from_openai(&json!({"input_tokens": 1000, "input_tokens_details": {"cached_tokens": 800}})),
-        (800, 200)
+        (800, 0)
     );
     assert_eq!(
         cache_usage_from_openai(&json!({"cached_tokens": 9})),
@@ -582,14 +583,14 @@ fn sse_state_machine_usage_capture() {
         "prompt_tokens": 12, "completion_tokens": 3,
         "prompt_cache_hit_tokens": 5, "prompt_cache_miss_tokens": 7
     }}));
-    assert_eq!(conv.usage_tokens(), (12, 3, 5, 7));
+    assert_eq!(conv.usage_tokens(), (7, 3, 5, 0));
 
     let evs = conv.finish();
     let delta = evs.iter().find(|s| s.starts_with("event: message_delta")).unwrap();
     assert!(delta.contains("\"output_tokens\":3"), "real usage in message_delta: {delta}");
-    assert!(delta.contains("\"input_tokens\":12"), "real input usage in message_delta: {delta}");
+    assert!(delta.contains("\"input_tokens\":7"), "real input usage in message_delta: {delta}");
     assert!(delta.contains("\"cache_read_input_tokens\":5"), "real cache usage in message_delta: {delta}");
-    assert!(delta.contains("\"cache_creation_input_tokens\":7"), "real cache usage in message_delta: {delta}");
+    assert!(delta.contains("\"cache_creation_input_tokens\":0"), "real cache usage in message_delta: {delta}");
 }
 
 // ---------------------------------------------------------------------------

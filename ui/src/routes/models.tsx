@@ -21,6 +21,7 @@ import { useTranslation } from 'react-i18next';
 import { Dialog, ConfirmDialog } from '../components/Modal';
 import { CopyButton } from '../components/CopyButton';
 import { parseServerDate } from '../utils/date';
+import { fmtSec } from '../utils/format';
 import { cn } from '../lib/utils'
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -426,7 +427,7 @@ export default function Models() {
                                 result.success ? "bg-success" : "bg-destructive"
                               )} />
                               {result.latency != null && (
-                                <span className="text-xs font-bold text-muted-foreground/50">{(result.latency / 1000).toFixed(1)}s</span>
+                                <span className="text-xs font-bold text-muted-foreground/50">{fmtSec(result.latency)}</span>
                               )}
                             </div>
                           )}
@@ -584,7 +585,7 @@ export default function Models() {
                   </span>
                 )}
                 {cardResult?.latency != null && (
-                  <span className="text-xs text-success font-bold">{(cardResult!.latency! / 1000).toFixed(1)}s</span>
+                  <span className="text-xs text-success font-bold">{fmtSec(cardResult!.latency!)}</span>
                 )}
                 {cardResult?.lastChecked && (
                   <span className="text-xs text-muted-foreground/60 font-medium">

@@ -2,20 +2,33 @@ import React, { useCallback, useEffect, useState, useMemo } from 'react';
 import { apiFetch } from '../lib/api';
 import { useTranslation } from 'react-i18next';
 import { useSearchParams } from 'react-router-dom';
-import { Loader2, ScrollText, ChevronLeft, ChevronRight } from 'lucide-react';
-import { StatusBadge } from '@/components/shared/StatusBadge';
+import { Loader2, ScrollText, ChevronLeft, ChevronRight, Copy, Check } from 'lucide-react';
+import { StatusDot } from '@/components/shared/StatusDot';
 import { Dialog } from '../components/Modal';
 import { JsonView } from '@/components/shared/JsonTree';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
 import { parseServerDate } from '../utils/date';
+import { fmtSec, netMs } from '../utils/format';
 import { cn } from '@/lib/utils';
 
-// t/s = output*1000 / (latency - ttft); falls back to full latency when ttft is absent.
+// t/s：流式按生成段(总耗时-首字时间)，非流式按总耗时。
 const calcTps = (outputTokens: number, latencyMs: number, ttftMs: number | null | undefined): number => {
-  const gen = Math.max(1, (latencyMs || 0) - (ttftMs ?? 0));
+  const total = latencyMs || 0;
+  const ttft = typeof ttftMs === 'number' && ttftMs > 0 && ttftMs < total ? ttftMs : 0;
+  const gen = Math.max(1, ttft ? total - ttft : total);
   return ((outputTokens || 0) * 1000) / gen;
+};
+const formatK = (n: number): string => {
+  const v = Math.round(n || 0);
+  if (v >= 1000) return `${(v / 1000).toFixed(1).replace(/\.0$/, '')}k`;
+  return `${v}`;
+};
+const cacheOf = (l: LogEntry): number => {
+  if (typeof (l as any).cache_tokens === 'number') return (l as any).cache_tokens;
+  if (typeof (l as any).cacheTokens === 'number') return (l as any).cacheTokens;
+  return (l.cacheReadInputTokens || 0); // 4-store-3-display: creation hidden
 };
 
 interface LogEntry {
@@ -28,6 +41,7 @@ interface LogEntry {
   outputTokens: number;
   cacheReadInputTokens: number;
   cacheCreationInputTokens: number;
+  cache_tokens?: number;
   latencyMs: number;
   ttftMs: number | null;
   isStream: number;
@@ -51,20 +65,18 @@ export default function Logs() {
   const [range, setRange] = useState<RangeKey>('24h');
   const [statusFilter, setStatusFilter] = useState<'all' | 'success' | 'failed'>('all');
   const [modelFilter, setModelFilter] = useState('');
-  const [streamOnly, setStreamOnly] = useState(false);
-  const [slowOnly, setSlowOnly] = useState(false);
+  const [streamMode, setStreamMode] = useState<'all' | 'stream' | 'nonStream'>('all');
   const [page, setPage] = useState(0);
   const [total, setTotal] = useState(0);
   const [pageInput, setPageInput] = useState('');
-  // 日志详情（发送/收到）——首页跳转经 ?log=<id> 打开
   const [detailLog, setDetailLog] = useState<LogEntry | null>(null);
   const [detailData, setDetailData] = useState<{ request_body: string | null; response_body: string | null; client_ip?: string | null } | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const [searchParams, setSearchParams] = useSearchParams();
-  // 详情整块折叠 + JSON 节点全部展开/收起（treeKey 变更触发 remount 重灌初始态）
   const [blockOpen, setBlockOpen] = useState({ request: true, response: true });
   const [allExpanded, setAllExpanded] = useState<boolean | undefined>(undefined);
   const [treeKey, setTreeKey] = useState(0);
+  const [copiedError, setCopiedError] = useState(false);
 
   const expandAllBlocks = () => {
     setAllExpanded(true);
@@ -93,7 +105,6 @@ export default function Logs() {
     setSearchParams({}, { replace: true });
   };
 
-  // 首页跳转过来（?log=<id>）：自动打开详情
   useEffect(() => {
     const logId = searchParams.get('log');
     if (!logId || detailLog) return;
@@ -139,14 +150,20 @@ export default function Logs() {
 
   const resetPage = () => setPage(0);
 
-  // 客户端快捷过滤：仅流式 / 慢查询（latency>2000 或 ttft>1000）
   const displayLogs = useMemo(() => {
     return logs.filter(l => {
-      if (streamOnly && !l.isStream) return false;
-      if (slowOnly && !((l.latencyMs || 0) > 2000 || (typeof l.ttftMs === 'number' && l.ttftMs > 1000))) return false;
+      if (streamMode === 'stream' && !l.isStream) return false;
+      if (streamMode === 'nonStream' && l.isStream) return false;
       return true;
     });
-  }, [logs, streamOnly, slowOnly]);
+  }, [logs, streamMode]);
+
+  const copyError = async () => {
+    if (!detailLog?.errorMessage) return;
+    await navigator.clipboard.writeText(detailLog.errorMessage);
+    setCopiedError(true);
+    setTimeout(() => setCopiedError(false), 1500);
+  };
 
   return (
     <div className="space-y-6 animate-fadeIn">
@@ -160,7 +177,6 @@ export default function Logs() {
         </div>
       </div>
 
-      {/* Filters */}
       <div className="flex flex-wrap items-center gap-3">
         <div className="flex border border-border rounded-lg overflow-hidden">
           {(['24h', '7d', 'all'] as RangeKey[]).map(k => (
@@ -194,22 +210,19 @@ export default function Logs() {
           placeholder={t('logs.filterModel')}
           className="w-56 h-9 text-sm"
         />
-        <Button
-          variant={streamOnly ? "default" : "ghost"}
-          size="sm"
-          onClick={() => { setStreamOnly(v => !v); resetPage(); }}
-          className="h-9 text-xs font-semibold"
-        >
-          {t('logs.streamOnly')}
-        </Button>
-        <Button
-          variant={slowOnly ? "default" : "ghost"}
-          size="sm"
-          onClick={() => { setSlowOnly(v => !v); resetPage(); }}
-          className="h-9 text-xs font-semibold"
-        >
-          {t('logs.slowOnly')}
-        </Button>
+        <div className="flex border border-border rounded-lg overflow-hidden">
+          {(['all', 'stream', 'nonStream'] as const).map(k => (
+            <Button
+              key={k}
+              variant={streamMode === k ? "default" : "ghost"}
+              size="sm"
+              onClick={() => { setStreamMode(k as any); resetPage(); }}
+              className="rounded-none h-auto py-1.5 text-xs font-semibold"
+            >
+              {t(k === 'all' ? 'logs.all' : k === 'stream' ? 'logs.stream' : 'logs.nonStream')}
+            </Button>
+          ))}
+        </div>
       </div>
 
       {error && (
@@ -224,51 +237,59 @@ export default function Logs() {
                 <th className="text-left px-4 py-2 font-medium">{t('logs.time')}</th>
                 <th className="text-left px-3 py-2 font-medium">{t('logs.model')}</th>
                 <th className="text-left px-3 py-2 font-medium">{t('logs.account')}</th>
-                <th className="text-right px-3 py-2 font-medium">{t('logs.tokens')} ({t('logs.input')}/{t('logs.output')})</th>
-                <th className="text-right px-3 py-2 font-medium">{t('logs.latency')}</th>
+                <th className="text-right px-3 py-2 font-medium">{t('logs.input')}</th>
+                <th className="text-right px-3 py-2 font-medium">{t('logs.output')}</th>
+                <th className="text-right px-3 py-2 font-medium">{t('logs.cacheTokens', { defaultValue: '缓存' })}</th>
+                <th className="text-right px-3 py-2 font-medium">{t('logs.elapsed', { defaultValue: '耗时' })}</th>
                 <th className="text-right px-3 py-2 font-medium">{t('logs.ttft')}</th>
                 <th className="text-right px-3 py-2 font-medium">{t('logs.throughput')}</th>
-                <th className="text-left px-3 py-2 font-medium">{t('logs.status')}</th>
-                <th className="text-left px-3 py-2 font-medium">{t('logs.error')}</th>
+                <th className="w-10 px-3 py-2 text-center font-medium">{t('logs.status')}</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-border/50">
               {isLoading && (
-                <tr><td colSpan={9} className="px-4 py-10 text-center text-muted-foreground"><Loader2 className="inline animate-spin mr-2" size={14} />{t('logs.loading')}</td></tr>
+                <tr><td colSpan={10} className="px-4 py-10 text-center text-muted-foreground"><Loader2 className="inline animate-spin mr-2" size={14} />{t('logs.loading')}</td></tr>
               )}
               {!isLoading && logs.length === 0 && (
-                <tr><td colSpan={9} className="px-4 py-10 text-center text-muted-foreground">{t('logs.empty')}</td></tr>
+                <tr><td colSpan={10} className="px-4 py-10 text-center text-muted-foreground">{t('logs.empty')}</td></tr>
               )}
               {!isLoading && displayLogs.map(log => (
-                <tr key={log.id} onClick={() => openLogDetail(log)} className="hover:bg-muted/30 cursor-pointer">
+                <tr
+                  key={log.id}
+                  onClick={() => openLogDetail(log)}
+                  title={log.errorMessage || undefined}
+                  className={cn(
+                    "cursor-pointer transition-colors",
+                    log.success ? "hover:bg-muted/30" : "bg-destructive/[0.06] hover:bg-destructive/10",
+                  )}
+                >
                   <td className="px-4 py-2 whitespace-nowrap font-mono text-muted-foreground">
                     {new Date(log.timestamp).toLocaleString([], { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' })}
                   </td>
                   <td className="px-3 py-2 font-mono max-w-[220px] truncate" title={log.model}>{log.model}</td>
-                  <td className="px-3 py-2 text-muted-foreground">{log.accountName || `#${log.accountId}`}</td>
-                  <td className="px-3 py-2 text-right font-mono whitespace-nowrap">{log.inputTokens}/{log.outputTokens}</td>
-                  <td className="px-3 py-2 text-right font-mono whitespace-nowrap">{log.latencyMs}ms</td>
+                  <td className="px-3 py-2 text-muted-foreground max-w-[140px] truncate" title={log.accountName || ''}>{log.accountName || `#${log.accountId}`}</td>
+                  <td className="px-3 py-2 text-right font-mono whitespace-nowrap">{formatK(log.inputTokens)}</td>
+                  <td className="px-3 py-2 text-right font-mono whitespace-nowrap">{formatK(log.outputTokens)}</td>
+                  <td className="px-3 py-2 text-right font-mono whitespace-nowrap text-muted-foreground">{formatK(cacheOf(log))}</td>
+                  <td className="px-3 py-2 text-right font-mono whitespace-nowrap" title={`总耗时 ${fmtSec(log.latencyMs)} · TTFT ${typeof log.ttftMs === 'number' ? fmtSec(log.ttftMs) : '—'}`}>{fmtSec(netMs(log.latencyMs, log.ttftMs, log.isStream))}</td>
                   <td className="px-3 py-2 text-right font-mono whitespace-nowrap">
                     {typeof log.ttftMs === 'number' ? (
-                      <span className={log.ttftMs > 1500 ? "text-destructive" : log.ttftMs > 800 ? "text-warning" : "text-foreground"}>{log.ttftMs}ms</span>
+                      <span className={cn(log.ttftMs > 1500 ? "text-destructive" : log.ttftMs > 800 ? "text-warning" : "text-foreground")}>{fmtSec(log.ttftMs)}</span>
                     ) : <span className="text-muted-foreground/40">—</span>}
                   </td>
                   <td className="px-3 py-2 text-right font-mono whitespace-nowrap">
                     {typeof log.tps === 'number' ? (
-                      <>{log.tps.toFixed(1)} t/s</>
+                      <>{log.tps.toFixed(1)} Token/s</>
                     ) : (
                       log.success && log.outputTokens > 0 ? (
-                        <>{calcTps(log.outputTokens, log.latencyMs, log.ttftMs).toFixed(1)} t/s</>
+                        <>{calcTps(log.outputTokens, log.latencyMs, log.ttftMs).toFixed(1)} Token/s</>
                       ) : <span className="text-muted-foreground/40">—</span>
                     )}
                   </td>
-                  <td className="px-3 py-2"><StatusBadge status={log.success ? 'online' : 'offline'} label={log.success ? t('logs.success') : t('logs.failed')} /></td>
-                  <td className="px-3 py-2 max-w-[280px]">
-                    {log.errorMessage ? (
-                      <span className="text-destructive block truncate" title={log.errorMessage}>{log.errorMessage}</span>
-                    ) : (
-                      <span className="text-muted-foreground/40">—</span>
-                    )}
+                  <td className="px-3 py-2 text-center">
+                    <span title={log.success ? t('logs.success') : (log.errorMessage || t('logs.failed'))} className="inline-flex justify-center">
+                      <StatusDot status={log.success ? 'online' : 'offline'} />
+                    </span>
                   </td>
                 </tr>
               ))}
@@ -301,20 +322,58 @@ export default function Logs() {
         </div>
       </div>
 
-      {/* 日志详情（发送/收到） */}
       <Dialog isOpen={!!detailLog} onClose={closeLogDetail} title={t('dashboard.logDetail.title')} size="lg">
         <div className="space-y-4">
-          <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
-            <span>{detailLog && parseServerDate(detailLog.timestamp).toLocaleString()}</span>
-            <span className="font-semibold text-foreground">{detailLog?.model}</span>
-            {detailLog?.accountName && <span>{detailLog.accountName}</span>}
-            {detailLog && <span>{detailLog.success ? '200' : 'ERR'}</span>}
-            {detailLog && <span>{t('logs.ttft')}: <span className="font-mono">{typeof detailLog.ttftMs === 'number' ? `${detailLog.ttftMs}ms` : '—'}</span></span>}
-            {detailLog && <span>{t('logs.total')}: <span className="font-mono">{(detailLog.latencyMs / 1000).toFixed(1)}s</span></span>}
-            {detailLog && <span>{t('logs.throughput')}: <span className="font-mono">{typeof detailLog.tps === 'number' ? `${detailLog.tps.toFixed(1)} t/s` : (detailLog.success && detailLog.outputTokens > 0 ? `${calcTps(detailLog.outputTokens, detailLog.latencyMs, detailLog.ttftMs).toFixed(1)} t/s` : '—')}</span></span>}
-            {detailLog?.isStream ? <Badge variant="secondary" className="bg-primary/10 text-primary border-primary/20">{t('logs.stream')}</Badge> : <Badge variant="secondary" className="bg-muted text-muted-foreground border-border">{t('logs.nonStream')}</Badge>}
-            {detailData?.client_ip && <span>IP: <span className="font-mono">{detailData.client_ip}</span></span>}
-          </div>
+          {detailLog && (
+            <div className="rounded-xl border border-border bg-muted/20 overflow-hidden">
+              <div className="divide-y divide-border/50 text-xs">
+                {[
+                  [t('logs.time'), detailLog ? parseServerDate(detailLog.timestamp).toLocaleString() : '—'],
+                  [t('logs.model'), detailLog.model],
+                  [t('logs.account'), detailLog.accountName || `#${detailLog.accountId}`],
+                  [t('logs.elapsed', { defaultValue: '耗时' }), detailLog.latencyMs ? fmtSec(netMs(detailLog.latencyMs, detailLog.ttftMs, detailLog.isStream)) : '—'],
+                  [t('logs.ttft'), typeof detailLog.ttftMs === 'number' ? fmtSec(detailLog.ttftMs) : '—'],
+                  [t('logs.input'), formatK(detailLog.inputTokens)],
+                  [t('logs.output'), formatK(detailLog.outputTokens)],
+                  [t('logs.cacheTokens', { defaultValue: '缓存' }), formatK(cacheOf(detailLog))],
+                  [t('logs.throughput'), typeof detailLog.tps === 'number' ? `${detailLog.tps.toFixed(1)} Token/s` : (detailLog.success && detailLog.outputTokens > 0 ? `${calcTps(detailLog.outputTokens, detailLog.latencyMs, detailLog.ttftMs).toFixed(1)} Token/s` : '—')],
+                  [t('logs.stream'), detailLog.isStream ? t('logs.stream') : t('logs.nonStream')],
+                  ['IP', detailData?.client_ip || '—'],
+                  [t('logs.status'), detailLog.success ? t('logs.success') : t('logs.failed')],
+                ].map(([label, value]) => (
+                  <div key={label as string} className="flex items-center justify-between gap-4 px-4 py-2.5">
+                    <span className="text-muted-foreground shrink-0">{label}</span>
+                    <span className="font-mono font-medium text-foreground text-right truncate flex items-center gap-2 justify-end">
+                      {label === t('logs.status') ? (
+                        <>
+                          <StatusDot status={detailLog.success ? 'online' : 'offline'} />
+                          <span className={cn(detailLog.success ? 'text-success' : 'text-destructive')}>{value as string}</span>
+                        </>
+                      ) : label === t('logs.stream') ? (
+                        <Badge variant="secondary" className={cn("text-[10px] px-2 py-0", detailLog.isStream ? "bg-primary/10 text-primary border-primary/20" : "bg-muted text-muted-foreground border-border")}>{value as string}</Badge>
+                      ) : label === t('logs.elapsed', { defaultValue: '耗时' }) ? (
+                        <span title={`总耗时 ${fmtSec(detailLog.latencyMs)} · TTFT ${typeof detailLog.ttftMs === 'number' ? fmtSec(detailLog.ttftMs) : '—'}`} className="truncate">{value as string}</span>
+                      ) : (
+                        <span title={String(value)} className="truncate">{value as string}</span>
+                      )}
+                    </span>
+                  </div>
+                ))}
+              </div>
+              {detailLog.errorMessage && !detailLog.success && (
+                <div className="px-4 py-3 bg-destructive/5 border-t border-destructive/10">
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="text-xs font-semibold text-destructive">{t('logs.error')}</div>
+                    <Button variant="ghost" size="sm" className="h-7 px-2 text-xs" onClick={copyError}>
+                      {copiedError ? <Check size={12} className="mr-1" /> : <Copy size={12} className="mr-1" />}
+                      {copiedError ? t('common.copied', { defaultValue: '已复制' }) : t('common.copy', { defaultValue: '复制' })}
+                    </Button>
+                  </div>
+                  <pre className="mt-2 text-xs font-mono whitespace-pre-wrap break-words text-destructive/90 bg-background border border-destructive/20 rounded-lg p-3 max-h-40 overflow-auto">{detailLog.errorMessage}</pre>
+                </div>
+              )}
+            </div>
+          )}
           <div className="flex items-center justify-end gap-2">
             <Button variant="outline" size="sm" onClick={expandAllBlocks}>
               <ChevronRight size={14} className="rotate-90" />

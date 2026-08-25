@@ -23,7 +23,7 @@ pub async fn get_activity(
 
     let logs = match sqlx::query(
         "SELECT l.id, l.timestamp, l.model, l.success, l.latency_ms,
-                l.error_message, l.ttft_ms, l.is_stream,
+                l.error_message, l.input_tokens, l.output_tokens, l.cache_read_input_tokens, l.cache_creation_input_tokens, l.ttft_ms, l.is_stream,
                 a.alias AS account_name, a.provider_id
          FROM usage_logs l
          LEFT JOIN accounts a ON l.account_id = a.id
@@ -47,12 +47,17 @@ pub async fn get_activity(
     let entries: Vec<Value> = logs
         .iter()
         .map(|row| {
+            let cache = row.try_get::<i64, _>("cache_read_input_tokens").unwrap_or_default()
+                + row.try_get::<i64, _>("cache_creation_input_tokens").unwrap_or_default();
             json!({
                 "id": row.try_get::<i64, _>("id").unwrap_or_default(),
                 "timestamp": row.try_get::<i64, _>("timestamp").unwrap_or_default(),
                 "model": row.try_get::<String, _>("model").unwrap_or_default(),
                 "success": row.try_get::<i64, _>("success").unwrap_or_default(),
                 "latency_ms": row.try_get::<i64, _>("latency_ms").unwrap_or_default(),
+                "input_tokens": row.try_get::<i64, _>("input_tokens").unwrap_or_default(),
+                "output_tokens": row.try_get::<i64, _>("output_tokens").unwrap_or_default(),
+                "cache_tokens": cache,
                 "ttft_ms": row.try_get::<Option<i64>, _>("ttft_ms").unwrap_or_default(),
                 "is_stream": row.try_get::<i64, _>("is_stream").unwrap_or_default(),
                 "error_message": row.try_get::<Option<String>, _>("error_message").unwrap_or_default(),
@@ -81,7 +86,7 @@ pub async fn get_activity_detail(
 ) -> Response {
     let row = match sqlx::query(
         "SELECT l.id, l.timestamp, l.model, l.success, l.latency_ms,
-                l.error_message, l.ttft_ms, l.is_stream,
+                l.error_message, l.input_tokens, l.output_tokens, l.cache_read_input_tokens, l.cache_creation_input_tokens, l.ttft_ms, l.is_stream,
                 l.request_body, l.response_body, l.client_ip,
                 a.alias AS account_name, a.provider_id
          FROM usage_logs l
@@ -104,12 +109,16 @@ pub async fn get_activity_detail(
         }
     };
 
+    let cache_tokens = row.try_get::<i64, _>("cache_read_input_tokens").unwrap_or_default();
     Json(json!({
         "id": row.try_get::<i64, _>("id").unwrap_or_default(),
         "timestamp": row.try_get::<i64, _>("timestamp").unwrap_or_default(),
         "model": row.try_get::<String, _>("model").unwrap_or_default(),
         "success": row.try_get::<i64, _>("success").unwrap_or_default(),
         "latency_ms": row.try_get::<i64, _>("latency_ms").unwrap_or_default(),
+        "input_tokens": row.try_get::<i64, _>("input_tokens").unwrap_or_default(),
+        "output_tokens": row.try_get::<i64, _>("output_tokens").unwrap_or_default(),
+        "cache_tokens": cache_tokens,
         "ttft_ms": row.try_get::<Option<i64>, _>("ttft_ms").unwrap_or_default(),
         "is_stream": row.try_get::<i64, _>("is_stream").unwrap_or_default(),
         "error_message": row.try_get::<Option<String>, _>("error_message").unwrap_or_default(),

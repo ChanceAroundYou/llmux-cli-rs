@@ -36,7 +36,8 @@
     "degraded": "部分降级",
     "down": "故障",
     "alias": "别名",
-    "logs": "请求日志"
+    "logs": "请求日志",
+    "copy": "复制"
   },
   "dashboard": {
     "overview": "系统概览",
@@ -87,15 +88,16 @@
     "noErrors": "暂无错误记录",
     "noDataTrend": "开启测试或接入客户端开始采集数据...",
     "monitor": {
-      "latencyPulse": "延迟脉搏",
-      "avgLag": "平均延迟",
+      "latencyPulse": "耗时脉搏",
+      "avgLag": "总耗时",
       "successRate": "最近成功率",
       "liveFeed": "实时动态",
       "reqs": "次请求",
-      "avgTtft": "平均TTFT",
-      "p95Latency": "P95 延迟",
-      "avgTps": "平均 t/s",
-      "ttftPulse": "TTFT 脉搏"
+      "avgTtft": "TTFT",
+      "p95Latency": "总耗时",
+      "avgTps": "Token/s",
+      "ttftPulse": "TTFT 脉搏",
+      "avgLabel": "平均"
     }
   },
   "usage": {
@@ -110,7 +112,7 @@
     "downloadCsv": "导出数据 (CSV)",
     "input": "输入",
     "output": "输出",
-    "cacheHit": "缓存命中",
+    "cacheHit": "缓存",
     "cacheCreate": "缓存写入",
     "day": "日",
     "month": "月",
@@ -141,15 +143,24 @@
     "statsCards": {
       "totalTokens": "总 Token",
       "cacheHit": "缓存命中",
-      "effectiveTokens": "有效 Token",
       "requests": "请求",
-      "cacheDetail": "读 {{read}} · 写 {{write}} — 读/总输入(含缓存)",
-      "effectiveHint": "输入+命中+创建的总输入面",
-      "inputOutput": "输入 {{input}} / 输出 {{output}}"
+      "p95Latency": "P95 耗时",
+      "latencyHint": "P95 {{value}}",
+      "ttftHint": "P95 {{value}}",
+      "tpsHint": "{{value}} Token/s",
+      "avgLatency": "平均耗时",
+      "avgTtft": "平均 TTFT",
+      "avgTps": "平均 Token/s"
     },
     "charts": {
       "byModelTop": "按模型 Top",
-      "byAccountTop": "按账号 Top"
+      "byAccountTop": "按账号 Top",
+      "tokenTimeseries": "Token",
+      "token": "Token",
+      "latencyDual": "耗时 & TTFT",
+      "throughput": "Token/s",
+      "netElapsed": "净耗时 (s)",
+      "ttftAxis": "TTFT (s)"
     },
     "tables": {
       "byModel": "按模型",
@@ -159,13 +170,15 @@
         "input": "输入",
         "output": "输出",
         "total": "合计",
-        "cacheHit": "命中",
+        "cacheHit": "缓存",
         "hitRate": "命中率",
         "requests": "请求",
         "successRate": "成功率",
-        "avgLatency": "均延",
+        "avgLatency": "耗时",
         "account": "账号",
-        "provider": "厂商"
+        "provider": "厂商",
+        "avgTtft": "TTFT",
+        "avgTps": "Token/s"
       }
     },
     "filter": {
@@ -189,7 +202,7 @@
     "activeVendors": "{{count}} 个活跃服务商",
     "activeAccounts": "{{count}} 个活跃渠道",
     "processed": "已审计",
-    "avgLatencyLabel": "平均延迟 (ms)",
+    "avgLatencyLabel": "平均耗时 (s)",
     "usageIo": "用量 (输入/输出)",
     "captureTraffic": "捕获流量以查看统计分析"
   },
@@ -434,7 +447,7 @@
     "tokens": "Tokens",
     "input": "输入",
     "output": "输出",
-    "latency": "延迟",
+    "latency": "总耗时",
     "status": "状态",
     "error": "错误",
     "all": "全部",
@@ -451,12 +464,14 @@
     "last24h": "最近 24 小时",
     "last7d": "最近 7 天",
     "allTime": "全部时间",
-    "ttft": "首字延迟",
-    "throughput": "吞吐 (t/s)",
+    "ttft": "TTFT",
+    "throughput": "Token/s",
     "total": "总耗时",
     "stream": "流式",
     "nonStream": "非流式",
     "streamOnly": "仅流式",
-    "slowOnly": "慢查询"
+    "slowOnly": "慢查询",
+    "cacheTokens": "缓存",
+    "elapsed": "耗时"
   }
 }
