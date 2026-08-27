@@ -1046,15 +1046,15 @@ fn oc_extract_wrk_ids(text: &str) -> Vec<String> {
     let bytes = text.as_bytes();
     let mut i = 0;
     while let Some(pos) = text[i..].find("wrk_") {
-        let start = i + pos + 4;
-        let mut end = start;
+        let start = i + pos;
+        let mut end = start + 4;
         while end < bytes.len() && (bytes[end].is_ascii_alphanumeric()) {
             end += 1;
         }
-        if end > start {
+        if end > start + 4 {
             out.push(text[start..end].to_string());
         }
-        i = start.max(i + 4);
+        i = (start + 4).max(i + 4);
     }
     out
 }
