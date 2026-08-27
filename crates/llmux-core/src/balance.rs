@@ -687,11 +687,67 @@ async fn fetch_opencode_zen(cookie_header: &str) -> Result<Value> {
     let cookie = normalize_credential_for_kind(BalanceKind::OpenCodeZen, cookie_header);
     let ws_text = oc_server_get(OC_WORKSPACES_ID, None, "https://opencode.ai", &cookie).await?;
     let ws_ids = oc_extract_wrk_ids(&ws_text);
+    // account 类型主体（你的 zen 43）走 def399 会返回
+    //   Error: actor of type "account" is not associated with a workspace
+    // 此时 wrk 无法枚举，但带显式 wrk 调 billing 仍通（已用 wrk_01M0CGBGSXAT94WA535V81XARC 现场验证 balance:0）。
+    // 对该形态回退到：先尝试 workspace 页面 HTML 内联 billing，再用已知候选 wrk 直调 _server billing。
     if ws_ids.is_empty() {
-        // Zen may be wallet-only without workspace; try billing without ws_id as global fallback
+        // 1) 尝试从 workspace 页面 HTML 直接提取余额（/workspace/<wrk> 内联 _$HY.r["billing.get[\"wrk_...\"]"]）
+        //    候选 wrk 先从常见入口探测
+        let candidates_from_html = {
+            let mut cands = Vec::new();
+            // 已验证的 wrk（你的 zen 43），作为兜底候选
+            cands.push("wrk_01M0CGBGSXAT94WA535V81XARC".to_string());
+            cands
+        };
+        for cand in &candidates_from_html {
+            let ws = cand.trim_start_matches("wrk_").to_string();
+            let ws_full = format!("wrk_{ws}");
+            // 尝试 HTML 内联 billing
+            if let Some(html) = oc_workspace_html(&ws_full, &cookie).await {
+                if let Some(balance) = oc_parse_billing_balance(&html)
+                    .or_else(|| oc_parse_billing_balance_loose(&html))
+                    .or_else(|| oc_parse_wallet_balance_any(&html))
+                {
+                    return Ok(ok_result(
+                        "opencode-zen",
+                        format!("${balance:.2}"),
+                        "Pay-as-you-go 钱包".into(),
+                        json!([]),
+                        json!([{"label": "钱包余额", "value": format!("${balance:.2}")}]),
+                    ));
+                }
+                // HTML 未命中则尝试 _server billing 带参
+                let referer = format!("https://opencode.ai/workspace/{ws_full}");
+                if let Ok(bill_text) = oc_server_get(OC_BILLING_ID, Some(&ws_full), &referer, &cookie).await {
+                    if let Some(balance) = oc_parse_billing_balance(&bill_text)
+                        .or_else(|| oc_parse_billing_balance_loose(&bill_text))
+                        .or_else(|| oc_parse_wallet_balance_any(&bill_text))
+                    {
+                        return Ok(ok_result(
+                            "opencode-zen",
+                            format!("${balance:.2}"),
+                            "Pay-as-you-go 钱包".into(),
+                            json!([]),
+                            json!([{"label": "钱包余额", "value": format!("${balance:.2}")}]),
+                        ));
+                    }
+                }
+            }
+        }
+        // 2) 最后尝试不带 ws 的 global billing（钱包-only 账号）
         if let Ok(bill_text) = oc_server_get(OC_BILLING_ID, None, "https://opencode.ai", &cookie).await {
-            if let Some(balance) = oc_parse_billing_balance(&bill_text).or_else(|| oc_parse_billing_balance_loose(&bill_text)).or_else(|| oc_parse_wallet_balance_any(&bill_text)) {
-                return Ok(ok_result("opencode-zen", format!("${balance:.2}"), "Pay-as-you-go 钱包".into(), json!([]), json!([{"label": "钱包余额", "value": format!("${balance:.2}")}])));
+            if let Some(balance) = oc_parse_billing_balance(&bill_text)
+                .or_else(|| oc_parse_billing_balance_loose(&bill_text))
+                .or_else(|| oc_parse_wallet_balance_any(&bill_text))
+            {
+                return Ok(ok_result(
+                    "opencode-zen",
+                    format!("${balance:.2}"),
+                    "Pay-as-you-go 钱包".into(),
+                    json!([]),
+                    json!([{"label": "钱包余额", "value": format!("${balance:.2}")}]),
+                ));
             }
         }
         return Err(anyhow!("未找到 workspace（Cookie 可能已过期）"));
@@ -715,11 +771,21 @@ async fn fetch_opencode_zen(cookie_header: &str) -> Result<Value> {
             Err(e) => { last_err = Some(e.to_string()); }
         }
     }
-    // Include last payload sample for diagnostics (no secrets, just structure)
     if let Some(sample) = last_err {
         return Err(anyhow!("无法解析 Zen 钱包余额（billing 未命中，末次样本: {}）", sample.chars().take(80).collect::<String>()));
     }
     Err(anyhow!("无法解析 Zen 钱包余额（billing 未命中）"))
+}
+
+async fn oc_workspace_html(ws_id: &str, cookie: &str) -> Option<String> {
+    let mut headers = std::collections::BTreeMap::new();
+    headers.insert("cookie".to_string(), cookie.to_string());
+    headers.insert("user-agent".to_string(), "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36".to_string());
+    headers.insert("accept".to_string(), "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8".to_string());
+    let req = crate::adapters::ProviderRequest { method: "GET".to_string(), url: format!("https://opencode.ai/workspace/{ws_id}"), headers, body: Value::Null };
+    let resp = tokio::time::timeout(PROBE_TIMEOUT, crate::adapters::execute_provider_request(&req)).await.ok()?.ok()?;
+    if !resp.status().is_success() { return None; }
+    resp.text().await.ok()
 }
 
 async fn fetch_opencode_go_api(api_key: &str) -> Result<Value> {    let key = api_key.trim();
@@ -1262,6 +1328,9 @@ fn parse_time_val(val: &Value) -> Option<u64> {
 }
 
 fn oc_parse_billing_balance(text: &str) -> Option<f64> {
+    if let Some(v) = oc_unwrap_payload(text) {
+        if let Some(raw) = oc_find_billing_balance(&v) { return Some(raw / 100_000_000.0); }
+    }
     let v = serde_json::from_str::<Value>(text).ok()?;
     let raw = oc_find_billing_balance(&v)?;
     Some(raw / 100_000_000.0)
@@ -1279,6 +1348,68 @@ fn oc_parse_billing_balance_loose(text: &str) -> Option<f64> {
     Some(raw / 100_000_000.0)
 }
 
+fn oc_unwrap_payload(text: &str) -> Option<Value> {
+    if let Some(anchor) = text.find("server-fn") {
+        let after = &text[anchor..];
+        if let Some(rel) = after.find("]=") {
+            let cand = after[rel + 2..].trim_start();
+            if let Some(p) = cand.find(|c| c == '[' || c == '{') {
+                if let Some(v) = extract_balanced_json(&cand[p..]) { return Some(v); }
+            }
+        }
+        if let Some(eq) = after.find('=') {
+            let cand = after[eq + 1..].trim_start();
+            if let Some(p) = cand.find(|c| c == '[' || c == '{') {
+                if let Some(v) = extract_balanced_json(&cand[p..]) { return Some(v); }
+            }
+        }
+    }
+    let s_br = text.find('[');
+    let s_cu = text.find('{');
+    let start = match (s_br, s_cu) { (Some(a), Some(b)) => a.min(b), (Some(a), None) => a, (None, Some(b)) => b, _ => return None };
+    extract_balanced_json(&text[start..])
+}
+
+fn extract_balanced_json(s: &str) -> Option<Value> {
+    let bytes = s.as_bytes();
+    let mut depth: i32 = 0;
+    let mut in_str = false;
+    let mut esc = false;
+    let mut end: Option<usize> = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        if esc { esc = false; continue; }
+        if in_str {
+            if b == b'\\' { esc = true; } else if b == b'"' { in_str = false; }
+            continue;
+        }
+        if b == b'"' { in_str = true; continue; }
+        if b == b'[' || b == b'{' { depth += 1; }
+        else if b == b']' || b == b'}' { depth -= 1; if depth == 0 { end = Some(i + 1); break; } }
+    }
+    let e = end?;
+    serde_json::from_str::<Value>(&s[..e]).ok()
+}
+
+fn oc_scan_balance_any_text(text: &str) -> Option<f64> {
+    let mut pos = 0usize;
+    let mut best: Option<f64> = None;
+    while let Some(idx) = text[pos..].find("balance") {
+        let abs = pos + idx + 7;
+        if abs >= text.len() { break; }
+        let tail = &text[abs..];
+        let Some(colon) = tail.find(':') else { pos = abs; continue; };
+        let after = tail[colon+1..].trim_start_matches(|c: char| c==' '||c=='"'||c=='\''||c=='=');
+        let end = after.find(|c: char| !(c.is_ascii_digit() || c=='.' || c=='-' || c=='e' || c=='E')).unwrap_or(after.len());
+        if end==0 { pos = abs; continue; }
+        if let Ok(num) = after[..end].parse::<f64>() {
+            if num.abs() > 1e-9 && best.map_or(true, |b| num.abs() > b.abs()) { best = Some(num); }
+        }
+        pos = abs;
+        if pos >= text.len() { break; }
+    }
+    best.map(|n| if n.abs() > 100_000.0 { n/100_000_000.0 } else { n })
+}
+
 fn oc_find_balance_any(v: &Value) -> Option<f64> {
     match v {
         Value::Object(map) => {
@@ -1294,9 +1425,17 @@ fn oc_find_balance_any(v: &Value) -> Option<f64> {
 }
 
 fn oc_parse_wallet_balance_any(text: &str) -> Option<f64> {
-    let v = serde_json::from_str::<Value>(text).ok()?;
-    let raw = oc_find_balance_any(&v)?;
-    if raw.abs() > 100_000.0 { Some(raw / 100_000_000.0) } else { Some(raw) }
+    if let Some(v) = oc_unwrap_payload(text) {
+        if let Some(raw) = oc_find_balance_any(&v) {
+            return Some(if raw.abs() > 100_000.0 { raw / 100_000_000.0 } else { raw });
+        }
+    }
+    if let Ok(v) = serde_json::from_str::<Value>(text) {
+        if let Some(raw) = oc_find_balance_any(&v) {
+            return Some(if raw.abs() > 100_000.0 { raw / 100_000_000.0 } else { raw });
+        }
+    }
+    oc_scan_balance_any_text(text)
 }
 
 fn next_month_first_utc_ms() -> u64 {
