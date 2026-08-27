@@ -186,10 +186,6 @@ pub fn normalize_credential_for_kind(kind: BalanceKind, raw: &str) -> String {
             format!("__Secure-commandcode_prod_.session_token={t}")
         }
         BalanceKind::OpenCode | BalanceKind::OpenCodeGo | BalanceKind::OpenCodeZen => format!("auth={t}"),
-        BalanceKind::DeepSeek => {
-            // platform.deepseek.com session: prefer full Cookie string, bare value wraps as thumbcache cookie
-            format!(".thumbcache_6b2e5483f9d858d7c661c5e276b6a6ae={t}")
-        }
         _ => t.to_string(),
     }
 }
@@ -222,23 +218,7 @@ async fn get_json(
 
 // ─── DeepSeek ────────────────────────────────────────────────────────────────
 
-fn looks_like_deepseek_cookie(s: &str) -> bool {
-    let t = s.trim().trim_start_matches("Cookie:").trim();
-    if t.contains('=') || t.to_lowercase().contains("thumbcache") { return true; }
-    // Bare Cookie value (e.g. O24Gvoqt...) is long base64-ish and not an sk-* key
-    !t.starts_with("sk-") && t.len() > 40
-}
-
 async fn fetch_deepseek(key: &str) -> Result<Value> {
-    // Cookie 版（platform.deepseek.com 会话）：探测到 Cookie 形态时优先走站内接口，
-    // 拿到后再复用同一套 balance_infos 解析；失败则回落到 Bearer 官方接口。
-    if looks_like_deepseek_cookie(key) {
-        let cookie = key.trim().trim_start_matches("Cookie:").trim().to_string();
-        let cookie = cookie.trim_start_matches("cookie:").trim().to_string();
-        if let Ok(v) = fetch_deepseek_via_cookie(&cookie).await {
-            return Ok(v);
-        }
-    }
     let (_, v) = get_json(
         "https://api.deepseek.com/user/balance",
         &[
@@ -307,178 +287,6 @@ async fn fetch_deepseek(key: &str) -> Result<Value> {
             {"label": "累计已用", "value": format!("{symbol}{:.2}", cum_used)},
         ]),
     ))
-}
-
-async fn fetch_deepseek_via_cookie(cookie: &str) -> Result<Value> {
-    // platform.deepseek.com 会话 Cookie（Name=.thumbcache_6b2e...）走站内接口。
-    // 内部接口未公开文档，实测 dashboard 走 /api/v0/users/current/balance 等；
-    // 这里尝试多个候选，命中任一即按 balance_infos 复用同一套解析。
-    let raw = cookie.trim().trim_start_matches("Cookie:").trim().trim_start_matches("cookie:").trim();
-    let cookie_header = if raw.contains('=') {
-        raw.to_string()
-    } else if raw.is_empty() {
-        String::new()
-    } else {
-        format!(".thumbcache_6b2e5483f9d858d7c661c5e276b6a6ae={raw}")
-    };
-    if cookie_header.is_empty() {
-        return Err(anyhow!("缺少 Cookie"));
-    }
-    let ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36";
-    let candidates = [
-        "https://platform.deepseek.com/api/v0/users/current/balance",
-        "https://platform.deepseek.com/api/v0/users/balance",
-        "https://platform.deepseek.com/api/v0/balance",
-    ];
-    let mut last_err: Option<String> = None;
-    for url in candidates {
-        let headers = [
-            ("cookie", cookie_header.clone()),
-            ("accept", "application/json".into()),
-            ("user-agent", ua.to_string()),
-            ("referer", "https://platform.deepseek.com/".into()),
-            ("origin", "https://platform.deepseek.com".into()),
-        ];
-        match get_json(url, &headers).await {
-            Ok((st, v)) if st.is_success() => {
-                if let Some(infos) = deepseek_find_balance_infos(&v) {
-                    if let Some(res) = deepseek_build_from_infos(&v, &infos) {
-                        return Ok(res);
-                    }
-                    last_err = Some(format!("解析失败 {url}"));
-                } else if v.get("balance_infos").is_some() {
-                    // direct shape
-                    if let Some(arr) = v.get("balance_infos").and_then(Value::as_array) {
-                        if let Some(res) = deepseek_build_from_infos(&v, arr) {
-                            return Ok(res);
-                        }
-                    }
-                    last_err = Some(format!("无 balance_infos {url}: {}", truncate_for_err(&v.to_string())));
-                } else {
-                    last_err = Some(format!("无 balance_infos {url}: {}", truncate_for_err(&v.to_string())));
-                }
-            }
-            Ok((st, v)) => {
-                last_err = Some(format!("HTTP {} {}: {}", st.as_u16(), url, truncate_for_err(&v.to_string())));
-            }
-            Err(e) => last_err = Some(e.to_string()),
-        }
-    }
-    Err(anyhow!("{}", last_err.unwrap_or_else(|| "Cookie 无效或已过期".into())))
-}
-
-fn deepseek_find_balance_infos(v: &Value) -> Option<Vec<Value>> {
-    match v {
-        Value::Object(m) => {
-            if let Some(arr) = m.get("balance_infos").and_then(Value::as_array) {
-                return Some(arr.clone());
-            }
-            if let Some(arr) = m.get("data").and_then(|d| d.get("balance_infos")).and_then(Value::as_array) {
-                return Some(arr.clone());
-            }
-            for val in m.values() {
-                if let Some(found) = deepseek_find_balance_infos(val) {
-                    return Some(found);
-                }
-            }
-            None
-        }
-        Value::Array(items) => {
-            for it in items {
-                if let Some(found) = deepseek_find_balance_infos(it) {
-                    return Some(found);
-                }
-            }
-            None
-        }
-        _ => None,
-    }
-}
-
-fn deepseek_build_from_infos(root: &Value, infos: &[Value]) -> Option<Value> {
-    struct Bal { currency: String, total: f64, granted: f64, topped: f64 }
-    let parse = |item: &Value| -> Option<Bal> {
-        let num = |s: Option<&str>| s.and_then(|s| s.trim().parse::<f64>().ok());
-        Some(Bal {
-            currency: item.get("currency")?.as_str()?.to_string(),
-            total: num(item.get("total_balance").and_then(Value::as_str))?,
-            granted: num(item.get("granted_balance").and_then(Value::as_str)).unwrap_or(0.0),
-            topped: num(item.get("topped_up_balance").and_then(Value::as_str)).unwrap_or(0.0),
-        })
-    };
-    let parsed: Vec<Bal> = infos.iter().filter_map(parse).collect();
-    let selected = parsed.iter()
-        .find(|b| b.currency == "CNY" && b.total > 0.0)
-        .or_else(|| parsed.iter().find(|b| b.total > 0.0))
-        .or_else(|| parsed.iter().find(|b| b.currency == "CNY"))
-        .or_else(|| parsed.first())?;
-    let symbol = if selected.currency == "CNY" { "¥" } else { "$" };
-    let cum_used = (selected.topped + selected.granted - selected.total).max(0.0);
-    // 尝试从 root 深搜日/月用量（若平台返回 usage 细分）
-    let daily = deepseek_find_usage(root, &["daily", "today", "day"]);
-    let monthly = deepseek_find_usage(root, &["monthly", "month", "current_month"]);
-    let is_available = root.get("is_available").and_then(Value::as_bool)
-        .or_else(|| deepseek_find_bool(root, "is_available"))
-        .unwrap_or(true);
-    let detail = if !is_available {
-        "余额不可用于 API 调用".to_string()
-    } else if daily.is_some() || monthly.is_some() {
-        format!("累计已用 {}{:.2}", symbol, cum_used)
-    } else {
-        format!("累计已用 {}{:.2} · 日/月明细仅控制台可见（platform.deepseek.com/usage）", symbol, cum_used)
-    };
-    Some(ok_result(
-        "deepseek",
-        format!("{}{:.2}", symbol, selected.total),
-        detail,
-        json!([]),
-        json!([
-            {"label": "本日已用", "value": format!("{}{:.2}", symbol, daily.unwrap_or(0.0))},
-            {"label": "本月已用", "value": format!("{}{:.2}", symbol, monthly.unwrap_or(0.0))},
-            {"label": "累计已用", "value": format!("{}{:.2}", symbol, cum_used)},
-        ]),
-    ))
-}
-
-fn deepseek_find_usage(v: &Value, keys: &[&str]) -> Option<f64> {
-    match v {
-        Value::Object(m) => {
-            for k in keys {
-                if let Some(val) = m.get(*k) {
-                    if let Some(n) = val.as_f64() { return Some(n); }
-                    if let Some(s) = val.as_str().and_then(|s| s.parse::<f64>().ok()) { return Some(s); }
-                    // nested object with amount/value
-                    if let Some(n) = val.get("amount").and_then(Value::as_f64) { return Some(n); }
-                    if let Some(n) = val.get("value").and_then(Value::as_f64) { return Some(n); }
-                    if let Some(s) = val.get("amount").and_then(Value::as_str).and_then(|s| s.parse::<f64>().ok()) { return Some(s); }
-                }
-            }
-            for val in m.values() {
-                if let Some(found) = deepseek_find_usage(val, keys) { return Some(found); }
-            }
-            None
-        }
-        Value::Array(items) => {
-            for it in items { if let Some(found) = deepseek_find_usage(it, keys) { return Some(found); } }
-            None
-        }
-        _ => None,
-    }
-}
-
-fn deepseek_find_bool(v: &Value, key: &str) -> Option<bool> {
-    match v {
-        Value::Object(m) => {
-            if let Some(b) = m.get(key).and_then(Value::as_bool) { return Some(b); }
-            for val in m.values() { if let Some(b) = deepseek_find_bool(val, key) { return Some(b); } }
-            None
-        }
-        Value::Array(items) => {
-            for it in items { if let Some(b) = deepseek_find_bool(it, key) { return Some(b); } }
-            None
-        }
-        _ => None,
-    }
 }
 
 // ─── GitHub Copilot ──────────────────────────────────────────────────────────
@@ -1454,16 +1262,12 @@ fn parse_time_val(val: &Value) -> Option<u64> {
 }
 
 fn oc_parse_billing_balance(text: &str) -> Option<f64> {
-    if let Some(v) = oc_unwrap_payload(text) {
-        if let Some(raw) = oc_find_billing_balance(&v) { return Some(raw / 100_000_000.0); }
-    }
     let v = serde_json::from_str::<Value>(text).ok()?;
     let raw = oc_find_billing_balance(&v)?;
     Some(raw / 100_000_000.0)
 }
 
 fn oc_parse_billing_balance_loose(text: &str) -> Option<f64> {
-    // JS-wrapped _server payload may embed JSON after `)`, scan for customerID/balance without strict JSON parse
     let pos = text.find("customerID")?;
     let bal_pos = text[pos..].find("\"balance\"").or_else(|| text[pos..].find("balance"))?;
     let tail = &text[pos + bal_pos..];
@@ -1473,76 +1277,6 @@ fn oc_parse_billing_balance_loose(text: &str) -> Option<f64> {
     let raw: f64 = t[..end].parse().ok()?;
     if raw.abs() < 1e-9 { return None; }
     Some(raw / 100_000_000.0)
-}
-
-fn oc_unwrap_payload(text: &str) -> Option<Value> {
-    // SolidStart _server returns JS like `;0x..;((self.$R=self.$R||{})["server-fn:..."]=[[...],{customerID...,balance...}])`
-    // The real JSON payload is after `["server-fn:..."]=`. Find that anchor first.
-    if let Some(anchor) = text.find("server-fn") {
-        // Find `"]=` after anchor (the closing `"]` of ["server-fn:..."] then `=`)
-        let after_anchor = &text[anchor..];
-        if let Some(rel) = after_anchor.find("]=") {
-            let after_eq = &after_anchor[rel + 2..];
-            let after_eq = after_eq.trim_start();
-            if let Some(p) = after_eq.find(|c| c == '[' || c == '{') {
-                if let Some(v) = extract_balanced_json(&after_eq[p..]) { return Some(v); }
-            }
-        }
-        if let Some(eq) = after_anchor.find('=') {
-            let after = &after_anchor[eq + 1..].trim_start();
-            if let Some(p) = after.find(|c| c == '[' || c == '{') {
-                if let Some(v) = extract_balanced_json(&after[p..]) { return Some(v); }
-            }
-        }
-    }
-    // Fallback: first balanced JSON in the whole text
-    let s_br = text.find('[');
-    let s_cu = text.find('{');
-    let start = match (s_br, s_cu) { (Some(a), Some(b)) => a.min(b), (Some(a), None) => a, (None, Some(b)) => b, _ => return None };
-    extract_balanced_json(&text[start..])
-}
-
-fn extract_balanced_json(s: &str) -> Option<Value> {
-    let bytes = s.as_bytes();
-    let mut depth: i32 = 0;
-    let mut in_str = false;
-    let mut esc = false;
-    let mut end: Option<usize> = None;
-    for (i, &b) in bytes.iter().enumerate() {
-        if esc { esc = false; continue; }
-        if in_str {
-            if b == b'\\' { esc = true; } else if b == b'"' { in_str = false; }
-            continue;
-        }
-        if b == b'"' { in_str = true; continue; }
-        if b == b'[' || b == b'{' { depth += 1; }
-        else if b == b']' || b == b'}' { depth -= 1; if depth == 0 { end = Some(i + 1); break; } }
-    }
-    let e = end?;
-    serde_json::from_str::<Value>(&s[..e]).ok()
-}
-
-fn oc_scan_balance_any_text(text: &str) -> Option<f64> {
-    // Fallback for JS-wrapped payloads: scan `balance: <num>` anywhere, no customerID required
-    let mut pos = 0usize;
-    let mut best: Option<f64> = None;
-    while let Some(idx) = text[pos..].find("balance") {
-        let abs = pos + idx + 7;
-        if abs >= text.len() { break; }
-        let tail = &text[abs..];
-        let Some(colon) = tail.find(':') else { pos = abs; continue; };
-        let after = tail[colon+1..].trim_start_matches(|c: char| c==' '||c=='"'||c=='\''||c=='=');
-        let end = after.find(|c: char| !(c.is_ascii_digit() || c=='.' || c=='-' || c=='e' || c=='E')).unwrap_or(after.len());
-        if end==0 { pos = abs; continue; }
-        if let Ok(num) = after[..end].parse::<f64>() {
-            if num.abs() > 1e-9 {
-                if best.map_or(true, |b| num.abs() > b.abs()) { best = Some(num); }
-            }
-        }
-        pos = abs;
-        if pos >= text.len() { break; }
-    }
-    best.map(|n| if n.abs() > 100_000.0 { n/100_000_000.0 } else { n })
 }
 
 fn oc_find_balance_any(v: &Value) -> Option<f64> {
@@ -1560,19 +1294,9 @@ fn oc_find_balance_any(v: &Value) -> Option<f64> {
 }
 
 fn oc_parse_wallet_balance_any(text: &str) -> Option<f64> {
-    // Try unwrapped JS payload first, then strict JSON
-    if let Some(v) = oc_unwrap_payload(text) {
-        if let Some(raw) = oc_find_balance_any(&v) {
-            return Some(if raw.abs() > 100_000.0 { raw / 100_000_000.0 } else { raw });
-        }
-    }
-    if let Ok(v) = serde_json::from_str::<Value>(text) {
-        if let Some(raw) = oc_find_balance_any(&v) {
-            return Some(if raw.abs() > 100_000.0 { raw / 100_000_000.0 } else { raw });
-        }
-    }
-    // Last resort: raw text scan
-    oc_scan_balance_any_text(text)
+    let v = serde_json::from_str::<Value>(text).ok()?;
+    let raw = oc_find_balance_any(&v)?;
+    if raw.abs() > 100_000.0 { Some(raw / 100_000_000.0) } else { Some(raw) }
 }
 
 fn next_month_first_utc_ms() -> u64 {

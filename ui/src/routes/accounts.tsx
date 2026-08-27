@@ -38,7 +38,7 @@ const PROTOCOLS = ['chat', 'responses', 'messages'] as const;
 type Protocol = typeof PROTOCOLS[number];
 
 // 需要网页登录凭据（Cookie/Token）而非 API Key 的余额查询类型。
-const COOKIE_KINDS = ['copilot', 'commandcode', 'opencode', 'opencode-go', 'opencode-zen', 'deepseek'];
+const COOKIE_KINDS = ['copilot', 'commandcode', 'opencode', 'opencode-go', 'opencode-zen'];
 
 // 各类型的凭据获取教程（小叹号展开）——精确到 Cookie 名。
 const BALANCE_AUTH_HELP: Record<string, string[]> = {
@@ -80,12 +80,6 @@ const BALANCE_AUTH_HELP: Record<string, string[]> = {
     '3. 找到 Name = auth 这一行，双击 Value 复制（以 Fe26.2** 开头）；',
     '4. 可粘 “auth=VALUE” 整串，也可只粘 VALUE，都会自动补齐为 auth=VALUE；',
     '5. 选用“OpenCode Zen”后仅查询钱包余额（与 OpenCode/Go 分离，需单独配置）。',
-  ],
-  deepseek: [
-    'DeepSeek 支持两种余额查询：API Key（Bearer）或网页 Cookie（platform.deepseek.com 会话，可细分日/月用量）。',
-    '· API Key 模式：直接使用 sk-… 查询 GET /user/balance，显示总余额与累计已用；',
-    '· Cookie 模式（可细分）：浏览器登录 https://platform.deepseek.com → F12 → Application → Storage → Cookies → https://platform.deepseek.com → 复制 Name=.thumbcache_6b2e5483f9d858d7c661c5e276b6a6ae 的 Value（或整串 Cookie），粘到下方；',
-    '  值形如 O24GvoqtXd/...（含 %3D 编码请保持原样）；系统会自动补齐为 .thumbcache_6b2e…=VALUE 走内部用量接口，失败则回落到 Bearer 查询。',
   ],
 };
 
@@ -225,8 +219,8 @@ function BalanceLine({ account: acc, balance, loading, unsupported, onRefresh }:
             {sortedWindows.map((w, idx) => (
               <React.Fragment key={w.label}>
                 {idx > 0 && <span className="text-muted-foreground/30 mx-0.5">·</span>}
-                <span className={cn('font-mono font-medium text-xs', w.exceeded ? 'text-muted-foreground' : 'text-foreground')}>
-                  {w.label} <span className={cn(w.exceeded ? 'text-muted-foreground' : 'text-success')}>{Math.round(w.percent)}%</span>
+                <span className="font-mono font-medium text-xs text-foreground">
+                  {w.label} <span className={cn(w.exceeded ? 'text-destructive' : 'text-muted-foreground')}>{Math.round(w.percent)}%</span>
                 </span>
               </React.Fragment>
             ))}
@@ -286,7 +280,7 @@ function BalanceLine({ account: acc, balance, loading, unsupported, onRefresh }:
               const exhausted = !!w.exceeded;
               return (
                 <div key={w.label} className="flex items-center justify-between gap-3 text-xs leading-relaxed min-w-0">
-                  <span className={cn('font-mono shrink-0', exhausted ? 'text-muted-foreground' : 'text-foreground')}>{w.label}</span>
+                  <span className="font-mono shrink-0 text-foreground">{w.label}</span>
                   {timeStr ? (
                     <span className={cn('font-mono text-xs truncate', exhausted ? 'text-destructive' : 'text-muted-foreground')}>
                       {exhausted ? `重置于 ${timeStr}` : `过期于 ${timeStr}`}
@@ -302,7 +296,7 @@ function BalanceLine({ account: acc, balance, loading, unsupported, onRefresh }:
                 const exhausted = !!w.exceeded;
                 return (
                   <div key={w.label} className="flex items-center justify-between gap-3 text-xs leading-relaxed min-w-0">
-                    <span className={cn('font-mono', exhausted ? 'text-muted-foreground' : 'text-foreground')}>{w.label} {Math.round(w.percent)}%</span>
+                    <span className="font-mono text-foreground">{w.label}</span>
                     {timeStr ? (
                       <span className={cn('font-mono text-xs truncate', exhausted ? 'text-destructive' : 'text-muted-foreground')}>
                         {exhausted ? `重置于 ${timeStr}` : `过期于 ${timeStr}`}
