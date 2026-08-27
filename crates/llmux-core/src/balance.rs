@@ -1445,55 +1445,48 @@ fn oc_parse_billing_balance(text: &str) -> Option<f64> {
 }
 
 fn oc_parse_billing_balance_loose(text: &str) -> Option<f64> {
-    let pos = text.find("customerID")?;
-    let bal_pos = text[pos..].find("\"balance\"").or_else(|| text[pos..].find("balance"))?;
-    let tail = &text[pos + bal_pos..];
-    let colon = tail.find(':')?;
-    let t = tail[colon + 1..].trim_start();
-    let end = t.find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-' || c == 'e' || c == 'E')).unwrap_or(t.len());
-    let raw: f64 = t[..end].parse().ok()?;
-    Some(raw / 100_000_000.0)
+    if let Some(pos) = text.find("customerID") {
+        if let Some(bal_pos) = text[pos..].find("\"balance\"").or_else(|| text[pos..].find("balance")) {
+            let tail = &text[pos + bal_pos..];
+            if let Some(colon) = tail.find(':') {
+                let t = tail[colon + 1..].trim_start();
+                let end = t.find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-' || c == 'e' || c == 'E')).unwrap_or(t.len());
+                if end > 0 {
+                    if let Ok(raw) = t[..end].parse::<f64>() {
+                        return Some(raw / 100_000_000.0);
+                    }
+                }
+            }
+        }
+    }
+    // Fallback: any balance in text (wallet-only or JS wrapper with new Date)
+    oc_scan_balance_any_text(text)
 }
 
 fn oc_unwrap_payload(text: &str) -> Option<Value> {
-    // SolidStart wraps as ;0x...;((self.$R...["server-fn:..."]=[],($R=>$R[0]={customerID...,balance:0}))
-    // First JSON is [] (empty), the real payload is the object assigned to $R[0].
-    // Scan all balanced JSONs and pick the one containing billing balance.
-    let mut best: Option<Value> = None;
-    let mut best_score: i32 = -1;
-    let bytes = text.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] != b'[' && bytes[i] != b'{' { i+=1; continue; }
-        if let Some(v) = extract_balanced_json(&text[i..]) {
-            let score = if oc_find_billing_balance(&v).is_some() { 3 }
-                else if oc_find_balance_any(&v).is_some() { 2 }
-                else if v.is_array() && v.as_array().map(|a| a.is_empty()).unwrap_or(false) { -1 }
-                else if v.is_object() { 1 } else { 0 };
-            if score > best_score {
-                best_score = score;
-                best = Some(v.clone());
-                if score == 3 { break; }
+    // SolidStart: ;0x...;((self.$R...["server-fn:..."]=[],($R=>$R[0]={customerID...,balance:0,new Date(...)}))
+    // The payload contains `new Date(...)` which is not valid JSON — unwrap will fail for Date payloads.
+    // In that case return None and let the loose text scan handle it (balance:0 is valid).
+    // Prefer the object after `$R[0]=` / `=>$R[0]=`
+    for needle in ["$R[0]=", "=>$R[0]="] {
+        if let Some(pos) = text.find(needle) {
+            let after = text[pos + needle.len()..].trim_start();
+            if let Some(p) = after.find(|c| c == '{' || c == '[') {
+                if let Some(v) = extract_balanced_json(&after[p..]) {
+                    return Some(v);
+                }
             }
-            // advance past this JSON
-            let json_len = serde_json::to_string(&v).ok().map(|s| s.len()).unwrap_or(1);
-            // approximate: move at least 1
-            i += 1;
-            let _ = json_len;
-        } else { i+=1; }
-        if i > bytes.len() { break; }
-        if best_score == 3 { break; }
-        if i > 200_000 { break; } // safety
+        }
     }
-    if best_score >= 0 { return best; }
-    // Fallback: original anchor heuristic for non-standard wrappers
     if let Some(anchor) = text.find("server-fn") {
         let after = &text[anchor..];
         if let Some(rel) = after.find("]=") {
             let cand = after[rel + 2..].trim_start();
             if let Some(p) = cand.find(|c| c == '[' || c == '{') {
                 if let Some(v) = extract_balanced_json(&cand[p..]) {
-                    if !v.is_array() || !v.as_array().map(|a| a.is_empty()).unwrap_or(false) { return Some(v); }
+                    if !(v.is_array() && v.as_array().map(|a| a.is_empty()).unwrap_or(false)) {
+                        return Some(v);
+                    }
                 }
             }
         }
