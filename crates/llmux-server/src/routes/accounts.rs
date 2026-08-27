@@ -10,10 +10,104 @@ use serde_json::{json, Value};
 use crate::app::AppState;
 use crate::routes::models::fetch_provider_models;
 
+/// GET /api/accounts/:id/balance — probe the upstream balance/usage endpoint
+/// for this account and cache the normalized result into `limits_cache`.
+pub async fn get_account_balance(
+    Extension(state): Extension<AppState>,
+    Path(id): Path<i64>,
+) -> Response {
+    use sqlx::Row as _;
+
+    let row = match sqlx::query(
+        "SELECT provider_id, api_key, base_url, anthropic_base_url, chat_endpoint, responses_endpoint, messages_endpoint, balance_provider, balance_auth FROM accounts WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await
+    {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return crate::error::simple_error(
+                format!("Account with id {id} not found"),
+                StatusCode::NOT_FOUND,
+            )
+        }
+        Err(e) => {
+            return crate::error::simple_error(
+                format!("Failed to lookup account: {e}"),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            )
+        }
+    };
+
+    let provider_id: String = row.try_get("provider_id").unwrap_or_default();
+    let enc_key: String = row.try_get("api_key").unwrap_or_default();
+    // Dedicated balance_auth (cookie/token) wins; the upstream API key is the fallback.
+    let auth_cipher: String = row.try_get("balance_auth").unwrap_or_default();
+    let credential = match if auth_cipher.is_empty() {
+        llmux_core::crypto::decrypt_api_key(&enc_key, &state.master_key)
+    } else {
+        llmux_core::crypto::decrypt_api_key(&auth_cipher, &state.master_key)
+    } {
+        Ok(k) => k,
+        Err(e) => {
+            return crate::error::simple_error(
+                format!("Failed to decrypt API key: {e}"),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            )
+        }
+    };
+    let endpoints: Vec<String> = ["base_url", "anthropic_base_url", "chat_endpoint", "responses_endpoint", "messages_endpoint"]
+        .iter()
+        .filter_map(|col| row.try_get::<Option<String>, _>(col).unwrap_or_default())
+        .collect();
+
+    let balance_provider: String = row.try_get("balance_provider").unwrap_or_default();
+
+    // Explicit balance_provider (form dropdown) wins; host sniffing is fallback.
+    let Some(kind) = llmux_core::balance::detect_kind(
+        &provider_id,
+        &endpoints.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        &balance_provider,
+    ) else {
+        return crate::error::simple_error("此账户未配置余额查询方式", StatusCode::UNPROCESSABLE_ENTITY);
+    };
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        llmux_core::balance::fetch_balance(kind, &credential, &endpoints),
+    )
+    .await
+    .unwrap_or_else(|_| json!({"provider": kind.as_str(), "ok": false, "error": "timeout"}));
+
+    // Cache (including failures — they're informative) into limits_cache.
+    let _ = sqlx::query(
+        "UPDATE accounts SET limits_cache = ?, limits_cache_updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+    )
+    .bind(result.to_string())
+    .bind(id)
+    .execute(&state.pool)
+    .await;
+
+    Json(json!({
+        "success": result.get("ok").and_then(Value::as_bool).unwrap_or(false),
+        "balance": result,
+        "updated_at": chrono_now_secs(),
+    }))
+    .into_response()
+}
+
+fn chrono_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 pub async fn list_accounts(Extension(state): Extension<AppState>) -> Response {
     // Lazy decrypt: list never returns api_key (eye fetches /:id/key on demand).
     let rows = match sqlx::query(
-        "SELECT id, alias, provider_id, base_url, anthropic_base_url, is_active, weight, notes, openai_compatible, created_at, chat_endpoint, responses_endpoint, messages_endpoint, default_protocol FROM accounts ORDER BY id DESC",
+        "SELECT id, alias, provider_id, base_url, anthropic_base_url, is_active, weight, notes, openai_compatible, created_at, chat_endpoint, responses_endpoint, messages_endpoint, default_protocol, balance_provider FROM accounts ORDER BY id DESC",
     )
     .fetch_all(&state.pool)
     .await
@@ -46,6 +140,8 @@ pub async fn list_accounts(Extension(state): Extension<AppState>) -> Response {
                 "responses_endpoint": r.try_get::<Option<String>, _>("responses_endpoint").unwrap_or_default(),
                 "messages_endpoint": r.try_get::<Option<String>, _>("messages_endpoint").unwrap_or_default(),
                 "default_protocol": r.try_get::<Option<String>, _>("default_protocol").unwrap_or_default(),
+                "balance_provider": r.try_get::<Option<String>, _>("balance_provider").unwrap_or_default(),
+                "balance_auth": Value::Null,
             })
         })
         .collect();
@@ -112,6 +208,28 @@ pub async fn create_account(
     // UI removed the skip-validation checkbox (2026-08): validation never blocks
     // creation anymore. Field kept for backwards compatibility with old clients.
     let skip_validation = body["skip_validation"].as_bool().unwrap_or(true);
+    // Balance query backend: "" (auto-detect), or one of the known kinds, "none" to disable.
+    let balance_provider = body
+        .get("balance_provider")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_lowercase())
+        .unwrap_or_default();
+    if !balance_provider.is_empty()
+        && !["deepseek", "copilot", "openrouter", "commandcode", "opencode", "opencode-go", "opencode_go", "opencode-zen", "opencode_zen", "zen", "none"]
+            .contains(&balance_provider.as_str())
+    {
+        return crate::error::simple_error(
+            format!("Invalid balance_provider: {balance_provider}"),
+            StatusCode::BAD_REQUEST,
+        );
+    }
+    // Balanced-probe credential (cookie/token for Copilot/CommandCode/OpenCode).
+    // Stored encrypted like the API key; empty = probe with the API key.
+    let balance_auth_plain = body
+        .get("balance_auth")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
 
     if alias.is_empty() || provider_id.is_empty() || api_key_plain.is_empty() {
         return crate::error::simple_error(
@@ -195,6 +313,8 @@ pub async fn create_account(
         responses_endpoint: responses_endpoint.clone(),
         messages_endpoint: messages_endpoint.clone(),
         default_protocol: Some(default_protocol.clone()),
+        balance_provider: balance_provider.clone(),
+        balance_auth: balance_auth_plain.clone(),
     };
 
     let provider_type = {
@@ -228,10 +348,23 @@ pub async fn create_account(
             );
         }
     };
+    let balance_auth_cipher = if balance_auth_plain.is_empty() {
+        String::new()
+    } else {
+        match encrypt_api_key(&balance_auth_plain, &state.master_key) {
+            Ok(c) => c,
+            Err(e) => {
+                return crate::error::simple_error(
+                    format!("Failed to encrypt balance_auth: {e}"),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                )
+            }
+        }
+    };
 
     match sqlx::query(
-        "INSERT INTO accounts (alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight, notes, openai_compatible, chat_endpoint, responses_endpoint, messages_endpoint, default_protocol)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO accounts (alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight, notes, openai_compatible, chat_endpoint, responses_endpoint, messages_endpoint, default_protocol, balance_provider, balance_auth)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&alias)
     .bind(&provider_id)
@@ -246,6 +379,8 @@ pub async fn create_account(
     .bind(&responses_endpoint)
     .bind(&messages_endpoint)
     .bind(&default_protocol)
+    .bind(&balance_provider)
+    .bind(&balance_auth_cipher)
     .execute(&state.pool)
     .await
     {
@@ -274,7 +409,7 @@ pub async fn update_account(
 ) -> Response {
     // Verify the account exists.
     let existing = sqlx::query_as::<_, llmux_core::models::Account>(
-        "SELECT id, alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight, notes, limits_cache, limits_cache_updated_at, openai_compatible, created_at, chat_endpoint, responses_endpoint, messages_endpoint, default_protocol FROM accounts WHERE id = ?",
+        "SELECT id, alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight, notes, limits_cache, limits_cache_updated_at, openai_compatible, created_at, chat_endpoint, responses_endpoint, messages_endpoint, default_protocol, balance_provider, balance_auth FROM accounts WHERE id = ?",
     )
     .bind(id)
     .fetch_optional(&state.pool)
@@ -340,6 +475,54 @@ pub async fn update_account(
         .get("openai_compatible")
         .and_then(|v| v.as_i64())
         .unwrap_or(existing.openai_compatible.unwrap_or(0));
+
+    // Balance backend: missing key = keep existing; explicit null = clear (auto-detect);
+    // string = set. Validated against the known kinds + "none".
+    let balance_provider = match body.get("balance_provider") {
+        None => existing.balance_provider.clone().unwrap_or_default(),
+        Some(Value::Null) => String::new(),
+        Some(v) => {
+            let s = v.as_str().unwrap_or("").trim().to_lowercase();
+            if !s.is_empty()
+                && s != "none"
+                && !["deepseek", "copilot", "openrouter", "commandcode", "opencode", "opencode-go", "opencode_go", "opencode-zen", "opencode_zen", "zen"].contains(&s.as_str())
+            {
+                return crate::error::simple_error(
+                    format!("Invalid balance_provider: {s}"),
+                    StatusCode::BAD_REQUEST,
+                );
+            }
+            s
+        }
+    };
+
+    // Balance probe credential: missing = keep existing, null = clear (fall back to
+    // api_key), string = set. Stored encrypted; plaintext only feeds the test literal.
+    let balance_auth_plain = body
+        .get("balance_auth")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    let balance_auth_cipher = match body.get("balance_auth") {
+        None => existing.balance_auth.clone().unwrap_or_default(),
+        Some(Value::Null) => String::new(),
+        Some(v) => {
+            let s = v.as_str().unwrap_or("").trim().to_string();
+            if s.is_empty() {
+                String::new()
+            } else {
+                match encrypt_api_key(&s, &state.master_key) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return crate::error::simple_error(
+                            format!("Failed to encrypt balance_auth: {e}"),
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                        )
+                    }
+                }
+            }
+        }
+    };
 
     // New multi-endpoint fields: explicit null/empty = disabled; missing = keep existing; legacy fallback only for create.
     let has_chat_key = body.as_object().map(|m| m.contains_key("chat_endpoint")).unwrap_or(false);
@@ -433,6 +616,8 @@ pub async fn update_account(
                 responses_endpoint: responses_endpoint.clone(),
                 messages_endpoint: messages_endpoint.clone(),
                 default_protocol: Some(default_protocol.clone()),
+        balance_provider: balance_provider.clone(),
+        balance_auth: balance_auth_plain.clone(),
             };
 
             let provider_type = {
@@ -471,7 +656,7 @@ pub async fn update_account(
     };
 
     let update_res = sqlx::query(
-        "UPDATE accounts SET alias = ?, provider_id = ?, api_key = ?, base_url = ?, anthropic_base_url = ?, is_active = ?, weight = ?, notes = ?, openai_compatible = ?, chat_endpoint = ?, responses_endpoint = ?, messages_endpoint = ?, default_protocol = ? WHERE id = ?",
+        "UPDATE accounts SET alias = ?, provider_id = ?, api_key = ?, base_url = ?, anthropic_base_url = ?, is_active = ?, weight = ?, notes = ?, openai_compatible = ?, chat_endpoint = ?, responses_endpoint = ?, messages_endpoint = ?, default_protocol = ?, balance_provider = ?, balance_auth = ? WHERE id = ?",
     )
     .bind(&alias)
     .bind(&provider_id)
@@ -486,6 +671,8 @@ pub async fn update_account(
     .bind(&responses_endpoint)
     .bind(&messages_endpoint)
     .bind(&default_protocol)
+    .bind(&balance_provider)
+    .bind(&balance_auth_cipher)
     .bind(id)
     .execute(&state.pool)
     .await;

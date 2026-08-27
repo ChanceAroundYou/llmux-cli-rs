@@ -262,6 +262,7 @@ fn core_router() -> AppRouter {
             put(accounts::update_account).delete(accounts::delete_account),
         )
         .route("/api/accounts/:id/key", get(accounts::get_account_key))
+        .route("/api/accounts/:id/balance", get(accounts::get_account_balance))
         .route(
             "/api/accounts/:id/export",
             get(accounts::export_account_usage),

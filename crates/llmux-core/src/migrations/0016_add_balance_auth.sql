@@ -1,0 +1,1 @@
+ALTER TABLE accounts ADD COLUMN balance_auth TEXT NOT NULL DEFAULT '';

@@ -69,7 +69,7 @@ pub async fn start_test_queue(
             // 若前端已指定 accountId，直接定向到该账户，避免同名模型串到 provider 的首账户
             let targeted_accounts: Option<Vec<llmux_core::adapters::Account>> = if let Some(acc_id) = account_id_override {
                 match sqlx::query(
-                    "SELECT id, alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight, openai_compatible, chat_endpoint, responses_endpoint, messages_endpoint, default_protocol FROM accounts WHERE id = ? AND is_active = 1",
+                    "SELECT id, alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight, openai_compatible, chat_endpoint, responses_endpoint, messages_endpoint, default_protocol, balance_provider, balance_auth FROM accounts WHERE id = ? AND is_active = 1",
                 )
                 .bind(acc_id)
                 .fetch_optional(&pool)
@@ -91,7 +91,9 @@ pub async fn start_test_queue(
                                 chat_endpoint: row.try_get("chat_endpoint").ok(),
                                 responses_endpoint: row.try_get("responses_endpoint").ok(),
                                 messages_endpoint: row.try_get("messages_endpoint").ok(),
-                                default_protocol: row.try_get("default_protocol").ok(),
+                                  default_protocol: row.try_get("default_protocol").ok(),
+                                balance_provider: row.try_get::<Option<String>, _>("balance_provider").ok().flatten().unwrap_or_default(),
+                balance_auth: row.try_get::<Option<String>, _>("balance_auth").ok().flatten().unwrap_or_default(),
                             }]),
                             Err(_) => Some(vec![]),
                         }
@@ -355,7 +357,7 @@ pub async fn test_model(
     let accounts = if let Some(acc_id) = account_id_override {
         // Directly fetch the specified account
         match sqlx::query(
-            "SELECT id, alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight, openai_compatible, chat_endpoint, responses_endpoint, messages_endpoint, default_protocol \
+            "SELECT id, alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight, openai_compatible, chat_endpoint, responses_endpoint, messages_endpoint, default_protocol, balance_provider, balance_auth \
              FROM accounts WHERE id = ? AND is_active = 1",
         )
         .bind(acc_id)
@@ -380,7 +382,9 @@ pub async fn test_model(
                         chat_endpoint: row.try_get("chat_endpoint").ok(),
                         responses_endpoint: row.try_get("responses_endpoint").ok(),
                         messages_endpoint: row.try_get("messages_endpoint").ok(),
-                        default_protocol: row.try_get("default_protocol").ok(),
+                          default_protocol: row.try_get("default_protocol").ok(),
+                                balance_provider: row.try_get::<Option<String>, _>("balance_provider").ok().flatten().unwrap_or_default(),
+                balance_auth: row.try_get::<Option<String>, _>("balance_auth").ok().flatten().unwrap_or_default(),
                     }],
                     Err(_) => vec![],
                 }

@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { useAccountsStore } from '../stores/accounts';
 import { useModelsStore } from '../stores/models';
+import { apiFetch } from '@/lib/api';
 import {
   Users,
   Trash2,
@@ -21,6 +22,8 @@ import {
   ChevronDown,
   Search,
   Filter,
+  RefreshCw,
+  Info,
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { Dialog, ConfirmDialog } from '../components/Modal';
@@ -33,6 +36,126 @@ import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group';
 
 const PROTOCOLS = ['chat', 'responses', 'messages'] as const;
 type Protocol = typeof PROTOCOLS[number];
+
+// 需要网页登录凭据（Cookie/Token）而非 API Key 的余额查询类型。
+const COOKIE_KINDS = ['copilot', 'commandcode', 'opencode', 'opencode-go', 'opencode-zen', 'deepseek'];
+
+// 各类型的凭据获取教程（小叹号展开）——精确到 Cookie 名。
+const BALANCE_AUTH_HELP: Record<string, string[]> = {
+  copilot: [
+    'GitHub Copilot 使用 GitHub OAuth token（gho_/ghp_ 开头）查询配额。',
+    '1. 终端执行 gh auth login 登录 GitHub；',
+    '2. 执行 gh auth token 复制输出；',
+    '3. 或 GitHub → Settings → Developer settings → Personal access tokens（账号需已开通 Copilot）。',
+  ],
+  commandcode: [
+    'CommandCode 使用浏览器登录后的 Cookie 查询额度（只认一条，精确到名）。',
+    '1. 浏览器登录 https://commandcode.ai；',
+    '2. 按 F12 → Application（应用）→ Storage → Cookies → https://commandcode.ai；',
+    '3. 找到 Name = __Secure-commandcode_prod_.session_token 这一行，双击 Value 复制；',
+    '4. 若 Value 含 %2B/%3D 请保持原样粘贴（服务端只认编码态，解码成 + 会 401）；',
+    '5. 可粘 “__Secure-commandcode_prod_.session_token=VALUE” 整串，也可只粘 VALUE。',
+    '补充：__Secure-commandcode_prod_.session_data 是 JWT 明文、__stripe_*/cid 只是埋点，全部无效。',
+  ],
+  opencode: [
+    'OpenCode 使用网页端的会话 Cookie 查询用量（精确到名：auth）。',
+    '1. 浏览器登录 https://opencode.ai；',
+    '2. 按 F12 → Application → Storage → Cookies → https://opencode.ai；',
+    '3. 找到 Name = auth 这一行，双击 Value 复制（以 Fe26.2** 开头）；',
+    '4. 可粘 “auth=VALUE” 整串，也可只粘 VALUE，都会自动补齐为 auth=VALUE；',
+    '5. 若提示“未找到 workspace”，说明 Cookie 已过期，请重新登录后复制最新的 auth。',
+    '说明：订阅为空时会回落到 Zen/Pay-as-you-go 钱包（customerID + balance / 1e8）。',
+  ],
+  'opencode-go': [
+    'OpenCode Go 有两种认证，二选一（在下方输入框填写）：',
+    '· API 模式（推荐）：粘贴 Go 的 API Key（op_…/sk-…，从 opencode.ai 开发者设置获取），走 GET /zen/go/v1/usage，无需 Cookie；',
+    '· Cookie 模式：与 OpenCode 共用，F12 → Application → Storage → Cookies → https://opencode.ai → 复制 Name=auth（Fe26.2** 开头）的 Value，可粘 auth=VALUE 或裸 VALUE；',
+    '⚠️ 若在此填 Cookie 却去请求 Go API，会报 401 Missing API key — 请确认所选“OpenCode Go”的凭据类型与上方二选一一致。',
+    '账号 zen 推荐选 OpenCode Go；若批量放在 Go 系聚合下，可对每个 Go 账号单独配此凭据。',
+  ],
+  'opencode-zen': [
+    'OpenCode Zen 为独立的 Pay-as-you-go 钱包余额（customerID + balance / 1e8），不走订阅窗口。',
+    '1. 浏览器登录 https://opencode.ai；',
+    '2. 按 F12 → Application → Storage → Cookies → https://opencode.ai；',
+    '3. 找到 Name = auth 这一行，双击 Value 复制（以 Fe26.2** 开头）；',
+    '4. 可粘 “auth=VALUE” 整串，也可只粘 VALUE，都会自动补齐为 auth=VALUE；',
+    '5. 选用“OpenCode Zen”后仅查询钱包余额（与 OpenCode/Go 分离，需单独配置）。',
+  ],
+  deepseek: [
+    'DeepSeek 支持两种余额查询：API Key（Bearer）或网页 Cookie（platform.deepseek.com 会话，可细分日/月用量）。',
+    '· API Key 模式：直接使用 sk-… 查询 GET /user/balance，显示总余额与累计已用；',
+    '· Cookie 模式（可细分）：浏览器登录 https://platform.deepseek.com → F12 → Application → Storage → Cookies → https://platform.deepseek.com → 复制 Name=.thumbcache_6b2e5483f9d858d7c661c5e276b6a6ae 的 Value（或整串 Cookie），粘到下方；',
+    '  值形如 O24GvoqtXd/...（含 %3D 编码请保持原样）；系统会自动补齐为 .thumbcache_6b2e…=VALUE 走内部用量接口，失败则回落到 Bearer 查询。',
+  ],
+};
+
+// 余额认证输入框：上方清晰说明 + 小叹号展开详细教程。
+function BalanceAuthInput({ kind, value, onChange, disabled }: { kind: string; value: string; onChange: (v: string) => void; disabled?: boolean }) {
+  const { t } = useTranslation();
+  const [helpOpen, setHelpOpen] = useState(false);
+  const help = BALANCE_AUTH_HELP[kind] ?? [];
+  const isGo = kind === 'opencode-go';
+  return (
+    <div className="space-y-2 rounded-md border border-border/70 bg-muted/20 p-3 min-w-0">
+      <div className="flex items-start gap-2">
+        <p className="flex-1 min-w-0 text-xs text-muted-foreground leading-relaxed">
+          {isGo
+            ? t('accounts.balanceAuthExplainGo', 'OpenCode Go 支持 API Key 或 Cookie 二选一：填 API Key 走 Go API（推荐），填 auth Cookie 走网页用量；请与上方“余额查询接口”的选择保持一致。')
+            : t('accounts.balanceAuthExplain', '该类型的余额接口需要网页登录凭据（Cookie / Token），仅用于余额查询，不影响正常请求转发。留空则使用上方 API Key 查询；编辑时留空表示不修改。')}
+        </p>
+        <button
+          type="button"
+          aria-label="Balance auth tutorial"
+          onClick={() => setHelpOpen(o => !o)}
+          className={`shrink-0 p-1 rounded-full border transition-colors ${helpOpen ? 'text-primary border-primary/40' : 'text-muted-foreground border-border hover:text-foreground'}`}
+        >
+          <Info size={14} />
+        </button>
+      </div>
+      <input
+        type="text"
+        value={value}
+        disabled={disabled}
+        onChange={e => onChange(e.target.value)}
+        placeholder={isGo ? t('accounts.balanceAuthPlaceholderGo', '粘贴 Go API Key（op_…/sk-…）或 auth Cookie（Fe26.2**…）…') : t('accounts.balanceAuthPlaceholder', '粘贴 Cookie 整串或 Token…')}
+        className="w-full min-w-0 h-9 px-3 rounded-md border border-input bg-background text-sm font-mono"
+      />
+      {helpOpen && (
+        <div className="space-y-1 text-xs text-muted-foreground leading-relaxed">
+          {help.map((line, i) => (
+            <p key={i} className={i === 0 ? 'font-medium text-foreground/90' : ''}>{line}</p>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function formatResetAt(resetsAt?: number): string {
+  if (!resetsAt) return '';
+  return formatAbsMs(resetsAt);
+}
+
+function formatAbsMs(ms: number): string {
+  const t = ms > 1e12 ? ms : ms * 1000;
+  if (Number.isNaN(new Date(t).getTime())) return '';
+  // 统一按东八区（UTC+8）展示，与后端 format_abs_ms 一致
+  const cstMs = t + 8 * 3600 * 1000;
+  const d = new Date(cstMs);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${pad(d.getUTCMonth() + 1)}月${pad(d.getUTCDate())}日 ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`;
+}
+
+// Normalized balance payload from GET /api/accounts/:id/balance (llmux-core::balance).
+interface BalanceResult {
+  provider: string;
+  ok: boolean;
+  summary?: string;
+  detail?: string;
+  windows?: { label: string; percent: number; resets_at?: number; exceeded?: boolean }[];
+  rows?: { label: string; value: string }[];
+  error?: string;
+}
 
 // Mirror of llmux-core join_upstream_url: merge path segments, dropping an
 // adjacent duplicate "v1" (config carries the version segment).
@@ -66,6 +189,150 @@ function resolvedEndpointUrl(base: string, proto: Protocol): string {
   return joinUpstreamUrl(base, ENDPOINT_SUFFIX[proto]);
 }
 
+// 余额/用量行：折叠态常显百分比（无时间，已耗尽灰色），展开态每行独立时间（未耗尽过期灰/已耗尽重置红，东八区）
+function BalanceLine({ account: acc, balance, loading, unsupported, onRefresh }: {
+  account: { id: number; is_active: number };
+  balance?: BalanceResult;
+  loading: boolean;
+  unsupported: boolean;
+  onRefresh: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const hasData = !!balance;
+  const showBtn = !unsupported;
+  // D: 前端二次排序兜底 — 5小时 → 周 → 月（兼容滚动/每周等别名）
+  const sortedWindows = useMemo(() => {
+    const ws = balance?.windows ?? [];
+    if (ws.length === 0) return ws;
+    const order = (label: string) => {
+      if (label.includes('5') || label.includes('小时') || label.includes('滚动')) return 0;
+      if (label.includes('周')) return 1;
+      if (label.includes('月')) return 2;
+      return 3;
+    };
+    return [...ws].sort((a, b) => order(a.label) - order(b.label));
+  }, [balance?.windows]);
+  // 仅当存在 windows 时才按订阅样式渲染；zen 钱包等 windows 为空但 rows 有余额时走计费分支
+  const hasWindows = sortedWindows.length > 0;
+  const isSubscription = hasWindows && (balance?.provider === 'commandcode' || balance?.provider === 'opencode' || balance?.provider === 'opencode-go');
+  if (unsupported) return null;
+
+  const collapsedContent = (() => {
+    if (hasData && balance!.ok) {
+      if (sortedWindows.length > 0) {
+        return (
+          <div className="flex items-center flex-wrap gap-x-1 gap-y-0.5 min-w-0">
+            {sortedWindows.map((w, idx) => (
+              <React.Fragment key={w.label}>
+                {idx > 0 && <span className="text-muted-foreground/30 mx-0.5">·</span>}
+                <span className={cn('font-mono font-medium text-xs', w.exceeded ? 'text-muted-foreground' : 'text-foreground')}>
+                  {w.label} <span className={cn(w.exceeded ? 'text-muted-foreground' : 'text-success')}>{Math.round(w.percent)}%</span>
+                </span>
+              </React.Fragment>
+            ))}
+          </div>
+        );
+      }
+      // 钱包/计费类：windows 空但 summary 有余额（如 Zen $0.00）
+      if (balance!.summary) {
+        return <span className="font-mono text-success font-semibold text-xs truncate">{balance!.summary}</span>;
+      }
+      return <span className="text-muted-foreground/40 text-xs">{balance!.detail || ''}</span>;
+    }
+    if (hasData && !balance!.ok) {
+      return <span className="text-warning truncate max-w-[16rem] text-xs" title={balance!.error}>{t_balanceError(balance!.error)}</span>;
+    }
+    if (!hasData && !loading) {
+      return <span className="text-muted-foreground/40 text-xs">{unsupported ? '' : t_balanceHint()}</span>;
+    }
+    if (loading) {
+      return <span className="text-muted-foreground/40 text-xs inline-flex items-center gap-1"><Loader2 size={12} className="animate-spin" /> 查询中…</span>;
+    }
+    return null;
+  })();
+
+  const hasRows = (balance?.rows?.length ?? 0) > 0;
+  const canExpand = hasData && balance!.ok && (sortedWindows.length > 0 || hasRows);
+
+  return (
+    <div className="mt-2 rounded-lg border border-border/50 bg-muted/20 overflow-hidden">
+      <div
+        className={cn('flex items-center justify-between gap-2 px-2.5 py-2 min-w-0', canExpand && 'cursor-pointer hover:bg-muted/30 transition-colors')}
+        onClick={() => { if (canExpand) setOpen(o => !o); }}
+        role={canExpand ? 'button' : undefined}
+        aria-expanded={canExpand ? open : undefined}
+      >
+        <div className="min-w-0 flex-1">{collapsedContent}</div>
+        <div className="flex items-center gap-1 shrink-0">
+          {canExpand && <ChevronDown size={14} className={cn('text-muted-foreground transition-transform duration-200', open && 'rotate-180')} />}
+          {showBtn && (
+            <button
+              type="button"
+              aria-label="Refresh balance"
+              onClick={e => { e.stopPropagation(); onRefresh(); }}
+              disabled={loading}
+              className="p-1 rounded text-muted-foreground hover:text-foreground hover:bg-background transition-colors shrink-0 disabled:opacity-50"
+            >
+              {loading ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
+            </button>
+          )}
+        </div>
+      </div>
+      {open && hasData && balance!.ok && (
+        <div className="border-t border-border/50 bg-background/60 px-2.5 py-2 space-y-1.5 animate-in fade-in slide-in-from-top-1 duration-200">
+          {isSubscription ? (
+            sortedWindows.map(w => {
+              const timeStr = w.resets_at ? formatAbsMs(w.resets_at) : '';
+              const exhausted = !!w.exceeded;
+              return (
+                <div key={w.label} className="flex items-center justify-between gap-3 text-xs leading-relaxed min-w-0">
+                  <span className={cn('font-mono shrink-0', exhausted ? 'text-muted-foreground' : 'text-foreground')}>{w.label}</span>
+                  {timeStr ? (
+                    <span className={cn('font-mono text-xs truncate', exhausted ? 'text-destructive' : 'text-muted-foreground')}>
+                      {exhausted ? `重置于 ${timeStr}` : `过期于 ${timeStr}`}
+                    </span>
+                  ) : <span className="font-mono text-xs text-muted-foreground/50 truncate">—</span>}
+                </div>
+              );
+            })
+          ) : (
+            <>
+              {sortedWindows.map(w => {
+                const timeStr = w.resets_at ? formatAbsMs(w.resets_at) : '';
+                const exhausted = !!w.exceeded;
+                return (
+                  <div key={w.label} className="flex items-center justify-between gap-3 text-xs leading-relaxed min-w-0">
+                    <span className={cn('font-mono', exhausted ? 'text-muted-foreground' : 'text-foreground')}>{w.label} {Math.round(w.percent)}%</span>
+                    {timeStr ? (
+                      <span className={cn('font-mono text-xs truncate', exhausted ? 'text-destructive' : 'text-muted-foreground')}>
+                        {exhausted ? `重置于 ${timeStr}` : `过期于 ${timeStr}`}
+                      </span>
+                    ) : <span className="font-mono text-xs text-muted-foreground/50 truncate">—</span>}
+                  </div>
+                );
+              })}
+              {(balance!.rows ?? []).length > 0 && (
+                <div className="flex flex-wrap gap-x-3 gap-y-1 pt-1 border-t border-border/30 text-xs text-muted-foreground">
+                  {(balance!.rows ?? []).map(r => (
+                    <span key={r.label} className="font-mono">{r.label} {r.value}</span>
+                  ))}
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function t_balanceError(err?: string): string {
+  return err || '查询失败';
+}
+function t_balanceHint(): string {
+  return '余额未查询';
+}
+
 function EndpointRow({ label, enabled, url, urls, onToggle, onChange }: { label: Protocol; enabled: boolean; url: string; urls: string[]; onToggle: (v: boolean) => void; onChange: (v: string) => void }) {
   const resolved = enabled ? resolvedEndpointUrl(url, label) : '';
   const [open, setOpen] = useState(false);
@@ -89,11 +356,11 @@ function EndpointRow({ label, enabled, url, urls, onToggle, onChange }: { label:
   }, [urls, url]);
   return (
     <div className="space-y-1.5">
-      <label className="flex items-center gap-2 cursor-pointer">
-        <input type="checkbox" checked={enabled} onChange={e => onToggle(e.target.checked)} className="w-4 h-4 rounded accent-primary" />
+      <label className="flex items-center gap-2 cursor-pointer min-w-0">
+        <input type="checkbox" checked={enabled} onChange={e => onToggle(e.target.checked)} className="w-4 h-4 rounded accent-primary shrink-0" />
         <span className="text-xs font-bold uppercase">{label}</span>
         {resolved && (
-          <span className="text-[10px] font-mono text-muted-foreground/70">{resolved}</span>
+          <span className="text-[10px] font-mono text-muted-foreground/70 truncate min-w-0">{resolved}</span>
         )}
       </label>
       {enabled && (
@@ -105,7 +372,7 @@ function EndpointRow({ label, enabled, url, urls, onToggle, onChange }: { label:
               onFocus={() => setOpen(true)}
               onBlur={() => setTimeout(() => setOpen(false), 150)}
               placeholder="https://api.example.com/v1"
-              className="flex-1 h-9 px-3 rounded-md border border-input bg-background text-sm font-mono"
+              className="flex-1 min-w-0 h-9 px-3 rounded-md border border-input bg-background text-sm font-mono"
             />
             <button
               type="button"
@@ -145,10 +412,10 @@ export default function Accounts() {
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [isEditOpen, setIsEditOpen] = useState(false);
   const [editingAccount, setEditingAccount] = useState<any>(null);
-  const [formData, setFormData] = useState({ alias: '', api_key: '', chat_endpoint: '', responses_endpoint: '', messages_endpoint: '', default_protocol: '' });
+  const [formData, setFormData] = useState({ alias: '', api_key: '', chat_endpoint: '', responses_endpoint: '', messages_endpoint: '', default_protocol: '', balance_provider: '', balance_auth: '' });
   const [formEnabled, setFormEnabled] = useState<Record<Protocol, boolean>>({ chat: false, responses: false, messages: false });
   const [formShowKey, setFormShowKey] = useState(false);
-  const [editData, setEditData] = useState({ alias: '', api_key: '', chat_endpoint: '', responses_endpoint: '', messages_endpoint: '', default_protocol: '', notes: '' });
+  const [editData, setEditData] = useState({ alias: '', api_key: '', chat_endpoint: '', responses_endpoint: '', messages_endpoint: '', default_protocol: '', notes: '', balance_provider: '', balance_auth: '' });
   const [editEnabled, setEditEnabled] = useState<Record<Protocol, boolean>>({ chat: false, responses: false, messages: false });
   const [editShowKey, setEditShowKey] = useState(false);
   const [accountToDelete, setAccountToDelete] = useState<{ id: number; name: string } | null>(null);
@@ -161,6 +428,52 @@ export default function Accounts() {
   const [accountSearch, setAccountSearch] = useState('');
   const [accountFilter, setAccountFilter] = useState<'all' | 'disabled' | 'enabled'>('all');
   const FILTER_CYCLE = ['all', 'disabled', 'enabled'] as const;
+  // Balance probe: per-account result + loading flag. Unsupported upstreams (422)
+  // are remembered so the UI never re-probes them.
+  const [balances, setBalances] = useState<Record<number, BalanceResult>>({});
+  const [balanceLoading, setBalanceLoading] = useState<Record<number, boolean>>({});
+  const [unsupportedBalances, setUnsupportedBalances] = useState<Set<number>>(new Set());
+
+  const refreshBalance = async (id: number) => {
+    setBalanceLoading(s => ({ ...s, [id]: true }));
+    try {
+      const res = await apiFetch(`/api/accounts/${id}/balance`);
+      const data = await res.json().catch(() => ({}));
+      if (res.ok) {
+        setBalances(s => ({ ...s, [id]: data.balance }));
+      } else {
+        if (res.status === 422) {
+          // 禁用查询：静默标记为不支持，不展示 422 错误文案
+          setUnsupportedBalances(prev => new Set(prev).add(id));
+          return;
+        }
+        setBalances(s => ({ ...s, [id]: { ok: false, error: data.message || `HTTP ${res.status}` } as BalanceResult }));
+      }
+    } catch (e: any) {
+      setBalances(s => ({ ...s, [id]: { ok: false, error: e.message || 'network error' } as BalanceResult }));
+    } finally {
+      setBalanceLoading(s => ({ ...s, [id]: false }));
+    }
+  };
+
+  // G: 打开页面即异步刷新全部余额（常显折叠态），不阻塞首屏；禁用查询的账户直接跳过不探针
+  useEffect(() => {
+    if (accounts.length === 0) return;
+    accounts.forEach(acc => {
+      if ((acc as any).balance_provider === 'none') {
+        setUnsupportedBalances(prev => {
+          if (prev.has(acc.id)) return prev;
+          const n = new Set(prev); n.add(acc.id); return n;
+        });
+        return;
+      }
+      if (balances[acc.id] !== undefined) return;
+      if (balanceLoading[acc.id]) return;
+      if (unsupportedBalances.has(acc.id)) return;
+      void refreshBalance(acc.id);
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [accounts.length]);
 
   const filteredAccounts = useMemo(() => {
     const q = accountSearch.trim().toLowerCase();
@@ -232,10 +545,12 @@ export default function Accounts() {
         responses_endpoint: formEnabled.responses ? formData.responses_endpoint.trim() || null : null,
         messages_endpoint: formEnabled.messages ? formData.messages_endpoint.trim() || null : null,
         default_protocol: formData.default_protocol,
+        balance_provider: formData.balance_provider,
+        balance_auth: COOKIE_KINDS.includes(formData.balance_provider) ? formData.balance_auth : '',
         openai_compatible: 0,
       });
       setIsModalOpen(false);
-      setFormData({ alias: '', api_key: '', chat_endpoint: '', responses_endpoint: '', messages_endpoint: '', default_protocol: '' });
+      setFormData({ alias: '', api_key: '', chat_endpoint: '', responses_endpoint: '', messages_endpoint: '', default_protocol: '', balance_provider: '', balance_auth: '' });
       setFormEnabled({ chat: false, responses: false, messages: false });
       setFormShowKey(false);
     } catch (err: any) {
@@ -262,6 +577,8 @@ export default function Accounts() {
       messages_endpoint: acc.messages_endpoint || '',
       default_protocol: acc.default_protocol || '',
       notes: acc.notes || '',
+      balance_provider: acc.balance_provider || '',
+      balance_auth: '',
     });
     setIsEditOpen(true);
   };
@@ -284,9 +601,16 @@ export default function Accounts() {
         responses_endpoint: editEnabled.responses ? editData.responses_endpoint.trim() || null : null,
         messages_endpoint: editEnabled.messages ? editData.messages_endpoint.trim() || null : null,
         default_protocol: editData.default_protocol,
+        balance_provider: editData.balance_provider,
       };
+      // 凭据只在填入且类型匹配时提交；留空 = 不修改已有值。
+      if (editData.balance_auth && COOKIE_KINDS.includes(editData.balance_provider)) payload.balance_auth = editData.balance_auth;
       if (editData.api_key) payload.api_key = editData.api_key;
       await updateAccount(editingAccount.id, payload);
+      // 余额配置可能变了：清掉旧的"不支持"标记与旧结果，让刷新按钮重新出现
+      const updatedId = editingAccount.id;
+      setUnsupportedBalances(prev => { const n = new Set(prev); n.delete(updatedId); return n; });
+      setBalances(s => { const n = { ...s }; delete n[updatedId]; return n; });
       setIsEditOpen(false);
       setEditingAccount(null);
     } catch (err: any) {
@@ -420,6 +744,14 @@ export default function Accounts() {
                 {visibleKeyId === acc.id ? <EyeOff size={12} /> : <Eye size={12} />}
               </button>
             </div>
+            {/* 余额/用量行：手动刷新（CodexBar 移植），不支持的上游隐藏按钮 */}
+            <BalanceLine
+              account={acc}
+              balance={balances[acc.id]}
+              loading={balanceLoading[acc.id] ?? false}
+              unsupported={unsupportedBalances.has(acc.id)}
+              onRefresh={() => refreshBalance(acc.id)}
+            />
           </div>
         ))}
 
@@ -529,6 +861,35 @@ export default function Accounts() {
                 ))}
               </ToggleGroup>
               <p className="text-xs text-muted-foreground">{t('accounts.defaultProtocolHint', 'Used when a request does not specify a protocol')}</p>
+            </div>
+
+            <div className="space-y-1.5">
+              <label className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.balanceProvider', '余额查询接口')}</label>
+              <select
+                value={formData.balance_provider}
+                disabled={isValidating}
+                onChange={e => setFormData({ ...formData, balance_provider: e.target.value })}
+                className="w-full h-10 px-3 py-2 rounded-md border border-input bg-background text-sm ring-offset-background focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2"
+              >
+                <option value="">{t('accounts.balanceAuto', '自动检测')}</option>
+                <option value="deepseek">DeepSeek</option>
+                <option value="copilot">Copilot</option>
+                <option value="openrouter">OpenRouter</option>
+                <option value="commandcode">CommandCode</option>
+                <option value="opencode">OpenCode</option>
+                <option value="opencode-go">OpenCode Go</option>
+                <option value="opencode-zen">OpenCode Zen</option>
+                <option value="none">{t('accounts.balanceDisabled', '禁用查询')}</option>
+              </select>
+              <p className="text-xs text-muted-foreground">{t('accounts.balanceProviderHint', '决定余额查询走哪个上游接口；自动检测按名称/地址推断')}</p>
+              {COOKIE_KINDS.includes(formData.balance_provider) && (
+                <BalanceAuthInput
+                  kind={formData.balance_provider}
+                  value={formData.balance_auth}
+                  onChange={v => setFormData({ ...formData, balance_auth: v })}
+                  disabled={isValidating}
+                />
+              )}
             </div>
 
             <div className="pt-4 flex gap-3">
@@ -658,6 +1019,35 @@ export default function Accounts() {
                 ))}
               </ToggleGroup>
               <p className="text-xs text-muted-foreground">{t('accounts.defaultProtocolHint', 'Used when a request does not specify a protocol')}</p>
+            </div>
+
+            <div className="space-y-1.5">
+              <label className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.balanceProvider', '余额查询接口')}</label>
+              <select
+                value={editData.balance_provider}
+                disabled={isValidating}
+                onChange={e => setEditData({ ...editData, balance_provider: e.target.value })}
+                className="w-full h-10 px-3 py-2 rounded-md border border-input bg-background text-sm ring-offset-background focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2"
+              >
+                <option value="">{t('accounts.balanceAuto', '自动检测')}</option>
+                <option value="deepseek">DeepSeek</option>
+                <option value="copilot">Copilot</option>
+                <option value="openrouter">OpenRouter</option>
+                <option value="commandcode">CommandCode</option>
+                <option value="opencode">OpenCode</option>
+                <option value="opencode-go">OpenCode Go</option>
+                <option value="opencode-zen">OpenCode Zen</option>
+                <option value="none">{t('accounts.balanceDisabled', '禁用查询')}</option>
+              </select>
+              <p className="text-xs text-muted-foreground">{t('accounts.balanceProviderHint', '决定余额查询走哪个上游接口；自动检测按名称/地址推断')}</p>
+              {COOKIE_KINDS.includes(editData.balance_provider) && (
+                <BalanceAuthInput
+                  kind={editData.balance_provider}
+                  value={editData.balance_auth}
+                  onChange={v => setEditData({ ...editData, balance_auth: v })}
+                  disabled={isValidating}
+                />
+              )}
             </div>
 
             <div className="pt-4 flex gap-3">

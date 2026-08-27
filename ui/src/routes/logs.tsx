@@ -204,12 +204,6 @@ export default function Logs() {
             </Button>
           ))}
         </div>
-        <Input
-          value={modelFilter}
-          onChange={e => { setModelFilter(e.target.value); resetPage(); }}
-          placeholder={t('logs.filterModel')}
-          className="w-56 h-9 text-sm"
-        />
         <div className="flex border border-border rounded-lg overflow-hidden">
           {(['all', 'stream', 'nonStream'] as const).map(k => (
             <Button
@@ -223,6 +217,12 @@ export default function Logs() {
             </Button>
           ))}
         </div>
+        <Input
+          value={modelFilter}
+          onChange={e => { setModelFilter(e.target.value); resetPage(); }}
+          placeholder={t('logs.filterModel')}
+          className="w-56 h-9 text-sm"
+        />
       </div>
 
       {error && (

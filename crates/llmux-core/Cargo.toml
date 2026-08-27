@@ -19,6 +19,7 @@ serde_json.workspace = true
 sqlx.workspace = true
 libsqlite3-sys.workspace = true
 thiserror.workspace = true
+time.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 tracing.workspace = true

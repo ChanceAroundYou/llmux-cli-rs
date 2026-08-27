@@ -1,5 +1,6 @@
 pub mod adapters;
 pub mod aggregate;
+pub mod balance;
 pub mod config;
 pub mod context;
 pub mod crypto;
