@@ -218,7 +218,21 @@ async fn get_json(
 
 // ─── DeepSeek ────────────────────────────────────────────────────────────────
 
+fn looks_like_deepseek_platform_token(s: &str) -> bool {
+    let t = s.trim().trim_start_matches("Bearer ").trim_start_matches("bearer ").trim();
+    // Platform Bearer from get_user_summary: not sk-*, contains +/ and length ~44
+    !t.is_empty() && !t.starts_with("sk-") && (t.contains('+') || t.contains('/') || t.len() >= 40)
+}
+
 async fn fetch_deepseek(key: &str) -> Result<Value> {
+    // Platform Bearer (platform.deepseek.com) carries daily/monthly via
+    //   GET /api/v0/users/get_user_summary  +  /api/v0/usage/by_api_key/cost?start=&end=&tz=
+    // If the credential looks like a platform token, try that first; on failure fall back to api.deepseek.com.
+    if looks_like_deepseek_platform_token(key) {
+        if let Ok(v) = fetch_deepseek_platform(key).await {
+            return Ok(v);
+        }
+    }
     let (_, v) = get_json(
         "https://api.deepseek.com/user/balance",
         &[
@@ -267,9 +281,6 @@ async fn fetch_deepseek(key: &str) -> Result<Value> {
     };
     let symbol = if b.currency == "CNY" { "¥" } else { "$" };
     let summary = format!("{}{:.2}", symbol, b.total);
-    // DeepSeek 官方仅 GET /user/balance（余额），无日/月用量接口（用量仅 platform.deepseek.com 控制台可见）。
-    // 替代方案：① 使用 platform 会话 Cookie 调内部 /api/v0/log/usage 非官方接口（不稳定）；② 由网关本地 usage_logs 聚合（推荐）。
-    // 当前取累计已用 = max(0, topped+granted - total) 近似，日/月为 0 占位并在 detail 提示来源。
     let cum_used = (b.topped + b.granted - b.total).max(0.0);
     let detail = if !is_available {
         "余额不可用于 API 调用".to_string()
@@ -287,6 +298,103 @@ async fn fetch_deepseek(key: &str) -> Result<Value> {
             {"label": "累计已用", "value": format!("{symbol}{:.2}", cum_used)},
         ]),
     ))
+}
+
+async fn fetch_deepseek_platform(token: &str) -> Result<Value> {
+    let bearer = token.trim().trim_start_matches("Bearer ").trim_start_matches("bearer ").trim();
+    if bearer.is_empty() { return Err(anyhow!("缺少 Bearer Token")); }
+    let auth = format!("Bearer {bearer}");
+    let common = [
+        ("authorization", auth.clone()),
+        ("accept", "application/json".into()),
+        ("user-agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36".into()),
+        ("referer", "https://platform.deepseek.com/usage".into()),
+        ("origin", "https://platform.deepseek.com".into()),
+    ];
+    let (_, v) = get_json("https://platform.deepseek.com/api/v0/users/get_user_summary", &common).await?;
+    if v.get("code").and_then(Value::as_i64) != Some(0) {
+        return Err(anyhow!("get_user_summary: {}", truncate_for_err(&v.to_string())));
+    }
+    let biz = v.get("data").and_then(|d| d.get("biz_data")).ok_or_else(|| anyhow!("缺少 biz_data"))?;
+    let wallets = biz.get("normal_wallets").and_then(Value::as_array).cloned().unwrap_or_default();
+    let total_costs = biz.get("total_costs").and_then(Value::as_array).cloned().unwrap_or_default();
+    // Prefer CNY wallet
+    let bal_str = wallets.iter().find(|w| w.get("currency").and_then(Value::as_str) == Some("CNY"))
+        .or_else(|| wallets.first())
+        .and_then(|w| w.get("balance").and_then(Value::as_str))
+        .ok_or_else(|| anyhow!("缺少钱包余额"))?;
+    let bal: f64 = bal_str.parse().unwrap_or(0.0);
+    let cum_str = total_costs.iter().find(|c| c.get("currency").and_then(Value::as_str) == Some("CNY"))
+        .and_then(|c| c.get("amount").and_then(Value::as_str))
+        .unwrap_or("0");
+    let cum: f64 = cum_str.parse().unwrap_or(0.0);
+
+    // Daily/monthly via cost buckets (same auth, Bearer only is enough — probe verified)
+    let tz: i64 = 28800;
+    let (day_start, day_end) = deepseek_day_range_sec(tz);
+    let (mon_start, mon_end) = deepseek_month_range_sec(tz);
+    let mut daily: f64 = 0.0;
+    let mut monthly: f64 = 0.0;
+
+    // Helper to sum cost buckets
+    async fn sum_cost(token: &str, start: u64, end: u64, tz: i64) -> Option<f64> {
+        let auth = format!("Bearer {}", token.trim().trim_start_matches("Bearer ").trim_start_matches("bearer ").trim());
+        let headers = [
+            ("authorization", auth),
+            ("accept", "application/json".into()),
+            ("user-agent", "Mozilla/5.0".into()),
+            ("referer", "https://platform.deepseek.com/usage".into()),
+            ("origin", "https://platform.deepseek.com".into()),
+        ];
+        let url = format!("https://platform.deepseek.com/api/v0/usage/by_api_key/cost?start={start}&end={end}&tz={tz}");
+        let (_, v) = get_json(&url, &headers).await.ok()?;
+        if v.get("code").and_then(Value::as_i64) != Some(0) { return None; }
+        let data = v.get("data").and_then(|d| d.get("biz_data"))?;
+        let arr = data.get("data").and_then(Value::as_array)?;
+        let mut sum = 0.0;
+        for entry in arr {
+            let series = entry.get("series").and_then(Value::as_array)?;
+            for s in series {
+                let buckets = s.get("buckets").and_then(Value::as_array)?;
+                for b in buckets {
+                    let c = b.get("cost").and_then(Value::as_str).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+                    sum += c;
+                }
+            }
+        }
+        Some(sum)
+    }
+    // Daily sum is single-day bucket; monthly sum is whole month
+    if let Some(s) = sum_cost(bearer, day_start, day_end, tz).await { daily = s; }
+    if let Some(s) = sum_cost(bearer, mon_start, mon_end, tz).await { monthly = s; }
+
+    Ok(ok_result(
+        "deepseek",
+        format!("¥{bal:.2}"),
+        format!("累计已用 ¥{cum:.2}"),
+        json!([]),
+        json!([
+            {"label": "本日已用", "value": format!("¥{daily:.2}")},
+            {"label": "本月已用", "value": format!("¥{monthly:.2}")},
+            {"label": "累计已用", "value": format!("¥{cum:.2}")},
+        ]),
+    ))
+}
+
+fn deepseek_day_range_sec(tz: i64) -> (u64, u64) {
+    let off = ::time::UtcOffset::from_hms((tz/3600) as i8, 0, 0).unwrap_or(::time::UtcOffset::UTC);
+    let now_cst = ::time::OffsetDateTime::now_utc().to_offset(off);
+    let d = ::time::Date::from_calendar_date(now_cst.year(), now_cst.month(), now_cst.day()).unwrap();
+    let start = d.with_time(::time::Time::MIDNIGHT).assume_offset(off).unix_timestamp() as u64;
+    (start, start + 86400)
+}
+fn deepseek_month_range_sec(tz: i64) -> (u64, u64) {
+    let off = ::time::UtcOffset::from_hms((tz/3600) as i8, 0, 0).unwrap_or(::time::UtcOffset::UTC);
+    let now_cst = ::time::OffsetDateTime::now_utc().to_offset(off);
+    let d1 = ::time::Date::from_calendar_date(now_cst.year(), now_cst.month(), 1).unwrap().with_time(::time::Time::MIDNIGHT).assume_offset(off).unix_timestamp() as u64;
+    let (y2, m2) = if now_cst.month() as u8 == 12 { (now_cst.year()+1, ::time::Month::January) } else { (now_cst.year(), now_cst.month().next()) };
+    let d2 = ::time::Date::from_calendar_date(y2, m2, 1).unwrap().with_time(::time::Time::MIDNIGHT).assume_offset(off).unix_timestamp() as u64;
+    (d1, d2)
 }
 
 // ─── GitHub Copilot ──────────────────────────────────────────────────────────

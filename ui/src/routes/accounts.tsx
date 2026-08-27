@@ -38,7 +38,7 @@ const PROTOCOLS = ['chat', 'responses', 'messages'] as const;
 type Protocol = typeof PROTOCOLS[number];
 
 // 需要网页登录凭据（Cookie/Token）而非 API Key 的余额查询类型。
-const COOKIE_KINDS = ['copilot', 'commandcode', 'opencode', 'opencode-go', 'opencode-zen'];
+const COOKIE_KINDS = ['copilot', 'commandcode', 'opencode', 'opencode-go', 'opencode-zen', 'deepseek'];
 
 // 各类型的凭据获取教程（小叹号展开）——精确到 Cookie 名。
 const BALANCE_AUTH_HELP: Record<string, string[]> = {
@@ -80,6 +80,13 @@ const BALANCE_AUTH_HELP: Record<string, string[]> = {
     '3. 找到 Name = auth 这一行，双击 Value 复制（以 Fe26.2** 开头）；',
     '4. 可粘 “auth=VALUE” 整串，也可只粘 VALUE，都会自动补齐为 auth=VALUE；',
     '5. 选用“OpenCode Zen”后仅查询钱包余额（与 OpenCode/Go 分离，需单独配置）。',
+  ],
+  deepseek: [
+    'DeepSeek 已切换为平台 Bearer 全链路（需 Authorization: Bearer QSh4...，不是 Cookie .thumbcache）。',
+    '1. 浏览器登录 https://platform.deepseek.com/usage（已登录态）→ F12 → Network → 刷新；',
+    '2. 找到任意 /api/v0/users/get_user_summary 或 /api/v0/usage/by_api_key/cost 的请求 → Request Headers → 复制 authorization: Bearer 后的那串（以 QSh4... 开头）；',
+    '3. 粘到下方余额认证框（可带 Bearer 前缀，系统会自动剥离）；将用 Bearer 拉 get_user_summary（余额 ¥ + 累计 ¥）与 by_api_key/cost?start=&end=&tz=28800（本日/本月 ¥），失败回落到 api.deepseek.com/user/balance；',
+    '4. 若 Network 里没有 Bearer，改去 Application → Local Storage → https://platform.deepseek.com 搜 token 复制。',
   ],
 };
 
