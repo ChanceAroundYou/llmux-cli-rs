@@ -38,14 +38,27 @@ pub async fn execute_provider_request(
     for (key, value) in &request.headers {
         builder = builder.header(key.as_str(), value.as_str());
     }
-    builder.json(&request.body).send().await.map_err(|e| {
-        tracing::error!(
-            "🚀❌ Upstream request failed: {} {} - {e}",
-            request.method,
-            request.url
-        );
-        anyhow::anyhow!("{e}")
-    })
+    // GET with a literal "null" body gets rejected by strict upstreams (GitHub
+    // API); only attach the JSON body when there is one.
+    if request.body.is_null() {
+        builder.send().await.map_err(|e| {
+            tracing::error!(
+                "🚀❌ Upstream request failed: {} {} - {e}",
+                request.method,
+                request.url
+            );
+            anyhow::anyhow!("{e}")
+        })
+    } else {
+        builder.json(&request.body).send().await.map_err(|e| {
+            tracing::error!(
+                "🚀❌ Upstream request failed: {} {} - {e}",
+                request.method,
+                request.url
+            );
+            anyhow::anyhow!("{e}")
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -63,6 +76,10 @@ pub struct Account {
     pub responses_endpoint: Option<String>,
     pub messages_endpoint: Option<String>,
     pub default_protocol: Option<String>,
+    /// Balance query backend override (""/None = auto-detect from host).
+    pub balance_provider: String,
+    /// Dedicated balance-probe credential (encrypted cookie/token); empty = use api_key.
+    pub balance_auth: String,
 }
 
 impl From<crate::models::Account> for Account {
@@ -81,6 +98,8 @@ impl From<crate::models::Account> for Account {
             responses_endpoint: value.responses_endpoint,
             messages_endpoint: value.messages_endpoint,
             default_protocol: value.default_protocol,
+            balance_provider: value.balance_provider.unwrap_or_default(),
+            balance_auth: value.balance_auth.unwrap_or_default(),
         }
     }
 }
@@ -102,6 +121,8 @@ impl From<Account> for crate::models::Account {
             messages_endpoint: value.messages_endpoint,
             default_protocol: value.default_protocol,
             notes: None,
+            balance_provider: None,
+            balance_auth: None,
             limits_cache: None,
             limits_cache_updated_at: None,
             created_at: None,

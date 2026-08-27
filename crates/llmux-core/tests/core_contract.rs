@@ -355,6 +355,8 @@ fn model_structs_preserve_legacy_field_names() {
         responses_endpoint: None,
         messages_endpoint: None,
         default_protocol: None,
+        balance_provider: None,
+            balance_auth: None,
         notes: None,
         limits_cache: None,
         limits_cache_updated_at: None,

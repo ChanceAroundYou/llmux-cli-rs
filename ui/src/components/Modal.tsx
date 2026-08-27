@@ -85,7 +85,7 @@ export function Dialog({
           <DialogTitle className="sr-only" />
         )}
         <DialogDescription className="sr-only" />
-        {children && <div className="px-6 py-4">{children}</div>}
+        {children && <div className="px-6 py-4 min-w-0">{children}</div>}
         {footer && <DialogFooter className="px-6 py-4 border-t border-border bg-muted/30">{footer}</DialogFooter>}
       </DialogContent>
     </ShadDialog>

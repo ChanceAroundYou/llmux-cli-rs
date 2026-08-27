@@ -17,6 +17,8 @@ pub struct Account {
     pub responses_endpoint: Option<String>,
     pub messages_endpoint: Option<String>,
     pub default_protocol: Option<String>,
+    pub balance_provider: Option<String>,
+    pub balance_auth: Option<String>,
     pub limits_cache: Option<String>,
     pub limits_cache_updated_at: Option<String>,
     pub created_at: Option<String>,

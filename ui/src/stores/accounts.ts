@@ -16,6 +16,8 @@ export interface Account {
   responses_endpoint: string | null;
   messages_endpoint: string | null;
   default_protocol: string | null;
+  balance_provider: string | null;
+  balance_auth: string | null;
 }
 
 interface AccountsState {
@@ -25,8 +27,8 @@ interface AccountsState {
   keys: Record<number, string>;
   fetchAccounts: () => Promise<void>;
   fetchAccountKey: (id: number) => Promise<string | null>;
-  addAccount: (account: { alias: string; provider_id: string; api_key: string; chat_endpoint?: string | null; responses_endpoint?: string | null; messages_endpoint?: string | null; default_protocol?: string; openai_compatible?: number; skip_validation?: boolean }) => Promise<void>;
-  updateAccount: (id: number, account: { alias?: string; provider_id?: string; api_key?: string; chat_endpoint?: string | null; responses_endpoint?: string | null; messages_endpoint?: string | null; default_protocol?: string; notes?: string; openai_compatible?: number; skip_validation?: boolean }) => Promise<void>;
+  addAccount: (account: { alias: string; provider_id: string; api_key: string; chat_endpoint?: string | null; responses_endpoint?: string | null; messages_endpoint?: string | null; default_protocol?: string; balance_provider?: string; balance_auth?: string; openai_compatible?: number; skip_validation?: boolean }) => Promise<void>;
+  updateAccount: (id: number, account: { alias?: string; provider_id?: string; api_key?: string; chat_endpoint?: string | null; responses_endpoint?: string | null; messages_endpoint?: string | null; default_protocol?: string; balance_provider?: string; balance_auth?: string; notes?: string; openai_compatible?: number; skip_validation?: boolean }) => Promise<void>;
   deleteAccount: (id: number) => Promise<void>;
   toggleActive: (id: number, currentStatus: number) => Promise<void>;
 }

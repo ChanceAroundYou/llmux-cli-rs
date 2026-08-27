@@ -317,7 +317,7 @@ pub async fn get_account_by_id(
     encryption_secret: &str,
 ) -> anyhow::Result<Option<crate::adapters::Account>> {
     let row = sqlx::query(
-        "SELECT id, alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight, openai_compatible, chat_endpoint, responses_endpoint, messages_endpoint, default_protocol FROM accounts WHERE id = ? AND is_active = 1",
+        "SELECT id, alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight, openai_compatible, chat_endpoint, responses_endpoint, messages_endpoint, default_protocol, balance_provider, balance_auth FROM accounts WHERE id = ? AND is_active = 1",
     )
     .bind(id)
     .fetch_optional(pool)
@@ -348,5 +348,7 @@ pub async fn get_account_by_id(
         responses_endpoint: row.try_get("responses_endpoint").ok(),
         messages_endpoint: row.try_get("messages_endpoint").ok(),
         default_protocol: row.try_get("default_protocol").ok(),
+        balance_provider: row.try_get::<Option<String>, _>("balance_provider").ok().flatten().unwrap_or_default(),
+                balance_auth: row.try_get::<Option<String>, _>("balance_auth").ok().flatten().unwrap_or_default(),
     }))
 }

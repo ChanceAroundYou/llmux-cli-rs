@@ -18,6 +18,8 @@ fn acc(
         responses_endpoint: resp.map(|s| s.to_string()),
         messages_endpoint: msg.map(|s| s.to_string()),
         default_protocol: Some(def.to_string()),
+        balance_provider: String::new(),
+        balance_auth: String::new(),
         is_active: 1,
         weight: 1,
         openai_compatible: 0,
