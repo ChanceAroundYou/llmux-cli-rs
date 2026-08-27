@@ -1435,7 +1435,7 @@ fn parse_time_val(val: &Value) -> Option<u64> {
     None
 }
 
-fn oc_parse_billing_balance(text: &str) -> Option<f64> {
+pub fn oc_parse_billing_balance(text: &str) -> Option<f64> {
     if let Some(v) = oc_unwrap_payload(text) {
         if let Some(raw) = oc_find_billing_balance(&v) { return Some(raw / 100_000_000.0); }
     }
@@ -1444,7 +1444,7 @@ fn oc_parse_billing_balance(text: &str) -> Option<f64> {
     Some(raw / 100_000_000.0)
 }
 
-fn oc_parse_billing_balance_loose(text: &str) -> Option<f64> {
+pub fn oc_parse_billing_balance_loose(text: &str) -> Option<f64> {
     if let Some(pos) = text.find("customerID") {
         if let Some(bal_pos) = text[pos..].find("\"balance\"").or_else(|| text[pos..].find("balance")) {
             let tail = &text[pos + bal_pos..];
@@ -1514,7 +1514,7 @@ fn extract_balanced_json(s: &str) -> Option<Value> {
     serde_json::from_str::<Value>(&s[..e]).ok()
 }
 
-fn oc_scan_balance_any_text(text: &str) -> Option<f64> {
+pub fn oc_scan_balance_any_text(text: &str) -> Option<f64> {
     let mut pos = 0usize;
     let mut best: Option<f64> = None;
     let mut found_zero = false;

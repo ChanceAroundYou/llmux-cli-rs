@@ -4,8 +4,9 @@
 //! worth locking down; the HTTP layer is exercised in production.
 
 use llmux_core::balance::{
-    balance_credential, commandcode_result, detect_kind, oc_parse_subscription,
-    oc_parse_subscription_goat, BalanceKind,
+    balance_credential, commandcode_result, detect_kind, oc_parse_billing_balance,
+    oc_parse_billing_balance_loose, oc_parse_subscription, oc_parse_subscription_goat,
+    oc_scan_balance_any_text, BalanceKind,
 };
 
 #[test]
@@ -253,4 +254,38 @@ fn commandcode_no_plan_no_fake_monthly() {
     assert_eq!(windows.len(), 2);
     // 无耗尽 + 无过期 → 摘要只有窗口百分比
     assert_eq!(v["summary"], "5小时 100% · 本周 100%");
+}
+
+// ─── OpenCode Zen billing 解析 ───────────────────────────────────────────────
+
+#[test]
+fn zen_billing_plain_json() {
+    // 标准 billing JSON：balance 原始单位 1e8 → 美元
+    let text = r#"{"customerID":"cus_1","balance":108000000}"#;
+    assert_eq!(oc_parse_billing_balance(text), Some(1.08));
+}
+
+#[test]
+fn zen_billing_js_wrapper_zero_with_date() {
+    // SolidStart `_server` 真实形态（2026-08-28 acct 43 实测）：
+    // `balance:0` 夹在 `new Date(...)` 里 → 整体非法 JSON，serde 解不出，
+    // 必须由 loose 扫描兜出 $0.00（历史 bug：零值被 `abs<1e-9` 过滤）。
+    let text = r#";0x0000010f;((self.$R=self.$R||{})["server-fn:774b2a51-775d-4f67-9087-f4686472c9"]=[{customerID:"cus_1",balance:0,new Date(1787840648000)}],($R=>$R[0])(self.$R))"#;
+    assert_eq!(oc_parse_billing_balance_loose(text), Some(0.0));
+    assert_eq!(oc_scan_balance_any_text(text), Some(0.0));
+}
+
+#[test]
+fn zen_billing_error_wrapper_no_balance() {
+    // 错误包装（如 actor 型账号用错 wrk 调 billing）：payload 无 balance 字段
+    // → 必须 miss（None），不得误读为 0 或崩。
+    let text = r#";0x00000293;((self.$R=self.$R||{})["server-fn:df300b5a-ec7e-41a6-bc97-b53053088a"]=[],($R=>$R[0]={error:"Error: actor of type \"account\" is not associated with a workspace"})(self.$R))"#;
+    assert_eq!(oc_parse_billing_balance_loose(text), None);
+}
+
+#[test]
+fn zen_billing_scan_no_false_positive() {
+    // "balance" 只出现在错误句子里（后面没有冒号+数字）→ 不得误判为余额。
+    assert_eq!(oc_scan_balance_any_text(r#"{"error":"no balance to show"}"#), None);
+    assert_eq!(oc_scan_balance_any_text(r#"{"balance":null}"#), None);
 }
