@@ -25,6 +25,7 @@ pub enum BalanceKind {
     OpenCodeGo,
     OpenCodeZen,
     Api123,
+    Bailian,
 }
 
 impl BalanceKind {
@@ -38,6 +39,7 @@ impl BalanceKind {
             Self::OpenCodeGo => "opencode-go",
             Self::OpenCodeZen => "opencode-zen",
             Self::Api123 => "api123",
+            Self::Bailian => "bailian",
         }
     }
 }
@@ -59,6 +61,7 @@ pub fn detect_kind(provider_id: &str, endpoints: &[&str], balance_provider: &str
             "opencode-go" | "opencode_go" => Some(BalanceKind::OpenCodeGo),
             "opencode-zen" | "opencode_zen" | "zen" => Some(BalanceKind::OpenCodeZen),
             "api123" => Some(BalanceKind::Api123),
+            "bailian" | "dashscope" | "aliyun" | "aliyun-bailian" => Some(BalanceKind::Bailian),
             _ => None, // "none"/unknown → disabled
         };
     }
@@ -94,6 +97,12 @@ pub fn detect_kind(provider_id: &str, endpoints: &[&str], balance_provider: &str
                     }
                 }
                 h if h.contains("api123go.com") => Some(BalanceKind::Api123),
+                h if h.contains("dashscope.aliyuncs.com")
+                    || h.contains("bailian.aliyuncs.com")
+                    || h.contains("aliyuncs.com") =>
+                {
+                    Some(BalanceKind::Bailian)
+                }
                 _ => None,
             }
         }),
@@ -158,6 +167,7 @@ pub async fn fetch_balance(kind: BalanceKind, credential: &str, endpoints: &[Str
         }
         BalanceKind::OpenCodeZen => fetch_opencode_zen(credential).await,
         BalanceKind::Api123 => fetch_api123(credential, endpoints).await,
+        BalanceKind::Bailian => fetch_bailian(credential, endpoints).await,
     }
     .unwrap_or_else(|e| err_result(kind.as_str(), &e.to_string()))
 }
@@ -703,6 +713,73 @@ pub fn api123_result(v: &Value) -> Value {
             .join(" · ")
     };
     ok_result("api123", summary, detail, json!(windows_json), json!([]))
+}
+
+// ─── Bailian / DashScope ─────────────────────────────────────────────────
+
+async fn fetch_bailian(key: &str, _endpoints: &[String]) -> Result<Value> {
+    // DashScope compatible-mode is OpenAI-compatible proxy without a public
+    // /v1/balance. Probe the few documented candidates best-effort; on 404
+    // return a friendly err_result (ok:false) rather than fabricating.
+    let candidates = [
+        "https://dashscope.aliyuncs.com/api/v1/usage",
+        "https://dashscope.aliyuncs.com/api/v1/billing/balance",
+        "https://dashscope.aliyuncs.com/compatible-mode/v1/balance",
+    ];
+    for url in candidates {
+        if let Ok((st, v)) = get_json(
+            url,
+            &[
+                ("authorization", format!("Bearer {}", key.trim())),
+                ("accept", "application/json".into()),
+            ],
+        )
+        .await
+        {
+            if st.is_success() {
+                return Ok(bailian_result(&v));
+            }
+        }
+    }
+    Err(anyhow!("百炼暂无公开余额接口，请至阿里云费用中心查看"))
+}
+
+/// Pure: normalize a Bailian/DashScope billing payload. Exposed for contract tests.
+pub fn bailian_result(v: &Value) -> Value {
+    // Wallet-shaped: {balance, total_available, available_balance, ...}
+    for k in ["balance", "total_available", "available_balance", "remaining"] {
+        if let Some(n) = v.get(k).and_then(Value::as_f64) {
+            let s = format!("¥{n:.2}");
+            return ok_result("bailian", s.clone(), "钱包余额".into(), json!([]), json!([{"label": "钱包余额", "value": s}]));
+        }
+        if let Some(s) = v.get(k).and_then(Value::as_str).and_then(|s| s.parse::<f64>().ok()) {
+            let out = format!("¥{s:.2}");
+            return ok_result("bailian", out.clone(), "钱包余额".into(), json!([]), json!([{"label": "钱包余额", "value": out}]));
+        }
+    }
+    if let Some(data) = v.get("data") {
+        if data.is_object() || data.is_number() {
+            let inner = bailian_result(data);
+            if inner.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+                return inner;
+            }
+        }
+    }
+    // Quota-shaped: {quota, usage, limit} → windows
+    let quota = v.get("quota").and_then(Value::as_f64).or_else(|| v.get("limit").and_then(Value::as_f64));
+    let usage = v.get("usage").and_then(Value::as_f64).unwrap_or(0.0);
+    if let Some(q) = quota {
+        if q > 0.0 {
+            let remaining = ((1.0 - usage / q) * 100.0).clamp(0.0, 100.0);
+            let mut w = json!({"label": "本月", "percent": remaining});
+            if remaining <= 0.5 { w["exceeded"] = json!(true); }
+            let summary = format!("本月 {:.0}%", remaining);
+            return ok_result("bailian", summary, "Bailian 用量".into(), json!([w]), json!([]));
+        }
+    }
+    // Unknown shape → rows fallback + detail passthrough
+    let detail = v.get("detail").and_then(Value::as_str).unwrap_or("Bailian").to_string();
+    ok_result("bailian", detail.clone(), detail, json!([]), json!([]))
 }
 
 // ─── CommandCode ─────────────────────────────────────────────────────────────

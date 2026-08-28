@@ -88,6 +88,12 @@ const BALANCE_AUTH_HELP: Record<string, string[]> = {
     '3. 粘到下方余额认证框（可带 Bearer 前缀，系统会自动剥离）；将用 Bearer 拉 get_user_summary（余额 ¥ + 累计 ¥）与 by_api_key/cost?start=&end=&tz=28800（本日/本月 ¥），失败回落到 api.deepseek.com/user/balance；',
     '4. 若 Network 里没有 Bearer，改去 Application → Local Storage → https://platform.deepseek.com 搜 token 复制。',
   ],
+  bailian: [
+    '阿里百炼（DashScope）使用百炼 API Key（sk-ws-…）查询，兼容 Bearer。',
+    '1. 登录 https://bailian.console.aliyun.com/ → API-KEY 管理复制 sk-ws-…；',
+    '2. 下方余额查询选“阿里百炼”，留空余额认证即用 API Key 直连；',
+    '3. 当前 DashScope compatible-mode 暂无公开余额端点，查询会提示“请至阿里云费用中心查看”，接入后自动显示钱包余额。',
+  ],
 };
 
 // 余额认证输入框：上方清晰说明 + 小叹号展开详细教程。
@@ -694,9 +700,9 @@ export default function Accounts() {
         </div>
       )}
 
-      <div className="space-y-3">
+      <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-3">
         {filteredAccounts.map((acc) => (
-          <div key={acc.id} className="p-4 rounded-xl border border-border bg-card hover:bg-muted/30 transition-all group">
+          <div key={acc.id} className="p-3 rounded-xl border border-border bg-card hover:bg-muted/30 transition-all group flex flex-col min-w-0">
             <div className="flex items-center justify-between gap-4">
               <div className="flex items-center gap-2 min-w-0">
                 <h3 className="font-semibold text-sm truncate">{acc.alias}</h3>
@@ -757,13 +763,13 @@ export default function Accounts() {
         ))}
 
         {!isLoading && accounts.length > 0 && filteredAccounts.length === 0 && (
-          <div className="py-10 text-center border border-dashed border-border rounded-xl">
+          <div className="py-10 text-center border border-dashed border-border rounded-xl col-span-full">
              <p className="text-sm text-muted-foreground">{t('accounts.noMatch')}</p>
           </div>
         )}
 
         {!isLoading && accounts.length === 0 && (
-          <div className="py-20 text-center border-2 border-dashed border-border rounded-xl">
+          <div className="py-20 text-center border-2 border-dashed border-border rounded-xl col-span-full">
              <AlertCircle className="mx-auto mb-2 text-muted-foreground/30" />
              <p className="text-sm text-muted-foreground">{t('accounts.noAccounts')}</p>
           </div>
@@ -881,6 +887,7 @@ export default function Accounts() {
                 <option value="opencode-go">OpenCode Go</option>
                 <option value="opencode-zen">OpenCode Zen</option>
                 <option value="api123">API123</option>
+                <option value="bailian">阿里百炼</option>
                 <option value="none">{t('accounts.balanceDisabled', '禁用查询')}</option>
               </select>
               <p className="text-xs text-muted-foreground">{t('accounts.balanceProviderHint', '决定余额查询走哪个上游接口；自动检测按名称/地址推断')}</p>
@@ -1040,6 +1047,7 @@ export default function Accounts() {
                 <option value="opencode-go">OpenCode Go</option>
                 <option value="opencode-zen">OpenCode Zen</option>
                 <option value="api123">API123</option>
+                <option value="bailian">阿里百炼</option>
                 <option value="none">{t('accounts.balanceDisabled', '禁用查询')}</option>
               </select>
               <p className="text-xs text-muted-foreground">{t('accounts.balanceProviderHint', '决定余额查询走哪个上游接口；自动检测按名称/地址推断')}</p>

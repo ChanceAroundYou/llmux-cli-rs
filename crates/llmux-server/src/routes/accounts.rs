@@ -215,7 +215,7 @@ pub async fn create_account(
         .map(|s| s.trim().to_lowercase())
         .unwrap_or_default();
     if !balance_provider.is_empty()
-        && !["deepseek", "copilot", "openrouter", "commandcode", "opencode", "opencode-go", "opencode_go", "opencode-zen", "opencode_zen", "zen", "api123", "none"]
+        && !["deepseek", "copilot", "openrouter", "commandcode", "opencode", "opencode-go", "opencode_go", "opencode-zen", "opencode_zen", "zen", "api123", "bailian", "dashscope", "aliyun", "none"]
             .contains(&balance_provider.as_str())
     {
         return crate::error::simple_error(
@@ -485,7 +485,7 @@ pub async fn update_account(
             let s = v.as_str().unwrap_or("").trim().to_lowercase();
             if !s.is_empty()
                 && s != "none"
-                && !["deepseek", "copilot", "openrouter", "commandcode", "opencode", "opencode-go", "opencode_go", "opencode-zen", "opencode_zen", "zen", "api123"].contains(&s.as_str())
+                && !["deepseek", "copilot", "openrouter", "commandcode", "opencode", "opencode-go", "opencode_go", "opencode-zen", "opencode_zen", "zen", "api123", "bailian", "dashscope", "aliyun"].contains(&s.as_str())
             {
                 return crate::error::simple_error(
                     format!("Invalid balance_provider: {s}"),
