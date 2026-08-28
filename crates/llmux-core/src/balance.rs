@@ -10,6 +10,9 @@
 
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
+use base64::Engine;
+use hmac::{Hmac, Mac};
+use sha1::Sha1;
 
 /// How long a single upstream probe may take (per request).
 const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
@@ -99,7 +102,8 @@ pub fn detect_kind(provider_id: &str, endpoints: &[&str], balance_provider: &str
                 h if h.contains("api123go.com") => Some(BalanceKind::Api123),
                 h if h.contains("dashscope.aliyuncs.com")
                     || h.contains("bailian.aliyuncs.com")
-                    || h.contains("aliyuncs.com") =>
+                    || h.contains("aliyuncs.com")
+                    || h.contains("maas.aliyuncs.com") =>
                 {
                     Some(BalanceKind::Bailian)
                 }
@@ -718,9 +722,9 @@ pub fn api123_result(v: &Value) -> Value {
 // ─── Bailian / DashScope ─────────────────────────────────────────────────
 
 async fn fetch_bailian(key: &str, _endpoints: &[String]) -> Result<Value> {
-    // DashScope compatible-mode is OpenAI-compatible proxy without a public
-    // /v1/balance. Probe the few documented candidates best-effort; on 404
-    // return a friendly err_result (ok:false) rather than fabricating.
+    if let Some((ak, sk)) = parse_bss_credential(key) {
+        return fetch_bailian_bss(&ak, &sk).await;
+    }
     let candidates = [
         "https://dashscope.aliyuncs.com/api/v1/usage",
         "https://dashscope.aliyuncs.com/api/v1/billing/balance",
@@ -741,7 +745,123 @@ async fn fetch_bailian(key: &str, _endpoints: &[String]) -> Result<Value> {
             }
         }
     }
-    Err(anyhow!("百炼暂无公开余额接口，请至阿里云费用中心查看"))
+    Err(anyhow!("百炼需在余额认证填入 RAM AK:SK（LTAI…:Secret，已授 AliyunBSSReadOnlyAccess）"))
+}
+
+fn parse_bss_credential(s: &str) -> Option<(String, String)> {
+    let t = s.trim();
+    let idx = t.find(':')?;
+    let ak = t[..idx].trim();
+    let sk = t[idx + 1..].trim();
+    if ak.starts_with("LTAI") && ak.len() >= 20 && sk.len() >= 16 {
+        Some((ak.to_string(), sk.to_string()))
+    } else {
+        None
+    }
+}
+
+async fn fetch_bailian_bss(ak: &str, sk: &str) -> Result<Value> {
+    let bal = bss_query_account_balance(ak, sk).await?;
+    let amt_str = bal.get("AvailableAmount").and_then(Value::as_str).unwrap_or("0");
+    let amt: f64 = amt_str.parse().unwrap_or(0.0);
+    let summary = format!("¥{amt:.2}");
+    let monthly = bss_query_monthly_cost(ak, sk).await.unwrap_or(0.0);
+    Ok(ok_result(
+        "bailian",
+        summary.clone(),
+        format!("可用余额 {summary}"),
+        json!([]),
+        json!([{"label": "本月已用", "value": format!("¥{monthly:.2}")}]),
+    ))
+}
+
+async fn bss_query_account_balance(ak: &str, sk: &str) -> Result<Value> {
+    let mut params = std::collections::BTreeMap::new();
+    params.insert("Action".to_string(), "QueryAccountBalance".to_string());
+    params.insert("Format".to_string(), "JSON".to_string());
+    params.insert("Version".to_string(), "2017-12-14".to_string());
+    let text = bss_rpc_call(ak, sk, "business.aliyuncs.com", params).await?;
+    let v: Value = serde_json::from_str(&text).map_err(|e| anyhow!("BSS balance 非 JSON: {e}"))?;
+    let code = v.get("Code").and_then(Value::as_str).unwrap_or("");
+    if code != "200" && code != "Success" {
+        let msg = v.get("Message").and_then(Value::as_str).unwrap_or("");
+        return Err(anyhow!("BSS QueryAccountBalance {code}: {msg}"));
+    }
+    let data = v.get("Data").cloned().unwrap_or(Value::Null);
+    if data.is_null() {
+        return Err(anyhow!("BSS 余额返回缺少 Data"));
+    }
+    Ok(data)
+}
+
+async fn bss_query_monthly_cost(ak: &str, sk: &str) -> Result<f64> {
+    let now = time::OffsetDateTime::now_utc();
+    let billing_cycle = format!("{:04}-{:02}", now.year(), now.month() as u8);
+    let mut params = std::collections::BTreeMap::new();
+    params.insert("Action".to_string(), "QueryBillOverview".to_string());
+    params.insert("Format".to_string(), "JSON".to_string());
+    params.insert("Version".to_string(), "2017-12-14".to_string());
+    params.insert("BillingCycle".to_string(), billing_cycle);
+    let text = bss_rpc_call(ak, sk, "business.aliyuncs.com", params).await?;
+    let v: Value = serde_json::from_str(&text).map_err(|e| anyhow!("BSS bill 非 JSON: {e}"))?;
+    let mut sum = 0.0;
+    if let Some(items) = v.get("Data").and_then(|d| d.get("Items")).and_then(|i| i.get("Item")).and_then(Value::as_array) {
+        for it in items {
+            let amt = it.get("PretaxAmount").and_then(Value::as_f64).or_else(|| it.get("OutstandingAmount").and_then(Value::as_f64)).unwrap_or(0.0);
+            sum += amt;
+        }
+    }
+    Ok(sum)
+}
+
+async fn bss_rpc_call(ak: &str, sk: &str, endpoint: &str, mut params: std::collections::BTreeMap<String, String>) -> Result<String> {
+    params.insert("AccessKeyId".to_string(), ak.to_string());
+    params.insert("SignatureMethod".to_string(), "HMAC-SHA1".to_string());
+    params.insert("SignatureVersion".to_string(), "1.0".to_string());
+    params.insert("SignatureNonce".to_string(), uuid::Uuid::new_v4().to_string());
+    let ts = time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).unwrap_or_else(|_| "2026-08-28T12:00:00Z".to_string());
+    params.insert("Timestamp".to_string(), ts);
+    fn pct(s: &str) -> String {
+        let mut out = String::new();
+        for b in s.bytes() {
+            if matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~') {
+                out.push(b as char);
+            } else {
+                out.push_str(&format!("%{:02X}", b));
+            }
+        }
+        out
+    }
+    let mut keys: Vec<&String> = params.keys().collect();
+    keys.sort();
+    let mut cand = String::new();
+    for (i, k) in keys.iter().enumerate() {
+        if i > 0 { cand.push('&'); }
+        cand.push_str(&pct(k));
+        cand.push('=');
+        cand.push_str(&pct(&params[*k]));
+    }
+    let string_to_sign = format!("GET&{}&{}", pct("/"), pct(&cand));
+    let key = format!("{sk}&");
+    let mut mac = Hmac::<Sha1>::new_from_slice(key.as_bytes()).map_err(|e| anyhow!("HMAC key: {e}"))?;
+    mac.update(string_to_sign.as_bytes());
+    let sig = base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
+    params.insert("Signature".to_string(), sig.clone());
+    let sig_enc = pct(&sig);
+    let url = format!("https://{endpoint}/?{cand}&Signature={sig_enc}");
+    let req = crate::adapters::ProviderRequest {
+        method: "GET".to_string(),
+        url,
+        headers: std::collections::BTreeMap::new(),
+        body: Value::Null,
+    };
+    let resp = tokio::time::timeout(PROBE_TIMEOUT, crate::adapters::execute_provider_request(&req)).await.map_err(|_| anyhow!("BSS timeout"))??;
+    let status = resp.status();
+    let text = resp.text().await?;
+    if !status.is_success() {
+        return Err(anyhow!("BSS HTTP {}: {}", status.as_u16(), truncate_for_err(&text)));
+    }
+    Ok(text)
 }
 
 /// Pure: normalize a Bailian/DashScope billing payload. Exposed for contract tests.
