@@ -700,7 +700,7 @@ export default function Accounts() {
         </div>
       )}
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-3">
+      <div className="grid grid-cols-1 lg:grid-cols-2 2xl:grid-cols-3 gap-3">
         {filteredAccounts.map((acc) => (
           <div key={acc.id} className="p-3 rounded-xl border border-border bg-card hover:bg-muted/30 transition-all group flex flex-col min-w-0">
             <div className="flex items-center justify-between gap-4">
