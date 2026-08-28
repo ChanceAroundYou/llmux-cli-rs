@@ -190,7 +190,7 @@ function resolvedEndpointUrl(base: string, proto: Protocol): string {
   return joinUpstreamUrl(base, ENDPOINT_SUFFIX[proto]);
 }
 
-// 余额/用量行：折叠态常显百分比（无时间，已耗尽灰色），展开态每行独立时间（未耗尽过期灰/已耗尽重置红，东八区）
+// 余额/用量行：折叠态常显百分比（无时间，已耗尽灰/可用绿），展开态每行独立时间（过期绿/重置灰，东八区）
 function BalanceLine({ account: acc, balance, loading, unsupported, onRefresh }: {
   account: { id: number; is_active: number };
   balance?: BalanceResult;
@@ -227,7 +227,7 @@ function BalanceLine({ account: acc, balance, loading, unsupported, onRefresh }:
               <React.Fragment key={w.label}>
                 {idx > 0 && <span className="text-muted-foreground/30 mx-0.5">·</span>}
                 <span className="font-mono font-medium text-xs text-foreground">
-                  {w.label} <span className={cn(w.exceeded ? 'text-destructive' : 'text-muted-foreground')}>{Math.round(w.percent)}%</span>
+                  {w.label} <span className={cn(w.exceeded ? 'text-muted-foreground' : 'text-success')}>{Math.round(w.percent)}%</span>
                 </span>
               </React.Fragment>
             ))}
@@ -289,7 +289,7 @@ function BalanceLine({ account: acc, balance, loading, unsupported, onRefresh }:
                 <div key={w.label} className="flex items-center justify-between gap-3 text-xs leading-relaxed min-w-0">
                   <span className="font-mono shrink-0 text-foreground">{w.label}</span>
                   {timeStr ? (
-                    <span className={cn('font-mono text-xs truncate', exhausted ? 'text-destructive' : 'text-muted-foreground')}>
+                    <span className={cn('font-mono text-xs truncate', exhausted ? 'text-muted-foreground' : 'text-success')}>
                       {exhausted ? `重置于 ${timeStr}` : `过期于 ${timeStr}`}
                     </span>
                   ) : <span className="font-mono text-xs text-muted-foreground/50 truncate">—</span>}
@@ -305,7 +305,7 @@ function BalanceLine({ account: acc, balance, loading, unsupported, onRefresh }:
                   <div key={w.label} className="flex items-center justify-between gap-3 text-xs leading-relaxed min-w-0">
                     <span className="font-mono text-foreground">{w.label}</span>
                     {timeStr ? (
-                      <span className={cn('font-mono text-xs truncate', exhausted ? 'text-destructive' : 'text-muted-foreground')}>
+                      <span className={cn('font-mono text-xs truncate', exhausted ? 'text-muted-foreground' : 'text-success')}>
                         {exhausted ? `重置于 ${timeStr}` : `过期于 ${timeStr}`}
                       </span>
                     ) : <span className="font-mono text-xs text-muted-foreground/50 truncate">—</span>}
