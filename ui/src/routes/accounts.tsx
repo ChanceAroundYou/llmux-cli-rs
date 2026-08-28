@@ -38,7 +38,7 @@ const PROTOCOLS = ['chat', 'responses', 'messages'] as const;
 type Protocol = typeof PROTOCOLS[number];
 
 // 需要网页登录凭据（Cookie/Token）而非 API Key 的余额查询类型。
-const COOKIE_KINDS = ['copilot', 'commandcode', 'opencode', 'opencode-go', 'opencode-zen', 'deepseek'];
+const COOKIE_KINDS = ['copilot', 'commandcode', 'opencode', 'opencode-go', 'opencode-zen', 'deepseek', 'bailian'];
 
 // 各类型的凭据获取教程（小叹号展开）——精确到 Cookie 名。
 const BALANCE_AUTH_HELP: Record<string, string[]> = {
@@ -89,10 +89,10 @@ const BALANCE_AUTH_HELP: Record<string, string[]> = {
     '4. 若 Network 里没有 Bearer，改去 Application → Local Storage → https://platform.deepseek.com 搜 token 复制。',
   ],
   bailian: [
-    '阿里百炼（DashScope）使用百炼 API Key（sk-ws-…）查询，兼容 Bearer。',
-    '1. 登录 https://bailian.console.aliyun.com/ → API-KEY 管理复制 sk-ws-…；',
-    '2. 下方余额查询选“阿里百炼”，留空余额认证即用 API Key 直连；',
-    '3. 当前 DashScope compatible-mode 暂无公开余额端点，查询会提示“请至阿里云费用中心查看”，接入后自动显示钱包余额。',
+    '阿里百炼余额走阿里云 BSS 账单（百炼与 DashScope 本身无公开余额接口）。',
+    '1. 阿里云 RAM 控制台 → 用户 finance-staff → 认证管理 → 创建 AccessKey（记下 LTAI… / Secret），并授予 AliyunBSSReadOnlyAccess（只读账单）；',
+    '2. 在下方“余额认证”填入 LTAI…:Secret（冒号分隔，加密存储，仅用于余额查询，不影响转发）；',
+    '3. 余额查询选“阿里百炼”：折叠态常显可用余额 ¥；填了 LTAI…:Secret 才可展开查看“本月已用”，否则不可展开。',
   ],
 };
 
