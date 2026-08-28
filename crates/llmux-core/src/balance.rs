@@ -24,6 +24,7 @@ pub enum BalanceKind {
     OpenCode,
     OpenCodeGo,
     OpenCodeZen,
+    Api123,
 }
 
 impl BalanceKind {
@@ -36,6 +37,7 @@ impl BalanceKind {
             Self::OpenCode => "opencode",
             Self::OpenCodeGo => "opencode-go",
             Self::OpenCodeZen => "opencode-zen",
+            Self::Api123 => "api123",
         }
     }
 }
@@ -56,6 +58,7 @@ pub fn detect_kind(provider_id: &str, endpoints: &[&str], balance_provider: &str
             "opencode" => Some(BalanceKind::OpenCode),
             "opencode-go" | "opencode_go" => Some(BalanceKind::OpenCodeGo),
             "opencode-zen" | "opencode_zen" | "zen" => Some(BalanceKind::OpenCodeZen),
+            "api123" => Some(BalanceKind::Api123),
             _ => None, // "none"/unknown → disabled
         };
     }
@@ -90,6 +93,7 @@ pub fn detect_kind(provider_id: &str, endpoints: &[&str], balance_provider: &str
                         Some(BalanceKind::OpenCode)
                     }
                 }
+                h if h.contains("api123go.com") => Some(BalanceKind::Api123),
                 _ => None,
             }
         }),
@@ -153,6 +157,7 @@ pub async fn fetch_balance(kind: BalanceKind, credential: &str, endpoints: &[Str
             }
         }
         BalanceKind::OpenCodeZen => fetch_opencode_zen(credential).await,
+        BalanceKind::Api123 => fetch_api123(credential, endpoints).await,
     }
     .unwrap_or_else(|e| err_result(kind.as_str(), &e.to_string()))
 }
@@ -562,6 +567,142 @@ async fn fetch_openrouter(key: &str, endpoints: &[String]) -> Result<Value> {
         json!([]),
         json!(rows),
     ))
+}
+
+// ─── Api123 (api123go.com) ───────────────────────────────────────────────────
+
+async fn fetch_api123(key: &str, endpoints: &[String]) -> Result<Value> {
+    let base = endpoints
+        .iter()
+        .find_map(|ep| {
+            let u = url::Url::parse(ep).ok()?;
+            if u.host_str()?.contains("api123go.com") {
+                Some(u.origin().ascii_serialization())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| "https://api123go.com".into());
+    let url = format!("{}/v1/usage", base.trim_end_matches('/'));
+    let (_, v) = get_json(
+        &url,
+        &[
+            ("authorization", format!("Bearer {}", key.trim())),
+            ("accept", "application/json".into()),
+        ],
+    )
+    .await?;
+    Ok(api123_result(&v))
+}
+
+fn api123_next_midnight_cst_ms() -> Option<u64> {
+    let off = ::time::UtcOffset::from_hms(8, 0, 0).ok()?;
+    let now = ::time::OffsetDateTime::now_utc().to_offset(off);
+    let today = ::time::Date::from_calendar_date(now.year(), now.month(), now.day()).ok()?;
+    let tomorrow = today + ::time::Duration::days(1);
+    let odt = tomorrow.with_time(::time::Time::MIDNIGHT).assume_offset(off);
+    Some((odt.unix_timestamp() as u64) * 1000)
+}
+
+/// Pure: build api123 balance result from `GET /v1/usage` payload. Exposed for contract tests.
+pub fn api123_result(v: &Value) -> Value {
+    let plan_name = v
+        .get("planName")
+        .and_then(Value::as_str)
+        .unwrap_or("api123")
+        .to_string();
+    let sub = v.get("subscription");
+    let daily_limit = sub
+        .and_then(|s| s.get("daily_limit_usd"))
+        .and_then(Value::as_f64);
+    let daily_usage = sub
+        .and_then(|s| s.get("daily_usage_usd"))
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    let weekly_limit = sub
+        .and_then(|s| s.get("weekly_limit_usd"))
+        .and_then(Value::as_f64);
+    let weekly_usage = sub
+        .and_then(|s| s.get("weekly_usage_usd"))
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    let expires_at = sub
+        .and_then(|s| s.get("expires_at"))
+        .and_then(Value::as_str);
+    let weekly_start = sub
+        .and_then(|s| s.get("weekly_window_start"))
+        .and_then(Value::as_str);
+
+    let expires_ms = expires_at.and_then(parse_rfc3339_ms);
+    let weekly_start_ms = weekly_start.and_then(parse_rfc3339_ms);
+
+    struct Win {
+        label: &'static str,
+        remaining: f64,
+        reset_ms: Option<u64>,
+        exceeded: bool,
+    }
+    let mut wins: Vec<Win> = Vec::new();
+    if let Some(limit) = daily_limit {
+        if limit > 0.0 {
+            let remaining = ((1.0 - daily_usage / limit) * 100.0).clamp(0.0, 100.0);
+            let exceeded = remaining <= 0.5;
+            let reset_ms = api123_next_midnight_cst_ms().or(expires_ms);
+            wins.push(Win {
+                label: "每日",
+                remaining,
+                reset_ms,
+                exceeded,
+            });
+        }
+    }
+    if let Some(limit) = weekly_limit {
+        if limit > 0.0 {
+            let remaining = ((1.0 - weekly_usage / limit) * 100.0).clamp(0.0, 100.0);
+            let exceeded = remaining <= 0.5;
+            let reset_ms = weekly_start_ms
+                .map(|ms| ms + 7 * 24 * 3600 * 1000)
+                .or(expires_ms);
+            wins.push(Win {
+                label: "每周",
+                remaining,
+                reset_ms,
+                exceeded,
+            });
+        }
+    }
+    wins.sort_by_key(|w| match w.label {
+        "每日" => 0,
+        "每周" => 1,
+        _ => 2,
+    });
+
+    let mut windows_json: Vec<Value> = Vec::new();
+    for w in &wins {
+        let mut obj = json!({ "label": w.label, "percent": w.remaining });
+        if let Some(ms) = w.reset_ms {
+            obj["resets_at"] = json!(ms);
+        }
+        if w.exceeded {
+            obj["exceeded"] = json!(true);
+        }
+        windows_json.push(obj);
+    }
+
+    let detail = if let Some(ms) = expires_ms {
+        format!("{} · 过期于 {}", plan_name, format_abs_ms(ms))
+    } else {
+        plan_name.clone()
+    };
+    let summary = if wins.is_empty() {
+        detail.clone()
+    } else {
+        wins.iter()
+            .map(|w| format!("{} {:.0}%", w.label, w.remaining))
+            .collect::<Vec<_>>()
+            .join(" · ")
+    };
+    ok_result("api123", summary, detail, json!(windows_json), json!([]))
 }
 
 // ─── CommandCode ─────────────────────────────────────────────────────────────
