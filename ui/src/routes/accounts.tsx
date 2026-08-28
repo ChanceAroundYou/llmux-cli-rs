@@ -206,7 +206,7 @@ function BalanceLine({ account: acc, balance, loading, unsupported, onRefresh }:
     const ws = balance?.windows ?? [];
     if (ws.length === 0) return ws;
     const order = (label: string) => {
-      if (label.includes('5') || label.includes('小时') || label.includes('滚动')) return 0;
+      if (label.includes('每日') || label.includes('日') || label.includes('5') || label.includes('小时') || label.includes('滚动')) return 0;
       if (label.includes('周')) return 1;
       if (label.includes('月')) return 2;
       return 3;
@@ -215,7 +215,7 @@ function BalanceLine({ account: acc, balance, loading, unsupported, onRefresh }:
   }, [balance?.windows]);
   // 仅当存在 windows 时才按订阅样式渲染；zen 钱包等 windows 为空但 rows 有余额时走计费分支
   const hasWindows = sortedWindows.length > 0;
-  const isSubscription = hasWindows && (balance?.provider === 'commandcode' || balance?.provider === 'opencode' || balance?.provider === 'opencode-go');
+  const isSubscription = hasWindows && (balance?.provider === 'commandcode' || balance?.provider === 'opencode' || balance?.provider === 'opencode-go' || balance?.provider === 'api123');
   if (unsupported) return null;
 
   const collapsedContent = (() => {
@@ -880,6 +880,7 @@ export default function Accounts() {
                 <option value="opencode">OpenCode</option>
                 <option value="opencode-go">OpenCode Go</option>
                 <option value="opencode-zen">OpenCode Zen</option>
+                <option value="api123">API123</option>
                 <option value="none">{t('accounts.balanceDisabled', '禁用查询')}</option>
               </select>
               <p className="text-xs text-muted-foreground">{t('accounts.balanceProviderHint', '决定余额查询走哪个上游接口；自动检测按名称/地址推断')}</p>
@@ -1038,6 +1039,7 @@ export default function Accounts() {
                 <option value="opencode">OpenCode</option>
                 <option value="opencode-go">OpenCode Go</option>
                 <option value="opencode-zen">OpenCode Zen</option>
+                <option value="api123">API123</option>
                 <option value="none">{t('accounts.balanceDisabled', '禁用查询')}</option>
               </select>
               <p className="text-xs text-muted-foreground">{t('accounts.balanceProviderHint', '决定余额查询走哪个上游接口；自动检测按名称/地址推断')}</p>
