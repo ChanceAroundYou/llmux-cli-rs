@@ -333,6 +333,49 @@ function BalanceLine({ account: acc, balance, loading, unsupported, onRefresh }:
   );
 }
 
+function ActivityMeta({ acc }: { acc: { requests_5h?: number | null; requests_24h?: number | null; requests_7d?: number | null; activity_bucket?: number | null } }) {
+  const { t } = useTranslation();
+  const r5 = Math.round(acc.requests_5h ?? 0);
+  const r24 = Math.round(acc.requests_24h ?? 0);
+  const r7 = Math.round(acc.requests_7d ?? 0);
+  const hasActivity = acc.requests_5h !== undefined || acc.requests_24h !== undefined || acc.requests_7d !== undefined;
+  if (!hasActivity) return null;
+  if (r5 === 0 && r24 === 0 && r7 === 0) {
+    return (
+      <div className="mt-1.5 flex items-center gap-1.5 text-[11px] text-muted-foreground/50">
+        <span className="inline-flex h-1.5 w-1.5 rounded-full bg-muted-foreground/30" />
+        <span>{t('accounts.activity.idle', '暂无活跃')}</span>
+      </div>
+    );
+  }
+  const bucket = acc.activity_bucket ?? 0;
+  const level: 'hot' | 'warm' | 'cold' = bucket >= 0.5 ? 'hot' : bucket >= 0.15 ? 'warm' : 'cold';
+  const dotClass = level === 'hot' ? 'bg-success' : level === 'warm' ? 'bg-warning' : 'bg-muted-foreground/40';
+  const label = level === 'hot' ? t('accounts.activity.hot', '活跃') : level === 'warm' ? t('accounts.activity.warm', '一般') : t('accounts.activity.cold', '较少');
+  return (
+    <div className="mt-1.5 flex items-center gap-1.5 text-[11px] leading-none flex-wrap">
+      <span className={cn('inline-flex h-1.5 w-1.5 rounded-full shrink-0', dotClass)} />
+      <span className="font-medium text-foreground/80">{label}</span>
+      <span className="text-muted-foreground/60">·</span>
+      <span className="font-mono text-muted-foreground" title={t('accounts.activity.recent5hTip', '近 5 小时请求数') as string}>
+        5h <span className="text-foreground font-medium">{r5}</span>
+      </span>
+      <span className="text-muted-foreground/30">·</span>
+      <span className="font-mono text-muted-foreground" title={t('accounts.activity.recent24hTip', '近 24 小时请求数') as string}>
+        24h <span className="text-foreground font-medium">{r24}</span>
+      </span>
+      {r7 > 0 && (
+        <>
+          <span className="text-muted-foreground/30">·</span>
+          <span className="font-mono text-muted-foreground/70" title={t('accounts.activity.recent7dTip', '近 7 天请求数') as string}>
+            7d {r7}
+          </span>
+        </>
+      )}
+    </div>
+  );
+}
+
 function t_balanceError(err?: string): string {
   return err || '查询失败';
 }
@@ -484,6 +527,7 @@ export default function Accounts() {
 
   const filteredAccounts = useMemo(() => {
     const q = accountSearch.trim().toLowerCase();
+    // 保持服务端已排好的活跃度顺序，仅过滤不重排，避免首帧抖动
     return accounts.filter(acc => {
       if (accountFilter === 'disabled' && acc.is_active !== 0) return false;
       if (accountFilter === 'enabled' && acc.is_active === 0) return false;
@@ -491,6 +535,22 @@ export default function Accounts() {
       return true;
     });
   }, [accounts, accountSearch, accountFilter]);
+
+  // 三档分组（服务端已按 tier+活跃度排好，组内不再重排，仅切段）
+  // tier 0: 启用且用量正常(ok=true)；tier 1: 启用但无用量/探活异常；tier 2: 已禁用
+  const groupedAccounts = useMemo(() => {
+    const g0: typeof filteredAccounts = [];
+    const g1: typeof filteredAccounts = [];
+    const g2: typeof filteredAccounts = [];
+    for (const acc of filteredAccounts) {
+      const a = acc as any;
+      const tier = typeof a.balance_tier === 'number' ? a.balance_tier : (a.is_active === 0 ? 2 : a.balance_ok ? 0 : 1);
+      if (tier === 0) g0.push(acc);
+      else if (tier === 1) g1.push(acc);
+      else g2.push(acc);
+    }
+    return [g0, g1, g2] as const;
+  }, [filteredAccounts]);
 
   const toggleReveal = async (id: number) => {
     if (visibleKeyId === id) { setVisibleKeyId(null); return; }
@@ -700,81 +760,60 @@ export default function Accounts() {
         </div>
       )}
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 2xl:grid-cols-3 gap-3">
-        {filteredAccounts.map((acc) => (
-          <div key={acc.id} className="p-3 rounded-xl border border-border bg-card hover:bg-muted/30 transition-all group flex flex-col min-w-0">
-            <div className="flex items-center justify-between gap-4">
-              <div className="flex items-center gap-2 min-w-0">
-                <h3 className="font-semibold text-sm truncate">{acc.alias}</h3>
-                <StatusDot status={acc.is_active === 1 ? 'online' : 'offline'} />
+      {!isLoading && accounts.length === 0 && (
+        <div className="py-20 text-center border-2 border-dashed border-border rounded-xl">
+           <AlertCircle className="mx-auto mb-2 text-muted-foreground/30" />
+           <p className="text-sm text-muted-foreground">{t('accounts.noAccounts')}</p>
+        </div>
+      )}
+
+      {!isLoading && accounts.length > 0 && filteredAccounts.length === 0 && (
+        <div className="py-10 text-center border border-dashed border-border rounded-xl">
+           <p className="text-sm text-muted-foreground">{t('accounts.noMatch')}</p>
+        </div>
+      )}
+
+      {!isLoading && filteredAccounts.length > 0 && (
+        <div className="space-y-8">
+          {([
+            { tier: 0, label: t('accounts.group.healthy', '可用 · 用量正常'), dotClass: 'bg-success', items: groupedAccounts[0] },
+            { tier: 1, label: t('accounts.group.unhealthy', '可用 · 用量异常/未配置'), dotClass: 'bg-warning', items: groupedAccounts[1] },
+            { tier: 2, label: t('accounts.group.disabled', '已禁用'), dotClass: 'bg-muted-foreground/40', items: groupedAccounts[2] },
+          ] as const).filter(g => g.items.length > 0).map(group => (
+            <section key={group.tier} className="space-y-3">
+              <div className="flex items-center gap-2 px-1">
+                <span className={cn('h-2 w-2 rounded-full shrink-0', group.dotClass)} />
+                <h2 className="text-xs font-bold tracking-widest uppercase text-muted-foreground">{group.label}</h2>
+                <span className="text-xs font-mono text-muted-foreground/60">{group.items.length}</span>
+                <div className="flex-1 h-px bg-border/50 ml-2" />
               </div>
-
-              <div className="flex items-center gap-2 shrink-0">
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    onClick={() => openEdit(acc)}
-                    className="text-warning hover:text-warning hover:bg-warning/10"
-                    title="Edit account"
-                  >
-                    <Pencil size={16} />
-                  </Button>
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    onClick={() => toggleActive(acc.id, acc.is_active)}
-                    className={acc.is_active === 1 ? "text-success hover:text-success hover:bg-success/10" : "text-muted-foreground/40 hover:text-muted-foreground hover:bg-muted"}
-                    title={acc.is_active === 1 ? t('common.online') : t('accounts.offline')}
-                  >
-                    <Power size={16} />
-                  </Button>
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    onClick={() => setAccountToDelete({ id: acc.id, name: acc.alias })}
-                    className="text-destructive hover:text-destructive hover:bg-destructive/10"
-                  >
-                    <Trash2 size={16} />
-                  </Button>
-                </div>
-            </div>
-            {/* API key 独立末行：明文换行显示，不把按钮顶走 */}
-            <div className="text-xs text-muted-foreground mt-2 flex items-start gap-1.5 uppercase tracking-tight">
-              <Key size={10} className="mt-0.5 shrink-0" /> {t('accounts.apiKey')}: {visibleKeyId === acc.id ? (revealing === acc.id ? <span className="font-mono normal-case lowercase text-muted-foreground/50">…</span> : ((revealedKeys[acc.id] ?? keys[acc.id]) ? <span className="font-mono normal-case lowercase break-all min-w-0">{revealedKeys[acc.id] ?? keys[acc.id]}</span> : <span className="text-muted-foreground/50">—</span>)) : '****'}
-              <button
-                type="button"
-                aria-label={visibleKeyId === acc.id ? 'Hide API key' : 'Show API key'}
-                onClick={() => toggleReveal(acc.id)}
-                disabled={revealing === acc.id}
-                className="p-0.5 rounded text-muted-foreground hover:text-foreground hover:bg-muted transition-colors shrink-0 disabled:opacity-50"
-              >
-                {visibleKeyId === acc.id ? <EyeOff size={12} /> : <Eye size={12} />}
-              </button>
-            </div>
-            {/* 余额/用量行：手动刷新（CodexBar 移植），不支持的上游隐藏按钮 */}
-            <BalanceLine
-              account={acc}
-              balance={balances[acc.id]}
-              loading={balanceLoading[acc.id] ?? false}
-              unsupported={unsupportedBalances.has(acc.id)}
-              onRefresh={() => refreshBalance(acc.id)}
-            />
-          </div>
-        ))}
-
-        {!isLoading && accounts.length > 0 && filteredAccounts.length === 0 && (
-          <div className="py-10 text-center border border-dashed border-border rounded-xl col-span-full">
-             <p className="text-sm text-muted-foreground">{t('accounts.noMatch')}</p>
-          </div>
-        )}
-
-        {!isLoading && accounts.length === 0 && (
-          <div className="py-20 text-center border-2 border-dashed border-border rounded-xl col-span-full">
-             <AlertCircle className="mx-auto mb-2 text-muted-foreground/30" />
-             <p className="text-sm text-muted-foreground">{t('accounts.noAccounts')}</p>
-          </div>
-        )}
-      </div>
+              <div className="grid grid-cols-1 lg:grid-cols-2 2xl:grid-cols-3 gap-3">
+                {group.items.map((acc) => (
+                  <div key={acc.id} className="p-3 rounded-xl border border-border bg-card hover:bg-muted/30 transition-all group flex flex-col min-w-0">
+                    <div className="flex items-center justify-between gap-4">
+                      <div className="flex items-center gap-2 min-w-0">
+                        <h3 className="font-semibold text-sm truncate">{acc.alias}</h3>
+                        <StatusDot status={acc.is_active === 1 ? 'online' : 'offline'} />
+                      </div>
+                      <div className="flex items-center gap-2 shrink-0">
+                        <Button variant="ghost" size="icon" onClick={() => openEdit(acc)} className="text-warning hover:text-warning hover:bg-warning/10" title="Edit account"><Pencil size={16} /></Button>
+                        <Button variant="ghost" size="icon" onClick={() => toggleActive(acc.id, acc.is_active)} className={acc.is_active === 1 ? "text-success hover:text-success hover:bg-success/10" : "text-muted-foreground/40 hover:text-muted-foreground hover:bg-muted"} title={acc.is_active === 1 ? t('common.online') : t('accounts.offline')}><Power size={16} /></Button>
+                        <Button variant="ghost" size="icon" onClick={() => setAccountToDelete({ id: acc.id, name: acc.alias })} className="text-destructive hover:text-destructive hover:bg-destructive/10"><Trash2 size={16} /></Button>
+                      </div>
+                    </div>
+                    <ActivityMeta acc={acc as any} />
+                    <div className="text-xs text-muted-foreground mt-2 flex items-start gap-1.5 uppercase tracking-tight">
+                      <Key size={10} className="mt-0.5 shrink-0" /> {t('accounts.apiKey')}: {visibleKeyId === acc.id ? (revealing === acc.id ? <span className="font-mono normal-case lowercase text-muted-foreground/50">…</span> : ((revealedKeys[acc.id] ?? keys[acc.id]) ? <span className="font-mono normal-case lowercase break-all min-w-0">{revealedKeys[acc.id] ?? keys[acc.id]}</span> : <span className="text-muted-foreground/50">—</span>)) : '****'}
+                      <button type="button" aria-label={visibleKeyId === acc.id ? 'Hide API key' : 'Show API key'} onClick={() => toggleReveal(acc.id)} disabled={revealing === acc.id} className="p-0.5 rounded text-muted-foreground hover:text-foreground hover:bg-muted transition-colors shrink-0 disabled:opacity-50">{visibleKeyId === acc.id ? <EyeOff size={12} /> : <Eye size={12} />}</button>
+                    </div>
+                    <BalanceLine account={acc} balance={balances[acc.id]} loading={balanceLoading[acc.id] ?? false} unsupported={unsupportedBalances.has(acc.id)} onRefresh={() => refreshBalance(acc.id)} />
+                  </div>
+                ))}
+              </div>
+            </section>
+          ))}
+        </div>
+      )}
 
       <Dialog
         isOpen={isModalOpen}

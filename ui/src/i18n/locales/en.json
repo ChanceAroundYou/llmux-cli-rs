@@ -298,7 +298,21 @@
     "defaultProtocol": "Default protocol",
     "defaultProtocolHint": "Upstream protocol used when a request does not specifiy one.",
     "needEndpoint": "At least one endpoint must be enabled",
-    "defaultInEnabled": "Default protocol must be one of the enabled endpoints"
+    "defaultInEnabled": "Default protocol must be one of the enabled endpoints",
+    "activity": {
+      "hot": "Active",
+      "warm": "Normal",
+      "cold": "Low",
+      "idle": "Idle",
+      "recent5hTip": "Requests in last 5h (rolling)",
+      "recent24hTip": "Requests in last 24h (rolling)",
+      "recent7dTip": "Requests in last 7 days"
+    },
+    "group": {
+      "healthy": "Enabled · Healthy",
+      "unhealthy": "Enabled · Unhealthy / Not configured",
+      "disabled": "Disabled"
+    }
   },
   "models": {
     "title": "Model Management",

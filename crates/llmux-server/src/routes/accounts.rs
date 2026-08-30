@@ -105,10 +105,42 @@ fn chrono_now_secs() -> u64 {
 }
 
 pub async fn list_accounts(Extension(state): Extension<AppState>) -> Response {
-    // Lazy decrypt: list never returns api_key (eye fetches /:id/key on demand).
+    // Activity-aware ordering: 5h (0.5) > 24h (0.35) > 7d avg (0.15), log-compressed,
+    // normalized, quantized to 0.05 buckets to debounce micro-jitters. Computed
+    // atomically in this single request so the first frame is already final.
+    use sqlx::Row as _;
+
+    let now_ms: i64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let t5 = now_ms - 5 * 60 * 60 * 1000;
+    let t24 = now_ms - 24 * 60 * 60 * 1000;
+    let t7 = now_ms - 7 * 24 * 60 * 60 * 1000;
+
+    // Single LEFT JOIN: per-account rolling counts (is_test=0, weighted by success).
+    // Filtering timestamp >= t7 keeps the scan bounded to 7d; older logs contribute 0
+    // to all three windows and can be ignored.
+    // Also pull limits_cache to derive balance-health tier for分组排序 (no extra round-trip).
     let rows = match sqlx::query(
-        "SELECT id, alias, provider_id, base_url, anthropic_base_url, is_active, weight, notes, openai_compatible, created_at, chat_endpoint, responses_endpoint, messages_endpoint, default_protocol, balance_provider FROM accounts ORDER BY id DESC",
+        "SELECT a.id, a.alias, a.provider_id, a.base_url, a.anthropic_base_url, \
+                a.is_active, a.weight, a.notes, a.openai_compatible, a.created_at, \
+                a.chat_endpoint, a.responses_endpoint, a.messages_endpoint, \
+                a.default_protocol, a.balance_provider, a.limits_cache, \
+                COALESCE(s.c5, 0) AS c5, COALESCE(s.c24, 0) AS c24, COALESCE(s.c7, 0) AS c7 \
+         FROM accounts a \
+         LEFT JOIN ( \
+           SELECT account_id, \
+                  SUM(CASE WHEN timestamp >= ? THEN CASE WHEN success = 1 THEN 1.0 ELSE 0.2 END ELSE 0 END) AS c5, \
+                  SUM(CASE WHEN timestamp >= ? THEN CASE WHEN success = 1 THEN 1.0 ELSE 0.2 END ELSE 0 END) AS c24, \
+                  SUM(CASE WHEN timestamp >= ? THEN CASE WHEN success = 1 THEN 1.0 ELSE 0.2 END ELSE 0 END) AS c7 \
+           FROM usage_logs WHERE is_test = 0 AND timestamp >= ? GROUP BY account_id \
+         ) s ON s.account_id = a.id",
     )
+    .bind(t5)
+    .bind(t24)
+    .bind(t7)
+    .bind(t7)
     .fetch_all(&state.pool)
     .await
     {
@@ -120,28 +152,128 @@ pub async fn list_accounts(Extension(state): Extension<AppState>) -> Response {
             )
         }
     };
-    use sqlx::Row as _;
-    let out: Vec<Value> = rows
+
+    struct RowOut {
+        id: i64,
+        alias: String,
+        provider_id: String,
+        base_url: Option<String>,
+        anthropic_base_url: Option<String>,
+        is_active: i64,
+        weight: i64,
+        notes: Option<String>,
+        openai_compatible: Option<i64>,
+        created_at: Option<String>,
+        chat_endpoint: Option<String>,
+        responses_endpoint: Option<String>,
+        messages_endpoint: Option<String>,
+        default_protocol: Option<String>,
+        balance_provider: Option<String>,
+        limits_cache: Option<String>,
+        c5: f64,
+        c24: f64,
+        c7: f64,
+        raw: f64,
+    }
+
+    fn balance_healthy(raw: &Option<String>, balance_provider: &Option<String>) -> bool {
+        if balance_provider.as_deref().map(|s| s.trim().to_lowercase() == "none").unwrap_or(false) {
+            return false;
+        }
+        let Some(s) = raw else { return false; };
+        let t = s.trim();
+        if t.is_empty() { return false; }
+        match serde_json::from_str::<Value>(t) {
+            Ok(v) => v.get("ok").and_then(Value::as_bool).unwrap_or(false),
+            Err(_) => false,
+        }
+    }
+
+    let items: Vec<RowOut> = rows
         .iter()
         .map(|r| {
+            let c5: f64 = r.try_get::<f64, _>("c5").unwrap_or(0.0);
+            let c24: f64 = r.try_get::<f64, _>("c24").unwrap_or(0.0);
+            let c7: f64 = r.try_get::<f64, _>("c7").unwrap_or(0.0);
+            let c7avg = c7 / 7.0;
+            let raw = 0.50 * (1.0 + c5).ln() + 0.35 * (1.0 + c24).ln() + 0.15 * (1.0 + c7avg).ln();
+            RowOut {
+                id: r.try_get::<i64, _>("id").unwrap_or_default(),
+                alias: r.try_get::<String, _>("alias").unwrap_or_default(),
+                provider_id: r.try_get::<String, _>("provider_id").unwrap_or_default(),
+                base_url: r.try_get::<Option<String>, _>("base_url").unwrap_or_default(),
+                anthropic_base_url: r.try_get::<Option<String>, _>("anthropic_base_url").unwrap_or_default(),
+                is_active: r.try_get::<i64, _>("is_active").unwrap_or(0),
+                weight: r.try_get::<i64, _>("weight").unwrap_or(1),
+                notes: r.try_get::<Option<String>, _>("notes").unwrap_or_default(),
+                openai_compatible: r.try_get::<Option<i64>, _>("openai_compatible").unwrap_or_default(),
+                created_at: r.try_get::<Option<String>, _>("created_at").unwrap_or_default(),
+                chat_endpoint: r.try_get::<Option<String>, _>("chat_endpoint").unwrap_or_default(),
+                responses_endpoint: r.try_get::<Option<String>, _>("responses_endpoint").unwrap_or_default(),
+                messages_endpoint: r.try_get::<Option<String>, _>("messages_endpoint").unwrap_or_default(),
+                default_protocol: r.try_get::<Option<String>, _>("default_protocol").unwrap_or_default(),
+                balance_provider: r.try_get::<Option<String>, _>("balance_provider").unwrap_or_default(),
+                limits_cache: r.try_get::<Option<String>, _>("limits_cache").unwrap_or_default(),
+                c5,
+                c24,
+                c7,
+                raw,
+            }
+        })
+        .collect();
+
+    let max_raw = items.iter().map(|x| x.raw).fold(0.0_f64, f64::max);
+    // Quantize score into 0.05 buckets (20 levels) to suppress micro-jitter.
+    // Tier: 0 = 启用且用量正常(ok=true), 1 = 启用但无用量/探活异常, 2 = 已禁用
+    let mut scored: Vec<(i32, bool, f64, f64, RowOut)> = items
+        .into_iter()
+        .map(|it| {
+            let score = if max_raw > 1e-9 { it.raw / max_raw } else { 0.0 };
+            let bucket = (score * 20.0).floor() / 20.0;
+            // clamp to [0,1] for safety
+            let bucket = bucket.clamp(0.0, 1.0);
+            let healthy = balance_healthy(&it.limits_cache, &it.balance_provider);
+            let tier: i32 = if it.is_active == 0 { 2 } else if healthy { 0 } else { 1 };
+            (tier, healthy, score, bucket, it)
+        })
+        .collect();
+
+    scored.sort_by(|a, b| {
+        // tier ASC (0 healthy enabled first) -> bucket DESC -> id DESC (stable)
+        a.0.cmp(&b.0)
+            .then_with(|| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal))
+            .then_with(|| b.4.id.cmp(&a.4.id))
+    });
+
+    let out: Vec<Value> = scored
+        .into_iter()
+        .map(|(tier, healthy, score, bucket, r)| {
             json!({
-                "id": r.try_get::<i64, _>("id").unwrap_or_default(),
-                "alias": r.try_get::<String, _>("alias").unwrap_or_default(),
-                "provider_id": r.try_get::<String, _>("provider_id").unwrap_or_default(),
+                "id": r.id,
+                "alias": r.alias,
+                "provider_id": r.provider_id,
                 "api_key": Value::Null,
-                "base_url": r.try_get::<Option<String>, _>("base_url").unwrap_or_default(),
-                "anthropic_base_url": r.try_get::<Option<String>, _>("anthropic_base_url").unwrap_or_default(),
-                "is_active": r.try_get::<i64, _>("is_active").unwrap_or(0),
-                "weight": r.try_get::<i64, _>("weight").unwrap_or(1),
-                "notes": r.try_get::<Option<String>, _>("notes").unwrap_or_default(),
-                "openai_compatible": r.try_get::<Option<i64>, _>("openai_compatible").unwrap_or_default(),
-                "created_at": r.try_get::<Option<String>, _>("created_at").unwrap_or_default(),
-                "chat_endpoint": r.try_get::<Option<String>, _>("chat_endpoint").unwrap_or_default(),
-                "responses_endpoint": r.try_get::<Option<String>, _>("responses_endpoint").unwrap_or_default(),
-                "messages_endpoint": r.try_get::<Option<String>, _>("messages_endpoint").unwrap_or_default(),
-                "default_protocol": r.try_get::<Option<String>, _>("default_protocol").unwrap_or_default(),
-                "balance_provider": r.try_get::<Option<String>, _>("balance_provider").unwrap_or_default(),
+                "base_url": r.base_url,
+                "anthropic_base_url": r.anthropic_base_url,
+                "is_active": r.is_active,
+                "weight": r.weight,
+                "notes": r.notes,
+                "openai_compatible": r.openai_compatible,
+                "created_at": r.created_at,
+                "chat_endpoint": r.chat_endpoint,
+                "responses_endpoint": r.responses_endpoint,
+                "messages_endpoint": r.messages_endpoint,
+                "default_protocol": r.default_protocol,
+                "balance_provider": r.balance_provider,
                 "balance_auth": Value::Null,
+                // Activity (read-only, for UI ordering / hints)
+                "requests_5h": r.c5,
+                "requests_24h": r.c24,
+                "requests_7d": r.c7,
+                "activity_score": score,
+                "activity_bucket": bucket,
+                "balance_ok": healthy,
+                "balance_tier": tier,
             })
         })
         .collect();

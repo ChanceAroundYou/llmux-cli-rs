@@ -18,6 +18,14 @@ export interface Account {
   default_protocol: string | null;
   balance_provider: string | null;
   balance_auth: string | null;
+  // Activity (server-computed, read-only): rolling 5h/24h/7d + normalized score
+  requests_5h?: number | null;
+  requests_24h?: number | null;
+  requests_7d?: number | null;
+  activity_score?: number | null;
+  activity_bucket?: number | null;
+  balance_ok?: boolean | null;
+  balance_tier?: number | null;
 }
 
 interface AccountsState {

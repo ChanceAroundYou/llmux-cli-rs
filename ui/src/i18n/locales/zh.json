@@ -300,7 +300,21 @@
     "defaultProtocol": "默认协议",
     "defaultProtocolHint": "请求未指定协议时使用的上游协议。",
     "needEndpoint": "至少启用一个服务端点",
-    "defaultInEnabled": "默认协议必须是已启用的端点之一"
+    "defaultInEnabled": "默认协议必须是已启用的端点之一",
+    "activity": {
+      "hot": "活跃",
+      "warm": "一般",
+      "cold": "较少",
+      "idle": "暂无活跃",
+      "recent5hTip": "近 5 小时请求数（滚动）",
+      "recent24hTip": "近 24 小时请求数（滚动）",
+      "recent7dTip": "近 7 天请求数"
+    },
+    "group": {
+      "healthy": "可用 · 用量正常",
+      "unhealthy": "可用 · 用量异常/未配置",
+      "disabled": "已禁用"
+    }
   },
   "models": {
     "title": "模型管理",
