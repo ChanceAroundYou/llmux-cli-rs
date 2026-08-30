@@ -4,7 +4,7 @@ import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router-dom';
 import { AlertTriangle, Database, Users, Zap, Key, Shield, Activity, LayoutDashboard, ChevronDown, Search } from 'lucide-react';
 import { parseServerDate } from '../utils/date';
-import { fmtSec } from '../utils/format';
+import { abbrModel, fmtSec, fmtSecNum } from '../utils/format';
 import { chartBarHeight, chartColorForLatency, chartColorForTtft, healthBadgeClass, totalTone, ttftTone } from '../utils/thresholds';
 import { cn } from '../lib/utils'
 import { StatusDot } from '../components/shared/StatusDot'
@@ -544,9 +544,9 @@ export default function Dashboard() {
                   <span className="text-muted-foreground/60 shrink-0 font-mono">
                     {parseServerDate(log.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false })}
                   </span>
-                  <span className="font-semibold text-foreground truncate flex-1 min-w-0" title={log.model}>{log.model}</span>
+                  <span className="font-semibold text-foreground truncate flex-1 min-w-0" title={log.model}>{abbrModel(log.model)}</span>
                   <span className="font-mono text-muted-foreground shrink-0" title={`输入 ${log.input_tokens} / 输出 ${log.output_tokens} / 缓存 ${log.cache_tokens}`}>{formatK((log.input_tokens||0)+(log.output_tokens||0)+(log.cache_tokens||0))}</span>
-                  <span className="font-mono text-muted-foreground shrink-0">{log.latency_ms ? fmtSec(log.latency_ms) : '--'}</span>
+                  <span className="font-mono text-muted-foreground shrink-0">{log.latency_ms ? fmtSecNum(log.latency_ms) : '--'}</span>
                 </div>
               </div>
             ))}

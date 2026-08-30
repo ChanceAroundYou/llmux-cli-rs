@@ -10,7 +10,7 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
 import { parseServerDate } from '../utils/date';
-import { fmtSec, netMs } from '../utils/format';
+import { abbrModel, fmtSec, fmtSecNum, fmtTpsNum, netMs } from '../utils/format';
 import { ttftTextClass } from '../utils/thresholds';
 import { cn } from '@/lib/utils';
 
@@ -30,6 +30,11 @@ const cacheOf = (l: LogEntry): number => {
   if (typeof (l as any).cache_tokens === 'number') return (l as any).cache_tokens;
   if (typeof (l as any).cacheTokens === 'number') return (l as any).cacheTokens;
   return (l.cacheReadInputTokens || 0); // 4-store-3-display: creation hidden
+};
+const tpsOf = (l: LogEntry): number | null => {
+  if (typeof l.tps === 'number' && Number.isFinite(l.tps)) return l.tps;
+  if (l.success && l.outputTokens > 0) return calcTps(l.outputTokens, l.latencyMs, l.ttftMs);
+  return null;
 };
 
 interface LogEntry {
@@ -57,6 +62,7 @@ interface LogEntry {
 const PAGE_SIZE = 50;
 
 type RangeKey = '24h' | '7d' | 'all';
+type SortKey = 'time' | 'model' | 'account' | 'input' | 'output' | 'cache' | 'elapsed' | 'ttft' | 'tps';
 
 export default function Logs() {
   const { t } = useTranslation();
@@ -78,6 +84,8 @@ export default function Logs() {
   const [allExpanded, setAllExpanded] = useState<boolean | undefined>(undefined);
   const [treeKey, setTreeKey] = useState(0);
   const [copiedError, setCopiedError] = useState(false);
+  const [sortKey, setSortKey] = useState<SortKey>('time');
+  const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc');
 
   const expandAllBlocks = () => {
     setAllExpanded(true);
@@ -151,13 +159,40 @@ export default function Logs() {
 
   const resetPage = () => setPage(0);
 
+  const toggleSort = (k: SortKey) => {
+    if (sortKey === k) setSortDir(d => d === 'asc' ? 'desc' : 'asc');
+    else { setSortKey(k); setSortDir(k === 'model' || k === 'account' ? 'asc' : 'desc'); }
+  };
+  const sortInd = (k: SortKey) => sortKey !== k ? ' ↕' : sortDir === 'asc' ? ' ▲' : ' ▼';
+
   const displayLogs = useMemo(() => {
-    return logs.filter(l => {
+    const filtered = logs.filter(l => {
       if (streamMode === 'stream' && !l.isStream) return false;
       if (streamMode === 'nonStream' && l.isStream) return false;
       return true;
     });
-  }, [logs, streamMode]);
+    const dir = sortDir === 'asc' ? 1 : -1;
+    const getVal = (l: LogEntry): string | number => {
+      switch (sortKey) {
+        case 'time': return l.timestamp;
+        case 'model': return (l.model || '').toLowerCase();
+        case 'account': return (l.accountName || `#${l.accountId}`).toLowerCase();
+        case 'input': return l.inputTokens;
+        case 'output': return l.outputTokens;
+        case 'cache': return cacheOf(l);
+        case 'elapsed': return netMs(l.latencyMs, l.ttftMs, l.isStream);
+        case 'ttft': return typeof l.ttftMs === 'number' ? l.ttftMs : -1;
+        case 'tps': return tpsOf(l) ?? -1;
+        default: return 0;
+      }
+    };
+    filtered.sort((a, b) => {
+      const av = getVal(a), bv = getVal(b);
+      if (typeof av === 'string') return (av as string).localeCompare(bv as string) * dir;
+      return ((av as number) - (bv as number)) * dir;
+    });
+    return filtered;
+  }, [logs, streamMode, sortKey, sortDir]);
 
   const copyError = async () => {
     if (!detailLog?.errorMessage) return;
@@ -235,15 +270,15 @@ export default function Logs() {
           <table className="w-full text-xs">
             <thead className="bg-muted/50 text-muted-foreground">
               <tr>
-                <th className="text-left px-4 py-2 font-medium">{t('logs.time')}</th>
-                <th className="text-left px-3 py-2 font-medium">{t('logs.model')}</th>
-                <th className="text-left px-3 py-2 font-medium">{t('logs.account')}</th>
-                <th className="text-right px-3 py-2 font-medium">{t('logs.input')}</th>
-                <th className="text-right px-3 py-2 font-medium">{t('logs.output')}</th>
-                <th className="text-right px-3 py-2 font-medium">{t('logs.cacheTokens', { defaultValue: '缓存' })}</th>
-                <th className="text-right px-3 py-2 font-medium">{t('logs.elapsed', { defaultValue: '耗时' })}</th>
-                <th className="text-right px-3 py-2 font-medium">{t('logs.ttft')}</th>
-                <th className="text-right px-3 py-2 font-medium">{t('logs.throughput')}</th>
+                <th className="text-left px-4 py-2 font-medium cursor-pointer select-none whitespace-nowrap" onClick={() => toggleSort('time')}>{t('logs.time')}{sortInd('time')}</th>
+                <th className="text-left px-3 py-2 font-medium cursor-pointer select-none" onClick={() => toggleSort('model')}>{t('logs.model')}{sortInd('model')}</th>
+                <th className="text-left px-3 py-2 font-medium cursor-pointer select-none" onClick={() => toggleSort('account')}>{t('logs.account')}{sortInd('account')}</th>
+                <th className="text-right px-3 py-2 font-medium cursor-pointer select-none" onClick={() => toggleSort('input')}>{t('logs.input')}{sortInd('input')}</th>
+                <th className="text-right px-3 py-2 font-medium cursor-pointer select-none" onClick={() => toggleSort('output')}>{t('logs.output')}{sortInd('output')}</th>
+                <th className="text-right px-3 py-2 font-medium cursor-pointer select-none" onClick={() => toggleSort('cache')}>{t('logs.cacheTokens', { defaultValue: '缓存' })}{sortInd('cache')}</th>
+                <th className="text-right px-3 py-2 font-medium cursor-pointer select-none whitespace-nowrap" onClick={() => toggleSort('elapsed')}>{t('logs.elapsed', { defaultValue: '耗时' })}(s){sortInd('elapsed')}</th>
+                <th className="text-right px-3 py-2 font-medium cursor-pointer select-none whitespace-nowrap" onClick={() => toggleSort('ttft')}>{t('logs.ttft')}(s){sortInd('ttft')}</th>
+                <th className="text-right px-3 py-2 font-medium cursor-pointer select-none whitespace-nowrap" onClick={() => toggleSort('tps')}>{t('logs.throughput')}{sortInd('tps')}</th>
                 <th className="w-10 px-3 py-2 text-center font-medium">{t('logs.status')}</th>
               </tr>
             </thead>
@@ -254,7 +289,10 @@ export default function Logs() {
               {!isLoading && logs.length === 0 && (
                 <tr><td colSpan={10} className="px-4 py-10 text-center text-muted-foreground">{t('logs.empty')}</td></tr>
               )}
-              {!isLoading && displayLogs.map(log => (
+              {!isLoading && displayLogs.map(log => {
+                const elapsed = netMs(log.latencyMs, log.ttftMs, log.isStream);
+                const tps = tpsOf(log);
+                return (
                 <tr
                   key={log.id}
                   onClick={() => openLogDetail(log)}
@@ -267,25 +305,19 @@ export default function Logs() {
                   <td className="px-4 py-2 whitespace-nowrap font-mono text-muted-foreground">
                     {new Date(log.timestamp).toLocaleString([], { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' })}
                   </td>
-                  <td className="px-3 py-2 font-mono max-w-[220px] truncate" title={log.model}>{log.model}</td>
+                  <td className="px-3 py-2 font-mono max-w-[220px] truncate" title={log.model}>{abbrModel(log.model)}</td>
                   <td className="px-3 py-2 text-muted-foreground max-w-[140px] truncate" title={log.accountName || ''}>{log.accountName || `#${log.accountId}`}</td>
                   <td className="px-3 py-2 text-right font-mono whitespace-nowrap">{formatK(log.inputTokens)}</td>
                   <td className="px-3 py-2 text-right font-mono whitespace-nowrap">{formatK(log.outputTokens)}</td>
                   <td className="px-3 py-2 text-right font-mono whitespace-nowrap text-muted-foreground">{formatK(cacheOf(log))}</td>
-                  <td className="px-3 py-2 text-right font-mono whitespace-nowrap" title={`总耗时 ${fmtSec(log.latencyMs)} · TTFT ${typeof log.ttftMs === 'number' ? fmtSec(log.ttftMs) : '—'}`}>{fmtSec(netMs(log.latencyMs, log.ttftMs, log.isStream))}</td>
+                  <td className="px-3 py-2 text-right font-mono whitespace-nowrap" title={`总耗时 ${fmtSec(log.latencyMs)} · TTFT ${typeof log.ttftMs === 'number' ? fmtSec(log.ttftMs) : '—'}`}>{fmtSecNum(elapsed)}</td>
                   <td className="px-3 py-2 text-right font-mono whitespace-nowrap">
                     {typeof log.ttftMs === 'number' ? (
-                      <span className={cn(ttftTextClass(log.ttftMs))}>{fmtSec(log.ttftMs)}</span>
+                      <span className={cn(ttftTextClass(log.ttftMs))}>{fmtSecNum(log.ttftMs)}</span>
                     ) : <span className="text-muted-foreground/40">—</span>}
                   </td>
                   <td className="px-3 py-2 text-right font-mono whitespace-nowrap">
-                    {typeof log.tps === 'number' ? (
-                      <>{log.tps.toFixed(1)} Token/s</>
-                    ) : (
-                      log.success && log.outputTokens > 0 ? (
-                        <>{calcTps(log.outputTokens, log.latencyMs, log.ttftMs).toFixed(1)} Token/s</>
-                      ) : <span className="text-muted-foreground/40">—</span>
-                    )}
+                    {tps !== null ? fmtTpsNum(tps) : <span className="text-muted-foreground/40">—</span>}
                   </td>
                   <td className="px-3 py-2 text-center">
                     <span title={log.success ? t('logs.success') : (log.errorMessage || t('logs.failed'))} className="inline-flex justify-center">
@@ -293,7 +325,8 @@ export default function Logs() {
                     </span>
                   </td>
                 </tr>
-              ))}
+                );
+              })}
             </tbody>
           </table>
         </div>
