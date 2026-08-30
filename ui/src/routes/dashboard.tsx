@@ -5,6 +5,7 @@ import { useNavigate } from 'react-router-dom';
 import { AlertTriangle, Database, Users, Zap, Key, Shield, Activity, LayoutDashboard, ChevronDown, Search } from 'lucide-react';
 import { parseServerDate } from '../utils/date';
 import { fmtSec } from '../utils/format';
+import { chartBarHeight, chartColorForLatency, chartColorForTtft, healthBadgeClass, totalTone, ttftTone } from '../utils/thresholds';
 import { cn } from '../lib/utils'
 import { StatusDot } from '../components/shared/StatusDot'
 import { PageHeader } from '../components/shared/PageHeader'
@@ -203,14 +204,8 @@ export default function Dashboard() {
     return {
       labels: displayLogs.map(() => ''),
       datasets: [{
-        data: displayLogs.map(l => {
-          if (l.success !== 1) return 0.8;
-          return (l.latency_ms || 0) > 2000 ? 1.2 : 1;
-        }),
-        backgroundColor: displayLogs.map(l => {
-          if (l.success !== 1) return '#ef4444';
-          return (l.latency_ms || 0) > 2000 ? '#f59e0b' : '#22c55e';
-        }),
+        data: displayLogs.map(l => chartBarHeight(totalTone(l.latency_ms), l.success)),
+        backgroundColor: displayLogs.map(l => chartColorForLatency(l.latency_ms, l.success)),
         borderRadius: 0,
         barThickness: 3,
       }]
@@ -255,16 +250,8 @@ export default function Dashboard() {
     return {
       labels: displayLogs.map(() => ''),
       datasets: [{
-        data: displayLogs.map(l => {
-          if (l.success !== 1) return 0.8;
-          const ttft = typeof l.ttft_ms === 'number' ? l.ttft_ms : 0;
-          return ttft > 1500 ? 1.2 : 1;
-        }),
-        backgroundColor: displayLogs.map(l => {
-          if (l.success !== 1) return '#ef4444';
-          const ttft = typeof l.ttft_ms === 'number' ? l.ttft_ms : 0;
-          return ttft > 1500 ? '#ef4444' : ttft > 800 ? '#f59e0b' : '#22c55e';
-        }),
+        data: displayLogs.map(l => chartBarHeight(ttftTone(typeof l.ttft_ms === 'number' ? l.ttft_ms : null), l.success)),
+        backgroundColor: displayLogs.map(l => chartColorForTtft(typeof l.ttft_ms === 'number' ? l.ttft_ms : null, l.success)),
         borderRadius: 0,
         barThickness: 3,
       }]
@@ -413,13 +400,8 @@ export default function Dashboard() {
                 </div>
                 <div className="text-right shrink-0">
                   {a.latency !== null ? (
-                    <Badge variant={a.success ? (a.latency < 500 ? "secondary" : a.latency < 1200 ? "secondary" : "secondary") : "destructive"}
-                      className={cn(
-                        "font-mono",
-                        a.success
-                          ? a.latency < 500 ? 'bg-success/10 text-success border-success/20' : a.latency < 1200 ? 'bg-warning/10 text-warning border-warning/20' : 'bg-primary/10 text-primary border-primary/20'
-                          : 'bg-destructive/10 text-destructive border-destructive/20'
-                      )}
+                    <Badge variant={a.success ? "secondary" : "destructive"}
+                      className={cn("font-mono", healthBadgeClass(a.latency, a.success))}
                     >
                       {a.success ? fmtSec(a.latency) : 'ERR'}
                     </Badge>
@@ -527,7 +509,7 @@ export default function Dashboard() {
               </div>
             </div>
 
-            {/* TTFT Pulse — warm colors, thresholds 800/1500ms */}
+            {/* TTFT Pulse — thresholds.ts: 8s warn / 18s bad (calibrated P50/P80) */}
             <div className="mt-4 space-y-2">
               <div className="flex items-center justify-between">
                 <span className="text-[10px] font-bold text-muted-foreground uppercase tracking-widest">{t('dashboard.monitor.ttftPulse')}</span>

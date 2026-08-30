@@ -11,6 +11,7 @@ import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
 import { parseServerDate } from '../utils/date';
 import { fmtSec, netMs } from '../utils/format';
+import { ttftTextClass } from '../utils/thresholds';
 import { cn } from '@/lib/utils';
 
 // t/s：流式按生成段(总耗时-首字时间)，非流式按总耗时。
@@ -274,7 +275,7 @@ export default function Logs() {
                   <td className="px-3 py-2 text-right font-mono whitespace-nowrap" title={`总耗时 ${fmtSec(log.latencyMs)} · TTFT ${typeof log.ttftMs === 'number' ? fmtSec(log.ttftMs) : '—'}`}>{fmtSec(netMs(log.latencyMs, log.ttftMs, log.isStream))}</td>
                   <td className="px-3 py-2 text-right font-mono whitespace-nowrap">
                     {typeof log.ttftMs === 'number' ? (
-                      <span className={cn(log.ttftMs > 1500 ? "text-destructive" : log.ttftMs > 800 ? "text-warning" : "text-foreground")}>{fmtSec(log.ttftMs)}</span>
+                      <span className={cn(ttftTextClass(log.ttftMs))}>{fmtSec(log.ttftMs)}</span>
                     ) : <span className="text-muted-foreground/40">—</span>}
                   </td>
                   <td className="px-3 py-2 text-right font-mono whitespace-nowrap">
