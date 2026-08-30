@@ -19,6 +19,7 @@ pub const MIGRATION_0013: &str = include_str!("migrations/0013_add_timing_metric
 pub const MIGRATION_0014: &str = include_str!("migrations/0014_add_health_index.sql");
 pub const MIGRATION_0015: &str = "ALTER TABLE accounts ADD COLUMN balance_provider TEXT NOT NULL DEFAULT '';";
 pub const MIGRATION_0016: &str = "ALTER TABLE accounts ADD COLUMN balance_auth TEXT NOT NULL DEFAULT '';";
+pub const MIGRATION_0017: &str = include_str!("migrations/0017_account_activity_index.sql");
 
 pub async fn connect_sqlite(database_url: &str) -> Result<SqlitePool> {
     let options = SqliteConnectOptions::from_str(database_url)?
@@ -61,6 +62,7 @@ pub async fn init_db(pool: &SqlitePool) -> Result<()> {
         ("0014", MIGRATION_0014),
         ("0015", MIGRATION_0015),
         ("0016", MIGRATION_0016),
+        ("0017", MIGRATION_0017),
     ];
     for (name, sql) in &migrations {
         for statement in sql.split(';') {
