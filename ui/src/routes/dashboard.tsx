@@ -458,21 +458,21 @@ export default function Dashboard() {
             {/* KPI strip */}
             <div className="grid grid-cols-3 gap-3 mt-6 p-4 bg-muted rounded-xl border border-border/50">
               <div>
-                <span className="text-[10px] font-medium text-muted-foreground block uppercase tracking-wider">{t('dashboard.monitor.avgTtft')}</span>
+                <span className="text-[10px] font-medium text-muted-foreground block uppercase tracking-wider">{t('dashboard.monitor.avgTtft')}(s)</span>
                 <div className="flex items-baseline gap-1 mt-1">
-                  <span className="text-xl font-bold text-foreground tracking-tight">{fmtSec(logMetrics.avgTtft)}</span>
+                  <span className="text-xl font-bold text-foreground tracking-tight">{fmtSecNum(logMetrics.avgTtft)}</span>
                 </div>
               </div>
               <div>
-                <span className="text-[10px] font-medium text-muted-foreground block uppercase tracking-wider">{t('dashboard.monitor.p95Latency')}</span>
+                <span className="text-[10px] font-medium text-muted-foreground block uppercase tracking-wider">{t('dashboard.monitor.p95Latency')}(s)</span>
                 <div className="flex items-baseline gap-1 mt-1">
-                  <span className="text-xl font-bold text-foreground tracking-tight">{fmtSec(logMetrics.avg)}</span>
+                  <span className="text-xl font-bold text-foreground tracking-tight">{fmtSecNum(logMetrics.avg)}</span>
                 </div>
               </div>
               <div>
                 <span className="text-[10px] font-medium text-muted-foreground block uppercase tracking-wider">{t('dashboard.monitor.avgTps')}</span>
                 <div className="flex items-baseline gap-1 mt-1">
-                  <span className="text-xl font-bold text-foreground tracking-tight">{logMetrics.avgTps}<span className="text-xs font-normal text-muted-foreground ml-0.5">Token/s</span></span>
+                  <span className="text-xl font-bold text-foreground tracking-tight">{logMetrics.avgTps}</span>
                 </div>
               </div>
             </div>
@@ -485,9 +485,9 @@ export default function Dashboard() {
                 </div>
               </div>
               <div>
-                <span className="text-xs font-medium text-muted-foreground block uppercase tracking-wider">{t('dashboard.monitor.avgLag')}</span>
+                <span className="text-xs font-medium text-muted-foreground block uppercase tracking-wider">{t('dashboard.monitor.avgLag')}(s)</span>
                 <div className="flex items-baseline gap-1 mt-1">
-                  <span className="text-xl font-bold text-foreground tracking-tight">{fmtSec(logMetrics.avg)}</span>
+                  <span className="text-xl font-bold text-foreground tracking-tight">{fmtSecNum(logMetrics.avg)}</span>
                 </div>
               </div>
             </div>
@@ -496,7 +496,7 @@ export default function Dashboard() {
             <div className="mt-4 space-y-2">
               <div className="flex items-center justify-between">
                 <span className="text-[10px] font-bold text-muted-foreground uppercase tracking-widest">{t('dashboard.monitor.latencyPulse')}</span>
-                <span className="text-[10px] font-mono text-muted-foreground/60">{t('dashboard.monitor.avgLabel', { defaultValue: '平均' })} {fmtSec(logMetrics.avg)}</span>
+                <span className="text-[10px] font-mono text-muted-foreground/60">{t('dashboard.monitor.avgLabel', { defaultValue: '平均' })} {fmtSecNum(logMetrics.avg)}</span>
               </div>
               <div className="h-16 w-full bg-muted/20 rounded-lg p-2 border border-border/40 relative">
                 {activityLogs.length > 0 ? (
@@ -513,7 +513,7 @@ export default function Dashboard() {
             <div className="mt-4 space-y-2">
               <div className="flex items-center justify-between">
                 <span className="text-[10px] font-bold text-muted-foreground uppercase tracking-widest">{t('dashboard.monitor.ttftPulse')}</span>
-                <span className="text-[10px] font-mono text-muted-foreground/60">{t('dashboard.monitor.avgLabel', { defaultValue: '平均' })} {fmtSec(logMetrics.avgTtft)}</span>
+                <span className="text-[10px] font-mono text-muted-foreground/60">{t('dashboard.monitor.avgLabel', { defaultValue: '平均' })} {fmtSecNum(logMetrics.avgTtft)}</span>
               </div>
               <div className="h-16 w-full bg-muted/20 rounded-lg p-2 border border-border/40 relative">
                 {activityLogs.length > 0 ? (

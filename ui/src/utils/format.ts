@@ -26,8 +26,10 @@ export const fmtTokens = (n: number | null | undefined): string => {
   return `${v}`;
 };
 
-// 中间省略：>20 字符时头 10 + … + 尾 8（仅超长触发，muse-*-free 通常命中，其它短名不触发）
+// 中间省略：>20 字符时极短版，头取前两段、尾只留末段（muse-spark-1.2-contributor-free → muse-spark…free）
 export const abbrModel = (s: string): string => {
   if (!s || s.length <= 20) return s;
-  return `${s.slice(0, 10)}…${s.slice(-8)}`;
+  const parts = s.split('-');
+  if (parts.length >= 3) return `${parts[0]}-${parts[1]}…${parts[parts.length - 1]}`;
+  return `${s.slice(0, 10)}…${s.slice(-4)}`;
 };
