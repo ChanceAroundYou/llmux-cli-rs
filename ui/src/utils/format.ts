@@ -26,10 +26,29 @@ export const fmtTokens = (n: number | null | undefined): string => {
   return `${v}`;
 };
 
-// 中间省略：>20 字符时极短版，头取前两段、尾只留末段（muse-spark-1.2-contributor-free → muse-spark…free）
+// 智能中间省略（>20 才触发）：按 '-' 词边界保留，尽量多保留头段信息，避免把单词切成 tor-free
+//  muse-spark-1.2-contributor-free → muse-spark-1.2…free (19) 优于 muse-spark…free (16) 更完整，且不切词
 export const abbrModel = (s: string): string => {
   if (!s || s.length <= 20) return s;
-  const parts = s.split('-');
-  if (parts.length >= 3) return `${parts[0]}-${parts[1]}…${parts[parts.length - 1]}`;
-  return `${s.slice(0, 10)}…${s.slice(-4)}`;
+  // 含分隔符的按词边界缩写（'-' '/' '_' 均视为边界）
+  const m = s.match(/^(.+)([-/_])([^-/_]+)$/);
+  if (!m) return `${s.slice(0, 10)}…${s.slice(-8)}`;
+  const tail = m[3]; // 末段，如 free
+  const tailWithSep = `${m[2]}${tail}`; // -free
+  // 头部按 '-' 切段，贪心多保留直到总长触及 20（含 …）
+  const headRaw = s.slice(0, s.length - tailWithSep.length); // 去掉尾段，保留 head 含分隔符
+  const parts = headRaw.split(/[-/_]/).filter(Boolean);
+  // 重建 head：逐步加段直到超预算回退一步
+  let best = parts.slice(0, 2).join('-');
+  if (!best) best = headRaw.slice(0, 10).replace(/[-/_]$/, '');
+  for (let n = 3; n <= parts.length; n++) {
+    const cand = parts.slice(0, n).join('-');
+    const total = `${cand}…${tail}`.length;
+    if (total <= 20) best = cand;
+    else break;
+  }
+  // 兜底：若 best 仍使总长超 20（极长段），截断到 12
+  const abbr = `${best}…${tail}`;
+  if (abbr.length <= 22) return abbr;
+  return `${best.slice(0, 12)}…${tail}`;
 };
