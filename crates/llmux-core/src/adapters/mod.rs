@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use sha1::{Digest, Sha1};
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -38,6 +39,24 @@ pub async fn execute_provider_request(
     for (key, value) in &request.headers {
         builder = builder.header(key.as_str(), value.as_str());
     }
+    // Console Go (opencode.ai/zen/go/*) requires inference requests to carry a
+    // stable `x-opencode-session` (per-conversation) and an identifying
+    // User-Agent; llmux is a gateway "client" and never forwards its own
+    // callers' session headers, so synthesize both here. Derived from the
+    // credential so retries/failover across goN accounts share one session
+    // (== one prompt-cache), stable across gateway restarts. Balance GETs
+    // already send their own browser UA and are not inference.
+    if request.method == "POST" && is_console_go(&request.url) {
+        let session = request
+            .headers
+            .get("x-opencode-session")
+            .cloned()
+            .unwrap_or_else(|| stable_oc_session(&request.headers));
+        builder = builder.header("x-opencode-session", &session);
+        if !request.headers.contains_key("user-agent") {
+            builder = builder.header("user-agent", format!("llmux-gateway/{}", env!("CARGO_PKG_VERSION")));
+        }
+    }
     // GET with a literal "null" body gets rejected by strict upstreams (GitHub
     // API); only attach the JSON body when there is one.
     if request.body.is_null() {
@@ -59,6 +78,44 @@ pub async fn execute_provider_request(
             anyhow::anyhow!("{e}")
         })
     }
+}
+
+/// True for the OpenCode Console Go upstream (`opencode.ai/zen/go/*`), the
+/// only host that enforces `x-opencode-session` on inference requests.
+fn is_console_go(url: &str) -> bool {
+    let host = url
+        .split("://")
+        .nth(1)
+        .unwrap_or("")
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    host.ends_with("opencode.ai")
+        && url
+            .split("://")
+            .nth(1)
+            .unwrap_or("")
+            .splitn(2, '/')
+            .nth(1)
+            .unwrap_or("")
+            .starts_with("zen/go/")
+}
+
+/// Deterministic per-credential session id (sha1 of bearer creds), stable
+/// across requests/restarts so Console Go can optimize prompt caching. Collisions
+/// across concurrent conversations are harmless — Console Go treats this as a
+/// routing/cache hint, not a conversation id.
+fn stable_oc_session(headers: &BTreeMap<String, String>) -> String {
+    let cred = headers
+        .get("authorization")
+        .or_else(|| headers.get("x-api-key"))
+        .map(|s| s.as_str())
+        .unwrap_or("");
+    let mut hasher = Sha1::new();
+    hasher.update(b"opencode-session:");
+    hasher.update(cred.as_bytes());
+    format!("llmux-{}", hex::encode(hasher.finalize())[..24].to_string())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -367,5 +424,51 @@ pub async fn test_provider_connection(account: &Account) -> Result<(), String> {
                 Err(format!("Connection test failed: {e}"))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod console_go_header_tests {
+    use super::*;
+
+    fn map(kvs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        kvs.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn console_go_detection_matches_only_opencode_zen_go() {
+        assert!(is_console_go("https://opencode.ai/zen/go/v1/chat/completions"));
+        assert!(is_console_go("https://opencode.ai/zen/go/v1/responses"));
+        // Zen (not Go), other hosts, and non-opencode hosts must NOT match.
+        assert!(!is_console_go("https://opencode.ai/zen/v1/chat/completions"));
+        assert!(!is_console_go("https://openrouter.ai/api/v1/chat/completions"));
+        assert!(!is_console_go("https://api.deepseek.com/v1/chat/completions"));
+        assert!(!is_console_go("https://opencode.ai/zen/go"));
+    }
+
+    #[test]
+    fn stable_session_is_deterministic_and_credential_scoped() {
+        let a = map(&[("authorization", "Bearer sk-aaa")]);
+        let b = map(&[("authorization", "Bearer sk-bbb")]);
+        let s1 = stable_oc_session(&a);
+        let s2 = stable_oc_session(&a);
+        let s3 = stable_oc_session(&b);
+        assert_eq!(s1, s2, "same credential must yield same session");
+        assert_ne!(s1, s3, "different credentials must yield different sessions");
+        assert!(s1.starts_with("llmux-"), "session must carry llmux prefix");
+        assert_eq!(s1.len(), 6 + 24, "session is prefix + 24 hex chars");
+    }
+
+    #[test]
+    fn derived_session_falls_back_to_x_api_key_without_bearer() {
+        // Messages-protocol upstreams send x-api-key instead of authorization;
+        // the session must still be deterministic per-credential.
+        let a = map(&[("x-api-key", "sk-abc")]);
+        let b = map(&[("x-api-key", "sk-abc")]);
+        let c = map(&[("x-api-key", "sk-def")]);
+        assert_eq!(stable_oc_session(&a), stable_oc_session(&b));
+        assert_ne!(stable_oc_session(&a), stable_oc_session(&c));
     }
 }
