@@ -36,26 +36,10 @@ pub async fn execute_provider_request(
     // mid-gzip make reqwest abort the whole stream ("error decoding response
     // body"); with identity we receive plaintext and emit partial events instead.
     builder = builder.header("accept-encoding", "identity");
-    for (key, value) in &request.headers {
+    let mut headers = request.headers.clone();
+    apply_upstream_identity_headers(&request.method, &request.url, &mut headers);
+    for (key, value) in &headers {
         builder = builder.header(key.as_str(), value.as_str());
-    }
-    // Console Go (opencode.ai/zen/go/*) requires inference requests to carry a
-    // stable `x-opencode-session` (per-conversation) and an identifying
-    // User-Agent; llmux is a gateway "client" and never forwards its own
-    // callers' session headers, so synthesize both here. Derived from the
-    // credential so retries/failover across goN accounts share one session
-    // (== one prompt-cache), stable across gateway restarts. Balance GETs
-    // already send their own browser UA and are not inference.
-    if request.method == "POST" && is_console_go(&request.url) {
-        let session = request
-            .headers
-            .get("x-opencode-session")
-            .cloned()
-            .unwrap_or_else(|| stable_oc_session(&request.headers));
-        builder = builder.header("x-opencode-session", &session);
-        if !request.headers.contains_key("user-agent") {
-            builder = builder.header("user-agent", format!("llmux-gateway/{}", env!("CARGO_PKG_VERSION")));
-        }
     }
     // GET with a literal "null" body gets rejected by strict upstreams (GitHub
     // API); only attach the JSON body when there is one.
@@ -80,9 +64,41 @@ pub async fn execute_provider_request(
     }
 }
 
+/// Console Go (opencode.ai/zen/go/*) rejects inference requests that lack a
+/// stable `x-opencode-session` (400 MissingSessionID) and a non-generic
+/// User-Agent; llmux is a gateway "client" and never forwards its callers'
+/// session headers, so synthesize both. Derived from the credential so
+/// retries/failover across goN accounts share one session (== one prompt-cache),
+/// stable across gateway restarts. Idempotent: an inbound session header or an
+/// explicitly chosen UA always wins, hence the contains_key guards.
+///
+/// Call this from **every** outbound inference path — the shared funnel
+/// (`execute_provider_request`) *and* the model 拨测 probes in
+/// `routes/models/testing.rs`, which post their own requests. Balance GETs
+/// send their own browser UA and are not inference, so they are untouched.
+pub fn apply_upstream_identity_headers(
+    method: &str,
+    url: &str,
+    headers: &mut BTreeMap<String, String>,
+) {
+    if !method.eq_ignore_ascii_case("POST") || !is_console_go(url) {
+        return;
+    }
+    if !headers.contains_key("x-opencode-session") {
+        let session = stable_oc_session(headers);
+        headers.insert("x-opencode-session".to_string(), session);
+    }
+    if !headers.contains_key("user-agent") {
+        headers.insert(
+            "user-agent".to_string(),
+            format!("llmux-gateway/{}", env!("CARGO_PKG_VERSION")),
+        );
+    }
+}
+
 /// True for the OpenCode Console Go upstream (`opencode.ai/zen/go/*`), the
 /// only host that enforces `x-opencode-session` on inference requests.
-fn is_console_go(url: &str) -> bool {
+pub fn is_console_go(url: &str) -> bool {
     let host = url
         .split("://")
         .nth(1)
@@ -470,5 +486,39 @@ mod console_go_header_tests {
         let c = map(&[("x-api-key", "sk-def")]);
         assert_eq!(stable_oc_session(&a), stable_oc_session(&b));
         assert_ne!(stable_oc_session(&a), stable_oc_session(&c));
+    }
+
+    #[test]
+    fn identity_headers_injected_for_console_go_posts_only() {
+        // 拨测 (routes/models/testing.rs) builds its own headers; the helper must
+        // fill in both Console Go requirements there too.
+        let mut h = map(&[
+            ("authorization", "Bearer sk-aaa"),
+            ("content-type", "application/json"),
+        ]);
+        apply_upstream_identity_headers("POST", "https://opencode.ai/zen/go/v1/messages", &mut h);
+        assert!(h["x-opencode-session"].starts_with("llmux-"));
+        assert!(h["user-agent"].starts_with("llmux-gateway/"));
+
+        // Other upstreams and non-POST (balance GETs) stay untouched.
+        let mut other = map(&[("authorization", "Bearer sk-aaa")]);
+        apply_upstream_identity_headers(
+            "POST",
+            "https://api.deepseek.com/v1/chat/completions",
+            &mut other,
+        );
+        apply_upstream_identity_headers("GET", "https://opencode.ai/zen/go/v1/usage", &mut other);
+        assert!(!other.contains_key("x-opencode-session"));
+        assert!(!other.contains_key("user-agent"));
+
+        // Caller-supplied identity always wins (helper is idempotent).
+        let mut explicit = map(&[("x-opencode-session", "caller-sess"), ("user-agent", "my-ua")]);
+        apply_upstream_identity_headers(
+            "POST",
+            "https://opencode.ai/zen/go/v1/responses",
+            &mut explicit,
+        );
+        assert_eq!(explicit["x-opencode-session"], "caller-sess");
+        assert_eq!(explicit["user-agent"], "my-ua");
     }
 }
