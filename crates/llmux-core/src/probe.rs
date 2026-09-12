@@ -158,14 +158,14 @@ async fn send_probe(
                             .or_else(|| v.pointer("/error/error/message"))
                             .and_then(|m| m.as_str().map(String::from))
                     })
-                    .unwrap_or_else(|| body.chars().take(200).collect())
+                    .unwrap_or_else(|| body.clone())
             };
             ProtocolProbe {
                 protocol,
                 ok,
                 status: status.as_u16(),
                 error,
-                body: body.chars().take(4000).collect(),
+                body,
                 latency_ms,
             }
         }
@@ -310,9 +310,9 @@ async fn native_probe(
                 error: if status.is_success() {
                     String::new()
                 } else {
-                    body.chars().take(200).collect()
+                    body.clone()
                 },
-                body: body.chars().take(4000).collect(),
+                body,
                 latency_ms,
             }
         }
