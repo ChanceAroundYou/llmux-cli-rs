@@ -8,6 +8,7 @@ pub mod db;
 pub mod dispatcher;
 pub mod export_import;
 pub mod models;
+pub mod probe;
 pub mod proxy;
 pub mod settings;
 pub mod protocol;
