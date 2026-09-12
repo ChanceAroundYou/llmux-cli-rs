@@ -11,7 +11,8 @@ import {
   Loader2,
   CheckCircle2,
   Download,
-  Upload
+  Upload,
+  KeyRound
 } from 'lucide-react';
 import { ConfirmDialog } from '../components/Modal';
 import { cn } from '../lib/utils';
@@ -58,9 +59,63 @@ export default function Settings() {
   const [importResult, setImportResult] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  // 管理员账号。当前密码是必填项 —— 只有会话 Cookie 不足以改密码，
+  // 否则一次 XSS 就能永久接管账号。
+  const [adminUser, setAdminUser] = useState('admin');
+  const [credForm, setCredForm] = useState({ current: '', username: '', password: '', confirm: '' });
+  const [credError, setCredError] = useState<string | null>(null);
+  const [credSaved, setCredSaved] = useState(false);
+  const [credSaving, setCredSaving] = useState(false);
+
   useEffect(() => {
     fetchSettings();
+    apiFetch('/api/auth/me')
+      .then(r => (r.ok ? r.json() : null))
+      .then(d => { if (d?.username) setAdminUser(d.username); })
+      .catch(() => {});
   }, []);
+
+  const handleCredSave = async () => {
+    setCredError(null);
+    setCredSaved(false);
+    if (!credForm.current) {
+      setCredError(t('settings.currentPasswordRequired', '请输入当前密码'));
+      return;
+    }
+    if (credForm.password && credForm.password !== credForm.confirm) {
+      setCredError(t('settings.passwordMismatch', '两次输入的新密码不一致'));
+      return;
+    }
+    if (!credForm.username.trim() && !credForm.password) {
+      setCredError(t('settings.nothingToUpdate', '新用户名和新密码至少填一项'));
+      return;
+    }
+    setCredSaving(true);
+    try {
+      const res = await apiFetch('/api/auth/credentials', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          current_password: credForm.current,
+          ...(credForm.username.trim() ? { username: credForm.username.trim() } : {}),
+          ...(credForm.password ? { new_password: credForm.password } : {}),
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setCredError(data.error || `HTTP ${res.status}`);
+        return;
+      }
+      if (data.username) setAdminUser(data.username);
+      setCredForm({ current: '', username: '', password: '', confirm: '' });
+      setCredSaved(true);
+      setTimeout(() => setCredSaved(false), 2500);
+    } catch (e: any) {
+      setCredError(e?.message || 'request failed');
+    } finally {
+      setCredSaving(false);
+    }
+  };
 
   useEffect(() => {
     if (config) setLocalConfig(config);
@@ -224,6 +279,56 @@ export default function Settings() {
                 >
                   {t('settings.themeSystem')}
                 </Button>
+             </div>
+           </SettingItem>
+        </SettingGroup>
+
+        <SettingGroup title={t('settings.account')} icon={KeyRound}>
+           <SettingItem label={t('settings.adminUser')} description={t('settings.adminUserDesc', { user: adminUser })}>
+             <div className="flex flex-col items-end gap-1.5 w-full sm:w-72">
+               <Input
+                 type="password"
+                 autoComplete="current-password"
+                 placeholder={t('settings.currentPassword')}
+                 value={credForm.current}
+                 onChange={e => setCredForm({ ...credForm, current: e.target.value })}
+                 className="h-auto py-1.5 text-xs font-semibold w-full"
+               />
+               <Input
+                 type="text"
+                 autoComplete="username"
+                 placeholder={t('settings.newUsername')}
+                 value={credForm.username}
+                 onChange={e => setCredForm({ ...credForm, username: e.target.value })}
+                 className="h-auto py-1.5 text-xs font-semibold w-full"
+               />
+               <Input
+                 type="password"
+                 autoComplete="new-password"
+                 placeholder={t('settings.newPassword')}
+                 value={credForm.password}
+                 onChange={e => setCredForm({ ...credForm, password: e.target.value })}
+                 className="h-auto py-1.5 text-xs font-semibold w-full"
+               />
+               <Input
+                 type="password"
+                 autoComplete="new-password"
+                 placeholder={t('settings.confirmPassword')}
+                 value={credForm.confirm}
+                 onChange={e => setCredForm({ ...credForm, confirm: e.target.value })}
+                 className="h-auto py-1.5 text-xs font-semibold w-full"
+               />
+               {credError && <span className="text-[11px] text-destructive font-medium">{credError}</span>}
+               {credSaved && <span className="text-[11px] text-success font-medium">{t('common.saved')}</span>}
+               <Button
+                 variant="outline"
+                 size="sm"
+                 onClick={handleCredSave}
+                 disabled={credSaving}
+               >
+                 {credSaving ? <Loader2 size={12} className="animate-spin mr-1" /> : <CheckCircle2 size={12} className="mr-1" />}
+                 {t('settings.updateAccount')}
+               </Button>
              </div>
            </SettingItem>
         </SettingGroup>

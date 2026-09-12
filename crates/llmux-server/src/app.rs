@@ -245,6 +245,7 @@ fn core_router() -> AppRouter {
         .route("/api/auth/login", post(auth::handle_login))
         .route("/api/auth/logout", post(auth::handle_logout))
         .route("/api/auth/me", get(auth::handle_me))
+        .route("/api/auth/credentials", post(auth::handle_update_credentials))
         .route(
             "/api/keys",
             get(keys::list_api_keys).post(keys::create_api_key),

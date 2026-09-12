@@ -56,6 +56,7 @@ async fn init_db_creates_fresh_schema_and_seed_providers() {
         vec![
             "account_model_cache",
             "accounts",
+            "admin_credentials",
             "aggregate_aliases",
             "api_keys",
             "model_aliases",
@@ -498,4 +499,65 @@ fn model_structs_preserve_legacy_field_names() {
     assert_eq!(alias_json["target_model"], json!("gpt"));
     assert_eq!(key_json["allowed_models"], json!("*"));
     assert_eq!(provider_json["type"], json!("openai"));
+}
+
+#[test]
+fn admin_password_hash_roundtrips_and_rejects_wrong_input() {
+    use llmux_core::crypto::{hash_password, verify_password};
+
+    let encoded = hash_password("hunter2").expect("hash");
+    assert!(encoded.starts_with("v1:"), "格式应为 v1:<salt>:<hash>");
+    assert!(!encoded.contains("hunter2"), "不得回显明文");
+    assert!(verify_password("hunter2", &encoded), "正确密码应通过");
+    assert!(!verify_password("hunter3", &encoded), "错误密码应拒绝");
+    assert!(!verify_password("", &encoded));
+
+    // 加盐：同一密码两次哈希不同，但都能验过。
+    let again = hash_password("hunter2").expect("hash again");
+    assert_ne!(encoded, again, "每次应用新随机盐");
+    assert!(verify_password("hunter2", &again));
+
+    // 畸形输入一律 false，不 panic。
+    for bad in ["", "v1", "v1:onlytwo", "v2:AAAA:BBBB", "v1:!!!:???", "v1:AAAA"] {
+        assert!(!verify_password("hunter2", bad), "畸形输入应拒绝: {bad:?}");
+    }
+}
+
+#[tokio::test]
+async fn admin_credentials_table_stores_hash_not_plaintext() {
+    let pool = memory_db().await;
+
+    // 空表 = 还没改过，登录走 env/默认分支。
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM admin_credentials")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 0);
+
+    let hash = llmux_core::crypto::hash_password("s3cret-pw").unwrap();
+    sqlx::query(
+        "INSERT INTO admin_credentials (id, username, password_hash, updated_at) VALUES (1, ?, ?, ?)",
+    )
+    .bind("ops")
+    .bind(&hash)
+    .bind(1_i64)
+    .execute(&pool)
+    .await
+    .expect("insert credentials");
+
+    let stored: String =
+        sqlx::query_scalar("SELECT password_hash FROM admin_credentials WHERE id = 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(!stored.contains("s3cret-pw"), "库里不得出现明文");
+    assert!(llmux_core::crypto::verify_password("s3cret-pw", &stored));
+
+    // 单行约束：id 只允许 1。
+    let dup = sqlx::query(
+        "INSERT INTO admin_credentials (id, username, password_hash, updated_at) VALUES (2, 'x', 'y', 0)",
+    )
+    .execute(&pool)
+    .await;
+    assert!(dup.is_err(), "id=2 应被 CHECK 约束拒绝");
 }

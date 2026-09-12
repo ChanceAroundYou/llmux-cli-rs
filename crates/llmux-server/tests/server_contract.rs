@@ -638,3 +638,97 @@ async fn test_queue_status_reports_and_validates_scope() {
         json!("models")
     );
 }
+
+/// 管理员账号：默认 admin/admin 可登录；改密需要当前密码；改完旧的失效、新的生效。
+#[tokio::test]
+async fn admin_credentials_change_requires_current_password_and_takes_effect() {
+    let state = llmux_server::test_state().await;
+    let app = llmux_server::app(state.clone());
+
+    // 默认凭据可登录（口令来自 DB 无记录时的 fallback，不再硬编码在源码里）。
+    assert!(
+        login_and_get_cookie(&app, &state).await.is_some(),
+        "默认 admin/admin 应能登录"
+    );
+
+    // 未认证：不带 Cookie 改密 → 401
+    let anon = Request::builder()
+        .method(Method::POST)
+        .uri("/api/auth/credentials")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(json!({"current_password":"admin","new_password":"newpass"}).to_string()))
+        .unwrap();
+    assert_eq!(
+        llmux_server::test_request(app.clone(), anon).await.status(),
+        StatusCode::UNAUTHORIZED,
+        "没有会话不能改密"
+    );
+
+    // 已认证但当前密码错 → 401
+    // 注意：必须打在自己这个 app/state 上 —— request_json 会另建一份内存库，
+    // 那样改密落库落到别处，后面查 admin_credentials 自然查不到。
+    let cookie = login_and_get_cookie(&app, &state).await.expect("session cookie");
+    let call = |path: &'static str, body: Value, cookie: Option<String>| {
+        let app = app.clone();
+        async move {
+            let mut builder = Request::builder()
+                .method(Method::POST)
+                .uri(path)
+                .header(header::CONTENT_TYPE, "application/json");
+            if let Some(c) = cookie {
+                builder = builder.header(header::COOKIE, c);
+            }
+            let req = builder.body(Body::from(body.to_string())).unwrap();
+            let resp = llmux_server::test_request(app, req).await;
+            let status = resp.status();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            (status, serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null))
+        }
+    };
+
+    let (status, body) = call(
+        "/api/auth/credentials",
+        json!({"current_password":"wrong","new_password":"newpass"}),
+        Some(cookie.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["error"], json!("Current password is incorrect"));
+
+    // 正确改密 → 200
+    let (status, body) = call(
+        "/api/auth/credentials",
+        json!({"current_password":"admin","username":"ops","new_password":"newpass"}),
+        Some(cookie),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "改密应成功: {body}");
+    assert_eq!(body["username"], json!("ops"));
+
+    // 库里只存哈希，不存明文
+    let stored: String =
+        sqlx::query_scalar("SELECT password_hash FROM admin_credentials WHERE id = 1")
+            .fetch_one(&state.pool)
+            .await
+            .expect("credentials row");
+    assert!(!stored.contains("newpass"), "不得存明文");
+    assert!(llmux_core::crypto::verify_password("newpass", &stored));
+
+    // 旧凭据失效、新凭据可用
+    let try_login = |user: &str, pass: &str| {
+        let app = app.clone();
+        let user = user.to_string();
+        let pass = pass.to_string();
+        async move {
+            let req = Request::builder()
+                .method(Method::POST)
+                .uri("/api/auth/login")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({"username": user, "password": pass}).to_string()))
+                .unwrap();
+            llmux_server::test_request(app, req).await.status()
+        }
+    };
+    assert_eq!(try_login("admin", "admin").await, StatusCode::UNAUTHORIZED, "旧凭据应失效");
+    assert_eq!(try_login("ops", "newpass").await, StatusCode::OK, "新凭据应可用");
+}

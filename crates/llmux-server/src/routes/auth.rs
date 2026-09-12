@@ -110,10 +110,62 @@ use axum::http::{HeaderMap, header};
 
 use crate::middleware::{SESSION_COOKIE, SESSION_TTL_SECS};
 
-fn admin_credentials() -> (String, String) {
-    let user = std::env::var("ADMIN_USERNAME").unwrap_or_else(|_| "admin".to_string());
-    let pass = std::env::var("ADMIN_PASSWORD").unwrap_or_else(|_| "admin".to_string());
+/// 没有任何配置时的兜底账号。**只应作为「开箱即用」的初始值** —— 默认密码
+/// 是公开知识，登录后第一件事就该去设置页改掉。
+const DEFAULT_ADMIN_USERNAME: &str = "admin";
+const DEFAULT_ADMIN_PASSWORD: &str = "admin";
+
+/// 当前生效的管理员凭据（用户名 + 密码哈希，哈希可能为空 = 尚未落库）。
+///
+/// 优先级：DB（UI 改过就以它为准）→ env → 默认 admin/admin。
+/// DB 一旦有记录就不再读 env —— 否则运维设了 env，用户在 UI 里改了却不生效。
+async fn admin_credentials(state: &AppState) -> (String, String) {
+    if let Ok(Some(row)) = sqlx::query_as::<_, (String, String)>(
+        "SELECT username, password_hash FROM admin_credentials WHERE id = 1",
+    )
+    .fetch_optional(&state.pool)
+    .await
+    {
+        return row;
+    }
+    let user = std::env::var("ADMIN_USERNAME")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_ADMIN_USERNAME.to_string());
+    // 尚未落库时没有哈希，返回空串表示「按明文比对 env/默认值」。
+    let pass = std::env::var("ADMIN_PASSWORD")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_default();
     (user, pass)
+}
+
+/// 校验登录。`stored_hash` 为空表示 DB 里还没有记录，此时比对 env/默认明文。
+async fn verify_admin(state: &AppState, username: &str, password: &str) -> bool {
+    let (expected_user, stored_hash) = admin_credentials(state).await;
+    if username != expected_user {
+        return false;
+    }
+    if stored_hash.is_empty() {
+        let expected_pass = std::env::var("ADMIN_PASSWORD")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| DEFAULT_ADMIN_PASSWORD.to_string());
+        // 明文兜底路径也要定时安全比较，避免按字符提前返回。
+        return constant_time_eq(password.as_bytes(), expected_pass.as_bytes());
+    }
+    llmux_core::crypto::verify_password(password, &stored_hash)
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 fn extract_session_from_headers(headers: &HeaderMap) -> Option<String> {
@@ -143,8 +195,7 @@ pub async fn handle_login(
 ) -> Response {
     let username = body.get("username").and_then(Value::as_str).unwrap_or("").trim().to_string();
     let password = body.get("password").and_then(Value::as_str).unwrap_or("").to_string();
-    let (exp_user, exp_pass) = admin_credentials();
-    if username != exp_user || password != exp_pass {
+    if !verify_admin(&state, &username, &password).await {
         return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Invalid credentials"}))).into_response();
     }
     let token = crate::middleware::sign_jwt(&username, &state.master_key, SESSION_TTL_SECS);
@@ -192,10 +243,117 @@ pub async fn handle_me(
 ) -> Response {
     if let Some(token) = extract_session_from_headers(&headers) {
         if is_session_valid(&state, &token) {
-            let (user, _) = admin_credentials();
+            let (user, _) = admin_credentials(&state).await;
             return Json(json!({"authenticated": true, "username": user})).into_response();
         }
     }
     (StatusCode::UNAUTHORIZED, Json(json!({"error": "Unauthorized"}))).into_response()
+}
+
+/// 修改管理员用户名/密码。**要求携带当前密码** —— 会话 Cookie 会被 XSS/嗅探
+/// 顺手带走，仅凭会话就能改掉账号密码的话，一次 XSS 就永久接管了。
+///
+/// 密码落库为 scrypt 哈希（见 `llmux_core::crypto::hash_password`），不存明文。
+pub async fn handle_update_credentials(
+    Extension(state): Extension<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    // 必须是已登录会话
+    let authed = extract_session_from_headers(&headers)
+        .map(|t| is_session_valid(&state, &t))
+        .unwrap_or(false);
+    if !authed {
+        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Unauthorized"}))).into_response();
+    }
+
+    let current = body.get("current_password").and_then(Value::as_str).unwrap_or("");
+    let new_username = body
+        .get("username")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+    let new_password = body
+        .get("new_password")
+        .and_then(Value::as_str)
+        .filter(|v| !v.is_empty());
+
+    // 当前密码必须对：用当前会话的用户名去验，防止拿别人的会话改。
+    let (current_user, _) = admin_credentials(&state).await;
+    if !verify_admin(&state, &current_user, current).await {
+        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Current password is incorrect"})))
+            .into_response();
+    }
+
+    if new_username.is_none() && new_password.is_none() {
+        return crate::error::simple_error(
+            "Nothing to update: provide username and/or new_password",
+            StatusCode::BAD_REQUEST,
+        );
+    }
+    if let Some(p) = new_password {
+        if p.chars().count() < 4 {
+            return crate::error::simple_error(
+                "New password must be at least 4 characters",
+                StatusCode::BAD_REQUEST,
+            );
+        }
+    }
+
+    let username = new_username.unwrap_or(&current_user).to_string();
+    // 只改用户名时沿用原密码哈希：DB 无哈希（还在用 env/默认）则把当前密码落成哈希。
+    let hash = match new_password {
+        Some(p) => match llmux_core::crypto::hash_password(p) {
+            Ok(h) => h,
+            Err(e) => {
+                return crate::error::simple_error(
+                    format!("Failed to hash password: {e}"),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                );
+            }
+        },
+        None => match sqlx::query_scalar::<_, String>(
+            "SELECT password_hash FROM admin_credentials WHERE id = 1",
+        )
+        .fetch_optional(&state.pool)
+        .await
+        {
+            Ok(Some(h)) => h,
+            _ => match llmux_core::crypto::hash_password(current) {
+                Ok(h) => h,
+                Err(e) => {
+                    return crate::error::simple_error(
+                        format!("Failed to hash password: {e}"),
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                    );
+                }
+            },
+        },
+    };
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+    match sqlx::query(
+        "INSERT INTO admin_credentials (id, username, password_hash, updated_at) VALUES (1, ?, ?, ?) \
+         ON CONFLICT(id) DO UPDATE SET username = excluded.username, \
+           password_hash = excluded.password_hash, updated_at = excluded.updated_at",
+    )
+    .bind(&username)
+    .bind(&hash)
+    .bind(now)
+    .execute(&state.pool)
+    .await
+    {
+        Ok(_) => {
+            tracing::info!("🔐 Admin credentials updated (username: {})", username);
+            Json(json!({"success": true, "username": username})).into_response()
+        }
+        Err(e) => crate::error::simple_error(
+            format!("Failed to update credentials: {e}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
 }
 

@@ -5,6 +5,24 @@
 
 ## [Unreleased]
 
+### Security
+
+- **移除硬编码的管理员登录凭据**：`auth.rs` 此前把生产用户名/密码写成
+  `unwrap_or_else` 的 fallback —— 源码里有、且随公开仓库的历史存在过一段
+  时间（git 历史已重写清除）。现在：
+  - 新增 `admin_credentials` 表（0022）存凭据，密码一律 **scrypt 加盐哈希**，
+    不存明文、不可逆；`hash_password` / `verify_password` 走与 API key 相同的
+    KDF，但**刻意不用 `Params::recommended()`** —— 那是每次 128MiB，对 2GB
+    路由器等于给未认证的登录接口开了个内存 DoS；改用 OWASP 清单里的低内存档
+    n=2^14/r=8/p=5（16MiB）。
+  - 凭据解析顺序：DB（UI 改过就以它为准）→ `ADMIN_USERNAME`/`ADMIN_PASSWORD`
+    → 默认 `admin`/`admin`。
+  - 新增 `POST /api/auth/credentials`，**必须携带当前密码**才能改（仅凭会话
+    Cookie 即可改密的话，一次 XSS 就能永久接管账号）；设置页新增「管理员账号」
+    表单。
+  - 提示：默认密码 `admin` 是公开知识，且该 UI 公网可达 —— 登录后第一件事
+    应当改掉。
+
 ### Added
 
 - **流式转换诊断日志（排查截断用）**：`anthropic_to_openai_streaming` 增加流级

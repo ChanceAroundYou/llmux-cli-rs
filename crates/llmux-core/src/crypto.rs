@@ -89,6 +89,87 @@ fn decode_part(part: Option<&str>, name: &str) -> Result<Vec<u8>> {
         .with_context(|| format!("invalid {name} encoding"))
 }
 
+// ---------------------------------------------------------------------------
+// Admin password hashing
+//
+// 与 `encrypt_api_key` 不同，这里**不是**为了能解回来：登录只需要「验」，不需要
+// 「取」。所以不加 AES，只做 scrypt 加盐哈希 —— 拿到库文件也无法还原密码。
+// 复用同一套 `Params::recommended()`（n=2^17），与既有 KDF 强度一致。
+
+const PASSWORD_VERSION: &str = "v1";
+
+/// 密码哈希参数：**故意不用 `Params::recommended()`**。
+///
+/// `recommended()` 是 n=2^17, r=8 → 每次哈希分配 128MiB。这对跑在 2GB 路由器上、
+/// 平时只占 18MiB 的进程是危险的：登录接口公开可达，几个并发请求就能把内存打爆
+/// （等于给了一个不用认证的 DoS）。这里取 OWASP 密码存储清单里的低内存档
+/// n=2^14, r=8, p=5（16MiB，靠 p 把工作量补回来），内存有上界、强度仍在推荐档内。
+///
+/// 注意 API key 的 `derive_key` 仍是 `recommended()` —— 那条路径有进程内缓存、
+/// 每把 key 只算一次，且不在公开的未认证路径上。
+fn password_params() -> Params {
+    Params::new(14, 8, 5, KEY_LEN).expect("static scrypt params are valid")
+}
+
+/// 生成 `v1:<salt_b64>:<hash_b64>`。每次调用都用新随机盐，同一个密码两次
+/// 哈希结果不同（防彩虹表 / 防「两个账号密码相同」被看出来）。
+pub fn hash_password(password: &str) -> Result<String> {
+    let mut salt = [0u8; SALT_LEN];
+    OsRng.fill_bytes(&mut salt);
+    let mut out = [0u8; KEY_LEN];
+    scrypt(password.as_bytes(), &salt, &password_params(), &mut out)
+        .context("hash admin password")?;
+    let encoded = format!(
+        "{}:{}:{}",
+        PASSWORD_VERSION,
+        STANDARD_NO_PAD.encode(salt),
+        STANDARD_NO_PAD.encode(out)
+    );
+    out.zeroize();
+    Ok(encoded)
+}
+
+/// 校验密码。任何格式错误都返回 false（不区分「格式坏」与「密码错」，
+/// 避免把内部状态透给未认证的调用方）。
+pub fn verify_password(password: &str, encoded: &str) -> bool {
+    let mut parts = encoded.split(':');
+    let (Some(version), Some(salt), Some(expected)) =
+        (parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    if version != PASSWORD_VERSION || parts.next().is_some() {
+        return false;
+    }
+    let (Ok(salt), Ok(expected)) = (decode_part(Some(salt), "salt"), decode_part(Some(expected), "hash"))
+    else {
+        return false;
+    };
+    if salt.len() != SALT_LEN || expected.len() != KEY_LEN {
+        return false;
+    }
+    let mut actual = [0u8; KEY_LEN];
+    if scrypt(password.as_bytes(), &salt, &password_params(), &mut actual).is_err() {
+        return false;
+    }
+    let matched = constant_time_eq(&actual, &expected);
+    actual.zeroize();
+    matched
+}
+
+/// 长度无关的定时安全比较（手写以免新引一个依赖）。长度不同直接 false ——
+/// 长度本身不是秘密（哈希长度固定）。
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 fn derive_key(secret: &str, salt: &[u8]) -> Result<[u8; KEY_LEN]> {
     // ponytail: cache by (salt_hex, secret_hash) — same account decrypted every request; hash avoids retaining secret plaintext in cache key
     let salt_hex = hex::encode(salt);
