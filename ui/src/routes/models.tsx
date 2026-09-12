@@ -77,7 +77,7 @@ export default function Models() {
     return { owner: v.slice(0, idx), id: v.slice(idx + 1) };
   };
 
-  const [testResults, setTestResults] = useState<Record<string, { success: boolean; latency?: number; error?: string; loading?: boolean; lastChecked?: string; limitsCache?: any; limitsUpdatedAt?: string }>>({});
+  const [testResults, setTestResults] = useState<Record<string, { success: boolean; latency?: number; error?: string; loading?: boolean; lastChecked?: string; limitsCache?: any; limitsUpdatedAt?: string; via?: string | null; supported?: string[] }>>({});
   const [queueStatus, setQueueStatus] = useState<{ isRunning: boolean; current: number; total: number; progress: number }>({ isRunning: false, current: 0, total: 0, progress: 0 });
   const { startTestQueue, fetchTestQueueStatus } = useModelsStore();
   const [testAllConfirm, setTestAllConfirm] = useState(false);
@@ -118,7 +118,9 @@ export default function Models() {
               error: row.error,
               lastChecked: row.last_checked,
               limitsCache: row.limits_cache,
-              limitsUpdatedAt: row.limits_cache_updated_at
+              limitsUpdatedAt: row.limits_cache_updated_at,
+              via: (row.supported?.[0] ?? row.via) ?? null,
+              supported: Array.isArray(row.supported) ? row.supported : undefined
             };
           });
           return next;
@@ -152,6 +154,8 @@ export default function Models() {
           lastChecked: (row as any).last_checked,
           limitsCache: (row as any).limits_cache,
           limitsUpdatedAt: (row as any).limits_cache_updated_at,
+          via: ((row as any).supported?.[0] ?? (row as any).via) ?? null,
+          supported: Array.isArray((row as any).supported) ? (row as any).supported : undefined,
         };
       }
       return next;
@@ -584,6 +588,30 @@ export default function Models() {
                     {formatContextLength(model.context_length)}
                   </span>
                 )}
+                {cardResult?.supported?.length ? (
+                  <span
+                    className="flex items-center gap-0.5"
+                    title={t('models.probeVia', '探测到该模型可用的上游协议，按 chat > messages > responses 排序（仅作提示，实际路由按别名配置）')}
+                  >
+                    {cardResult.supported.map((proto: string, idx: number) => (
+                      <span
+                        key={proto}
+                        className={cn(
+                          "text-[10px] font-bold uppercase rounded px-1.5 py-0.5 border",
+                          idx === 0
+                            ? "text-primary/80 bg-primary/10 border-primary/30"
+                            : "text-muted-foreground/50 bg-muted/40 border-border/50"
+                        )}
+                      >
+                        {proto.slice(0, 4)}
+                      </span>
+                    ))}
+                  </span>
+                ) : cardResult?.via ? (
+                  <span className="text-[10px] font-bold uppercase text-muted-foreground/60 bg-muted/50 border border-border/50 rounded px-1.5 py-0.5">
+                    {cardResult.via.slice(0, 4)}
+                  </span>
+                ) : null}
                 {cardResult?.latency != null && (
                   <span className="text-xs text-success font-bold">{fmtSec(cardResult!.latency!)}</span>
                 )}
