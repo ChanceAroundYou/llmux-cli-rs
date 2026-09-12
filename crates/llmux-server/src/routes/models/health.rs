@@ -35,6 +35,8 @@ pub async fn get_models_health(Extension(state): Extension<AppState>) -> Respons
         }
     };
 
+    let protocols = llmux_core::probe::load_protocol_map(&state.pool).await;
+
     let health: Vec<Value> = rows
         .iter()
         .map(|row: &SqliteRow| {
@@ -44,10 +46,14 @@ pub async fn get_models_health(Extension(state): Extension<AppState>) -> Respons
                 .as_deref()
                 .and_then(|s| serde_json::from_str(s).ok())
                 .unwrap_or(Value::Null);
+            let account_id = row.try_get::<i64, _>("account_id").unwrap_or_default();
+            let model = row.try_get::<String, _>("model").unwrap_or_default();
+            // 该 (账户, 模型) 探测到能走通的协议 —— 供 UI 角标与「配置是否写错」提示。
+            // 只回显探测事实，不参与路由。
             json!({
-                "account_id": row.try_get::<i64, _>("account_id").unwrap_or_default(),
+                "account_id": account_id,
                 "provider_id": row.try_get::<String, _>("provider_id").unwrap_or_default(),
-                "model": row.try_get::<String, _>("model").unwrap_or_default(),
+                "model": model,
                 "last_checked": row.try_get::<i64, _>("last_checked").unwrap_or_default(),
                 "success": row.try_get::<i64, _>("success").unwrap_or_default(),
                 "latency": row.try_get::<i64, _>("latency").unwrap_or_default(),
@@ -55,6 +61,10 @@ pub async fn get_models_health(Extension(state): Extension<AppState>) -> Respons
                 "limits_cache": limits_cache,
                 "limits_cache_updated_at": row.try_get::<Option<String>, _>("limits_cache_updated_at").unwrap_or_default(),
                 "account_name": row.try_get::<String, _>("account_name").unwrap_or_default(),
+                "supported": protocols
+                    .get(&(account_id, model.clone()))
+                    .map(|v| v.iter().map(|p| p.as_str()).collect::<Vec<_>>())
+                    .unwrap_or_default(),
             })
         })
         .collect();

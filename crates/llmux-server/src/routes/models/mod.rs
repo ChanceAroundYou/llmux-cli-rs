@@ -5,6 +5,7 @@ pub mod health;
 pub mod stream;
 pub mod summary;
 pub mod testing;
+pub mod verify;
 
 use serde::{Deserialize, Serialize};
 

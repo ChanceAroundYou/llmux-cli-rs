@@ -106,7 +106,16 @@ pub async fn set_model_alias(
             }
             state.invalidate_model_cache(&alias);
             tracing::info!("🏷️ Set alias {} -> {} (provider: {:?}), cache invalidated", alias, target_model, provider_id);
-            Json(json!({ "success": true, "message": "Alias set successfully" })).into_response()
+            // 保存后自动验证：探到的协议只记录 + 提示，不改配置。
+            let ids: Vec<i64> = account_ids
+                .as_deref()
+                .and_then(|s| serde_json::from_str::<Vec<i64>>(s).ok())
+                .unwrap_or_default();
+            let verified =
+                super::verify::verify_targets(&state, &target_model, provider_id, &ids).await;
+            let mut resp = json!({ "success": true, "message": "Alias set successfully" });
+            resp["verified"] = super::verify::attach(verified)["verified"].clone();
+            Json(resp).into_response()
         },
         Err(e) => crate::error::simple_error(
             format!("Failed to set alias: {e}"),

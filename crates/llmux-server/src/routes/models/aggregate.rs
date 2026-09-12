@@ -228,7 +228,24 @@ pub async fn set_aggregate_alias(
                 *cache = None;
             }
             tracing::info!("🔀 Set aggregate alias {} ({} candidates)", alias, parsed.len());
-            Json(json!({ "success": true, "message": "Aggregate alias set successfully" })).into_response()
+            // 保存后自动验证每个候选：探到的协议只记录 + 提示，不改配置。
+            // 一个聚合里的候选可以各走各的协议（实测 go5 上 muse-spark 只服
+            // /v1/responses、mimo 只服 /chat/completions），所以按候选逐个探。
+            let mut verified = Vec::new();
+            if let Ok(typed) = parse_candidates(&candidates_json) {
+                for cand in &typed {
+                    let ids = vec![cand.account_id];
+                    let mut row =
+                        super::verify::verify_targets(&state, &cand.model, None, &ids).await;
+                    if let Some(v) = row.pop() {
+                        verified.push(v);
+                    }
+                }
+            }
+            let mut resp =
+                json!({ "success": true, "message": "Aggregate alias set successfully" });
+            resp["verified"] = super::verify::attach(verified)["verified"].clone();
+            Json(resp).into_response()
         }
         Err(e) => crate::error::simple_error(
             format!("Failed to set aggregate alias: {e}"),

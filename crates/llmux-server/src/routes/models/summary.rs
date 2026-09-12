@@ -120,11 +120,14 @@ async fn fetch_health(state: &AppState) -> anyhow::Result<Value> {
     )
     .fetch_all(&state.pool)
     .await?;
+    let protocols = llmux_core::probe::load_protocol_map(&state.pool).await;
     let out: Vec<Value> = rows
         .iter()
         .map(|r| {
             let limits_cache_str: Option<String> = r.try_get("limits_cache").unwrap_or_default();
             let limits_cache: Value = limits_cache_str.as_deref().and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+            let account_id = r.try_get::<i64, _>("account_id").unwrap_or_default();
+            let model = r.try_get::<String, _>("model").unwrap_or_default();
             json!({
                 "account_id": r.try_get::<i64, _>("account_id").unwrap_or_default(),
                 "provider_id": r.try_get::<String, _>("provider_id").unwrap_or_default(),
@@ -136,6 +139,11 @@ async fn fetch_health(state: &AppState) -> anyhow::Result<Value> {
                 "limits_cache": limits_cache,
                 "limits_cache_updated_at": r.try_get::<Option<String>, _>("limits_cache_updated_at").unwrap_or_default(),
                 "account_name": r.try_get::<String, _>("account_name").unwrap_or_default(),
+                // 探测到的可用协议（角标用）；只回显事实，不参与路由。
+                "supported": protocols
+                    .get(&(account_id, model.clone()))
+                    .map(|v| v.iter().map(|p| p.as_str()).collect::<Vec<_>>())
+                    .unwrap_or_default(),
             })
         })
         .collect();
