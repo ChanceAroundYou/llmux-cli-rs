@@ -81,6 +81,8 @@ export default function Models() {
   const [queueStatus, setQueueStatus] = useState<{ isRunning: boolean; current: number; total: number; progress: number }>({ isRunning: false, current: 0, total: 0, progress: 0 });
   const { startTestQueue, fetchTestQueueStatus } = useModelsStore();
   const [testAllConfirm, setTestAllConfirm] = useState(false);
+  const [testAllScope, setTestAllScope] = useState<'aliases' | 'aggregates' | 'models'>('aliases');
+  const [queueNotice, setQueueNotice] = useState<{ label: string; count: number } | null>(null);
   const [aliasToDelete, setAliasToDelete] = useState<{id: number, name: string} | null>(null);
   const [aggregateToDelete, setAggregateToDelete] = useState<{id: number, name: string} | null>(null);
   const [overwriteConfirm, setOverwriteConfirm] = useState<{ kind: 'ordinary'|'aggregate', alias: string, pending: any } | null>(null);
@@ -204,9 +206,29 @@ export default function Models() {
     });
   }, [safeModels, search, activeProvider]);
 
-  const handleTestAll = () => {
+  const handleTestAll = (scope: 'aliases' | 'aggregates' | 'models') => {
     if (queueStatus.isRunning) return;
+    setTestAllScope(scope);
     setTestAllConfirm(true);
+  };
+
+  // 三个入口共用同一队列，只是待测集合不同：
+  //   aliases      → 普通别名
+  //   aggregates   → 聚合别名的每个候选（逐个测，候选可各走各的协议）
+  //   models       → 模型卡片（无筛选时 = 当前账户全部模型；有筛选时 = 筛选后可见）
+  const runTestQueue = async (
+    label: string,
+    items: { model: string; providerId: string; accountId?: number }[],
+  ) => {
+    if (items.length === 0) {
+      setTestAllConfirm(false);
+      return;
+    }
+    await startTestQueue(items);
+    const status = await fetchTestQueueStatus();
+    setQueueStatus(status);
+    setTestAllConfirm(false);
+    setQueueNotice({ label, count: items.length });
   };
 
   const executeTestAll = async () => {
@@ -224,18 +246,37 @@ export default function Models() {
       return { model: a.target_model, providerId: a.provider_id || '', ...(accountId != null ? { accountId } : {}) };
     }).filter(m => m.model);
 
-    if (modelsToTest.length === 0) {
-      setTestAllConfirm(false);
-      return;
-    }
-
-    await startTestQueue(modelsToTest);
-
-    // 立即刷新状态
-    const status = await fetchTestQueueStatus();
-    setQueueStatus(status);
-    setTestAllConfirm(false);
+    await runTestQueue(t('models.testAliases', '普通别名'), modelsToTest);
   };
+
+  // 聚合别名：展开每个候选。候选自带 account_id，直接定向。
+  const executeTestAggregates = async () => {
+    const items = (aggregateAliases || []).flatMap(agg =>
+      (agg.candidates || []).map(c => ({
+        model: c.model,
+        providerId: '',
+        accountId: Number(c.account_id),
+      }))
+    ).filter(m => m.model);
+    await runTestQueue(t('models.testAggregates', '聚合别名候选'), items);
+  };
+
+  // 模型卡片入口：无筛选 → 当前账户全部模型；有筛选 → 筛选后可见的模型。
+  const hasFilter = search.trim() !== '';
+  const executeTestModels = async () => {
+    const source = hasFilter
+      ? filteredModels
+      : safeModels.filter(m => m.owned_by === activeProvider);
+    const items = source.map(m => {
+      const aid = modelAccountId(m.owned_by, m.id);
+      return { model: m.id, providerId: m.owned_by, ...(aid != null ? { accountId: aid } : {}) };
+    }).filter(m => m.model);
+    await runTestQueue(
+      hasFilter ? t('models.testFiltered', '筛选后的模型') : t('models.testAllModels', '当前账户全部模型'),
+      items,
+    );
+  };
+
   const handleAddAlias = async (e: React.FormEvent) => {
     e.preventDefault();
     try {
@@ -346,17 +387,31 @@ export default function Models() {
           </div>
         </div>
         <div className="flex items-center gap-2">
-           <Button
-             variant="outline"
-             size="sm"
-             onClick={handleTestAll}
-             disabled={queueStatus.isRunning || filteredModels.length === 0}
-             className="bg-warning/10 text-warning hover:bg-warning/20 border-0"
-             title={t('models.testAllDesc')}
-           >
-             <Zap size={16} className={cn(queueStatus.isRunning && "animate-pulse")} />
-             {queueStatus.isRunning ? t('models.testingQueue', { current: queueStatus.current, total: queueStatus.total }) : t('models.testAll')}
-           </Button>
+           {([
+             { scope: 'aliases' as const, label: t('models.testAliases', '拨测别名'), hint: t('models.testAliasesDesc', '测试已配置的普通别名') },
+             { scope: 'aggregates' as const, label: t('models.testAggregates', '拨测聚合'), hint: t('models.testAggregatesDesc', '测试每个聚合别名的全部候选') },
+             { scope: 'models' as const, label: t('models.testModels', '拨测模型'), hint: t('models.testModelsDesc', '有筛选时测筛选结果，无筛选时测当前账户全部模型') },
+           ]).map(({ scope, label, hint }) => (
+             <Button
+               key={scope}
+               variant="outline"
+               size="sm"
+               onClick={() => handleTestAll(scope)}
+               disabled={queueStatus.isRunning}
+               className="bg-warning/10 text-warning hover:bg-warning/20 border-0"
+               title={hint}
+             >
+               <Zap size={16} className={cn(queueStatus.isRunning && "animate-pulse")} />
+               {queueStatus.isRunning
+                 ? t('models.testingQueue', { current: queueStatus.current, total: queueStatus.total })
+                 : label}
+             </Button>
+           ))}
+           {queueNotice && !queueStatus.isRunning && (
+             <span className="text-xs text-muted-foreground">
+               {t('models.queueDone', '{{label}}：已完成 {{count}} 个', { label: queueNotice.label, count: queueNotice.count })}
+             </span>
+           )}
            <Button
              variant="outline"
              size="sm"
@@ -624,7 +679,12 @@ export default function Models() {
                 )}
               </div>
               {cardResult?.error && (
-                <p className="text-xs text-destructive font-medium line-clamp-1 opacity-80" title={cardResult?.error}>{cardResult?.error}</p>
+                // 两行高度 + 层内滚动：报错原文常常远超一行，之前 line-clamp-1
+                // 把关键信息（如上游的具体拒绝原因）截掉了。
+                <p
+                  className="text-xs text-destructive font-medium opacity-80 max-h-8 overflow-y-auto whitespace-pre-wrap break-words leading-4"
+                  title={cardResult?.error}
+                >{cardResult?.error}</p>
               )}
               {/* 限额进度条：只有厂商返回了 ratelimit 数据才显示 */}
               {(() => {
@@ -994,9 +1054,15 @@ export default function Models() {
       <ConfirmDialog
         isOpen={testAllConfirm}
         onClose={() => setTestAllConfirm(false)}
-        onConfirm={executeTestAll}
+        onConfirm={
+          testAllScope === 'aggregates'
+            ? executeTestAggregates
+            : testAllScope === 'models'
+              ? executeTestModels
+              : executeTestAll
+        }
         title={t('models.testAllTitle')}
-        description={t('models.testAllConfirm', '即将对你已配置别名的模型进行后台顺序拨测。\n\n⚠️注意：测试将真实调用模型接口发出一句简单的问候，每次将消耗约 1 Token 左右的资源。\n如果在执行期间离开此页面，后台测试依然会继续直至完成。是否继续？')}
+        description={t('models.testAllConfirm', '即将对所选范围进行后台顺序拨测。\n\n⚠️注意：测试将真实调用模型接口发出一句简单的问候，每次将消耗约 1 Token 左右的资源。\n如果在执行期间离开此页面，后台测试依然会继续直至完成。是否继续？')}
         confirmText={t('models.testAllStart')}
         variant="warning"
       />
