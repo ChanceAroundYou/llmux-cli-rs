@@ -157,76 +157,62 @@ async fn probe_candidate(
         _ => return false,
     };
 
-    // Build a minimal 1-token probe request
-    let is_anthropic = account
-        .anthropic_base_url
-        .as_deref()
-        .map(|u| !u.trim().is_empty())
-        .unwrap_or(false)
-        && account.base_url.as_deref().map(|u| u.trim().is_empty()).unwrap_or(true);
-
-    // For probe, we send a tiny chat completion / messages request
-    let (url, body, headers) = if is_anthropic {
-        let base = account
-            .anthropic_base_url
-            .as_deref()
-            .unwrap_or("https://api.anthropic.com/v1");
-        let url = format!("{}/messages", base.trim_end_matches('/'));
-        let body = serde_json::json!({
-            "model": cand.model,
-            "max_tokens": 1,
-            "messages": [{"role": "user", "content": "ping"}]
-        });
-        let mut h = std::collections::BTreeMap::new();
-        h.insert("content-type".to_string(), "application/json".to_string());
-        h.insert("x-api-key".to_string(), account.api_key.clone());
-        h.insert("anthropic-version".to_string(), "2023-06-01".to_string());
-        (url, body, h)
-    } else {
-        let base = account
-            .base_url
-            .as_deref()
-            .filter(|u| !u.is_empty())
-            .unwrap_or("https://api.openai.com/v1");
-        let url = format!("{}/chat/completions", base.trim_end_matches('/'));
-        let body = serde_json::json!({
-            "model": cand.model,
-            "messages": [{"role": "user", "content": "ping"}],
-            "max_tokens": 1
-        });
-        let mut h = std::collections::BTreeMap::new();
-        h.insert("content-type".to_string(), "application/json".to_string());
-        h.insert("authorization".to_string(), format!("Bearer {}", account.api_key));
-        (url, body, h)
+    let provider_type = {
+        let pt = sqlx::query_scalar::<_, Option<String>>("SELECT type FROM providers WHERE id = ?")
+            .bind(&account.provider_id)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten()
+            .flatten();
+        llmux_core::dispatcher::resolve_provider_type(pt.as_deref(), &account.provider_id)
     };
 
-    let req = llmux_core::adapters::ProviderRequest {
-        method: "POST".to_string(),
-        url,
-        headers,
-        body,
+    // 与拨测/别名校验走**同一套**探测（协议缓存起点 + 真实路由同款回退阶梯）。
+    // 此前这里只会拼 /chat/completions，对只服务 /v1/responses 的模型
+    // （Console Go muse-spark-1.x-contributor）永远判死，聚合候选会被错误降级。
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let outcome = match tokio::time::timeout(
+        Duration::from_secs(15),
+        llmux_core::probe::run_probe(
+            &client,
+            &account,
+            &cand.model,
+            &provider_type,
+            llmux_core::protocol::DownstreamMode::Chat,
+        ),
+    )
+    .await
+    {
+        Ok(o) => o,
+        _ => return false,
     };
 
-    // 10s timeout via tokio::time::timeout
-    let res = tokio::time::timeout(
-        Duration::from_secs(10),
-        llmux_core::adapters::execute_provider_request(&req),
+    llmux_core::probe::store_probed_protocols(
+        pool,
+        account.id,
+        &cand.model,
+        &outcome.supported,
+        outcome.native,
     )
     .await;
 
-    match res {
-        Ok(Ok(resp)) => {
-            let status = resp.status().as_u16();
-            // 2xx is alive; 401/403/429 are retryable failures (dead for this candidate)
-            if resp.status().is_success() {
-                true
-            } else if llmux_core::dispatcher::is_retryable_status(status) {
-                false
-            } else {
-                // Non-retryable 5xx etc — also dead
-                false
-            }
+    if outcome.success() {
+        if let Some(configured) = outcome.mismatched_config {
+            tracing::warn!(
+                "🧭 [agg] {} | {} 实际走 /{}，但别名配的是 /{} —— 配置可能写错了",
+                cand.model,
+                account.alias,
+                outcome.via_label(),
+                configured.as_str()
+            );
         }
-        _ => false,
     }
+    outcome.success()
 }
