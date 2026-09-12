@@ -61,6 +61,7 @@ async fn init_db_creates_fresh_schema_and_seed_providers() {
             "model_aliases",
             "model_prices",
             "model_protocol_cache",
+            "model_test_results",
             "providers",
             "settings",
             "usage_logs",
