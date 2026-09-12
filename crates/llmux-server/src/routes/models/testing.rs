@@ -16,8 +16,11 @@ use crate::app::AppState;
 /// 拨测结果落库。**独立于 usage_logs** —— 真实流量与拨测各存一处，
 /// 谁更新都不会抹掉对方（此前共用 usage_logs 按 (account,model) 取最新一条，
 /// 真实流量随时把拨测结果冲掉）。展示时由 health 接口合并两边的「最近一次」。
+///
+/// 协议集合（`supported`）也存这里 —— 原 `model_protocol_cache` 已合并进来
+/// （0018 主键漏了 protocol 列，多协议模型永远写不进去）。
 #[allow(clippy::too_many_arguments)]
-async fn persist_test_result(
+pub(crate) async fn persist_test_result(
     pool: &sqlx::SqlitePool,
     account: &llmux_core::adapters::Account,
     model: &str,
@@ -25,25 +28,36 @@ async fn persist_test_result(
     latency_ms: i64,
     error: Option<&str>,
     outcome: Option<&llmux_core::probe::ProbeOutcome>,
+    source: probe::TestSource,
 ) {
     let via = outcome
         .and_then(|o| o.preferred())
         .map(|p| p.as_str().to_string());
-    let supported = outcome.map(|o| {
-        o.supported
-            .iter()
-            .map(|p| p.as_str())
-            .collect::<Vec<_>>()
-            .join(",")
-    });
+    // native provider（anthropic/gemini）用自己的端点形式，不是三协议之一，
+    // 存了会让 UI 显示一个语义不对的角标。
+    let supported = outcome
+        .filter(|o| !o.native)
+        .map(|o| {
+            o.supported
+                .iter()
+                .map(|p| p.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_default();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
     let _ = sqlx::query(
         "INSERT INTO model_test_results \
-         (account_id, model, success, latency_ms, error_message, via, supported, checked_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
+         (account_id, model, success, latency_ms, error_message, via, supported, checked_at, source) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT(account_id, model) DO UPDATE SET \
            success = excluded.success, latency_ms = excluded.latency_ms, \
            error_message = excluded.error_message, via = excluded.via, \
-           supported = excluded.supported, checked_at = excluded.checked_at",
+           supported = excluded.supported, checked_at = excluded.checked_at, \
+           source = excluded.source",
     )
     .bind(account.id)
     .bind(model)
@@ -52,14 +66,208 @@ async fn persist_test_result(
     .bind(error)
     .bind(via)
     .bind(supported)
-    .bind(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64,
-    )
+    .bind(now_ms)
+    .bind(source.as_str())
     .execute(pool)
     .await;
+
+    // 请求日志页（`/api/stats/logs`）读的是 usage_logs —— 拨测此前只写
+    // model_test_results，页面上一条都看不到（e0fc691 把原先只存在于批量队列里
+    // 的那条 INSERT 也一并换掉了）。这里补一条 is_test=1：用量统计、账号排序、
+    // 仪表盘活动流全都带 `is_test = 0`，不会污染真实数据，只有请求日志页会展示。
+    // 后台聚合探活（每 300s 一轮、近 20 个候选）不写 —— 会把真实请求淹掉，
+    // 它的结果在模型卡片角标里已经能看到。
+    if !matches!(source, probe::TestSource::Aggregate) {
+        let _ = sqlx::query(
+            "INSERT INTO usage_logs \
+             (timestamp, account_id, provider_id, model, input_tokens, output_tokens, \
+              latency_ms, success, error_message, is_stream, is_test) \
+             VALUES (?, ?, ?, ?, 0, 0, ?, ?, ?, 0, 1)",
+        )
+        .bind(now_ms)
+        .bind(account.id)
+        .bind(&account.provider_id)
+        .bind(model)
+        .bind(latency_ms)
+        .bind(if success { 1 } else { 0 })
+        .bind(error)
+        .execute(pool)
+        .await;
+    }
+
+    // 连续失败 → 暂停自动拨测；成功 → 解除暂停。所有探测路径都经这里，
+    // 所以「显式调用成功也能救回模型」是自动成立的（真实流量走 proxy，成功时
+    // 另行调用 probe::clear_suspension —— 见 v1/helpers.rs）。
+    if success {
+        probe::clear_suspension(pool, account.id, model).await;
+    } else {
+        let newly = probe::note_failure(pool, account.id, model, error).await;
+        if newly {
+            tracing::warn!(
+                "⏸️  {} | {} 连续失败，暂停自动拨测 {} 分钟",
+                model,
+                account.alias,
+                probe::SUSPEND_SECS / 60
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use llmux_core::probe::TestSource;
+
+    async fn pool() -> sqlx::SqlitePool {
+        let pool = llmux_core::db::connect_sqlite("sqlite::memory:").await.unwrap();
+        llmux_core::db::init_db(&pool).await.unwrap();
+        pool
+    }
+
+    fn account() -> llmux_core::adapters::Account {
+        llmux_core::adapters::Account {
+            id: 7,
+            alias: "acc".into(),
+            provider_id: "prov".into(),
+            api_key: "k".into(),
+            base_url: None,
+            anthropic_base_url: None,
+            is_active: 1,
+            weight: 1,
+            openai_compatible: 0,
+            chat_endpoint: None,
+            responses_endpoint: None,
+            messages_endpoint: None,
+            default_protocol: None,
+            balance_provider: String::new(),
+            balance_auth: String::new(),
+        }
+    }
+
+    /// 拨测必须同时落 usage_logs（is_test=1），否则请求日志页看不到；
+    /// 后台聚合探活必须不落，否则每轮二十条把真实请求淹掉。
+    #[tokio::test]
+    async fn probe_writes_request_log_but_background_aggregate_does_not() {
+        let pool = pool().await;
+
+        persist_test_result(
+            &pool, &account(), "m1", false, 1200, Some("boom"), None, TestSource::Manual,
+        )
+        .await;
+        persist_test_result(
+            &pool, &account(), "m2", true, 900, None, None, TestSource::Verify,
+        )
+        .await;
+        persist_test_result(
+            &pool, &account(), "m3", true, 800, None, None, TestSource::Aggregate,
+        )
+        .await;
+
+        let rows: Vec<(String, i64, i64, Option<String>)> = sqlx::query_as(
+            "SELECT model, success, is_test, error_message FROM usage_logs ORDER BY model",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("m1".to_string(), 0, 1, Some("boom".to_string())),
+                ("m2".to_string(), 1, 1, None),
+            ],
+            "manual/verify 拨测要进请求日志，aggregate 不进"
+        );
+
+        // 三者的结果都仍然进 model_test_results（卡片/健康角标的数据源）。
+        let results: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM model_test_results")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(results, 3);
+    }
+
+    /// 方案 A 的状态机：单次失败不停、连续失败才停、成功即解除。
+    #[tokio::test]
+    async fn consecutive_failures_suspend_then_success_clears() {
+        let pool = pool().await;
+        let acc = account();
+        let m = "dead-model";
+        let a = |pool: &sqlx::SqlitePool| {
+            let pool = pool.clone();
+            async move { llmux_core::probe::is_suspended(&pool, 7, m).await }
+        };
+
+        // 第 1 次失败：还没到阈值，不该停 —— 上游抖动很常见。
+        persist_test_result(&pool, &acc, m, false, 100, Some("e1"), None, TestSource::Manual).await;
+        assert!(!a(&pool).await, "首次失败不应暂停");
+
+        // 第 2 次：达到阈值，暂停。
+        persist_test_result(&pool, &acc, m, false, 100, Some("e2"), None, TestSource::Aggregate).await;
+        assert!(a(&pool).await, "连续两次失败应暂停");
+        let failures: i64 =
+            sqlx::query_scalar("SELECT consecutive_failures FROM model_probe_suspensions")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(failures, 2);
+
+        // 成功一次（这里用真实流量那条路径）→ 解除。
+        // 单模型拨测走 persist_test_result，等价于显式拨测成功。
+        persist_test_result(&pool, &acc, m, true, 50, None, None, TestSource::Manual).await;
+        assert!(!a(&pool).await, "成功应解除暂停");
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM model_probe_suspensions")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(left, 0, "成功应把暂停记录整条清掉");
+    }
+
+    /// 真实流量成功也要解除暂停（不等冷却到期由自动拨测发现）。
+    #[tokio::test]
+    async fn clear_suspension_is_callable_from_traffic_path() {
+        let pool = pool().await;
+        let acc = account();
+        for _ in 0..2 {
+            persist_test_result(&pool, &acc, "m", false, 100, Some("x"), None, TestSource::Aggregate)
+                .await;
+        }
+        assert!(llmux_core::probe::is_suspended(&pool, 7, "m").await);
+        // v1/helpers.rs 的成功分支就是这么调的
+        llmux_core::probe::clear_suspension(&pool, 7, "m").await;
+        assert!(!llmux_core::probe::is_suspended(&pool, 7, "m").await);
+    }
+
+    /// 冷却到期后，再失败一次要重新起算 30 分钟（而不是叠加）。
+    #[tokio::test]
+    async fn expired_cooldown_restarts_from_now() {
+        let pool = pool().await;
+        let acc = account();
+        for _ in 0..2 {
+            persist_test_result(&pool, &acc, "m", false, 100, Some("x"), None, TestSource::Aggregate)
+                .await;
+        }
+        // 手工把到期时间拨到过去，模拟「冷却结束，自动拨测又来试一次」。
+        sqlx::query("UPDATE model_probe_suspensions SET suspended_until = 1 WHERE account_id = 7")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(!llmux_core::probe::is_suspended(&pool, 7, "m").await, "已到期应视为未暂停");
+
+        // 再失败 → 从现在重新暂停，且不应把 past 的旧值带进来。
+        persist_test_result(&pool, &acc, "m", false, 100, Some("x"), None, TestSource::Aggregate).await;
+        let (until, first): (i64, i64) =
+            sqlx::query_as("SELECT suspended_until, first_suspended_at FROM model_probe_suspensions")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        assert!(until > now, "到期后再失败应重新暂停");
+        assert!(until <= now + llmux_core::probe::SUSPEND_SECS * 1000 + 5_000);
+        assert!(first > now - 60_000, "首次暂停时间应重置为本次，而不是沿用过期值");
+    }
 }
 
 pub async fn get_test_queue_status(Extension(state): Extension<AppState>) -> Response {
@@ -69,6 +277,8 @@ pub async fn get_test_queue_status(Extension(state): Extension<AppState>) -> Res
         "total": queue.total,
         "current": queue.current,
         "progress": queue.progress,
+        // 让前端知道这条队列该归给哪个入口（刷新/换标签页后靠它恢复进度显示）
+        "scope": queue.scope,
     }))
     .into_response()
 }
@@ -94,6 +304,12 @@ pub async fn start_test_queue(
         queue.total = models.len();
         queue.current = 0;
         queue.progress = 0;
+        queue.scope = body
+            .get("scope")
+            .and_then(Value::as_str)
+            .filter(|s| matches!(*s, "aliases" | "aggregates" | "models"))
+            .unwrap_or("models")
+            .to_string();
     }
 
     tracing::info!("🧪 Starting test for {} models", models.len());
@@ -113,6 +329,19 @@ pub async fn start_test_queue(
                 .get("providerId")
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty());
+
+            // 批量队列是「自动拨测」的一种，冷却中的 (账户, 模型) 跳过 ——
+            // 否则每一轮都要为已被上游下架的模型付一次必然失败的请求。
+            // 定向到具体账户的条目才能精确判断；未指定账户的等下面解析出账户后再判。
+            if let Some(acc_id) = account_id_override {
+                if probe::is_suspended(&pool, acc_id, model_name).await {
+                    tracing::debug!("⏸️  跳过 {} | 账户 {}：冷却中", model_name, acc_id);
+                    let mut queue = queue_state.lock().unwrap();
+                    queue.current = i + 1;
+                    queue.progress = if queue.total > 0 { ((i + 1) * 100) / queue.total } else { 0 };
+                    continue;
+                }
+            }
 
             // 若前端已指定 accountId，直接定向到该账户，避免同名模型串到 provider 的首账户
             let targeted_accounts: Option<Vec<llmux_core::adapters::Account>> = if let Some(acc_id) = account_id_override {
@@ -179,6 +408,17 @@ pub async fn start_test_queue(
                 acs
             } else { vec![] };
             if let Some(account) = accounts_for_test.first() {
+                        // 未定向条目在这里才解析出账户 —— 补一次冷却判断
+                        // （定向的那批已在循环开头拦过）。
+                        if account_id_override.is_none()
+                            && probe::is_suspended(&pool, account.id, model_name).await
+                        {
+                            tracing::debug!("⏸️  跳过 {} | {}：冷却中", model_name, account.alias);
+                            let mut queue = queue_state.lock().unwrap();
+                            queue.current = i + 1;
+                            queue.progress = if queue.total > 0 { ((i + 1) * 100) / queue.total } else { 0 };
+                            continue;
+                        }
                         let provider_type = {
                             let pt = sqlx::query_scalar::<_, Option<String>>(
                                 "SELECT type FROM providers WHERE id = ?",
@@ -210,14 +450,6 @@ pub async fn start_test_queue(
                             Err(_) => None,
                         };
                         if let Some(o) = &outcome {
-                            probe::store_probed_protocols(
-                                &pool,
-                                account.id,
-                                model_name,
-                                &o.supported,
-                                o.native,
-                            )
-                            .await;
                             if let Some(configured) = o.mismatched_config {
                                 tracing::warn!(
                                     "🧭 {} | {} 实际可用 [{}]，但别名配的是 /{} —— 配置可能写错了",
@@ -265,6 +497,7 @@ pub async fn start_test_queue(
                                 .map(|o| o.error_summary())
                                 .as_deref(),
                             outcome.as_ref(),
+                            probe::TestSource::Manual,
                         )
                         .await;
                     }
@@ -425,14 +658,6 @@ pub async fn test_model(
         probe_mode,
     )
     .await;
-    probe::store_probed_protocols(
-        &state.pool,
-        account.id,
-        model_name,
-        &outcome.supported,
-        outcome.native,
-    )
-    .await;
     if let Some(configured) = outcome.mismatched_config {
         tracing::warn!(
             "🧭 {} | {} 实际可用 [{}]，但别名配的是 /{} —— 配置可能写错了",
@@ -471,6 +696,7 @@ pub async fn test_model(
         latency_ms,
         error_msg.as_deref(),
         Some(&outcome),
+        probe::TestSource::Manual,
     )
     .await;
 

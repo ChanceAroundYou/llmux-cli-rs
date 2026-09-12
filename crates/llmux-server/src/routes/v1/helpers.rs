@@ -316,6 +316,11 @@ pub fn spawn_log_usage_ip(
     );
     tokio::spawn(async move {
         let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
+        // 真实调用成功 → 解除「连续失败暂停自动拨测」。模型恢复后不必等冷却
+        // 到期由自动探活去发现，用户跑通一次就恢复了。
+        if success {
+            llmux_core::probe::clear_suspension(&pool, account.id, &model).await;
+        }
         let res = sqlx::query("INSERT INTO usage_logs (timestamp, account_id, provider_id, model, input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens, latency_ms, success, error_message, request_body, response_body, ttft_ms, is_stream, client_ip, is_test) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
             .bind(timestamp).bind(account.id).bind(&provider_id).bind(&model)
             .bind(input_tokens).bind(output_tokens).bind(cache_read_input_tokens).bind(cache_creation_input_tokens)
@@ -332,7 +337,6 @@ pub fn spawn_log_usage_ip(
 // Sync variant (used by background tasks)
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 pub async fn log_usage(
     pool: &sqlx::SqlitePool,
@@ -368,6 +372,11 @@ pub async fn log_usage(
         RESPONSE_BODY_CAP_SUCCESS,
         RESPONSE_BODY_CAP_FAILURE,
     );
+
+    // 真实调用成功 → 解除「连续失败暂停自动拨测」（同 spawn_log_usage_ip）。
+    if success {
+        llmux_core::probe::clear_suspension(pool, account.id, model).await;
+    }
 
     let result = sqlx::query(
         "INSERT INTO usage_logs (

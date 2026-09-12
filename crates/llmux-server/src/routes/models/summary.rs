@@ -116,20 +116,23 @@ async fn fetch_accounts_light(state: &AppState) -> anyhow::Result<Value> {
 async fn fetch_health(state: &AppState) -> anyhow::Result<Value> {
     let rows = sqlx::query(
         "SELECT k.account_id, a.provider_id, k.model, a.limits_cache, a.limits_cache_updated_at, a.alias AS account_name, \
-                t.timestamp AS traffic_at, t.success AS traffic_ok, t.latency_ms AS traffic_latency, t.error_message AS traffic_err, \
-                r.success AS test_ok, r.latency_ms AS test_latency, r.error_message AS test_err, r.supported AS test_supported, r.checked_at AS test_at \
+                t.timestamp AS traffic_at, t.success AS traffic_ok, t.latency_ms AS traffic_latency, t.error_message AS traffic_err \
          FROM ( \
            SELECT account_id, model FROM usage_logs \
            UNION \
            SELECT account_id, model FROM model_test_results \
          ) k \
          JOIN accounts a ON a.id = k.account_id \
-         LEFT JOIN usage_logs t ON t.id = (SELECT id FROM usage_logs WHERE account_id = k.account_id AND model = k.model ORDER BY id DESC LIMIT 1) \
-         LEFT JOIN model_test_results r ON r.account_id = k.account_id AND r.model = k.model",
+         LEFT JOIN usage_logs t ON t.id = (SELECT id FROM usage_logs WHERE account_id = k.account_id AND model = k.model ORDER BY id DESC LIMIT 1)",
     )
     .fetch_all(&state.pool)
     .await?;
-    let protocols = llmux_core::probe::load_protocol_map(&state.pool).await;
+    let tests = llmux_core::probe::load_test_results(&state.pool).await;
+    let suspensions = llmux_core::probe::load_suspensions(&state.pool).await;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
     let out: Vec<Value> = rows
         .iter()
         .map(|r| {
@@ -137,37 +140,22 @@ async fn fetch_health(state: &AppState) -> anyhow::Result<Value> {
             let limits_cache: Value = limits_cache_str.as_deref().and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
             let account_id = r.try_get::<i64, _>("account_id").unwrap_or_default();
             let model = r.try_get::<String, _>("model").unwrap_or_default();
-            // 同 health：展示层面合并「最近一次」，拨测与真实流量各自留档。
+            let test = tests.get(&(account_id, model.clone()));
+            // 同 health：展示层面合并「最近一次」，但只有手工拨测能覆盖真实流量
+            // —— 后台聚合探活每 300s 一轮，采信它等于用户永远看不到手工结果。
             let traffic_at = r.try_get::<Option<i64>, _>("traffic_at").ok().flatten().unwrap_or(0);
-            let test_at = r.try_get::<Option<i64>, _>("test_at").ok().flatten().unwrap_or(0);
-            let test_ok = r.try_get::<Option<i64>, _>("test_ok").ok().flatten();
-            let use_test = test_at > traffic_at && test_ok.is_some();
-            let (success, latency, error, last_checked) = if use_test {
-                (
-                    test_ok.unwrap_or_default(),
-                    r.try_get::<Option<i64>, _>("test_latency").ok().flatten().unwrap_or_default(),
-                    r.try_get::<Option<String>, _>("test_err").ok().flatten(),
-                    test_at,
-                )
-            } else {
-                (
+            let (success, latency, error, last_checked) = match test.filter(|t| t.is_manual() && t.checked_at > traffic_at) {
+                Some(t) => (t.success, t.latency_ms, t.error_message.clone(), t.checked_at),
+                None => (
                     r.try_get::<Option<i64>, _>("traffic_ok").ok().flatten().unwrap_or_default(),
                     r.try_get::<Option<i64>, _>("traffic_latency").ok().flatten().unwrap_or_default(),
                     r.try_get::<Option<String>, _>("traffic_err").ok().flatten(),
                     traffic_at,
                 )
             };
-            let supported: Vec<String> = r
-                .try_get::<Option<String>, _>("test_supported")
-                .ok()
-                .flatten()
-                .map(|sup| sup.split(',').filter(|x| !x.is_empty()).map(String::from).collect())
-                .unwrap_or_else(|| {
-                    protocols
-                        .get(&(account_id, model.clone()))
-                        .map(|v| v.iter().map(|p| p.as_str().to_string()).collect())
-                        .unwrap_or_default()
-                });
+            let supported: Vec<String> = test
+                .map(|t| t.protocols().iter().map(|p| p.as_str().to_string()).collect())
+                .unwrap_or_default();
             json!({
                 "account_id": r.try_get::<i64, _>("account_id").unwrap_or_default(),
                 "provider_id": r.try_get::<String, _>("provider_id").unwrap_or_default(),
@@ -181,6 +169,13 @@ async fn fetch_health(state: &AppState) -> anyhow::Result<Value> {
                 "account_name": r.try_get::<String, _>("account_name").unwrap_or_default(),
                 // 探测到的可用协议（角标用）；只回显事实，不参与路由。
                 "supported": supported,
+                // 连续失败暂停状态（方案 A），与 health 同形。
+                "suspension": suspensions.get(&(account_id, model.clone())).map(|s| json!({
+                    "suspended": s.is_suspended(now_ms),
+                    "failures": s.consecutive_failures,
+                    "remaining_secs": s.remaining_secs(now_ms),
+                    "last_error": s.last_error,
+                })),
             })
         })
         .collect();
@@ -194,5 +189,6 @@ async fn fetch_queue(state: &AppState) -> anyhow::Result<Value> {
         "total": q.total,
         "current": q.current,
         "progress": q.progress,
+        "scope": q.scope,
     }))
 }

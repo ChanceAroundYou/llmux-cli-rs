@@ -80,6 +80,9 @@ pub async fn get_activity(
 
 /// Log detail: request/response bodies captured at dispatch time (nullable
 /// for old rows or paths without a capture point).
+///
+/// 不过滤 `is_test` —— 请求日志页也会列拨测行，点进去得能看到详情。
+/// 仪表盘的活动流（上面那个）仍然只取真实流量。
 pub async fn get_activity_detail(
     Extension(state): Extension<AppState>,
     axum::extract::Path(id): axum::extract::Path<i64>,
@@ -91,7 +94,7 @@ pub async fn get_activity_detail(
                 a.alias AS account_name, a.provider_id
          FROM usage_logs l
          LEFT JOIN accounts a ON l.account_id = a.id
-         WHERE l.id = ? AND l.is_test = 0",
+         WHERE l.id = ?",
     )
     .bind(id)
     .fetch_optional(&state.pool)

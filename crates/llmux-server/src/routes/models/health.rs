@@ -44,23 +44,14 @@ pub async fn get_models_health(Extension(state): Extension<AppState>) -> Respons
         }
     };
 
-    let protocols = llmux_core::probe::load_protocol_map(&state.pool).await;
-
-    // 拨测结果（独立表）按 (account_id, model) 取出，用于与真实流量合并展示：
-    // 两边各带自己的时间戳，谁更新都不会抹掉对方。
-    let test_rows: Vec<(i64, String, i64, i64, Option<String>, Option<String>, Option<String>, i64)> =
-        sqlx::query_as(
-            "SELECT account_id, model, success, latency_ms, error_message, via, supported, checked_at \
-             FROM model_test_results",
-        )
-        .fetch_all(&state.pool)
-        .await
-        .unwrap_or_default();
-    let tests: std::collections::HashMap<(i64, String), (i64, i64, Option<String>, Option<String>, Option<String>, i64)> =
-        test_rows
-            .into_iter()
-            .map(|(a, m, ok, lat, err, via, sup, at)| ((a, m), (ok, lat, err, via, sup, at)))
-            .collect();
+    let tests = llmux_core::probe::load_test_results(&state.pool).await;
+    // 连续失败暂停状态（方案 A）。UI 据此把卡片打灰并显示还剩多久，
+    // 而不是让一堆已下架的模型永远挂着红点。
+    let suspensions = llmux_core::probe::load_suspensions(&state.pool).await;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
 
     let health: Vec<Value> = rows
         .iter()
@@ -74,29 +65,25 @@ pub async fn get_models_health(Extension(state): Extension<AppState>) -> Respons
             let account_id = row.try_get::<i64, _>("account_id").unwrap_or_default();
             let model = row.try_get::<String, _>("model").unwrap_or_default();
             let traffic_at = row.try_get::<Option<i64>, _>("traffic_at").ok().flatten().unwrap_or(0);
+            // 拨测记录（含协议集合）。由 usage_logs 之外独立提供 —— 见 0019/0020。
             let test = tests.get(&(account_id, model.clone()));
-            // 展示层面合并「最近一次状态」：以时间戳更近的一方为准 —— 报错文案
-            // 允许互相覆盖（用户要求），但两张表各自的记录始终保留、互不抹除。
-            let test_at = test.map(|t| t.5).unwrap_or(0);
-            let (success, latency, error, last_checked) = match test {
-                Some((ok, lat, err, _, _, _)) if test_at > traffic_at => (*ok, *lat, err.clone(), test_at),
-                _ => (
+            // 展示层面合并「最近一次状态」：拨测（限手工，`manual`）与真实流量
+            // 各带时间戳，谁更近谁显示。后台聚合探活/别名校验不在这里抢 ——
+            // 它们每 300s 一轮，会把用户手动拨测的结果一遍遍刷掉。
+            let (success, latency, error, last_checked) = match test.filter(|t| t.is_manual() && t.checked_at > traffic_at) {
+                Some(t) => (t.success, t.latency_ms, t.error_message.clone(), t.checked_at),
+                None => (
                     row.try_get::<Option<i64>, _>("traffic_ok").ok().flatten().unwrap_or_default(),
                     row.try_get::<Option<i64>, _>("traffic_latency").ok().flatten().unwrap_or_default(),
                     row.try_get::<Option<String>, _>("traffic_err").ok().flatten(),
                     traffic_at,
-                ),
+                )
             };
-            // 可用协议优先用拨测记下的（更全），否则退回协议缓存，供角标用。
-            let supported: Vec<String> = match test {
-                Some((_, _, _, _, Some(sup), _)) => {
-                    sup.split(',').filter(|x| !x.is_empty()).map(String::from).collect()
-                }
-                _ => protocols
-                    .get(&(account_id, model.clone()))
-                    .map(|v| v.iter().map(|p| p.as_str().to_string()).collect())
-                    .unwrap_or_default(),
-            };
+            // 可用协议 = 该 (账户, 模型) 最近一次探测记下的集合（角标用），
+            // 三个来源通用 —— 角标只看事实，不涉及「谁抢谁」。
+            let supported: Vec<String> = test
+                .map(|t| t.protocols().iter().map(|p| p.as_str().to_string()).collect())
+                .unwrap_or_default();
             json!({
                 "account_id": account_id,
                 "provider_id": row.try_get::<String, _>("provider_id").unwrap_or_default(),
@@ -110,8 +97,18 @@ pub async fn get_models_health(Extension(state): Extension<AppState>) -> Respons
                 "account_name": row.try_get::<String, _>("account_name").unwrap_or_default(),
                 "supported": supported,
                 // 拨测结果单独回传，UI 可区分「拨测」与「真实流量」
-                "test": test.map(|(ok, lat, err, _, _, at)| json!({
-                    "success": ok, "latency": lat, "error": err, "checked_at": at,
+                "test": test.map(|t| json!({
+                    "success": t.success, "latency": t.latency_ms,
+                    "error": t.error_message, "checked_at": t.checked_at,
+                    "via": t.via, "source": t.source,
+                })),
+                // 自动拨测是否被暂停（连续失败 N 次触发）。`suspended` 为当前
+                // 是否仍在冷却期内，`failures` 用于展示原因。
+                "suspension": suspensions.get(&(account_id, model.clone())).map(|s| json!({
+                    "suspended": s.is_suspended(now_ms),
+                    "failures": s.consecutive_failures,
+                    "remaining_secs": s.remaining_secs(now_ms),
+                    "last_error": s.last_error,
                 })),
             })
         })

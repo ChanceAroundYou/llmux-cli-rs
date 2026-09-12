@@ -1,8 +1,11 @@
 //! 别名保存后的自动验证。
 //!
-//! 保存别名时顺带探一次该(账户, 模型)，把走通的协议记进 `model_protocol_cache`
+//! 保存别名时顺带探一次该(账户, 模型)，把走通的协议记进 `model_test_results`
 //! 并回显给 UI。**只记事实、只提示，不改任何配置** —— 线上走哪个协议由用户配的
 //! `upstream_api` 决定，探出不一致时提示「配置可能写错」，绝不静默覆盖。
+//!
+//! 写入标 `source=verify`：角标会用这次的协议集合，但 health 的「最近一次状态」
+//! 不采信 —— 保存别名这个动作不该把用户手工拨测的结果顶掉。
 //!
 //! 走的是和拨测/聚合探活完全同一个 `llmux_core::probe`，没有第二套逻辑。
 
@@ -69,14 +72,30 @@ pub async fn verify_targets(
             llmux_core::protocol::DownstreamMode::Default,
         )
         .await;
-        probe::store_probed_protocols(
+        let error = (!outcome.success()).then(|| outcome.error_summary());
+        crate::routes::models::testing::persist_test_result(
             &state.pool,
-            account.id,
+            &account,
             model,
-            &outcome.supported,
-            outcome.native,
+            outcome.success(),
+            outcome.latency_ms(),
+            error.as_deref(),
+            Some(&outcome),
+            llmux_core::probe::TestSource::Verify,
         )
         .await;
+        // 别名校验也要留痕：否则用户保存别名后探测失败，只能去 UI 卡片里找原因。
+        if outcome.success() {
+            tracing::info!(
+                "🧪 [verify] {} | {} | {}ms | OK [{}]",
+                model, account.alias, outcome.latency_ms(), outcome.via_label()
+            );
+        } else {
+            tracing::warn!(
+                "🧪 [verify] {} | {} | FAILED: {}",
+                model, account.alias, outcome.error_summary()
+            );
+        }
 
         results.push(json!({
             "account_id": account.id,

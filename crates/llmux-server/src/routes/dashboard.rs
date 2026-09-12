@@ -160,33 +160,27 @@ async fn fetch_model_health(state: &AppState) -> anyhow::Result<Value> {
     // 与 /api/models/health 同源：真实流量 ∪ 拨测结果，展示「最近一次」。
     let rows = sqlx::query(
         "SELECT k.account_id, a.provider_id, k.model, a.limits_cache, a.limits_cache_updated_at, a.alias AS account_name, \
-                t.timestamp AS traffic_at, t.success AS traffic_ok, t.latency_ms AS traffic_latency, t.error_message AS traffic_err, \
-                r.success AS test_ok, r.latency_ms AS test_latency, r.error_message AS test_err, r.checked_at AS test_at \
+                t.timestamp AS traffic_at, t.success AS traffic_ok, t.latency_ms AS traffic_latency, t.error_message AS traffic_err \
          FROM (SELECT account_id, model FROM usage_logs UNION SELECT account_id, model FROM model_test_results) k \
          JOIN accounts a ON a.id = k.account_id \
-         LEFT JOIN usage_logs t ON t.id = (SELECT id FROM usage_logs WHERE account_id = k.account_id AND model = k.model ORDER BY id DESC LIMIT 1) \
-         LEFT JOIN model_test_results r ON r.account_id = k.account_id AND r.model = k.model",
+         LEFT JOIN usage_logs t ON t.id = (SELECT id FROM usage_logs WHERE account_id = k.account_id AND model = k.model ORDER BY id DESC LIMIT 1)",
     )
     .fetch_all(&state.pool)
     .await?;
+    let tests = llmux_core::probe::load_test_results(&state.pool).await;
     let out: Vec<Value> = rows
         .iter()
         .map(|r| {
             let limits_cache_str: Option<String> = r.try_get("limits_cache").unwrap_or_default();
             let limits_cache: Value = limits_cache_str.as_deref().and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+            let account_id = r.try_get::<i64, _>("account_id").unwrap_or_default();
+            let model = r.try_get::<String, _>("model").unwrap_or_default();
+            let test = tests.get(&(account_id, model.clone()));
+            // 同 /api/models/health：只有手工拨测能覆盖真实流量。
             let traffic_at = r.try_get::<Option<i64>, _>("traffic_at").ok().flatten().unwrap_or(0);
-            let test_at = r.try_get::<Option<i64>, _>("test_at").ok().flatten().unwrap_or(0);
-            let test_ok = r.try_get::<Option<i64>, _>("test_ok").ok().flatten();
-            let use_test = test_at > traffic_at && test_ok.is_some();
-            let (success, latency, error, last_checked) = if use_test {
-                (
-                    test_ok.unwrap_or_default(),
-                    r.try_get::<Option<i64>, _>("test_latency").ok().flatten().unwrap_or_default(),
-                    r.try_get::<Option<String>, _>("test_err").ok().flatten(),
-                    test_at,
-                )
-            } else {
-                (
+            let (success, latency, error, last_checked) = match test.filter(|t| t.is_manual() && t.checked_at > traffic_at) {
+                Some(t) => (t.success, t.latency_ms, t.error_message.clone(), t.checked_at),
+                None => (
                     r.try_get::<Option<i64>, _>("traffic_ok").ok().flatten().unwrap_or_default(),
                     r.try_get::<Option<i64>, _>("traffic_latency").ok().flatten().unwrap_or_default(),
                     r.try_get::<Option<String>, _>("traffic_err").ok().flatten(),

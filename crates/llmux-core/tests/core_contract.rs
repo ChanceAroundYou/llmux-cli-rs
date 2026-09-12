@@ -60,7 +60,7 @@ async fn init_db_creates_fresh_schema_and_seed_providers() {
             "api_keys",
             "model_aliases",
             "model_prices",
-            "model_protocol_cache",
+            "model_probe_suspensions",
             "model_test_results",
             "providers",
             "settings",
@@ -254,6 +254,107 @@ async fn usage_service_logs_usage_updates_limit_cache_and_queries_non_test_data(
         serde_json::from_str::<serde_json::Value>(&limit_cache).unwrap()["remaining_tokens"],
         json!(99)
     );
+}
+
+#[tokio::test]
+async fn multi_protocol_result_survives_in_one_row() {
+    // 回归：原 model_protocol_cache 的 PK 是 (account_id, model)、漏了 protocol，
+    // 多协议模型的第二次 INSERT 必然 UNIQUE 失败并回滚 —— 线上 106 次写失败，
+    // 表里 14 行全是单协议。合并进 model_test_results 后必须能整set存取。
+    let pool = memory_db().await;
+    let account_id = sqlx::query("INSERT INTO accounts (alias, provider_id, api_key) VALUES (?, ?, ?)")
+        .bind("Main")
+        .bind("openai")
+        .bind("encrypted")
+        .execute(&pool)
+        .await
+        .expect("insert account")
+        .last_insert_rowid();
+
+    sqlx::query(
+        "INSERT INTO model_test_results \
+         (account_id, model, success, latency_ms, error_message, via, supported, checked_at, source) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(account_id)
+    .bind("gpt-5.6-luna")
+    .bind(1_i64)
+    .bind(120_i64)
+    .bind(Option::<String>::None)
+    .bind("messages")
+    .bind("chat,messages,responses") // 三个协议共存于一行
+    .bind(1_000_i64)
+    .bind("manual")
+    .execute(&pool)
+    .await
+    .expect("store multi-protocol result");
+
+    let map = llmux_core::probe::load_test_results(&pool).await;
+    let row = map
+        .get(&(account_id, "gpt-5.6-luna".to_string()))
+        .expect("row present");
+    assert_eq!(
+        row.protocols(),
+        vec![
+            llmux_core::protocol::Protocol::Chat,
+            llmux_core::protocol::Protocol::Messages,
+            llmux_core::protocol::Protocol::Responses,
+        ],
+        "协议集合应按 chat > messages > responses 排序且一个不少"
+    );
+    assert!(row.is_manual(), "手工拨测应能覆盖真实流量显示");
+    assert_eq!(row.via.as_deref(), Some("messages"));
+
+    // UPSERT 覆盖，不是新增行 —— 与 0018 的「多行」不同，这里恒定一行。
+    sqlx::query(
+        "INSERT INTO model_test_results \
+         (account_id, model, success, latency_ms, error_message, via, supported, checked_at, source) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT(account_id, model) DO UPDATE SET \
+           supported = excluded.supported, checked_at = excluded.checked_at, source = excluded.source",
+    )
+    .bind(account_id)
+    .bind("gpt-5.6-luna")
+    .bind(0_i64)
+    .bind(9_i64)
+    .bind(Some("boom"))
+    .bind(Option::<String>::None)
+    .bind("chat")
+    .bind(2_000_i64)
+    .bind("aggregate")
+    .execute(&pool)
+    .await
+    .expect("upsert again");
+
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM model_test_results")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1, "同一 (账户, 模型) 恒为一行");
+
+    let map = llmux_core::probe::load_test_results(&pool).await;
+    let row = map.get(&(account_id, "gpt-5.6-luna".to_string())).unwrap();
+    assert_eq!(row.protocols(), vec![llmux_core::protocol::Protocol::Chat]);
+    assert!(!row.is_manual(), "后台聚合探活不应抢手工拨测的显示状态");
+}
+
+#[tokio::test]
+async fn migration_0020_adds_source_and_drops_protocol_cache() {
+    let pool = memory_db().await;
+    let cols: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_table_info('model_test_results')")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert!(cols.contains(&"source".to_string()));
+
+    let gone: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='model_protocol_cache'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(gone, 0, "0018 的坏表应被 0020 删除");
 }
 
 #[tokio::test]

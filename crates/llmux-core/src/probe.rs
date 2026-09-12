@@ -5,8 +5,8 @@
 //!   不像早期那样「先试一个、失败再试下一个」—— 那样只能得到「第一个能用的」，
 //!   而 UI 要展示「这个模型支持的全部协议」。并发发起，总耗时 = 最慢的那个。
 //! * **每个协议独立判定**：一次 2xx 即认为该协议可用。互不影响。
-//! * 结果**全部写回** `model_protocol_cache`（每个可用协议一行），供 UI 角标与
-//!   下次探测参考。
+//! * 结果**全部写回** `model_test_results`（协议集合与成败同表），供 UI 角标、
+//!   health 的「最近一次状态」与下次探测参考。
 //! * **优先级 chat > messages > responses**：仅用于「首选/回显」的排序，不用于
 //!   剪枝 —— 三个都探，不做短路，否则角标就不完整了。
 //! * 缓存**不参与路由**：线上走哪个协议由别名配置决定，探测与配置不一致时只
@@ -338,120 +338,76 @@ fn mismatch(probed: Protocol, mode: DownstreamMode, account: &Account) -> Option
 }
 
 // ---------------------------------------------------------------------------
-// 协议缓存读写（不参与路由；供 UI 角标 + 「配置是否写错」提示）
+// 协议缓存读写（合并了原 model_protocol_cache；不参与路由，供 UI 角标 +
+// 「配置是否写错」提示 + health 合并展示）
 // ---------------------------------------------------------------------------
 
-/// 缓存里该 (账户, 模型) 支持的全部协议。
-pub async fn load_cached_protocols(
-    pool: &sqlx::SqlitePool,
-    account_id: i64,
-    model: &str,
-) -> Vec<Protocol> {
-    let rows: Vec<String> = sqlx::query_scalar(
-        "SELECT protocol FROM model_protocol_cache WHERE account_id = ? AND model = ?",
+/// 写入方。决定 health 的「最近一次状态」是否采信该行 —— 只有 `Manual`
+/// （用户手动拨测）能覆盖真实流量；后台聚合探活/别名校验只更新角标，
+/// 不抢用户看到的成败状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TestSource {
+    /// UI 拨测按钮 / 单模型拨测。
+    Manual,
+    /// 聚合别名后台探活（每 300s 一轮）。
+    Aggregate,
+    /// 保存别名时的自动校验。
+    Verify,
+}
+
+impl TestSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::Aggregate => "aggregate",
+            Self::Verify => "verify",
+        }
+    }
+}
+
+/// 一条 (账户, 模型) 的探测记录（0019 表，0018 的协议缓存已并入 `supported`）。
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct TestResult {
+    pub account_id: i64,
+    pub model: String,
+    pub success: i64,
+    pub latency_ms: i64,
+    pub error_message: Option<String>,
+    pub via: Option<String>,
+    /// 逗号分隔的可用协议；native provider 为空。
+    pub supported: String,
+    pub checked_at: i64,
+    pub source: String,
+}
+
+impl TestResult {
+    /// 用户手工拨测 —— 唯一可以覆盖真实流量显示状态的来源。
+    pub fn is_manual(&self) -> bool {
+        self.source == TestSource::Manual.as_str()
+    }
+
+    /// 可用协议，已按 `PROTOCOL_PRIORITY` 排序。
+    pub fn protocols(&self) -> Vec<Protocol> {
+        parse_supported(Some(&self.supported))
+    }
+}
+
+/// 批量读探测结果，供列表/角标/health 合并展示用。
+pub async fn load_test_results(pool: &sqlx::SqlitePool) -> BTreeMap<(i64, String), TestResult> {
+    let rows: Vec<TestResult> = sqlx::query_as(
+        "SELECT account_id, model, success, latency_ms, error_message, via, supported, checked_at, source \
+         FROM model_test_results",
     )
-    .bind(account_id)
-    .bind(model)
     .fetch_all(pool)
     .await
     .unwrap_or_default();
-    sort_by_priority(rows.iter().filter_map(|s| parse_protocol(s)))
+    rows.into_iter()
+        .map(|r| ((r.account_id, r.model.clone()), r))
+        .collect()
 }
 
-/// 用本轮探测结果**整体替换**该 (账户, 模型) 的协议集合。
-///
-/// 用替换而非合并：某协议这次探失败就该从缓存里消失（可能上游收回了支持），
-/// 否则角标会一直显示一个已经坏掉的协议。
-pub async fn store_probed_protocols(
-    pool: &sqlx::SqlitePool,
-    account_id: i64,
-    model: &str,
-    protocols: &[Protocol],
-    native: bool,
-) {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64;
-    let previous = load_cached_protocols(pool, account_id, model).await;
-
-    let mut tx = match pool.begin().await {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::warn!("探测协议写库失败 {account_id}/{model}: {e}");
-            return;
-        }
-    };
-    if let Err(e) = sqlx::query("DELETE FROM model_protocol_cache WHERE account_id = ? AND model = ?")
-        .bind(account_id)
-        .bind(model)
-        .execute(&mut *tx)
-        .await
-    {
-        tracing::warn!("探测协议清理失败 {account_id}/{model}: {e}");
-        return;
-    }
-    // native provider（anthropic/gemini）用自己的端点形式，不是三协议之一，
-    // 不写缓存 —— 写了会让 UI 显示一个语义不对的角标。
-    if !native {
-        for p in protocols {
-            if let Err(e) = sqlx::query(
-                "INSERT INTO model_protocol_cache (account_id, model, protocol, updated_at) VALUES (?, ?, ?, ?)",
-            )
-            .bind(account_id)
-            .bind(model)
-            .bind(p.as_str())
-            .bind(now)
-            .execute(&mut *tx)
-            .await
-            {
-                tracing::warn!("探测协议写入失败 {account_id}/{model}: {e}");
-                return;
-            }
-        }
-    }
-    if let Err(e) = tx.commit().await {
-        tracing::warn!("探测协议事务提交失败 {account_id}/{model}: {e}");
-        return;
-    }
-
-    let current = sort_by_priority(protocols.iter().copied());
-    if current != previous {
-        let fmt = |v: &[Protocol]| {
-            if v.is_empty() {
-                "(无)".to_string()
-            } else {
-                v.iter().map(|p| p.as_str()).collect::<Vec<_>>().join("+")
-            }
-        };
-        tracing::info!(
-            "🧭 记录协议路径 {}/{}: {} → {}",
-            account_id,
-            model,
-            fmt(&previous),
-            fmt(&current)
-        );
-    }
-}
-
-/// 批量读缓存，供列表/角标用。返回 `(account_id, model) -> 支持的协议（已排序）`。
-pub async fn load_protocol_map(
-    pool: &sqlx::SqlitePool,
-) -> BTreeMap<(i64, String), Vec<Protocol>> {
-    let rows: Vec<(i64, String, String)> =
-        sqlx::query_as("SELECT account_id, model, protocol FROM model_protocol_cache")
-            .fetch_all(pool)
-            .await
-            .unwrap_or_default();
-    let mut out: BTreeMap<(i64, String), Vec<Protocol>> = BTreeMap::new();
-    for (account_id, model, raw) in rows {
-        let Some(p) = parse_protocol(&raw) else { continue };
-        out.entry((account_id, model)).or_default().push(p);
-    }
-    for v in out.values_mut() {
-        *v = sort_by_priority(v.iter().copied());
-    }
-    out
+fn parse_supported(raw: Option<&str>) -> Vec<Protocol> {
+    sort_by_priority(raw.unwrap_or_default().split(',').filter_map(parse_protocol))
 }
 
 fn parse_protocol(s: &str) -> Option<Protocol> {
@@ -473,6 +429,174 @@ fn sort_by_priority(iter: impl Iterator<Item = Protocol>) -> Vec<Protocol> {
     });
     v.dedup();
     v
+}
+
+// ---------------------------------------------------------------------------
+// 连续失败暂停（方案 A）
+//
+// 上游把模型下架后常常仍留在 `/v1/models` 列表里（go5 一次就有 7 个），于是
+// 自动探活每一轮都要为它们付一次必然失败的请求，UI 上永远挂着红点，真正的
+// 故障被淹掉。这里做两件事：
+//
+// * **只拦自动拨测**：后台聚合探活 + 批量队列。显式调用（真实流量）与用户
+//   单独点「拨测」不受影响 —— 用户明确要看结果时不该被冷却挡住。
+// * **成功即退出暂停**：只要有一次成功（无论来源），计数和暂停一起清零。
+//   所以模型恢复后不需要等冷却到期，手工拨一次就能救回来。
+//
+// 冷却按 30 分钟逐次递增：失败 → 暂停到 now+30m；到期后再试再失败 → +30m。
+// `consecutive_failures` 不断累积，UI 据此显示「已连续失败 N 次」。
+
+/// 连续失败多少次后进入暂停。2 次：单次失败可能只是上游抖动，不值得停。
+pub const SUSPEND_AFTER_FAILURES: i64 = 2;
+
+/// 每次暂停的时长（30 分钟，逐次递增）。
+pub const SUSPEND_SECS: i64 = 30 * 60;
+
+/// 一条 (账户, 模型) 的暂停状态。
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ProbeSuspension {
+    pub account_id: i64,
+    pub model: String,
+    pub consecutive_failures: i64,
+    pub suspended_until: i64,
+    pub first_suspended_at: i64,
+    pub last_error: Option<String>,
+}
+
+impl ProbeSuspension {
+    /// 当前是否处于冷却期（`now_ms` 之前到期的都不算）。
+    pub fn is_suspended(&self, now_ms: i64) -> bool {
+        self.suspended_until > now_ms
+    }
+
+    /// 距离冷却结束还有多少秒（未暂停为 0）。
+    pub fn remaining_secs(&self, now_ms: i64) -> i64 {
+        ((self.suspended_until - now_ms).max(0)) / 1000
+    }
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
+/// 批量读暂停状态，供 health/角标与自动拨测剪枝用。
+pub async fn load_suspensions(pool: &sqlx::SqlitePool) -> BTreeMap<(i64, String), ProbeSuspension> {
+    let rows: Vec<ProbeSuspension> = sqlx::query_as(
+        "SELECT account_id, model, consecutive_failures, suspended_until, first_suspended_at, last_error \
+         FROM model_probe_suspensions",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    rows.into_iter()
+        .map(|r| ((r.account_id, r.model.clone()), r))
+        .collect()
+}
+
+/// 该 (账户, 模型) 当前是否被暂停自动拨测。
+pub async fn is_suspended(pool: &sqlx::SqlitePool, account_id: i64, model: &str) -> bool {
+    let until: Option<i64> = sqlx::query_scalar(
+        "SELECT suspended_until FROM model_probe_suspensions \
+         WHERE account_id = ? AND model = ?",
+    )
+    .bind(account_id)
+    .bind(model)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    until.unwrap_or(0) > now_ms()
+}
+
+/// 记一次失败：累加连续失败数，达到阈值即（重新）暂停 30 分钟。
+///
+/// 返回值是**本次是否正好进入/延长了暂停**，仅供调用方决定是否打日志。
+pub async fn note_failure(
+    pool: &sqlx::SqlitePool,
+    account_id: i64,
+    model: &str,
+    error: Option<&str>,
+) -> bool {
+    let now = now_ms();
+    let row: Option<(i64, i64)> = sqlx::query_as(
+        "SELECT consecutive_failures, suspended_until FROM model_probe_suspensions \
+         WHERE account_id = ? AND model = ?",
+    )
+    .bind(account_id)
+    .bind(model)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+
+    let (failures, was_until) = row.unwrap_or((0, 0));
+    let failures = failures + 1;
+
+    if failures < SUSPEND_AFTER_FAILURES {
+        // 还没到阈值：只记数，不暂停。
+        let _ = sqlx::query(
+            "INSERT INTO model_probe_suspensions \
+             (account_id, model, consecutive_failures, suspended_until, first_suspended_at, last_error) \
+             VALUES (?, ?, ?, 0, 0, ?) \
+             ON CONFLICT(account_id, model) DO UPDATE SET \
+               consecutive_failures = excluded.consecutive_failures, \
+               last_error = excluded.last_error",
+        )
+        .bind(account_id)
+        .bind(model)
+        .bind(failures)
+        .bind(error)
+        .execute(pool)
+        .await;
+        return false;
+    }
+
+    // 到阈值：暂停到 now + 30min。已在冷却中的话从**现在**重新起算（每次到期后
+    // 再失败就再 +30min，而不是叠加在旧到期时间上无限延长）。
+    let until = now + SUSPEND_SECS * 1000;
+    let first_at = if was_until <= now { now } else {
+        // 还在冷却里又失败：保持首次暂停时间
+        let existing: Option<i64> = sqlx::query_scalar(
+            "SELECT first_suspended_at FROM model_probe_suspensions WHERE account_id = ? AND model = ?",
+        ).bind(account_id).bind(model).fetch_optional(pool).await.ok().flatten();
+        existing.filter(|v| *v > 0).unwrap_or(now)
+    };
+    let _ = sqlx::query(
+        "INSERT INTO model_probe_suspensions \
+         (account_id, model, consecutive_failures, suspended_until, first_suspended_at, last_error) \
+         VALUES (?, ?, ?, ?, ?, ?) \
+         ON CONFLICT(account_id, model) DO UPDATE SET \
+           consecutive_failures = excluded.consecutive_failures, \
+           suspended_until = excluded.suspended_until, \
+           first_suspended_at = excluded.first_suspended_at, \
+           last_error = excluded.last_error",
+    )
+    .bind(account_id)
+    .bind(model)
+    .bind(failures)
+    .bind(until)
+    .bind(first_at)
+    .bind(error)
+    .execute(pool)
+    .await;
+    true
+}
+
+/// 记一次成功：清掉计数与暂停。
+///
+/// 显式调用（真实流量）也走这里 —— 模型恢复后第一次真实调用成功就该解除暂停，
+/// 不必等冷却到期后由自动拨测来发现。
+pub async fn clear_suspension(pool: &sqlx::SqlitePool, account_id: i64, model: &str) {
+    let _ = sqlx::query(
+        "DELETE FROM model_probe_suspensions WHERE account_id = ? AND model = ?",
+    )
+    .bind(account_id)
+    .bind(model)
+    .execute(pool)
+    .await;
 }
 
 // ---------------------------------------------------------------------------

@@ -95,7 +95,8 @@ async fn api_read_routes_match_gateway_empty_placeholder_shapes() {
         ("/api/models/health", json!([])),
         (
             "/api/models/test-queue/status",
-            json!({"isRunning": false, "total": 0, "current": 0, "progress": 0}),
+            // scope 标识队列由哪个拨测入口发起，前端据此把进度归到对应按钮
+            json!({"isRunning": false, "total": 0, "current": 0, "progress": 0, "scope": ""}),
         ),
         (
             "/api/activity",
@@ -575,3 +576,65 @@ async fn ui_auth_login_and_me_and_logout_gate() {
     assert_eq!(resp.status(), http::StatusCode::UNAUTHORIZED);
 }
 
+
+/// 队列要记住是哪个拨测入口起的（`scope`），前端刷新页面后才能把进度归到正确
+/// 的按钮上 —— 这正是「点了一键拨测只显示 0/4 然后什么都不跑」的根因：
+/// 客户端丢了 runningScope，就不会再轮询服务端状态。
+#[tokio::test]
+async fn test_queue_status_reports_and_validates_scope() {
+    use http::header;
+
+    // 每个用例都用全新的 state：空 models 的队列也会先置 is_running，紧接着
+    // 由 spawn 的任务清掉，共用一个 app 会和下一次 start 抢跑（409）。
+    async fn start_and_read_scope(scope: Option<Value>) -> Value {
+        let state = llmux_server::test_state().await;
+        let app = llmux_server::app(state.clone());
+        let login_req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/auth/login")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({"username":"admin","password":"admin"}).to_string(),
+            ))
+            .unwrap();
+        let cookie =
+            extract_session_cookie(&llmux_server::test_request(app.clone(), login_req).await)
+                .expect("session cookie");
+
+        let mut payload = json!({"models": []});
+        if let Some(s) = scope {
+            payload["scope"] = s;
+        }
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/models/test-all")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::COOKIE, cookie.clone())
+            .body(Body::from(payload.to_string()))
+            .unwrap();
+        let resp = llmux_server::test_request(app.clone(), req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/models/test-queue/status")
+            .header(header::COOKIE, cookie)
+            .body(Body::empty())
+            .unwrap();
+        let resp = llmux_server::test_request(app, req).await;
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice::<Value>(&bytes).unwrap()
+    }
+
+    // 合法 scope 原样记录
+    for want in ["aliases", "aggregates", "models"] {
+        let s = start_and_read_scope(Some(json!(want))).await;
+        assert_eq!(s["scope"], json!(want));
+    }
+    // 未给 scope / 未知 scope 一律回落到 "models"，不写脏值
+    assert_eq!(start_and_read_scope(None).await["scope"], json!("models"));
+    assert_eq!(
+        start_and_read_scope(Some(json!("../../etc/passwd"))).await["scope"],
+        json!("models")
+    );
+}

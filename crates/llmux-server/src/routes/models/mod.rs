@@ -23,4 +23,8 @@ pub struct TestQueueState {
     pub total: usize,
     pub current: usize,
     pub progress: usize,
+    /// 谁起的队列：`aliases` / `aggregates` / `models`。三个拨测入口共用同一条
+    /// 队列，但前端要各自独立显示进度 —— 页面刷新或换标签页后，只有靠这个字段
+    /// 才知道该把进度归给哪个按钮。
+    pub scope: String,
 }

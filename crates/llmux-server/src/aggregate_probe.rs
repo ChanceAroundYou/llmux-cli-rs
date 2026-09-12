@@ -152,6 +152,13 @@ async fn probe_candidate(
     pool: &sqlx::SqlitePool,
     master_key: &str,
 ) -> bool {
+    // 冷却中的候选直接判死，不发请求 —— 这是「定时触发的自动拨测」，
+    // 正是暂停机制要拦的那类。手工拨测与真实调用不走这里，不受影响。
+    if llmux_core::probe::is_suspended(pool, cand.account_id, &cand.model).await {
+        tracing::debug!("⏸️  [agg] 跳过 {} | 账户 {}：冷却中", cand.model, cand.account_id);
+        return false;
+    }
+
     let account = match get_account_by_id(pool, cand.account_id, master_key).await {
         Ok(Some(a)) => a,
         _ => return false,
@@ -194,12 +201,19 @@ async fn probe_candidate(
         _ => return false,
     };
 
-    llmux_core::probe::store_probed_protocols(
+    // 落库标 aggregate：角标会用这次探测的协议集合，但 health 的「最近一次
+    // 状态」不采信 —— 否则这个每 300s 一轮的后台探活会把用户手工拨测的结果
+    // 一遍遍刷掉。
+    let error = (!outcome.success()).then(|| outcome.error_summary());
+    crate::routes::models::testing::persist_test_result(
         pool,
-        account.id,
+        &account,
         &cand.model,
-        &outcome.supported,
-        outcome.native,
+        outcome.success(),
+        outcome.latency_ms(),
+        error.as_deref(),
+        Some(&outcome),
+        llmux_core::probe::TestSource::Aggregate,
     )
     .await;
 
@@ -213,6 +227,18 @@ async fn probe_candidate(
                 configured.as_str()
             );
         }
+        tracing::debug!(
+            "🧪 [agg] {} | {} | {}ms | OK [{}]",
+            cand.model, account.alias, outcome.latency_ms(), outcome.via_label()
+        );
+    } else {
+        // 探活失败此前只在 UI 里可见，日志无从 grep。补一行。
+        tracing::warn!(
+            "🧪 [agg] {} | {} | FAILED: {}",
+            cand.model,
+            account.alias,
+            outcome.error_summary()
+        );
     }
     outcome.success()
 }
