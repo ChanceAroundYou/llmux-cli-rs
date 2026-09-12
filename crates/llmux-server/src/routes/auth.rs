@@ -132,12 +132,13 @@ async fn admin_credentials(state: &AppState) -> (String, String) {
         .ok()
         .filter(|v| !v.trim().is_empty())
         .unwrap_or_else(|| DEFAULT_ADMIN_USERNAME.to_string());
-    // 尚未落库时没有哈希，返回空串表示「按明文比对 env/默认值」。
-    let pass = std::env::var("ADMIN_PASSWORD")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .unwrap_or_default();
-    (user, pass)
+    // 第二个槽位**只放哈希**，没有就返回空串。
+    //
+    // 曾经这里返回的是 env 的明文密码，而 `verify_admin` 把「非空」当作「有哈希」，
+    // 于是去 `verify_password` 里解析 `vXkb111717!` 这种根本不是 `v1:salt:hash`
+    // 的东西，必然 parse 失败 → 登录恒 401。只在**设了 env** 时复现，而测试环境
+    // 不设 env，所以单测全绿、生产全挂。env 明文的比对放在 verify_admin 里做。
+    (user, String::new())
 }
 
 /// 校验登录。`stored_hash` 为空表示 DB 里还没有记录，此时比对 env/默认明文。
