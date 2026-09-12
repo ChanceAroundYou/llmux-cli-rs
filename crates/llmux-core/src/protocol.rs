@@ -74,10 +74,11 @@ pub fn endpoint_for(a: &Account, p: Protocol) -> Option<&str> {
             .filter(|s| !s.is_empty())
             .or_else(|| a.base_url.as_deref().filter(|s| !s.is_empty())),
         // Messages deliberately does NOT fall back to base_url: base_url is an
-        // OpenAI-compatible endpoint (e.g. opencode.ai/zen/go/v1) whose /v1/messages
-        // Anthropic route often doesn't exist or is broken. Accounts without an
-        // explicit Anthropic endpoint are treated as chat-only and their messages
-        // ingress gets protocol-converted instead of blindly POSTing to /v1/messages.
+        // OpenAI-compatible endpoint, and treating it as an Anthropic one would
+        // make chat-only accounts POST /v1/messages blindly. Note the route
+        // itself usually *does* exist on these hosts (opencode.ai/zen/go/v1/messages
+        // answers JSON, not 404) — whether a given model is served there is
+        // per-model, so this is about not guessing, not about the route missing.
         Protocol::Messages => a
             .messages_endpoint
             .as_deref()
@@ -112,3 +113,4 @@ pub fn default_protocol_for(a: &Account) -> Protocol {
         _ => Protocol::Chat,
     }
 }
+
