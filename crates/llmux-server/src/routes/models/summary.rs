@@ -115,8 +115,17 @@ async fn fetch_accounts_light(state: &AppState) -> anyhow::Result<Value> {
 
 async fn fetch_health(state: &AppState) -> anyhow::Result<Value> {
     let rows = sqlx::query(
-        "SELECT u.account_id, a.provider_id, u.model, u.timestamp AS last_checked, u.success, u.latency_ms AS latency, u.error_message AS error, a.limits_cache, a.limits_cache_updated_at, a.alias AS account_name \
-         FROM usage_logs u JOIN accounts a ON u.account_id = a.id WHERE u.id IN (SELECT MAX(id) FROM usage_logs GROUP BY account_id, model)",
+        "SELECT k.account_id, a.provider_id, k.model, a.limits_cache, a.limits_cache_updated_at, a.alias AS account_name, \
+                t.timestamp AS traffic_at, t.success AS traffic_ok, t.latency_ms AS traffic_latency, t.error_message AS traffic_err, \
+                r.success AS test_ok, r.latency_ms AS test_latency, r.error_message AS test_err, r.supported AS test_supported, r.checked_at AS test_at \
+         FROM ( \
+           SELECT account_id, model FROM usage_logs \
+           UNION \
+           SELECT account_id, model FROM model_test_results \
+         ) k \
+         JOIN accounts a ON a.id = k.account_id \
+         LEFT JOIN usage_logs t ON t.id = (SELECT id FROM usage_logs WHERE account_id = k.account_id AND model = k.model ORDER BY id DESC LIMIT 1) \
+         LEFT JOIN model_test_results r ON r.account_id = k.account_id AND r.model = k.model",
     )
     .fetch_all(&state.pool)
     .await?;
@@ -128,22 +137,50 @@ async fn fetch_health(state: &AppState) -> anyhow::Result<Value> {
             let limits_cache: Value = limits_cache_str.as_deref().and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
             let account_id = r.try_get::<i64, _>("account_id").unwrap_or_default();
             let model = r.try_get::<String, _>("model").unwrap_or_default();
+            // 同 health：展示层面合并「最近一次」，拨测与真实流量各自留档。
+            let traffic_at = r.try_get::<Option<i64>, _>("traffic_at").ok().flatten().unwrap_or(0);
+            let test_at = r.try_get::<Option<i64>, _>("test_at").ok().flatten().unwrap_or(0);
+            let test_ok = r.try_get::<Option<i64>, _>("test_ok").ok().flatten();
+            let use_test = test_at > traffic_at && test_ok.is_some();
+            let (success, latency, error, last_checked) = if use_test {
+                (
+                    test_ok.unwrap_or_default(),
+                    r.try_get::<Option<i64>, _>("test_latency").ok().flatten().unwrap_or_default(),
+                    r.try_get::<Option<String>, _>("test_err").ok().flatten(),
+                    test_at,
+                )
+            } else {
+                (
+                    r.try_get::<Option<i64>, _>("traffic_ok").ok().flatten().unwrap_or_default(),
+                    r.try_get::<Option<i64>, _>("traffic_latency").ok().flatten().unwrap_or_default(),
+                    r.try_get::<Option<String>, _>("traffic_err").ok().flatten(),
+                    traffic_at,
+                )
+            };
+            let supported: Vec<String> = r
+                .try_get::<Option<String>, _>("test_supported")
+                .ok()
+                .flatten()
+                .map(|sup| sup.split(',').filter(|x| !x.is_empty()).map(String::from).collect())
+                .unwrap_or_else(|| {
+                    protocols
+                        .get(&(account_id, model.clone()))
+                        .map(|v| v.iter().map(|p| p.as_str().to_string()).collect())
+                        .unwrap_or_default()
+                });
             json!({
                 "account_id": r.try_get::<i64, _>("account_id").unwrap_or_default(),
                 "provider_id": r.try_get::<String, _>("provider_id").unwrap_or_default(),
                 "model": r.try_get::<String, _>("model").unwrap_or_default(),
-                "last_checked": r.try_get::<i64, _>("last_checked").unwrap_or_default(),
-                "success": r.try_get::<i64, _>("success").unwrap_or_default(),
-                "latency": r.try_get::<i64, _>("latency").unwrap_or_default(),
-                "error": r.try_get::<Option<String>, _>("error").unwrap_or_default(),
+                "last_checked": last_checked,
+                "success": success,
+                "latency": latency,
+                "error": error,
                 "limits_cache": limits_cache,
                 "limits_cache_updated_at": r.try_get::<Option<String>, _>("limits_cache_updated_at").unwrap_or_default(),
                 "account_name": r.try_get::<String, _>("account_name").unwrap_or_default(),
                 // 探测到的可用协议（角标用）；只回显事实，不参与路由。
-                "supported": protocols
-                    .get(&(account_id, model.clone()))
-                    .map(|v| v.iter().map(|p| p.as_str()).collect::<Vec<_>>())
-                    .unwrap_or_default(),
+                "supported": supported,
             })
         })
         .collect();
