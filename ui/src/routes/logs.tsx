@@ -305,7 +305,15 @@ export default function Logs() {
                   <td className="px-4 py-2 whitespace-nowrap font-mono text-muted-foreground">
                     {new Date(log.timestamp).toLocaleString([], { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' })}
                   </td>
-                  <td className="px-3 py-2 font-mono max-w-[220px] truncate" title={log.model}>{abbrModel(log.model)}</td>
+                  <td className="px-3 py-2 font-mono max-w-[220px] truncate" title={log.model}>
+                    {!!log.isTest && (
+                      // 拨测行没有 token，样式上跟真实流量区分开，免得被误读成一次请求。
+                      <Badge variant="secondary" className="mr-1.5 px-1.5 py-0 align-middle text-[10px] bg-warning/10 text-warning border-warning/20">
+                        {t('logs.probe', { defaultValue: '拨测' })}
+                      </Badge>
+                    )}
+                    {abbrModel(log.model)}
+                  </td>
                   <td className="px-3 py-2 text-muted-foreground max-w-[140px] truncate" title={log.accountName || ''}>{log.accountName || `#${log.accountId}`}</td>
                   <td className="px-3 py-2 text-right font-mono whitespace-nowrap">{formatK(log.inputTokens)}</td>
                   <td className="px-3 py-2 text-right font-mono whitespace-nowrap">{formatK(log.outputTokens)}</td>

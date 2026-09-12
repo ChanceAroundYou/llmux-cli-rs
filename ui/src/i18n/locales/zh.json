@@ -375,6 +375,8 @@
       "copyName": "复制模型名称"
     },
     "testBtn": "拨测",
+    "probeSuspended": "已暂停自动拨测（连续失败 {{n}} 次）· {{t}} 后重试",
+    "probeSuspendedHint": "连续失败 {{n}} 次，已暂停自动拨测，{{t}} 后再试",
     "testAll": "拨测全部",
     "testAllStart": "开始拨测",
     "testAllTitle": "拨测全部模型",
@@ -486,6 +488,7 @@
     "streamOnly": "仅流式",
     "slowOnly": "慢查询",
     "cacheTokens": "缓存",
+    "probe": "拨测",
     "elapsed": "耗时"
   }
 }

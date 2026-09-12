@@ -373,6 +373,8 @@
       "copyName": "Copy Model Name"
     },
     "testBtn": "Test",
+    "probeSuspended": "Auto-probing paused ({{n}} consecutive failures) · retry in {{t}}",
+    "probeSuspendedHint": "{{n}} consecutive failures — auto-probing paused, retrying in {{t}}",
     "testAll": "Test All",
     "testAllStart": "Start Testing",
     "testAllTitle": "Test All Models",
@@ -485,6 +487,7 @@
     "streamOnly": "Stream only",
     "slowOnly": "Slow queries",
     "cacheTokens": "Cache",
+    "probe": "Probe",
     "elapsed": "Elapsed"
   }
 }

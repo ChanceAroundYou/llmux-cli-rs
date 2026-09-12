@@ -62,7 +62,7 @@ interface ModelsState {
   streaming: boolean;
   perAccountMeta: Record<string, PerAccountMeta>;
   healthCache: any[] | null;
-  queueCache: { isRunning: boolean; current: number; total: number; progress: number } | null;
+  queueCache: { isRunning: boolean; current: number; total: number; progress: number; scope?: string } | null;
   error: string | null;
   fetchModels: (force?: boolean) => Promise<void>;
   streamModels: (force?: boolean) => Promise<void>;
@@ -76,8 +76,8 @@ interface ModelsState {
   deleteAggregateAlias: (id: number) => Promise<void>;
   setAggregateActive: (id: number, active: number) => Promise<void>;
   testModel: (modelId: string, providerId?: string, accountId?: number) => Promise<{ success: boolean; error?: string; latency?: number; status?: number; via?: string | null; supported?: string[]; mismatchedConfig?: string | null }>;
-  startTestQueue: (models: { model: string, providerId: string, accountId?: number }[]) => Promise<{ success: boolean; error?: string }>;
-  fetchTestQueueStatus: () => Promise<{ isRunning: boolean; current: number; total: number; progress: number }>;
+  startTestQueue: (models: { model: string, providerId: string, accountId?: number }[], scope?: string) => Promise<{ success: boolean; error?: string }>;
+  fetchTestQueueStatus: () => Promise<{ isRunning: boolean; current: number; total: number; progress: number; scope?: string }>;
 }
 
 let streamAbort: AbortController | null = null;
@@ -329,12 +329,12 @@ export const useModelsStore = create<ModelsState>((set, get) => ({
     }
   },
 
-  startTestQueue: async (models) => {
+  startTestQueue: async (models, scope) => {
     try {
       const res = await apiFetch('/api/models/test-all', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ models }),
+        body: JSON.stringify({ models, scope }),
       });
       return await res.json();
     } catch (err: any) {

@@ -15,7 +15,8 @@ import {
   Copy,
   Layers,
   ChevronUp,
-  ChevronDown
+  ChevronDown,
+  PauseCircle
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { Dialog, ConfirmDialog } from '../components/Modal';
@@ -50,6 +51,48 @@ const supports = (acc: any, proto: string) =>
   : proto === 'responses' ? !!acc.responses_endpoint
   : !!acc.messages_endpoint;
 
+type TestScope = 'aliases' | 'aggregates' | 'models';
+type QueueStatus = { isRunning: boolean; current: number; total: number; progress: number };
+const IDLE_QUEUE: QueueStatus = { isRunning: false, current: 0, total: 0, progress: 0 };
+const TEST_SCOPES: TestScope[] = ['aliases', 'aggregates', 'models'];
+
+/// 拨测入口按钮。三个入口（别名 / 聚合 / 模型）视觉与交互完全一致，只有待测集合
+/// 不同；各自持有独立状态，所以点其中一个不会让另外两个也显示「测试中」。
+function ScopeTestButton({
+  label, hint, queue, disabled, done, onClick,
+}: {
+  label: string;
+  hint: string;
+  queue: QueueStatus;
+  disabled: boolean;
+  done?: { label: string; count: number } | null;
+  onClick: () => void;
+}) {
+  const { t } = useTranslation();
+  return (
+    <div className="flex items-center gap-2 shrink-0">
+      <Button
+        variant="outline"
+        size="sm"
+        onClick={onClick}
+        disabled={disabled}
+        className="bg-warning/10 text-warning hover:bg-warning/20 border-0"
+        title={hint}
+      >
+        <Zap size={16} className={cn(queue.isRunning && "animate-pulse")} />
+        {queue.isRunning
+          ? t('models.testingQueue', { current: queue.current, total: queue.total })
+          : label}
+      </Button>
+      {done && !queue.isRunning && (
+        <span className="text-xs text-muted-foreground whitespace-nowrap">
+          {t('models.queueDone', '{{label}}：已完成 {{count}} 个', { label: done.label, count: done.count })}
+        </span>
+      )}
+    </div>
+  );
+}
+
 export default function Models() {
   const { t, i18n } = useTranslation();
   const { availableModels, aliases, aggregateAliases, accounts, isLoading, streaming, healthCache, queueCache, fetchModels, streamModels, fetchAliases, fetchAggregateAliases, fetchAccounts, fetchSummary, addAlias, deleteAlias, saveAggregateAlias, deleteAggregateAlias, setAggregateActive, testModel } = useModelsStore();
@@ -77,12 +120,18 @@ export default function Models() {
     return { owner: v.slice(0, idx), id: v.slice(idx + 1) };
   };
 
-  const [testResults, setTestResults] = useState<Record<string, { success: boolean; latency?: number; error?: string; loading?: boolean; lastChecked?: string; limitsCache?: any; limitsUpdatedAt?: string; via?: string | null; supported?: string[] }>>({});
-  const [queueStatus, setQueueStatus] = useState<{ isRunning: boolean; current: number; total: number; progress: number }>({ isRunning: false, current: 0, total: 0, progress: 0 });
+  const [testResults, setTestResults] = useState<Record<string, { success: boolean; latency?: number; error?: string; loading?: boolean; lastChecked?: string; limitsCache?: any; limitsUpdatedAt?: string; via?: string | null; supported?: string[]; suspension?: { suspended: boolean; failures: number; remaining_secs: number; last_error?: string | null } | null }>>({});
+  const [gridQueue, setGridQueue] = useState<QueueStatus>(IDLE_QUEUE);
+  const [aliasQueue, setAliasQueue] = useState<QueueStatus>(IDLE_QUEUE);
+  const [aggregateQueue, setAggregateQueue] = useState<QueueStatus>(IDLE_QUEUE);
+  // 三个拨测入口共用后端同一个队列，但显示状态必须各自独立 —— 点「拨测别名」
+  // 不该让另外两个按钮也变成「测试中」。runningScope 记住是谁起的队列，只有它
+  // 显示进度；三个按钮在队列忙时都禁用（后端确实只有一个队列，同时跑会串）。
+  const [runningScope, setRunningScope] = useState<TestScope | null>(null);
   const { startTestQueue, fetchTestQueueStatus } = useModelsStore();
   const [testAllConfirm, setTestAllConfirm] = useState(false);
-  const [testAllScope, setTestAllScope] = useState<'aliases' | 'aggregates' | 'models'>('aliases');
-  const [queueNotice, setQueueNotice] = useState<{ label: string; count: number } | null>(null);
+  const [testAllScope, setTestAllScope] = useState<TestScope>('aliases');
+  const [queueNotice, setQueueNotice] = useState<{ scope: TestScope; label: string; count: number } | null>(null);
   const [aliasToDelete, setAliasToDelete] = useState<{id: number, name: string} | null>(null);
   const [aggregateToDelete, setAggregateToDelete] = useState<{id: number, name: string} | null>(null);
   const [overwriteConfirm, setOverwriteConfirm] = useState<{ kind: 'ordinary'|'aggregate', alias: string, pending: any } | null>(null);
@@ -100,7 +149,9 @@ export default function Models() {
     setTestResults(prev => ({ ...prev, [key]: { success: false, loading: true } }));
     const result = await testModel(modelId, providerId, resolvedAccountId ?? undefined);
     // @ts-ignore
-    setTestResults(prev => ({ ...prev, [key]: { ...result, loading: false } }));
+    setTestResults(prev => ({ ...prev, [key]: { ...result, loading: false, suspension: null } }));
+    // 显式拨测成功 → 后端已解除暂停，把卡片从灰色恢复成正常色。
+    // 失败则不动：暂停状态等下一条 health 回来时由后端裁定。
   };
 
   const fetchHealth = async () => {
@@ -122,7 +173,8 @@ export default function Models() {
               limitsCache: row.limits_cache,
               limitsUpdatedAt: row.limits_cache_updated_at,
               via: (row.supported?.[0] ?? row.via) ?? null,
-              supported: Array.isArray(row.supported) ? row.supported : undefined
+              supported: Array.isArray(row.supported) ? row.supported : undefined,
+              suspension: row.suspension ?? null,
             };
           });
           return next;
@@ -158,6 +210,9 @@ export default function Models() {
           limitsUpdatedAt: (row as any).limits_cache_updated_at,
           via: ((row as any).supported?.[0] ?? (row as any).via) ?? null,
           supported: Array.isArray((row as any).supported) ? (row as any).supported : undefined,
+          // 连续失败暂停（方案 A）。suspended 为 false 时也带着 failures，
+          // 卡片可显示「已连续失败 N 次」而还没到暂停阈值。
+          suspension: (row as any).suspension ?? null,
         };
       }
       return next;
@@ -165,25 +220,64 @@ export default function Models() {
   }, [healthCache]);
 
   useEffect(() => {
-    if (queueCache) setQueueStatus(queueCache as any);
-  }, [queueCache]);
+    if (queueCache && runningScope) setQueueForScope(runningScope, queueCache as QueueStatus);
+  }, [queueCache, runningScope]);
 
-  // 2. 智能轮询：仅在队列运行时开启定时器
+  const setQueueForScope = (scope: TestScope, status: QueueStatus) => {
+    ({ aliases: setAliasQueue, aggregates: setAggregateQueue, models: setGridQueue }[scope])(status);
+  };
+  // 每个入口只认自己那份状态；队列不属于它时一律显示空闲。
+  const queueFor = (scope: TestScope): QueueStatus =>
+    runningScope === scope
+      ? { aliases: aliasQueue, aggregates: aggregateQueue, models: gridQueue }[scope]
+      : IDLE_QUEUE;
+  // 后端只有一条队列：谁在跑，三个按钮都禁用，避免互相踩。
+  const queueBusy = aliasQueue.isRunning || aggregateQueue.isRunning || gridQueue.isRunning;
+
+  // 有没有卡片处于冷却中 —— 只有这时候才需要每秒滴答，其他时候不白跑定时器。
+  const anySuspended = useMemo(
+    () => Object.values(testResults).some(r => r?.suspension?.suspended),
+    [testResults],
+  );
+  // 冷却倒计时的时钟：`remaining_secs` 是后端算的快照，本地按秒递减才不会跳。
+  const [nowTick, setNowTick] = useState(0);
   useEffect(() => {
-    if (!queueStatus.isRunning) return;
+    if (!anySuspended) return;
+    const t = setInterval(() => setNowTick(n => n + 1), 1000);
+    return () => clearInterval(t);
+  }, [anySuspended]);
+
+  // 2. 轮询：只要后端说队列在跑就跟着刷新 —— 不再要求 runningScope 是本标签页
+  // 设的。此前依赖 runningScope，导致刷新页面/另一个标签页起的队列永远不轮询，
+  // 界面就卡在一个 0/N 的旧快照上（服务端其实早跑完了）。
+  useEffect(() => {
+    if (!queueBusy) return;
 
     const timer = setInterval(async () => {
       const status = await fetchTestQueueStatus();
-      setQueueStatus(status);
-
-      // 如果还在跑，顺便刷新健康状态
-      if (status.isRunning) {
-        fetchHealth();
+      // runningScope 未知时（队列是别处起的）只更新本地那份，不强行归属某个入口。
+      if (runningScope) setQueueForScope(runningScope, status);
+      if (!status.isRunning) {
+        setRunningScope(null);
+        // 队列结束：各入口一律回到空闲，避免残留进度
+        TEST_SCOPES.forEach(s => setQueueForScope(s, IDLE_QUEUE));
       }
+      fetchHealth();
     }, 2000);
 
     return () => clearInterval(timer);
-  }, [queueStatus.isRunning]);
+  }, [queueBusy, runningScope]);
+
+  // 挂载时对一次后端状态：前一秒刷新页面/在别的标签页起的队列也能正确显示进度，
+  // 而不是卡在一个 0/N 的旧快照上。scope 由后端记录，不需要前端猜。
+  useEffect(() => {
+    fetchTestQueueStatus().then(status => {
+      if (!status.isRunning) return;
+      const scope = (status.scope as TestScope) ?? 'models';
+      setRunningScope(scope);
+      setQueueForScope(scope, status);
+    });
+  }, []);
 
   const providers = useMemo(() => {
     const p = Array.from(new Set((safeModels).map(m => m.owned_by)));
@@ -206,8 +300,8 @@ export default function Models() {
     });
   }, [safeModels, search, activeProvider]);
 
-  const handleTestAll = (scope: 'aliases' | 'aggregates' | 'models') => {
-    if (queueStatus.isRunning) return;
+  const handleTestAll = (scope: TestScope) => {
+    if (queueBusy) return;
     setTestAllScope(scope);
     setTestAllConfirm(true);
   };
@@ -217,6 +311,7 @@ export default function Models() {
   //   aggregates   → 聚合别名的每个候选（逐个测，候选可各走各的协议）
   //   models       → 模型卡片（无筛选时 = 当前账户全部模型；有筛选时 = 筛选后可见）
   const runTestQueue = async (
+    scope: TestScope,
     label: string,
     items: { model: string; providerId: string; accountId?: number }[],
   ) => {
@@ -224,11 +319,12 @@ export default function Models() {
       setTestAllConfirm(false);
       return;
     }
-    await startTestQueue(items);
+    setRunningScope(scope);
+    await startTestQueue(items, scope);
     const status = await fetchTestQueueStatus();
-    setQueueStatus(status);
+    setQueueForScope(scope, status);
     setTestAllConfirm(false);
-    setQueueNotice({ label, count: items.length });
+    setQueueNotice({ scope, label, count: items.length });
   };
 
   const executeTestAll = async () => {
@@ -246,7 +342,7 @@ export default function Models() {
       return { model: a.target_model, providerId: a.provider_id || '', ...(accountId != null ? { accountId } : {}) };
     }).filter(m => m.model);
 
-    await runTestQueue(t('models.testAliases', '普通别名'), modelsToTest);
+    await runTestQueue('aliases', t('models.testAliases', '普通别名'), modelsToTest);
   };
 
   // 聚合别名：展开每个候选。候选自带 account_id，直接定向。
@@ -258,7 +354,7 @@ export default function Models() {
         accountId: Number(c.account_id),
       }))
     ).filter(m => m.model);
-    await runTestQueue(t('models.testAggregates', '聚合别名候选'), items);
+    await runTestQueue('aggregates', t('models.testAggregates', '聚合别名候选'), items);
   };
 
   // 模型卡片入口：无筛选 → 当前账户全部模型；有筛选 → 筛选后可见的模型。
@@ -272,6 +368,7 @@ export default function Models() {
       return { model: m.id, providerId: m.owned_by, ...(aid != null ? { accountId: aid } : {}) };
     }).filter(m => m.model);
     await runTestQueue(
+      'models',
       hasFilter ? t('models.testFiltered', '筛选后的模型') : t('models.testAllModels', '当前账户全部模型'),
       items,
     );
@@ -387,31 +484,6 @@ export default function Models() {
           </div>
         </div>
         <div className="flex items-center gap-2">
-           {([
-             { scope: 'aliases' as const, label: t('models.testAliases', '拨测别名'), hint: t('models.testAliasesDesc', '测试已配置的普通别名') },
-             { scope: 'aggregates' as const, label: t('models.testAggregates', '拨测聚合'), hint: t('models.testAggregatesDesc', '测试每个聚合别名的全部候选') },
-             { scope: 'models' as const, label: t('models.testModels', '拨测模型'), hint: t('models.testModelsDesc', '有筛选时测筛选结果，无筛选时测当前账户全部模型') },
-           ]).map(({ scope, label, hint }) => (
-             <Button
-               key={scope}
-               variant="outline"
-               size="sm"
-               onClick={() => handleTestAll(scope)}
-               disabled={queueStatus.isRunning}
-               className="bg-warning/10 text-warning hover:bg-warning/20 border-0"
-               title={hint}
-             >
-               <Zap size={16} className={cn(queueStatus.isRunning && "animate-pulse")} />
-               {queueStatus.isRunning
-                 ? t('models.testingQueue', { current: queueStatus.current, total: queueStatus.total })
-                 : label}
-             </Button>
-           ))}
-           {queueNotice && !queueStatus.isRunning && (
-             <span className="text-xs text-muted-foreground">
-               {t('models.queueDone', '{{label}}：已完成 {{count}} 个', { label: queueNotice.label, count: queueNotice.count })}
-             </span>
-           )}
            <Button
              variant="outline"
              size="sm"
@@ -431,14 +503,24 @@ export default function Models() {
             <Zap size={14} className="text-primary" />
             {'别名'}
           </h2>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => { setEditingAliasId(null); setAliasForm({ alias: '', target: '', provider: '', selectedAccountIds: [], preferredAccountId: null, downstreamMode: 'default' }); setIsModalOpen(true); }}
-          >
-            <Plus size={16} />
-            {t('models.createAlias')}
-          </Button>
+          <div className="flex items-center gap-2">
+            <ScopeTestButton
+              label={t('models.testAliases', '拨测别名')}
+              hint={t('models.testAliasesDesc', '测试已配置的普通别名')}
+              queue={queueFor('aliases')}
+              disabled={queueBusy}
+              done={queueNotice?.scope === 'aliases' ? queueNotice : null}
+              onClick={() => handleTestAll('aliases')}
+            />
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => { setEditingAliasId(null); setAliasForm({ alias: '', target: '', provider: '', selectedAccountIds: [], preferredAccountId: null, downstreamMode: 'default' }); setIsModalOpen(true); }}
+            >
+              <Plus size={16} />
+              {t('models.createAlias')}
+            </Button>
+          </div>
         </div>
         {aliases.length > 0 && (
         <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3">
@@ -514,14 +596,24 @@ export default function Models() {
             <Layers size={14} className="text-primary" />
             {t('models.aggregateAlias')}
           </h2>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => openAggregateModal()}
-          >
-            <Layers size={16} />
-            {t('models.aggregateAlias')}
-          </Button>
+          <div className="flex items-center gap-2">
+            <ScopeTestButton
+              label={t('models.testAggregates', '拨测聚合')}
+              hint={t('models.testAggregatesDesc', '测试每个聚合别名的全部候选')}
+              queue={queueFor('aggregates')}
+              disabled={queueBusy}
+              done={queueNotice?.scope === 'aggregates' ? queueNotice : null}
+              onClick={() => handleTestAll('aggregates')}
+            />
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => openAggregateModal()}
+            >
+              <Layers size={16} />
+              {t('models.aggregateAlias')}
+            </Button>
+          </div>
         </div>
         {aggregateAliases.length > 0 && (
         <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3">
@@ -573,7 +665,7 @@ export default function Models() {
 
       {/* Filters & Tabs */}
       <div className="space-y-4">
-        <div className="flex items-center justify-between gap-4">
+        <div className="flex items-center justify-between gap-4 flex-wrap">
            <Tabs value={activeProvider} onValueChange={setActiveProvider} className="overflow-x-auto">
               <TabsList className="bg-muted/50 border border-border/50">
                 {providers.map(p => (
@@ -585,6 +677,15 @@ export default function Models() {
                 {providers.length > 0 && <span className="shrink-0 w-1.5" aria-hidden />}
               </TabsList>
            </Tabs>
+
+           <ScopeTestButton
+             label={t('models.testModels', '拨测模型')}
+             hint={t('models.testModelsDesc', '有筛选时测筛选结果，无筛选时测当前账户全部模型')}
+             queue={queueFor('models')}
+             disabled={queueBusy}
+             done={queueNotice?.scope === 'models' ? queueNotice : null}
+             onClick={() => handleTestAll('models')}
+           />
 
            <div className="relative flex-1 min-w-[110px] max-w-[170px]">
               {search === '' && (
@@ -608,13 +709,30 @@ export default function Models() {
           const cardAccountId = modelAccountId(model.owned_by, model.id);
           const cardKey = healthKey(cardAccountId, model.id);
           const cardResult = (!isPlaceholder ? (testResults[cardKey] ?? testResults[model.id]) : undefined);
+          // 连续失败暂停中（方案 A）：整卡打灰。倒计时按本地时钟递减
+          // —— remaining_secs 是后端算的快照，每秒减一才不会跳。
+          const susp = cardResult?.suspension;
+          const suspended = Boolean(susp?.suspended);
+          const remainingSecs = suspended ? Math.max(0, (susp!.remaining_secs) - nowTick) : 0;
+          const cooldownText = remainingSecs > 0
+            ? `${Math.floor(remainingSecs / 60)}:${String(remainingSecs % 60).padStart(2, '0')}`
+            : '';
           return (
-          <div key={`${model.owned_by}:${model.id}`} className={cn("p-4 rounded-xl border bg-card hover:border-primary/40 transition-all group flex flex-col justify-between min-h-[160px]", isPlaceholder ? "border-dashed border-warning/30 bg-warning/5" : "border-border")}>
+          <div key={`${model.owned_by}:${model.id}`} className={cn("p-4 rounded-xl border bg-card hover:border-primary/40 transition-all group flex flex-col justify-between min-h-[160px]",
+            isPlaceholder ? "border-dashed border-warning/30 bg-warning/5" : "border-border",
+            suspended && "opacity-60 grayscale-[0.5] border-muted-foreground/20",
+          )}>
             <div className="space-y-1">
               <div className="flex items-center justify-between">
                 <span className="text-xs font-bold text-primary uppercase tracking-widest">{model.owned_by}</span>
                 <div className="flex items-center gap-1.5">
-                   {!isPlaceholder && cardResult?.loading ? (
+                   {suspended ? (
+                     // 暂停中优先显示暂停图标 —— 此前的红点会让人以为要立刻处理，
+                     // 但自动拨测已经停了，不需要任何动作。
+                     <span title={t('models.probeSuspendedHint', { defaultValue: '连续失败 {{n}} 次，已暂停自动拨测，{{t}} 后再试', n: susp?.failures ?? 0, t: cooldownText || '—' })}>
+                       <PauseCircle size={11} className="text-muted-foreground" />
+                     </span>
+                   ) : !isPlaceholder && cardResult?.loading ? (
                      <RefreshCcw size={10} className="animate-spin text-muted-foreground" />
                    ) : !isPlaceholder && cardResult ? (
                      <div className={cn(
@@ -626,23 +744,25 @@ export default function Models() {
                 </div>
               </div>
               <div className="flex items-start justify-between gap-2">
-                <h3 className="font-semibold text-sm tracking-tight line-clamp-2 leading-snug">{model.name || model.id}</h3>
-                <CopyButton 
-                  value={model.id} 
-                  size={12} 
-                  className="mt-0.5 opacity-40 hover:opacity-100 transition-opacity" 
-                  title={t('models.actions.copyName')} 
+                <div className="flex items-center gap-1.5 min-w-0">
+                  <h3 className="font-semibold text-sm tracking-tight line-clamp-2 leading-snug">{model.name || model.id}</h3>
+                  {model.context_length != null && model.context_length > 0 && (
+                    <span
+                      className="shrink-0 text-[10px] font-bold text-muted-foreground/60 bg-muted/50 border border-border/50 rounded px-1.5 py-0.5"
+                      title={`${t('models.contextLength')}: ${model.context_length.toLocaleString()}`}
+                    >
+                      {formatContextLength(model.context_length)}
+                    </span>
+                  )}
+                </div>
+                <CopyButton
+                  value={model.id}
+                  size={12}
+                  className="mt-0.5 opacity-40 hover:opacity-100 transition-opacity"
+                  title={t('models.actions.copyName')}
                 />
               </div>
               <div className="flex items-center gap-2">
-                {model.context_length != null && model.context_length > 0 && (
-                  <span
-                    className="text-[10px] font-bold text-muted-foreground/60 bg-muted/50 border border-border/50 rounded px-1.5 py-0.5"
-                    title={`${t('models.contextLength')}: ${model.context_length.toLocaleString()}`}
-                  >
-                    {formatContextLength(model.context_length)}
-                  </span>
-                )}
                 {cardResult?.supported?.length ? (
                   <span
                     className="flex items-center gap-0.5"
@@ -670,21 +790,21 @@ export default function Models() {
                 {cardResult?.latency != null && (
                   <span className="text-xs text-success font-bold">{fmtSec(cardResult!.latency!)}</span>
                 )}
-                {cardResult?.lastChecked && (
-                  <span className="text-xs text-muted-foreground/60 font-medium">
-                    {parseServerDate(cardResult!.lastChecked!).toLocaleString(i18n.language, {
-                      month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'
-                    })}
-                  </span>
-                )}
               </div>
-              {cardResult?.error && (
-                // 两行高度 + 层内滚动：报错原文常常远超一行，之前 line-clamp-1
-                // 把关键信息（如上游的具体拒绝原因）截掉了。
-                <p
-                  className="text-xs text-destructive font-medium opacity-80 max-h-8 overflow-y-auto whitespace-pre-wrap break-words leading-4"
-                  title={cardResult?.error}
-                >{cardResult?.error}</p>
+              {!isPlaceholder && (
+                // 两行高度**恒定占位**：出错时不再往下挤动布局。报错原文常常远超
+                // 一行，层内滚动，之前 line-clamp-1 把关键信息截掉了。
+                // 暂停中改为显示冷却倒计时 —— 那才是此刻需要知道的信息。
+                suspended ? (
+                  <p className="text-xs text-muted-foreground font-medium h-8 overflow-hidden leading-4">
+                    {t('models.probeSuspended', { defaultValue: '已暂停自动拨测（连续失败 {{n}} 次）· {{t}} 后重试', n: susp?.failures ?? 0, t: cooldownText })}
+                  </p>
+                ) : (
+                  <p
+                    className="text-xs text-destructive font-medium opacity-80 h-8 overflow-y-auto whitespace-pre-wrap break-words leading-4"
+                    title={cardResult?.error}
+                  >{cardResult?.error}</p>
+                )
               )}
               {/* 限额进度条：只有厂商返回了 ratelimit 数据才显示 */}
               {(() => {
@@ -726,7 +846,9 @@ export default function Models() {
                ) : (
                  <button
                    onClick={() => handleTest(model.id, model.owned_by, cardAccountId ?? undefined)}
-                   disabled={cardResult?.loading || queueStatus.isRunning}
+                   // 刻意**不**因 suspended 而禁用：暂停只拦自动拨测，用户明确要
+                   // 单独测一次时照常放行（成功还会顺手解除暂停）。
+                   disabled={cardResult?.loading || queueBusy}
                    className="flex items-center gap-1 hover:text-foreground transition-colors disabled:opacity-50"
                  >
                    <Zap size={12} className={cn(cardResult?.success && "text-warning")} />
