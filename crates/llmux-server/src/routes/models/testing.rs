@@ -8,9 +8,8 @@ use sqlx::Row;
 
 use llmux_core::crypto::decrypt_api_key;
 use llmux_core::dispatcher::{get_active_accounts, resolve_model, resolve_provider_type, ModelResolution};
-use llmux_core::proxy::build_anthropic_target_url;
-
-use crate::routes::v1::helpers::normalize_base_url;
+use llmux_core::probe;
+use llmux_core::protocol::DownstreamMode;
 
 use crate::app::AppState;
 
@@ -122,6 +121,8 @@ pub async fn start_test_queue(
             } else {
                 &resolution.provider_id
             };
+            // 拨测的首选协议必须与真实路由同源：alias 的 upstream_api 决定 mode。
+            let probe_mode = DownstreamMode::from_str(resolution.upstream_api.as_str());
 
             let accounts_for_test: Vec<llmux_core::adapters::Account> = if let Some(v) = targeted_accounts {
                 v
@@ -142,139 +143,65 @@ pub async fn start_test_queue(
                             resolve_provider_type(pt.as_deref(), &account.provider_id)
                         };
 
-                        let (url, headers, body) = match provider_type.as_str() {
-                            "anthropic" => {
-                                let base = account.anthropic_base_url.as_deref().unwrap_or(
-                                    account
-                                        .base_url
-                                        .as_deref()
-                                        .unwrap_or("https://api.anthropic.com/v1"),
-                                );
-                                let url = build_anthropic_target_url(base);
-                                let mut headers = std::collections::BTreeMap::new();
-                                headers.insert(
-                                    "x-api-key".to_string(),
-                                    account.api_key.clone(),
-                                );
-                                headers.insert(
-                                    "anthropic-version".to_string(),
-                                    "2023-06-01".to_string(),
-                                );
-                                headers.insert(
-                                    "content-type".to_string(),
-                                    "application/json".to_string(),
-                                );
-                                let body = json!({
-                                    "model": model_name,
-                                    "max_tokens": 10,
-                                    "messages": [{"role": "user", "content": "Say OK and nothing else."}]
-                                });
-                                (url, headers, body)
-                            }
-                            "gemini" => {
-                                let base = account.base_url.as_deref().filter(|u| !u.is_empty()).unwrap_or(
-                                    "https://generativelanguage.googleapis.com/v1beta",
-                                );
-                                let model_id = if model_name.starts_with("models/") {
-                                    model_name.to_string()
-                                } else {
-                                    format!("models/{}", model_name)
-                                };
-                                let url = format!(
-                                    "{}/{}:generateContent?key={}",
-                                    base.trim_end_matches('/'),
-                                    model_id,
-                                    account.api_key
-                                );
-                                let mut headers = std::collections::BTreeMap::new();
-                                headers.insert(
-                                    "content-type".to_string(),
-                                    "application/json".to_string(),
-                                );
-                                let body = json!({
-                                    "contents": [{"parts": [{"text": "Say OK and nothing else."}]}]
-                                });
-                                (url, headers, body)
-                            }
-                            _ => {
-                                // OpenAI and custom. Accounts with a valid
-                                // anthropic_base_url are served via the Anthropic
-                                // Messages endpoint in real traffic (mirrors the
-                                // /v1/messages passthrough routing) — e.g. GitHub
-                                // Copilot's gateway rejects GPT-5.x models on
-                                // /chat/completions but serves them on /v1/messages.
-                                if let Some(anthropic_base) = account
-                                    .anthropic_base_url
-                                    .as_deref()
-                                    .map(str::trim)
-                                    .filter(|u| !u.is_empty())
-                                {
-                                    let url = build_anthropic_target_url(anthropic_base);
-                                    let mut headers = std::collections::BTreeMap::new();
-                                    headers.insert(
-                                        "x-api-key".to_string(),
-                                        account.api_key.clone(),
-                                    );
-                                    headers.insert(
-                                        "anthropic-version".to_string(),
-                                        "2023-06-01".to_string(),
-                                    );
-                                    headers.insert(
-                                        "content-type".to_string(),
-                                        "application/json".to_string(),
-                                    );
-                                    let body = json!({
-                                        "model": model_name,
-                                        "max_tokens": 10,
-                                        "messages": [{"role": "user", "content": "Say OK and nothing else."}]
-                                    });
-                                    (url, headers, body)
-                                } else {
-                                    let base = account
-                                        .base_url
-                                        .as_deref()
-                                        .unwrap_or("https://api.openai.com/v1");
-                                    let url = format!(
-                                        "{}/chat/completions",
-                                        normalize_base_url(base).trim_end_matches('/')
-                                    );
-                                    let mut headers = std::collections::BTreeMap::new();
-                                    headers.insert(
-                                        "authorization".to_string(),
-                                        format!("Bearer {}", account.api_key),
-                                    );
-                                    headers.insert(
-                                        "content-type".to_string(),
-                                        "application/json".to_string(),
-                                    );
-                                    let body = json!({
-                                        "model": model_name,
-                                        "messages": [{"role": "user", "content": "Say OK and nothing else."}],
-                                        "max_tokens": 10
-                                    });
-                                    (url, headers, body)
-                                }
-                            }
-                        };
-
-                        // Build reqwest request
-                        let start = std::time::Instant::now();
-                        let test_success = if let Ok(client) = reqwest::Client::builder()
+                        // 统一探测：并行探 chat/messages/responses，可用的全部记入库。
+                        let outcome = match reqwest::Client::builder()
                             .timeout(std::time::Duration::from_secs(30))
                             .build()
                         {
-                            let mut req = client.post(&url);
-                            for (k, v) in &headers {
-                                req = req.header(k.as_str(), v.as_str());
-                            }
-                            match req.json(&body).send().await {
-                                Ok(response) => response.status().is_success(),
-                                Err(_) => false,
-                            }
-                        } else {
-                            false
+                            Ok(client) => Some(
+                                probe::run_probe(
+                                    &client,
+                                    account,
+                                    model_name,
+                                    &provider_type,
+                                    probe_mode,
+                                )
+                                .await,
+                            ),
+                            Err(_) => None,
                         };
-                        let latency_ms = start.elapsed().as_millis() as i64;
+                        if let Some(o) = &outcome {
+                            probe::store_probed_protocols(
+                                &pool,
+                                account.id,
+                                model_name,
+                                &o.supported,
+                                o.native,
+                            )
+                            .await;
+                            if let Some(configured) = o.mismatched_config {
+                                tracing::warn!(
+                                    "🧭 {} | {} 实际可用 [{}]，但别名配的是 /{} —— 配置可能写错了",
+                                    model_name,
+                                    account.alias,
+                                    o.via_label(),
+                                    configured.as_str()
+                                );
+                            }
+                        }
+                        let test_success = outcome.as_ref().map(|o| o.success()).unwrap_or(false);
+                        let latency_ms = outcome.as_ref().map(|o| o.latency_ms()).unwrap_or(0);
+                        // 批量队列此前不写日志，失败只能去 UI 看；补一行便于事后 grep。
+                        match &outcome {
+                            Some(o) if o.success() => tracing::info!(
+                                "🧪 {} | {} | {}ms | OK [{}]",
+                                model_name,
+                                account.alias,
+                                o.latency_ms(),
+                                o.via_label()
+                            ),
+                            Some(o) => tracing::warn!(
+                                "🧪 {} | {} | FAILED: {}",
+                                model_name,
+                                account.alias,
+                                o.error_summary().chars().take(160).collect::<String>()
+                            ),
+                            None => tracing::warn!(
+                                "🧪 {} | {} | FAILED: 无法创建 HTTP client",
+                                model_name,
+                                account.alias
+                            ),
+                        }
 
                         // Log test result
                         let _ = sqlx::query(
@@ -353,6 +280,8 @@ pub async fn test_model(
     let effective_provider = provider_id_override
         .as_deref()
         .unwrap_or(&resolution.provider_id);
+    // 拨测的首选协议必须与真实路由同源：alias 的 upstream_api 决定 mode。
+    let probe_mode = DownstreamMode::from_str(resolution.upstream_api.as_str());
 
     let accounts = if let Some(acc_id) = account_id_override {
         // Directly fetch the specified account
@@ -430,97 +359,6 @@ pub async fn test_model(
         resolve_provider_type(pt.as_deref(), &account.provider_id)
     };
 
-    let (url, headers, req_body) = match provider_type.as_str() {
-        "anthropic" => {
-            let base = account.anthropic_base_url.as_deref().unwrap_or(
-                account
-                    .base_url
-                    .as_deref()
-                    .unwrap_or("https://api.anthropic.com/v1"),
-            );
-            let url = build_anthropic_target_url(base);
-            let mut headers = std::collections::BTreeMap::new();
-            headers.insert("x-api-key".to_string(), account.api_key.clone());
-            headers.insert("anthropic-version".to_string(), "2023-06-01".to_string());
-            headers.insert("content-type".to_string(), "application/json".to_string());
-            let body = json!({
-                "model": model_name,
-                "max_tokens": 50,
-                "messages": [{"role": "user", "content": "Say exactly: OK"}]
-            });
-            (url, headers, body)
-        }
-        "gemini" => {
-            let base = account.base_url.as_deref().filter(|u| !u.is_empty()).unwrap_or(
-                "https://generativelanguage.googleapis.com/v1beta",
-            );
-            let model_id = if model_name.starts_with("models/") {
-                model_name.to_string()
-            } else {
-                format!("models/{}", model_name)
-            };
-            let url = format!(
-                "{}/{}:generateContent?key={}",
-                base.trim_end_matches('/'),
-                model_id,
-                account.api_key
-            );
-            let mut headers = std::collections::BTreeMap::new();
-            headers.insert("content-type".to_string(), "application/json".to_string());
-            let body = json!({
-                "contents": [{"parts": [{"text": "Say exactly: OK"}]}]
-            });
-            (url, headers, body)
-        }
-        _ => {
-            // OpenAI and custom providers. Accounts with a valid
-            // anthropic_base_url are probed via the Anthropic Messages endpoint
-            // (mirrors the /v1/messages passthrough routing) — GitHub Copilot's
-            // gateway rejects GPT-5.x models on /chat/completions but serves
-            // them on /v1/messages.
-            if let Some(anthropic_base) = account
-                .anthropic_base_url
-                .as_deref()
-                .map(str::trim)
-                .filter(|u| !u.is_empty())
-            {
-                let url = build_anthropic_target_url(anthropic_base);
-                let mut headers = std::collections::BTreeMap::new();
-                headers.insert("x-api-key".to_string(), account.api_key.clone());
-                headers.insert("anthropic-version".to_string(), "2023-06-01".to_string());
-                headers.insert("content-type".to_string(), "application/json".to_string());
-                let body = json!({
-                    "model": model_name,
-                    "max_tokens": 50,
-                    "messages": [{"role": "user", "content": "Say exactly: OK"}]
-                });
-                (url, headers, body)
-            } else {
-                let base = account
-                    .base_url
-                    .as_deref()
-                    .unwrap_or("https://api.openai.com/v1");
-                let url = format!(
-                    "{}/chat/completions",
-                    normalize_base_url(base).trim_end_matches('/')
-                );
-                let mut headers = std::collections::BTreeMap::new();
-                headers.insert(
-                    "authorization".to_string(),
-                    format!("Bearer {}", account.api_key),
-                );
-                headers.insert("content-type".to_string(), "application/json".to_string());
-                let body = json!({
-                    "model": model_name,
-                    "messages": [{"role": "user", "content": "Say exactly: OK"}],
-                    "max_tokens": 50
-                });
-                (url, headers, body)
-            }
-        }
-    };
-
-    let start = std::time::Instant::now();
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
@@ -535,46 +373,60 @@ pub async fn test_model(
         }
     };
 
-    let mut req = client.post(&url);
-    for (k, v) in &headers {
-        req = req.header(k.as_str(), v.as_str());
+    // 统一探测：并行探 chat/messages/responses，可用的全部记入库。
+    let outcome = probe::run_probe(
+        &client,
+        account,
+        model_name,
+        &provider_type,
+        probe_mode,
+    )
+    .await;
+    probe::store_probed_protocols(
+        &state.pool,
+        account.id,
+        model_name,
+        &outcome.supported,
+        outcome.native,
+    )
+    .await;
+    if let Some(configured) = outcome.mismatched_config {
+        tracing::warn!(
+            "🧭 {} | {} 实际可用 [{}]，但别名配的是 /{} —— 配置可能写错了",
+            model_name,
+            account.alias,
+            outcome.via_label(),
+            configured.as_str()
+        );
     }
 
-    let response = match req.json(&req_body).send().await {
-        Ok(r) => r,
-        Err(e) => {
-            return Json(json!({
-                "success": false,
-                "error": format!("Request failed: {e}")
-            }))
-            .into_response();
-        }
-    };
-
-    let latency_ms = start.elapsed().as_millis() as i64;
-    let status = response.status();
-    let body_text = response.text().await.unwrap_or_default();
+    let latency_ms = outcome.latency_ms();
+    let success = outcome.success();
+    // 回显首选协议那次探测的原始应答（成功时是模型回答，失败时是上游错误体）。
+    let body_text = outcome
+        .preferred()
+        .and_then(|p| outcome.protocols.iter().find(|x| x.protocol == p))
+        .map(|p| p.body.clone())
+        .unwrap_or_else(|| outcome.error_summary());
     let response_json: Value = serde_json::from_str(&body_text).unwrap_or(Value::Null);
-
-    let success = status.is_success();
     let error_msg = if success {
         None
     } else {
         response_json
-            .get("error")
-            .and_then(|e| e.get("message"))
+            .pointer("/error/message")
             .and_then(Value::as_str)
             .map(String::from)
-            .or_else(|| Some(body_text.clone()))
+            .or_else(|| Some(outcome.error_summary()))
     };
 
     if success {
         tracing::info!(
-            "🧪 {} | {} | {} | {}ms | OK",
+            "🧪 {} | {} | {} | {}ms | OK [{}]",
             model_name,
             account.alias,
             effective_provider,
-            latency_ms
+            latency_ms,
+            outcome.via_label(),
         );
     } else {
         tracing::warn!(
@@ -583,14 +435,19 @@ pub async fn test_model(
             account.alias,
             effective_provider,
             latency_ms,
-            error_msg.as_deref().unwrap_or("unknown error")
+            outcome.error_summary()
         );
     }
 
     Json(json!({
         "success": success,
         "latency": latency_ms,
-        "status": status.as_u16(),
+        "status": outcome.status(),
+        // 支持的**全部**协议（按 chat > messages > responses 排序）+ 首选，
+        // 前端据此显示多协议角标。
+        "supported": outcome.supported.iter().map(|p| p.as_str()).collect::<Vec<_>>(),
+        "via": outcome.preferred().map(|p| p.as_str()),
+        "mismatchedConfig": outcome.mismatched_config.map(|p| p.as_str()),
         "response": if success { response_json } else { Value::Null },
         "error": error_msg,
     }))
