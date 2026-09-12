@@ -13,6 +13,55 @@ use llmux_core::protocol::DownstreamMode;
 
 use crate::app::AppState;
 
+/// 拨测结果落库。**独立于 usage_logs** —— 真实流量与拨测各存一处，
+/// 谁更新都不会抹掉对方（此前共用 usage_logs 按 (account,model) 取最新一条，
+/// 真实流量随时把拨测结果冲掉）。展示时由 health 接口合并两边的「最近一次」。
+#[allow(clippy::too_many_arguments)]
+async fn persist_test_result(
+    pool: &sqlx::SqlitePool,
+    account: &llmux_core::adapters::Account,
+    model: &str,
+    success: bool,
+    latency_ms: i64,
+    error: Option<&str>,
+    outcome: Option<&llmux_core::probe::ProbeOutcome>,
+) {
+    let via = outcome
+        .and_then(|o| o.preferred())
+        .map(|p| p.as_str().to_string());
+    let supported = outcome.map(|o| {
+        o.supported
+            .iter()
+            .map(|p| p.as_str())
+            .collect::<Vec<_>>()
+            .join(",")
+    });
+    let _ = sqlx::query(
+        "INSERT INTO model_test_results \
+         (account_id, model, success, latency_ms, error_message, via, supported, checked_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT(account_id, model) DO UPDATE SET \
+           success = excluded.success, latency_ms = excluded.latency_ms, \
+           error_message = excluded.error_message, via = excluded.via, \
+           supported = excluded.supported, checked_at = excluded.checked_at",
+    )
+    .bind(account.id)
+    .bind(model)
+    .bind(if success { 1 } else { 0 })
+    .bind(latency_ms)
+    .bind(error)
+    .bind(via)
+    .bind(supported)
+    .bind(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64,
+    )
+    .execute(pool)
+    .await;
+}
+
 pub async fn get_test_queue_status(Extension(state): Extension<AppState>) -> Response {
     let queue = state.test_queue.lock().unwrap();
     Json(json!({
@@ -203,26 +252,20 @@ pub async fn start_test_queue(
                             ),
                         }
 
-                        // Log test result
-                        let _ = sqlx::query(
-                            "INSERT INTO usage_logs \
-                             (timestamp, account_id, provider_id, model, input_tokens, output_tokens, \
-                              cache_read_input_tokens, cache_creation_input_tokens, \
-                              latency_ms, success, error_message, is_test) \
-                             VALUES (?, ?, ?, ?, 0, 0, 0, 0, ?, ?, NULL, 1)",
+                        // 拨测结果落库（与单模型拨测共用同一实现）
+                        persist_test_result(
+                            &pool,
+                            account,
+                            model_name,
+                            test_success,
+                            latency_ms,
+                            outcome
+                                .as_ref()
+                                .filter(|o| !o.success())
+                                .map(|o| o.error_summary())
+                                .as_deref(),
+                            outcome.as_ref(),
                         )
-                        .bind(
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_millis() as i64,
-                        )
-                        .bind(account.id)
-                        .bind(&account.provider_id)
-                        .bind(model_name)
-                        .bind(latency_ms)
-                        .bind(if test_success { 1 } else { 0 })
-                        .execute(&pool)
                         .await;
                     }
 
@@ -418,6 +461,18 @@ pub async fn test_model(
             .map(String::from)
             .or_else(|| Some(outcome.error_summary()))
     };
+
+    // 落库 —— 此前单模型拨测不写 usage_logs，刷新后结果就没了。
+    persist_test_result(
+        &state.pool,
+        account,
+        model_name,
+        success,
+        latency_ms,
+        error_msg.as_deref(),
+        Some(&outcome),
+    )
+    .await;
 
     if success {
         tracing::info!(
