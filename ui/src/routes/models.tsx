@@ -101,6 +101,9 @@ export default function Models() {
   const [search, setSearch] = useState('');
   const [activeProvider, setActiveProvider] = useState<string>('');
   const [isModalOpen, setIsModalOpen] = useState(false);
+  // 目标下拉可能上百项 —— 输入筛选缩小选项，不重造组件
+  const [targetFilter, setTargetFilter] = useState('');
+  const [targetOpen, setTargetOpen] = useState(false);
   const [aliasForm, setAliasForm] = useState({ alias: '', target: '', provider: '', selectedAccountIds: [] as number[], preferredAccountId: null as number | null, downstreamMode: 'chat' as string });
   // 提交时若强制模式选中了不支持的账户，提示并高亮
   const [aliasModeNotice, setAliasModeNotice] = useState<string | null>(null);
@@ -111,13 +114,6 @@ export default function Models() {
     if (!m) return null;
     const acc = safeAccounts.find(a => a.alias === owned_by);
     return acc ? Number(acc.id) : null;
-  };
-  // 别名下拉使用复合值，避免同名模型回显串台：value = "owned_by:modelId"
-  const optionValue = (owned_by: string, id: string) => `${owned_by}:${id}`;
-  const parseOptionValue = (v: string): { owner: string; id: string } => {
-    const idx = v.indexOf(':');
-    if (idx === -1) return { owner: '', id: v };
-    return { owner: v.slice(0, idx), id: v.slice(idx + 1) };
   };
 
   const [testResults, setTestResults] = useState<Record<string, { success: boolean; latency?: number; error?: string; loading?: boolean; lastChecked?: string; limitsCache?: any; limitsUpdatedAt?: string; via?: string | null; supported?: string[]; suspension?: { suspended: boolean; failures: number; remaining_secs: number; last_error?: string | null } | null }>>({});
@@ -678,26 +674,32 @@ export default function Models() {
               </TabsList>
            </Tabs>
 
-           <ScopeTestButton
-             label={t('models.testModels', '拨测模型')}
-             hint={t('models.testModelsDesc', '有筛选时测筛选结果，无筛选时测当前账户全部模型')}
-             queue={queueFor('models')}
-             disabled={queueBusy}
-             done={queueNotice?.scope === 'models' ? queueNotice : null}
-             onClick={() => handleTestAll('models')}
-           />
+           {/* 按钮和搜索框必须裹在同一组里：外层是 justify-between，
+               作为直接子元素会被均匀撑开，两者之间留出一大段空白；
+               裹起来之后 justify-between 只把「这一组」推到右边，组内保持紧贴
+               —— 与别名/聚合那两行同一个写法。 */}
+           <div className="flex items-center gap-2">
+             <ScopeTestButton
+               label={t('models.testModels', '拨测模型')}
+               hint={t('models.testModelsDesc', '有筛选时测筛选结果，无筛选时测当前账户全部模型')}
+               queue={queueFor('models')}
+               disabled={queueBusy}
+               done={queueNotice?.scope === 'models' ? queueNotice : null}
+               onClick={() => handleTestAll('models')}
+             />
 
-           <div className="relative flex-1 min-w-[110px] max-w-[170px]">
-              {search === '' && (
-                <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground z-10" size={14} />
-              )}
-              <Input
-                type="text"
-                placeholder={t('models.filter.searchPlaceholder')}
-                value={search}
-                onChange={e => setSearch(e.target.value)}
-                className={search ? 'pl-3' : 'pl-9'}
-              />
+             <div className="relative w-[170px] min-w-[110px]">
+                {search === '' && (
+                  <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground z-10" size={14} />
+                )}
+                <Input
+                  type="text"
+                  placeholder={t('models.filter.searchPlaceholder')}
+                  value={search}
+                  onChange={e => setSearch(e.target.value)}
+                  className={search ? 'pl-3' : 'pl-9'}
+                />
+             </div>
            </div>
         </div>
       </div>
@@ -897,31 +899,84 @@ export default function Models() {
           </div>
           <div className="space-y-1.5">
             <label className="text-xs font-bold text-muted-foreground uppercase">{t('models.targetModel')}</label>
-            <select
-              value={aliasForm.target ? optionValue(aliasForm.provider || safeModels.find(m => m.id === aliasForm.target)?.owned_by || '', aliasForm.target) : ''}
-              onChange={e => {
-                const parsed = parseOptionValue(e.target.value);
-                const accts = safeAccounts;
-                if (!parsed.id) {
-                  setAliasForm({ ...aliasForm, target: '', provider: '', selectedAccountIds: [] });
-                  return;
-                }
-                // 按模型 id 匹配所有拥有该模型的账户，不只所选 owner，避免同名模型在多账户间被隐藏
-                const matchingAccounts = accts.filter(a => a.is_active === 1 && safeModels.some(m => m.id === parsed.id && m.owned_by === a.alias));
-                setAliasForm({
-                  ...aliasForm,
-                  target: parsed.id,
-                  provider: parsed.owner,
-                  selectedAccountIds: matchingAccounts.map(a => a.id),
-                });
-              }}
-              className="w-full h-10 px-3 py-2 rounded-md border border-input bg-background text-sm ring-offset-background focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2"
-            >
-              <option value="">{t('common.default')}</option>
-              {safeModels.map(mod => (
-                <option key={`${mod.owned_by}:${mod.id}`} value={optionValue(mod.owned_by, mod.id)}>[{mod.owned_by}] {mod.id}</option>
-              ))}
-            </select>
+            {/* 单一可输入筛选的下拉框：别名与其他模型混排在同一列表里 */}
+            <div className="relative">
+              <Input
+                type="text"
+                value={aliasForm.target
+                  ? (aliasForm.provider
+                      ? `[${aliasForm.provider}] ${aliasForm.target}`
+                      : `[别名→${aliasForm.target}]`)
+                  : targetFilter}
+                onChange={e => {
+                  setAliasForm({ ...aliasForm, target: '', provider: '' });
+                  setTargetFilter(e.target.value);
+                }}
+                onFocus={() => { setTargetFilter(''); setTargetOpen(true); }}
+                onBlur={() => setTimeout(() => setTargetOpen(false), 150)}
+                placeholder={editingAliasId !== null && !aliasForm.target ? '' : t('models.targetSearchPlaceholder')}
+                className="w-full h-10 cursor-pointer"
+              />
+              {targetOpen && (
+                <div className="absolute z-50 mt-1 max-h-64 w-full overflow-auto rounded-md border border-input bg-background shadow-lg">
+                  {(() => {
+                    const q = targetFilter.toLowerCase();
+                    const aliasItems = aliases
+                      .filter(a => a.alias !== aliasForm.alias)
+                      .filter(a => !q || a.alias.toLowerCase().includes(q));
+                    const modelItems = safeModels
+                      .filter(m => !q || (m.owned_by + ' ' + m.id).toLowerCase().includes(q));
+                    const pickAlias = (name: string) => {
+                      // 重定向别名：provider 留空、不绑账户，请求沿别名链解析
+                      setAliasForm({ ...aliasForm, target: name, provider: '', selectedAccountIds: [], preferredAccountId: null, downstreamMode: 'default' });
+                      setTargetFilter('');
+                      setTargetOpen(false);
+                    };
+                    const pickModel = (owner: string, id: string) => {
+                      const accts = safeAccounts;
+                      // 按模型 id 匹配所有拥有该模型的账户，不只所选 owner，避免同名模型在多账户间被隐藏
+                      const matchingAccounts = accts.filter(a => a.is_active === 1 && safeModels.some(m => m.id === id && m.owned_by === a.alias));
+                      setAliasForm({
+                        ...aliasForm,
+                        target: id,
+                        provider: owner,
+                        selectedAccountIds: matchingAccounts.map(a => a.id),
+                      });
+                      setTargetFilter('');
+                      setTargetOpen(false);
+                    };
+                    if (aliasItems.length === 0 && modelItems.length === 0) {
+                      return <p className="px-3 py-2 text-xs text-muted-foreground">{t('models.noTargetMatch')}</p>;
+                    }
+                    return (
+                      <>
+                        {aliasItems.map(a => (
+                          <button
+                            type="button"
+                            key={`alias:${a.alias}`}
+                            onMouseDown={e => { e.preventDefault(); pickAlias(a.alias); }}
+                            className="block w-full px-3 py-1.5 text-left text-sm hover:bg-muted"
+                          >
+                            <span className="text-primary">[别名] {a.alias}</span>
+                            <span className="ml-2 text-muted-foreground text-xs">→ {a.target_model}</span>
+                          </button>
+                        ))}
+                        {modelItems.map(mod => (
+                          <button
+                            type="button"
+                            key={`${mod.owned_by}:${mod.id}`}
+                            onMouseDown={e => { e.preventDefault(); pickModel(mod.owned_by, mod.id); }}
+                            className="block w-full px-3 py-1.5 text-left text-sm hover:bg-muted truncate"
+                          >
+                            [{mod.owned_by}] {mod.id}
+                          </button>
+                        ))}
+                      </>
+                    );
+                  })()}
+                </div>
+              )}
+            </div>
           </div>
           {(() => {
             const accts = safeAccounts;
@@ -933,6 +988,16 @@ export default function Models() {
             // runtime skips them for forced modes.
             const filtered = matchingAccounts;
             if (!aliasForm.target) return null;
+            // 重定向别名（provider 为空 = 目标是另一个别名）：不绑账户，沿链解析
+            if (!aliasForm.provider) {
+              return (
+                <div className="space-y-1.5 border-t border-border pt-3">
+                  <p className="text-xs text-primary bg-primary/5 border border-primary/20 rounded px-2 py-1.5">
+                    {t('models.aliasRedirectHint')}
+                  </p>
+                </div>
+              );
+            }
             return (
               <div className="space-y-1.5 border-t border-border pt-3">
                 <label className="text-xs font-bold text-muted-foreground uppercase">
