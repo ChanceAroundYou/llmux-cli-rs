@@ -561,3 +561,140 @@ async fn admin_credentials_table_stores_hash_not_plaintext() {
     .await;
     assert!(dup.is_err(), "id=2 应被 CHECK 约束拒绝");
 }
+
+#[tokio::test]
+async fn alias_redirect_follows_chain_to_final_alias() {
+    // ponytail: 别名可重定向到其他别名 —— A->B->(provider直传) 与 A->B->C(绑账户) 两条链
+    let pool = memory_db().await;
+
+    sqlx::query("INSERT INTO model_aliases (alias, target_model) VALUES (?, ?)")
+        .bind("chain-a")
+        .bind("chain-b")
+        .execute(&pool)
+        .await
+        .expect("insert redirect alias");
+
+    // 终点带 provider_id 的别名 → 直传
+    sqlx::query("INSERT INTO model_aliases (alias, target_model, provider_id) VALUES (?, ?, ?)")
+        .bind("chain-b")
+        .bind("gpt-4o")
+        .bind("openai")
+        .execute(&pool)
+        .await
+        .expect("insert provider alias");
+
+    let resolved = llmux_core::dispatcher::resolve_model(&pool, "chain-a")
+        .await
+        .expect("resolve chain");
+    assert_eq!(resolved.provider_id, "openai");
+    assert_eq!(resolved.target_model, "gpt-4o");
+    assert_eq!(resolved.alias_name.as_deref(), Some("chain-b"));
+
+    // 终点带 account_ids 的别名 → 解析出账户列表
+    let account_id =
+        sqlx::query("INSERT INTO accounts (alias, provider_id, api_key) VALUES (?, ?, ?)")
+            .bind("T1")
+            .bind("openai")
+            .bind("k")
+            .execute(&pool)
+            .await
+            .expect("insert account")
+            .last_insert_rowid();
+    sqlx::query("UPDATE model_aliases SET provider_id = NULL, account_ids = ? WHERE alias = 'chain-b'")
+        .bind(json!([account_id]).to_string())
+        .execute(&pool)
+        .await
+        .expect("rebind chain-b accounts");
+
+    let resolved = llmux_core::dispatcher::resolve_model(&pool, "chain-a")
+        .await
+        .expect("resolve account chain");
+    assert_eq!(resolved.account_ids, vec![account_id]);
+    assert_eq!(resolved.target_model, "gpt-4o");
+
+    // 自重定向不允许无限打转:指向自己时按前缀兜底(裸名 → 直传)
+    sqlx::query("UPDATE model_aliases SET target_model = 'chain-a' WHERE alias = 'chain-a'")
+        .execute(&pool)
+        .await
+        .expect("self redirect");
+    let resolved = llmux_core::dispatcher::resolve_model(&pool, "chain-a")
+        .await
+        .expect("resolve self-redirect");
+    assert_ne!(resolved.alias_name.map(|s| s == "chain-a").unwrap_or(false), true);
+}
+
+/// Claude Desktop / Claude Code 的 gateway model discovery 只保留 id 匹配
+/// /(claude|anthropic)/i 的条目，所以 `/v1/models` 把别名广告成 `claude-<alias>`；
+/// 客户端回传的就是这个名字，必须能原路解析回别名（含聚合别名）。
+#[tokio::test]
+async fn discovery_prefixed_alias_names_resolve_back_to_the_alias() {
+    let pool = memory_db().await;
+
+    sqlx::query("INSERT INTO model_aliases (alias, target_model, provider_id) VALUES (?, ?, ?)")
+        .bind("d4")
+        .bind("deepseek-chat")
+        .bind("deepseek")
+        .execute(&pool)
+        .await
+        .expect("insert alias");
+
+    for name in ["d4", "claude-d4", "anthropic-d4"] {
+        let resolved = llmux_core::dispatcher::resolve_model(&pool, name)
+            .await
+            .unwrap_or_else(|e| panic!("resolve {name}: {e}"));
+        assert_eq!(resolved.alias_name.as_deref(), Some("d4"), "{name}");
+        assert_eq!(resolved.provider_id, "deepseek", "{name}");
+        assert_eq!(resolved.target_model, "deepseek-chat", "{name}");
+    }
+
+    // 精确匹配优先：真有个叫 claude-d4 的别名时，前缀还原不能抢走它
+    sqlx::query("INSERT INTO model_aliases (alias, target_model, provider_id) VALUES (?, ?, ?)")
+        .bind("claude-d4")
+        .bind("gpt-4o")
+        .bind("openai")
+        .execute(&pool)
+        .await
+        .expect("insert literal alias");
+    let resolved = llmux_core::dispatcher::resolve_model(&pool, "claude-d4")
+        .await
+        .expect("resolve literal prefixed alias");
+    assert_eq!(resolved.alias_name.as_deref(), Some("claude-d4"));
+    assert_eq!(resolved.target_model, "gpt-4o");
+}
+
+#[tokio::test]
+async fn discovery_prefixed_aggregate_names_resolve_back_to_the_aggregate() {
+    let pool = memory_db().await;
+    let router = llmux_core::aggregate::AggregateRouter::default();
+
+    let account_id =
+        sqlx::query("INSERT INTO accounts (alias, provider_id, api_key) VALUES (?, ?, ?)")
+            .bind("go6")
+            .bind("openai")
+            .bind("k")
+            .execute(&pool)
+            .await
+            .expect("insert account")
+            .last_insert_rowid();
+
+    sqlx::query("INSERT INTO aggregate_aliases (alias, candidates, upstream_api) VALUES (?, ?, ?)")
+        .bind("of")
+        .bind(json!([{"account_id": account_id, "model": "deepseek-v4.1-flash"}]).to_string())
+        .bind("chat")
+        .execute(&pool)
+        .await
+        .expect("insert aggregate alias");
+
+    let agg = llmux_core::aggregate::resolve_aggregate(&pool, "claude-of", &router)
+        .await
+        .expect("resolve aggregate")
+        .expect("aggregate should resolve");
+    assert_eq!(agg.alias, "of");
+    assert_eq!(agg.candidates[0].model, "deepseek-v4.1-flash");
+
+    let agg = llmux_core::aggregate::resolve_aggregate(&pool, "of", &router)
+        .await
+        .expect("resolve plain aggregate")
+        .expect("aggregate should resolve");
+    assert_eq!(agg.alias, "of");
+}

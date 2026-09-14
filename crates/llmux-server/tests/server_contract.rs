@@ -260,6 +260,99 @@ async fn v1_models_reports_context_length_from_table_cache_and_unknown() {
     assert!(by_id["u"].get("context_length").is_none(), "{body}");
 }
 
+/// Claude Desktop's gateway mode authenticates with `Authorization: Bearer`
+/// and may omit `anthropic-version`, but still parses the Anthropic model-list
+/// envelope. Header sniffing used to hand it an OpenAI-shaped list, which it
+/// silently dropped ("Model discovery: found 0 models") despite HTTP 200.
+#[tokio::test]
+async fn v1_models_item_carries_both_anthropic_and_openai_fields() {
+    use http::header;
+    let state = llmux_server::test_state().await;
+    sqlx::query("INSERT INTO api_keys (name, key, allowed_models) VALUES ('test', 'sk-test', '')")
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO model_aliases (alias, target_model, provider_id) VALUES ('g', 'gpt-4o', 'openai')",
+    )
+    .execute(&state.pool)
+    .await
+    .unwrap();
+
+    let app = llmux_server::app(state);
+    for variant in [
+        vec![
+            (header::AUTHORIZATION.as_str(), "Bearer sk-test"),
+            ("anthropic-version", "2023-06-01"),
+        ],
+        vec![(header::AUTHORIZATION.as_str(), "Bearer sk-test")],
+        vec![("x-api-key", "sk-test")],
+    ] {
+        let mut builder = Request::builder().method(Method::GET).uri("/v1/models");
+        for (name, value) in &variant {
+            builder = builder.header(*name, *value);
+        }
+        let request = builder.body(Body::empty()).unwrap();
+        let response = llmux_server::test_request(app.clone(), request).await;
+        assert_eq!(response.status(), StatusCode::OK, "{variant:?}");
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(body["object"], json!("list"), "{variant:?}: {body}");
+        assert_eq!(body["has_more"], json!(false), "{variant:?}: {body}");
+        assert_eq!(body["first_id"], json!("g"), "{variant:?}: {body}");
+        assert_eq!(body["last_id"], json!("g"), "{variant:?}: {body}");
+
+        let item = &body["data"][0];
+        assert_eq!(item["type"], json!("model"), "{variant:?}: {body}");
+        assert_eq!(item["id"], json!("g"), "{variant:?}: {body}");
+        assert_eq!(item["display_name"], json!("g"), "{variant:?}: {body}");
+        assert!(item["created_at"].is_string(), "{variant:?}: {body}");
+        assert_eq!(item["object"], json!("model"), "{variant:?}: {body}");
+        assert_eq!(item["owned_by"], json!("llmux"), "{variant:?}: {body}");
+        assert!(item["created"].is_u64(), "{variant:?}: {body}");
+    }
+}
+
+/// Desktop 的模型选择器硬过滤掉 id 不含 claude/anthropic 的条目，所以单独给它
+/// `/{base}/cc/v1/models`；普通 `/v1/models` 必须保持裸别名不受影响。
+#[tokio::test]
+async fn desktop_mount_prefixes_model_ids_while_the_default_mount_does_not() {
+    use http::header;
+    let state = llmux_server::test_state().await;
+    sqlx::query("INSERT INTO api_keys (name, key, allowed_models) VALUES ('test', 'sk-test', '')")
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO model_aliases (alias, target_model, provider_id) VALUES ('d4', 'deepseek-chat', 'deepseek')",
+    )
+    .execute(&state.pool)
+    .await
+    .unwrap();
+
+    let app = llmux_server::app(state);
+    for (path, want_id) in [("/v1/models", "d4"), ("/cc/v1/models", "claude-d4")] {
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri(path)
+            .header(header::AUTHORIZATION, "Bearer sk-test")
+            .body(Body::empty())
+            .unwrap();
+        let response = llmux_server::test_request(app.clone(), request).await;
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["data"][0]["id"], json!(want_id), "{path}: {body}");
+        // 选择器显示的是 display_name，两种情况都该是裸别名
+        assert_eq!(body["data"][0]["display_name"], json!("d4"), "{path}: {body}");
+    }
+}
+
 #[tokio::test]
 async fn unknown_api_routes_return_gateway_not_found_error_without_spa_fallback() {
     let (status, body) = request_json(Method::GET, "/api/does-not-exist", None).await;
