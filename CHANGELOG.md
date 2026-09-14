@@ -49,6 +49,22 @@
 
 ### Fixed
 
+- **opencode-go 账号余额被误报成「Goat Lite」**：`balance_auth` cookie 在选凭据时
+  无条件压过 API key（`balance_credential`），于是同时配了两者的账号走 `_server`
+  网页路径 —— 该路径的 subscription RPC 对 go6（53）返回 `null`，解析失败后回落
+  billing，payload 里的 `liteSubscriptionID` 命中硬编码兜底，摘要被写成
+  「Goat Lite」、窗口列表为空；而同一账号的 Go usage API（`/zen/go/v1/usage`）
+  实际返回 `rolling 5% / weekly 2% / monthly 1%`。
+  - 新增 `prefers_api_key_for_balance()`：仅 **opencode-go** 且 `api_key` 为
+    `sk-` 形态时优先用 key，其余 kind 的「cookie 优先」规则不变。
+  - `accounts.rs` 改为两个凭据都解密后按上述规则选择，且只对实际使用的那个
+    报解密失败。
+  - 顺带纠正命名冲突：opencode 路径的「Goat Lite」→「Go Lite」（go 账号）/
+    「Lite」（opencode 账号）、「Goat 订阅用量」→「Go 订阅用量」—— **Goat 是
+    CommandCode 的套餐名**（`individual-goat`，$70/月），与 OpenCode Go 无关，
+    是 CodexBar 移植时带进来的叫法。
+  - 新增测试 `opencode_go_prefers_api_key_over_cookie`。
+
 - **拨测记录在请求日志页一条都看不到**：`e0fc691` 把批量拨测原先写 `usage_logs`
   的那条 INSERT 换成了只写 `model_test_results`，于是三个拨测入口（别名/聚合/模型）
   的成败与报错都进不了请求日志页，只能去 `docker logs` / `llmux.log` 里 grep `🧪`。
