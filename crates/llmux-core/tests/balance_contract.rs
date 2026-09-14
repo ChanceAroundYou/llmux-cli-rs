@@ -6,7 +6,7 @@
 use llmux_core::balance::{
     balance_credential, commandcode_result, detect_kind, oc_parse_billing_balance,
     oc_parse_billing_balance_loose, oc_parse_subscription, oc_parse_subscription_goat,
-    oc_scan_balance_any_text, BalanceKind,
+    oc_scan_balance_any_text, prefers_api_key_for_balance, BalanceKind,
 };
 
 #[test]
@@ -16,6 +16,21 @@ fn balance_credential_prefers_dedicated_auth() {
     assert_eq!(balance_credential("", "sk-123"), "sk-123");
     assert_eq!(balance_credential("gho_secret", ""), "gho_secret");
     assert_eq!(balance_credential("", ""), "");
+}
+
+#[test]
+fn opencode_go_prefers_api_key_over_cookie() {
+    // cookie + sk- key 同时存在 → 走 Go usage API（cookie 的 _server subscription RPC
+    // 对某些账号返回 null，会误报成按量计费（Go Lite））
+    assert!(prefers_api_key_for_balance(BalanceKind::OpenCodeGo, "auth=xyz", "sk-abc"));
+    // 只有 cookie（网页登录账号）→ 保持 cookie 路径
+    assert!(!prefers_api_key_for_balance(BalanceKind::OpenCodeGo, "auth=xyz", ""));
+    // 非 API key 形态的凭据不当成 key 用
+    assert!(!prefers_api_key_for_balance(BalanceKind::OpenCodeGo, "auth=xyz", "Fe26.abc"));
+    // 其他 kind 的「cookie 优先」规则不变
+    assert!(!prefers_api_key_for_balance(BalanceKind::OpenCodeZen, "auth=xyz", "sk-abc"));
+    assert!(!prefers_api_key_for_balance(BalanceKind::OpenCode, "auth=xyz", "sk-abc"));
+    assert!(!prefers_api_key_for_balance(BalanceKind::CommandCode, "s=xyz", "sk-abc"));
 }
 
 // ─── detect_kind ─────────────────────────────────────────────────────────────
