@@ -292,25 +292,57 @@ pub fn resolve_model_by_prefix(model_name: &str) -> ModelResolution {
     }
 }
 
-pub async fn resolve_model(pool: &SqlitePool, model_name: &str) -> anyhow::Result<ModelResolution> {
-    let model_name = sanitize_model_name(model_name);
-    let alias = sqlx::query_as::<_, ModelAlias>(
-        "SELECT id, alias, target_model, provider_id, account_ids, preferred_account_id, upstream_api FROM model_aliases WHERE alias = ?",
-    )
-    .bind(&model_name)
-    .fetch_optional(pool)
-    .await?;
+/// Claude Desktop / Claude Code 的模型选择器在 gateway discovery 时会丢掉所有
+/// `id` 不匹配 `/(claude|anthropic)/i` 的条目（客户端硬编码的过滤），所以
+/// `/v1/models` 把别名按 `claude-<alias>` 广告。这里把该拼写还原回别名表里的真名。
+pub fn strip_client_prefix(name: &str) -> Option<&str> {
+    let lower = name.to_ascii_lowercase();
+    let len = ["claude-", "anthropic-"]
+        .into_iter()
+        .find(|prefix| lower.starts_with(prefix))
+        .map(str::len)?;
+    let rest = &name[len..];
+    (!rest.is_empty()).then_some(rest)
+}
 
-    if let Some(alias) = alias {
+const ALIAS_LOOKUP_SQL: &str = "SELECT id, alias, target_model, provider_id, account_ids, preferred_account_id, upstream_api FROM model_aliases WHERE alias = ?";
+
+/// 先按原名精确匹配别名表，查不到且名字带 discovery 前缀时再去掉前缀查一次。
+/// 精确匹配优先，所以真有个叫 `claude-xxx` 的别名时不会被前缀还原抢走。
+pub async fn find_alias(pool: &SqlitePool, name: &str) -> anyhow::Result<Option<ModelAlias>> {
+    let row = sqlx::query_as::<_, ModelAlias>(ALIAS_LOOKUP_SQL)
+        .bind(name)
+        .fetch_optional(pool)
+        .await?;
+    if row.is_some() {
+        return Ok(row);
+    }
+    match strip_client_prefix(name) {
+        Some(stripped) => Ok(sqlx::query_as::<_, ModelAlias>(ALIAS_LOOKUP_SQL)
+            .bind(stripped)
+            .fetch_optional(pool)
+            .await?),
+        None => Ok(None),
+    }
+}
+
+pub async fn resolve_model(pool: &SqlitePool, model_name: &str) -> anyhow::Result<ModelResolution> {
+    let mut model_name = sanitize_model_name(model_name);
+    // ponytail: 别名可重定向到其他别名 —— target_model 命中 model_aliases 表的另一条
+    // 别名时沿链解析;深度上限 8 防自环,超限后按前缀直传兜底
+    for _ in 0..8 {
+        let alias = find_alias(pool, &model_name).await?;
+
+        let Some(alias) = alias else { break };
         // Parse account_ids JSON array e.g. "[1,5,7]"
         let account_ids: Vec<i64> = alias
             .account_ids
             .as_deref()
             .and_then(|s| serde_json::from_str(s).ok())
             .unwrap_or_default();
-
         let alias_name = Some(alias.alias.clone());
-        let upstream_api = crate::upstream_api::UpstreamApi::from_str(alias.upstream_api.as_deref().unwrap_or("default"));
+        let upstream_api =
+            crate::upstream_api::UpstreamApi::from_str(alias.upstream_api.as_deref().unwrap_or("default"));
 
         if !account_ids.is_empty() {
             return Ok(ModelResolution {
@@ -333,6 +365,13 @@ pub async fn resolve_model(pool: &SqlitePool, model_name: &str) -> anyhow::Resul
                 upstream_api,
             });
         }
+
+        // Redirect alias: no accounts, no provider — target_model is another alias name
+        let next = sanitize_model_name(&alias.target_model);
+        if next == model_name {
+            break; // self-redirect: stop before looping
+        }
+        model_name = next;
     }
     Ok(resolve_model_by_prefix(&model_name))
 }

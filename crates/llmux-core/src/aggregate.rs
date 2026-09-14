@@ -267,6 +267,18 @@ impl AggregateRouter {
 // DB helpers
 // ---------------------------------------------------------------------------
 
+async fn find_aggregate_row(
+    pool: &SqlitePool,
+    alias: &str,
+) -> anyhow::Result<Option<AggregateAliasRow>> {
+    Ok(sqlx::query_as::<_, AggregateAliasRow>(
+        "SELECT id, alias, candidates, interval_secs, upstream_api, created_at, updated_at FROM aggregate_aliases WHERE alias = ?",
+    )
+    .bind(alias)
+    .fetch_optional(pool)
+    .await?)
+}
+
 pub async fn resolve_aggregate(
     pool: &SqlitePool,
     model_name: &str,
@@ -277,23 +289,20 @@ pub async fn resolve_aggregate(
         return Ok(None);
     }
     // Ordinary alias takes precedence
-    let ordinary = sqlx::query_as::<_, crate::models::ModelAlias>(
-        "SELECT id, alias, target_model, provider_id, account_ids, preferred_account_id, upstream_api FROM model_aliases WHERE alias = ?",
-    )
-    .bind(&m)
-    .fetch_optional(pool)
-    .await?;
-    if ordinary.is_some() {
+    if crate::dispatcher::find_alias(pool, &m).await?.is_some() {
         return Ok(None);
     }
-    let row = sqlx::query_as::<_, AggregateAliasRow>(
-        "SELECT id, alias, candidates, interval_secs, upstream_api, created_at, updated_at FROM aggregate_aliases WHERE alias = ?",
-    )
-    .bind(&m)
-    .fetch_optional(pool)
-    .await?;
-    let Some(row) = row else {
-        return Ok(None);
+    // 聚合别名同样可能带着 `/v1/models` 广告的 `claude-` 前缀进来（见
+    // dispatcher::strip_client_prefix），精确匹配落空时再去前缀重查一次。
+    let row = match find_aggregate_row(pool, &m).await? {
+        Some(row) => row,
+        None => match crate::dispatcher::strip_client_prefix(&m) {
+            Some(stripped) => match find_aggregate_row(pool, stripped).await? {
+                Some(row) => row,
+                None => return Ok(None),
+            },
+            None => return Ok(None),
+        },
     };
     let candidates = parse_candidates(&row.candidates)?;
     let active = router.get_active(&row.alias);
