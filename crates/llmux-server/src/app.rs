@@ -227,20 +227,76 @@ where
     }
 }
 
+/// 把任何带 `/v1/v1/` 的请求路径归一化为单 `/v1/`,在 axum 路由匹配之前执行。
+/// 部署在 serve() 的最外层(整个 Router 之外),对所有接口生效,无需逐路由适配。
+#[derive(Clone, Default)]
+struct V1NormalizeLayer;
+
+impl<S> Layer<S> for V1NormalizeLayer {
+    type Service = V1Normalize<S>;    fn layer(&self, inner: S) -> Self::Service {
+        V1Normalize { inner }
+    }
+}
+
+#[derive(Clone)]
+pub struct V1Normalize<S> {
+    inner: S,
+}
+
+impl<S, B> Service<http::Request<B>> for V1Normalize<S>
+where
+    S: Service<http::Request<B>>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = S::Future;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: http::Request<B>) -> Self::Future {
+        // ponytail: 只做一次字符串替换,不区分场景 — 兼容层语义就是"宽松归一化"
+        if req.uri().path().contains("/v1/v1/") {
+            let (mut parts, body) = req.into_parts();
+            parts.uri = normalize_gateway_uri(&parts.uri)
+                .to_string()
+                .parse()
+                .unwrap_or_else(|_| parts.uri.clone());
+            return self.inner.call(http::Request::from_parts(parts, body));
+        }
+        self.inner.call(req)
+    }
+}
+
+/// Claude Desktop / Claude Code 的 gateway discovery 会把 `/v1/models` 拼在它自己的
+/// base URL 后面,并且客户端硬过滤掉 id 不匹配 `/(claude|anthropic)/i` 的条目。
+/// 所以给它单开一个挂载点:把 Desktop 的 Gateway base URL 设成 `{base}/cc`,只有
+/// 走这个前缀的 `/v1/models` 才广告 `claude-<alias>`,其余入口一律裸别名。
+/// 收到的 `claude-<alias>` 由 `llmux_core::dispatcher::find_alias` 还原回真实别名。
+pub const DESKTOP_SEGMENT: &str = "cc";
+
+fn desktop_router() -> AppRouter {
+    Router::new()
+        .route("/v1/chat/completions", post(v1::chat_completions))
+        .route("/v1/responses", post(v1::responses))
+        .route("/v1/messages", post(v1::messages))
+        .route("/v1/messages/count_tokens", post(v1::count_tokens))
+        .route("/v1/models", get(v1::models_for_desktop))
+        .route_layer(middleware::from_fn(crate::middleware::v1_auth_middleware))
+}
+
 fn core_router() -> AppRouter {
     Router::new()
         .route("/v1/chat/completions", post(v1::chat_completions))
         .route("/v1/responses", post(v1::responses))
         .route("/v1/messages", post(v1::messages))
+        .route("/v1/messages/count_tokens", post(v1::count_tokens))
         .route("/v1/models", get(v1::models))
         .route("/v1beta/models/:model_and_action", post(v1::gemini))
         .route("/v1beta/:model_and_action", post(v1::gemini))
-        // Handle double /v1/v1/ prefix from ANTHROPIC_BASE_URL=/v1
-        .route("/v1/v1/chat/completions", post(v1::chat_completions))
-        .route("/v1/v1/responses", post(v1::responses))
-        .route("/v1/v1/messages", post(v1::messages))
-        .route("/v1/v1/models", get(v1::models))
         .route_layer(middleware::from_fn(crate::middleware::v1_auth_middleware))
+        .nest(&format!("/{DESKTOP_SEGMENT}"), desktop_router())
         .route("/api/auth/web-session", post(auth::handle_web_session))
         .route("/api/auth/login", post(auth::handle_login))
         .route("/api/auth/logout", post(auth::handle_logout))
@@ -397,8 +453,17 @@ async fn fallback(OriginalUri(uri): OriginalUri, Extension(state): Extension<App
 
 pub async fn serve(addr: std::net::SocketAddr, state: AppState) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app(state)).await?;
+    axum::serve(listener, with_v1_normalize(app(state))).await?;
     Ok(())
+}
+
+/// 给 Router 套上 /v1/v1 归一化层并转成 make service。必须包在 Router **之外**
+/// —— axum 的路由匹配先于 middleware 执行,middleware 里改 path 不会重新路由。
+pub fn with_v1_normalize(
+    router: AppRouter,
+) -> axum::routing::IntoMakeService<V1Normalize<AppRouter>> {
+    use axum::{body::Body, ServiceExt};
+    axum::ServiceExt::<http::Request<Body>>::into_make_service(V1NormalizeLayer.layer(router))
 }
 
 pub async fn test_state() -> AppState {
@@ -499,4 +564,23 @@ pub fn normalize_gateway_uri(uri: &Uri) -> Uri {
 
 pub fn method_not_allowed() -> Response {
     StatusCode::METHOD_NOT_ALLOWED.into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn n(path: &str) -> String {
+        normalize_gateway_uri(&path.parse().unwrap()).to_string()
+    }
+
+    #[test]
+    fn normalize_gateway_uri_collapses_double_v1() {
+        assert_eq!(n("/llmux/v1/v1/messages"), "/llmux/v1/messages");
+        assert_eq!(n("/llmux/v1/v1/messages/count_tokens"), "/llmux/v1/messages/count_tokens");
+        assert_eq!(n("/v1/v1/models"), "/v1/models");
+        assert_eq!(n("/v1/v1/chat/completions?x=1"), "/v1/chat/completions?x=1");
+        assert_eq!(n("/v1/messages"), "/v1/messages");
+        assert_eq!(n("/api/health"), "/api/health");
+    }
 }

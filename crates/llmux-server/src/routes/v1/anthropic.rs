@@ -490,6 +490,133 @@ pub async fn messages(
     middleware::send_error(&error_msg, "upstream_error", StatusCode::BAD_GATEWAY, is_anthropic)
 }
 
+/// POST /v1/messages/count_tokens — Claude Code calls this every turn before
+/// dispatching. When the requested model's accounts speak Anthropic Messages
+/// natively, forward to the first Messages-capable account for an exact count
+/// (a single non-streamed round-trip); otherwise answer with a local estimate.
+/// Any network/auth failure silently falls back to the local estimate:
+/// over- vs under-counting a few % is fine — the client only uses it for UI
+/// display and compaction thresholds, and the request must never hard-fail.
+pub async fn count_tokens(
+    Extension(state): Extension<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let raw_model = body["model"].as_str().unwrap_or_default();
+    let model_name = dispatcher::sanitize_model_name(raw_model);
+
+    // Aggregate aliases keep the local estimate (V-anchored failover spans
+    // multiple protocols; exactness isn't worth a special path here).
+    let is_aggregate = matches!(state.resolve_aggregate_cached(&model_name).await, Ok(Some(_)));
+    let resolution = if is_aggregate { None } else { state.resolve_model_cached(&model_name).await.ok() };
+    if let Some(res) = resolution {
+        if let Some(upstream) = forward_count_tokens(&state, &model_name, &headers, &body, &res).await {
+            return upstream;
+        }
+    }
+    let tokens = estimate_anthropic_tokens(&body);
+    Json(serde_json::json!({ "input_tokens": tokens })).into_response()
+}
+
+/// Try a best-effort upstream count against the first Messages-capable account
+/// of the alias. Returns None (caller falls back to the local estimate) when no
+/// such account exists or the request fails for any reason.
+async fn forward_count_tokens(
+    state: &AppState,
+    model_name: &str,
+    headers: &HeaderMap,
+    body: &Value,
+    res: &llmux_core::dispatcher::ModelResolution,
+) -> Option<Response> {
+    let accounts = if !res.account_ids.is_empty() {
+        get_accounts_by_ids(&state.pool, &res.account_ids, &state.master_key)
+            .await
+            .ok()?
+    } else {
+        get_active_accounts(&state.pool, Some(&res.provider_id), &state.master_key)
+            .await
+            .ok()?
+    };
+    let account = accounts
+        .into_iter()
+        .find(|a| llmux_core::protocol::supports(a, llmux_core::protocol::Protocol::Messages))?;
+
+    let anthropic_beta = headers
+        .get("anthropic-beta")
+        .and_then(|v| v.to_str().ok());
+    let patched = {
+        let mut b = body.clone();
+        b["model"] = Value::String(model_name.to_string());
+        b
+    };
+    let provider_request =
+        adapters::build_passthrough_with_beta(&account, llmux_core::protocol::Protocol::Messages, &patched, anthropic_beta);
+
+    let response = execute_provider_request(&provider_request).await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let data: Value = response.json().await.ok()?;
+    let tokens = data["usage"]["input_tokens"].as_i64().unwrap_or_default();
+    if tokens <= 0 {
+        return None; // upstream didn't report usable token counts
+    }
+    tracing::debug!("🔢 count_tokens {model_name} → {} exact={}", account.alias, tokens);
+    Some(Json(serde_json::json!({ "input_tokens": tokens })).into_response())
+}
+
+fn anthropic_text_len(content: &Value) -> usize {
+    match content {
+        Value::String(s) => s.len(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .map(|b| {
+                b["text"].as_str().map(str::len).unwrap_or(0)
+                    + b["input"].to_string().len() // tool_use args
+                    + anthropic_text_len(&b["content"])
+            })
+            .sum(),
+        _ => 0,
+    }
+}
+
+/// ~4 bytes/token heuristic over messages, system, and tool definitions.
+fn estimate_anthropic_tokens(body: &Value) -> u64 {
+    let mut chars: usize = 0;
+    if let Some(msgs) = body["messages"].as_array() {
+        for m in msgs {
+            chars += anthropic_text_len(&m["content"]);
+        }
+    }
+    chars += anthropic_text_len(&body["system"]);
+    if let Some(tools) = body["tools"].as_array() {
+        chars += serde_json::to_string(tools).unwrap_or_default().len();
+    }
+    (chars as u64).saturating_add(4) / 4
+}
+
+#[cfg(test)]
+mod tests {
+    use super::estimate_anthropic_tokens;
+    use serde_json::json;
+
+    #[test]
+    fn estimate_counts_messages_system_tools() {
+        let body = json!({
+            "model": "x",
+            "system": "abcdabcdabcdabcd",
+            "tools": [{"name": "t", "description": "desc"}],
+            "messages": [
+                {"role": "user", "content": "hello world foo"},
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "1", "name": "t", "input": {"a": 1}}]}
+            ]
+        });
+        let t = estimate_anthropic_tokens(&body);
+        assert!(t > 10);
+        assert_eq!(estimate_anthropic_tokens(&json!({"messages": []})), 1);
+    }
+}
+
 async fn dispatch_aggregate_anthropic(
     state: AppState,
     auth: AuthContext,

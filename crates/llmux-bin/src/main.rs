@@ -167,7 +167,7 @@ async fn start(port_override: Option<u16>, use_tui: bool) -> anyhow::Result<()> 
 
         // Spawn server in background
         let server = tokio::spawn(async move {
-            axum::serve(listener, router)
+            axum::serve(listener, llmux_server::app::with_v1_normalize(router))
                 .with_graceful_shutdown(shutdown_signal())
                 .await
                 .ok();
@@ -188,7 +188,7 @@ async fn start(port_override: Option<u16>, use_tui: bool) -> anyhow::Result<()> 
             effective_port
         );
 
-        axum::serve(listener, router)
+        axum::serve(listener, llmux_server::app::with_v1_normalize(router))
             .with_graceful_shutdown(shutdown_signal())
             .await?;
     }
