@@ -5,6 +5,19 @@
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 
+/// 上游 Responses 实现对 `max_output_tokens < 16` 直接 400
+/// (`integer below minimum value. Expected a value >= 16`)。Claude Desktop 的
+/// 连通性探测会发 `max_tokens: 1`，原样转发会让整条聚合链路假失败 —— 只是个
+/// 上限、不是预留额度，抬到下限不影响语义。同 `probe::PROBE_MAX_TOKENS`。
+const MIN_MAX_OUTPUT_TOKENS: i64 = 16;
+
+fn clamp_max_output_tokens(v: &Value) -> Value {
+    match v.as_i64() {
+        Some(n) if n < MIN_MAX_OUTPUT_TOKENS => json!(MIN_MAX_OUTPUT_TOKENS),
+        _ => v.clone(),
+    }
+}
+
 /// Convert Chat Completions content parts to the Responses input vocabulary.
 /// Strings are valid in both APIs; unsupported structured parts become text so
 /// a prior tool-result/history turn cannot invalidate the whole request.
@@ -180,7 +193,7 @@ pub fn chat_to_responses(chat_body: &Value, resolved_model: &str) -> Value {
         .or_else(|| chat_body.get("max_tokens"))
         .or_else(|| chat_body.get("max_completion_tokens"))
     {
-        out.insert("max_output_tokens".to_string(), v.clone());
+        out.insert("max_output_tokens".to_string(), clamp_max_output_tokens(v));
     }
     if let Some(v) = chat_body.get("stream_options") {
         out.insert("stream_options".to_string(), v.clone());
@@ -290,7 +303,7 @@ pub fn anthropic_to_responses(anth_body: &Value, resolved_model: &str) -> Value 
         }
     }
     if let Some(v) = anth_body.get("max_tokens") {
-        out.insert("max_output_tokens".to_string(), v.clone());
+        out.insert("max_output_tokens".to_string(), clamp_max_output_tokens(v));
     }
     if let Some(v) = anth_body.get("stop_sequences") {
         out.insert("stop".to_string(), v.clone());
@@ -1164,6 +1177,30 @@ mod tests {
             "type": "function_call_output", "call_id": "call_1", "output": "ok"
         }));
         assert_eq!(translated["input"][1]["content"][0], json!({"type": "input_text", "text": "call the tool"}));
+    }
+
+    /// Claude Desktop 的连通性探测发 `max_tokens: 1`；上游 Responses 实现对该
+    /// 字段 < 16 直接 400，原样转发会让整条聚合链路假失败。
+    #[test]
+    fn max_output_tokens_is_clamped_to_the_upstream_minimum() {
+        let anth = json!({
+            "max_tokens": 1,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        assert_eq!(anthropic_to_responses(&anth, "muse")["max_output_tokens"], json!(16));
+
+        let chat = json!({
+            "max_tokens": 1,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        assert_eq!(chat_to_responses(&chat, "muse")["max_output_tokens"], json!(16));
+
+        // 正常值原样透传
+        let anth = json!({
+            "max_tokens": 4096,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        assert_eq!(anthropic_to_responses(&anth, "muse")["max_output_tokens"], json!(4096));
     }
 
     #[test]
