@@ -148,6 +148,16 @@ pub fn balance_credential<'a>(balance_auth_decrypted: &'a str, api_key_decrypted
     }
 }
 
+/// opencode-go 专用例外：Go usage API（`/zen/go/v1/usage`，Bearer api_key）是 Go 额度的
+/// 权威源；cookie 只是「只能网页登录」账号的兜底 —— 它的 `_server` subscription RPC 对部分
+/// 账号返回 `null`，会掉进 billing 的 lite 兜底，把有额度的 Go 账号误报成按量计费账号。
+/// 因此同时配了 cookie 和 API key 的 go 账号，优先用 API key。
+pub fn prefers_api_key_for_balance(kind: BalanceKind, balance_auth: &str, api_key: &str) -> bool {
+    matches!(kind, BalanceKind::OpenCodeGo)
+        && !balance_auth.is_empty()
+        && looks_like_api_key(api_key)
+}
+
 /// Fetch and normalize the balance for one account. Never fails with Err on
 /// upstream problems — those become `{"ok":false,"error":...}` payloads so the
 /// caller can still cache them.
@@ -1086,7 +1096,7 @@ async fn fetch_opencode_by_cookie(cookie_header: &str, kind: BalanceKind) -> Res
         };
         let is_goat = matches!(kind, BalanceKind::OpenCodeGo);
         if let Some(mut v) = if is_goat { oc_parse_subscription_goat(&sub_text) } else { oc_parse_subscription(&sub_text) } {
-            // Goat 订阅缺「本月」窗口时，兜底拉 /workspace/<id>/go 页面再扫一遍
+            // Go 订阅缺「本月」窗口时，兜底拉 /workspace/<id>/go 页面再扫一遍
             //（CodexBar 的 Go 主源即该页面内嵌的订阅负载）。
             if is_goat && !oc_has_window(&v, "本月") {
                 if let Some(page) = oc_go_page(ws_id, &cookie).await {
@@ -1107,7 +1117,7 @@ async fn fetch_opencode_by_cookie(cookie_header: &str, kind: BalanceKind) -> Res
         if let Ok(bill_text) = oc_server_get(OC_BILLING_ID, Some(ws_id), &referer, &cookie).await {
             if is_goat {
                 if bill_text.contains("liteSubscriptionID") || bill_text.contains("\"lite\"") {
-                    return Ok(ok_result(label, "Goat Lite".into(), "Goat Lite 订阅（按量计费，暂无窗口）".into(), json!([]), json!([])));
+                    return Ok(ok_result(label, "Go Lite".into(), "Go Lite 订阅（按量计费，暂无窗口）".into(), json!([]), json!([])));
                 }
             } else {
                 if let Some(balance) = oc_parse_billing_balance(&bill_text) {
@@ -1117,7 +1127,7 @@ async fn fetch_opencode_by_cookie(cookie_header: &str, kind: BalanceKind) -> Res
                     if let Some(balance) = oc_parse_billing_balance(&bill_text) {
                         return Ok(ok_result(label, format!("${:.2}", balance), "Pay-as-you-go 钱包".into(), json!([]), json!([{"label": "钱包余额", "value": format!("${balance:.2}")}])));
                     }
-                    return Ok(ok_result(label, "Goat Lite".into(), "Goat Lite 订阅（按量计费，暂无窗口）".into(), json!([]), json!([])));
+                    return Ok(ok_result(label, "Lite".into(), "Lite 订阅（按量计费，暂无窗口）".into(), json!([]), json!([])));
                 }
                 // billing 无 lite 标记但仍可能只有余额（不同 paywall 形态），最后兜底
                 if let Some(balance) = oc_parse_billing_balance(&bill_text) {
@@ -1413,7 +1423,7 @@ fn oc_looks_like_subscription(text: &str) -> bool {
 
 /// Parse rolling/weekly usage windows out of the subscription payload. Tries
 /// strict JSON walking first, then a loose text scan (CodexBar parity).
-/// Returns remaining% (100 - used) with resets_at, matching Goat spec.
+/// Returns remaining% (100 - used) with resets_at, matching Go spec.
 pub fn oc_parse_subscription(text: &str) -> Option<Value> {
     oc_parse_subscription_inner(text, false)
 }
@@ -1446,7 +1456,7 @@ fn oc_parse_subscription_inner(text: &str, goat: bool) -> Option<Value> {
 
 /// Build the normalized result from parsed windows.
 ///
-/// Goat 模式（go）：3 窗口显示剩余%（100 - used），标签 5小时/本月/本周；有窗口耗尽时
+/// Go 模式（go）：3 窗口显示剩余%（100 - used），标签 5小时/本月/本周；有窗口耗尽时
 /// 摘要带「重置于 <max reset>」，无耗尽带「过期于 <renewAt>」（订阅续期），与 CommandCode 同口径。
 /// 非 goat（opencode）：保持 CodexBar 原样（滚动/每周 used%），仅把订阅续期时间并入 detail。
 fn oc_build_windows_value(
@@ -1496,7 +1506,7 @@ fn oc_build_windows_value(
             Some(ms) => (format!("重置于 {}", format_abs_ms(ms)), Some(ms)),
             None => match renewal_ms {
                 Some(ms) => (format!("过期于 {}", format_abs_ms(ms)), Some(ms)),
-                None => ("Goat 订阅用量".to_string(), None),
+                None => ("Go 订阅用量".to_string(), None),
             },
         };
         // B: collapsed summary must not carry any time — only percentages (time lives per-window in expanded view)

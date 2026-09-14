@@ -42,21 +42,7 @@ pub async fn get_account_balance(
 
     let provider_id: String = row.try_get("provider_id").unwrap_or_default();
     let enc_key: String = row.try_get("api_key").unwrap_or_default();
-    // Dedicated balance_auth (cookie/token) wins; the upstream API key is the fallback.
     let auth_cipher: String = row.try_get("balance_auth").unwrap_or_default();
-    let credential = match if auth_cipher.is_empty() {
-        llmux_core::crypto::decrypt_api_key(&enc_key, &state.master_key)
-    } else {
-        llmux_core::crypto::decrypt_api_key(&auth_cipher, &state.master_key)
-    } {
-        Ok(k) => k,
-        Err(e) => {
-            return crate::error::simple_error(
-                format!("Failed to decrypt API key: {e}"),
-                StatusCode::INTERNAL_SERVER_ERROR,
-            )
-        }
-    };
     let endpoints: Vec<String> = ["base_url", "anthropic_base_url", "chat_endpoint", "responses_endpoint", "messages_endpoint"]
         .iter()
         .filter_map(|col| row.try_get::<Option<String>, _>(col).unwrap_or_default())
@@ -71,6 +57,36 @@ pub async fn get_account_balance(
         &balance_provider,
     ) else {
         return crate::error::simple_error("此账户未配置余额查询方式", StatusCode::UNPROCESSABLE_ENTITY);
+    };
+
+    // Dedicated balance_auth (cookie/token) wins; the upstream API key is the fallback —
+    // except for opencode-go accounts that also carry an API key (see the helper).
+    let decrypt = |cipher: &str| -> Result<String, String> {
+        if cipher.is_empty() {
+            Ok(String::new())
+        } else {
+            llmux_core::crypto::decrypt_api_key(cipher, &state.master_key).map_err(|e| e.to_string())
+        }
+    };
+    let auth_plain = decrypt(&auth_cipher);
+    let key_plain = decrypt(&enc_key);
+    let chosen = if llmux_core::balance::prefers_api_key_for_balance(
+        kind,
+        auth_plain.as_deref().unwrap_or(""),
+        key_plain.as_deref().unwrap_or(""),
+    ) {
+        key_plain
+    } else {
+        auth_plain
+    };
+    let credential = match chosen {
+        Ok(k) => k,
+        Err(e) => {
+            return crate::error::simple_error(
+                format!("Failed to decrypt API key: {e}"),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            )
+        }
     };
 
     let result = tokio::time::timeout(
