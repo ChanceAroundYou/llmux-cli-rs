@@ -55,10 +55,13 @@
   billing，payload 里的 `liteSubscriptionID` 命中硬编码兜底，摘要被写成
   「Goat Lite」、窗口列表为空；而同一账号的 Go usage API（`/zen/go/v1/usage`）
   实际返回 `rolling 5% / weekly 2% / monthly 1%`。
-  - 新增 `prefers_api_key_for_balance()`：仅 **opencode-go** 且 `api_key` 为
-    `sk-` 形态时优先用 key，其余 kind 的「cookie 优先」规则不变。
-  - `accounts.rs` 改为两个凭据都解密后按上述规则选择，且只对实际使用的那个
-    报解密失败。
+  - 新增 `balance_uses_api_key()`：选凭据时该用 API key 还是 cookie 的**完整判据** ——
+    cookie 为空时回落 API key（`balance_credential` 原语义），或 opencode-go 且
+    `api_key` 为 `sk-` 形态时优先用 key；其余 kind 的「cookie 优先」规则不变。
+  - `accounts.rs` 改为两个凭据都解密后按上述判据选择，且只对实际使用的那个报解密失败。
+  - api123 的 `GET /v1/usage` 现在检查 HTTP 状态：非 2xx 的 JSON（401
+    `API_KEY_REQUIRED` 等）字段全缺，照常解析会得到「窗口为空但 ok:true」的假余额，
+    把失败藏起来。
   - 顺带纠正命名冲突：opencode 路径的「Goat Lite」→「Go Lite」（go 账号）/
     「Lite」（opencode 账号）、「Goat 订阅用量」→「Go 订阅用量」—— **Goat 是
     CommandCode 的套餐名**（`individual-goat`，$70/月），与 OpenCode Go 无关，

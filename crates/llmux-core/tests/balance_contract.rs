@@ -4,9 +4,9 @@
 //! worth locking down; the HTTP layer is exercised in production.
 
 use llmux_core::balance::{
-    balance_credential, commandcode_result, detect_kind, oc_parse_billing_balance,
+    balance_credential, balance_uses_api_key, commandcode_result, detect_kind, oc_parse_billing_balance,
     oc_parse_billing_balance_loose, oc_parse_subscription, oc_parse_subscription_goat,
-    oc_scan_balance_any_text, prefers_api_key_for_balance, BalanceKind,
+    oc_scan_balance_any_text, BalanceKind,
 };
 
 #[test]
@@ -19,18 +19,22 @@ fn balance_credential_prefers_dedicated_auth() {
 }
 
 #[test]
-fn opencode_go_prefers_api_key_over_cookie() {
-    // cookie + sk- key 同时存在 → 走 Go usage API（cookie 的 _server subscription RPC
-    // 对某些账号返回 null，会误报成按量计费（Go Lite））
-    assert!(prefers_api_key_for_balance(BalanceKind::OpenCodeGo, "auth=xyz", "sk-abc"));
-    // 只有 cookie（网页登录账号）→ 保持 cookie 路径
-    assert!(!prefers_api_key_for_balance(BalanceKind::OpenCodeGo, "auth=xyz", ""));
+fn balance_uses_api_key_matches_balance_credential_fallback() {
+    // cookie 为空 → 必须走 API key（回归：2026-09-15 漏掉这条，5 个 auth 为空的账号
+    // 拿着空凭据探测，上游 401 的 JSON 被当成数据解析，静默显示空余额）
+    for kind in [BalanceKind::Api123, BalanceKind::OpenRouter, BalanceKind::DeepSeek, BalanceKind::OpenCodeGo, BalanceKind::OpenCodeZen] {
+        assert!(balance_uses_api_key(kind, "", "sk-abc"), "{:?} 无 cookie 时必须回落 key", kind);
+    }
+    // 有 cookie：只有 opencode-go + sk- key 才反过来（Go usage API 才是权威源）
+    assert!(balance_uses_api_key(BalanceKind::OpenCodeGo, "auth=xyz", "sk-abc"));
+    // 其他 kind 的「cookie 优先」规则不变 —— 与 balance_credential 结论一致
+    for kind in [BalanceKind::OpenCodeZen, BalanceKind::OpenCode, BalanceKind::Api123, BalanceKind::CommandCode] {
+        assert!(!balance_uses_api_key(kind, "session=1", "sk-abc"), "{:?} 有 cookie 时不该改用 key", kind);
+    }
     // 非 API key 形态的凭据不当成 key 用
-    assert!(!prefers_api_key_for_balance(BalanceKind::OpenCodeGo, "auth=xyz", "Fe26.abc"));
-    // 其他 kind 的「cookie 优先」规则不变
-    assert!(!prefers_api_key_for_balance(BalanceKind::OpenCodeZen, "auth=xyz", "sk-abc"));
-    assert!(!prefers_api_key_for_balance(BalanceKind::OpenCode, "auth=xyz", "sk-abc"));
-    assert!(!prefers_api_key_for_balance(BalanceKind::CommandCode, "s=xyz", "sk-abc"));
+    assert!(!balance_uses_api_key(BalanceKind::OpenCodeGo, "auth=xyz", "Fe26.abc"));
+    // 两者都空：仍走 key 分支（解出来还是空，与 balance_credential("","") 行为一致）
+    assert!(balance_uses_api_key(BalanceKind::Api123, "", ""));
 }
 
 // ─── detect_kind ─────────────────────────────────────────────────────────────

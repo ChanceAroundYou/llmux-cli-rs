@@ -70,7 +70,9 @@ pub async fn get_account_balance(
     };
     let auth_plain = decrypt(&auth_cipher);
     let key_plain = decrypt(&enc_key);
-    let chosen = if llmux_core::balance::prefers_api_key_for_balance(
+    // Dedicated balance_auth (cookie/token) wins; empty falls back to the API key —
+    // except for opencode-go accounts that also carry an sk- key (see the helper).
+    let chosen = if llmux_core::balance::balance_uses_api_key(
         kind,
         auth_plain.as_deref().unwrap_or(""),
         key_plain.as_deref().unwrap_or(""),

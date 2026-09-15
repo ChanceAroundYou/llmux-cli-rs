@@ -148,14 +148,18 @@ pub fn balance_credential<'a>(balance_auth_decrypted: &'a str, api_key_decrypted
     }
 }
 
-/// opencode-go 专用例外：Go usage API（`/zen/go/v1/usage`，Bearer api_key）是 Go 额度的
-/// 权威源；cookie 只是「只能网页登录」账号的兜底 —— 它的 `_server` subscription RPC 对部分
-/// 账号返回 `null`，会掉进 billing 的 lite 兜底，把有额度的 Go 账号误报成按量计费账号。
-/// 因此同时配了 cookie 和 API key 的 go 账号，优先用 API key。
-pub fn prefers_api_key_for_balance(kind: BalanceKind, balance_auth: &str, api_key: &str) -> bool {
-    matches!(kind, BalanceKind::OpenCodeGo)
-        && !balance_auth.is_empty()
-        && looks_like_api_key(api_key)
+/// 选凭据时该用 `api_key` 还是 `balance_auth`（cookie/token）？两种情况用 key：
+///
+/// 1. **cookie 为空** —— 只能用它，即 `balance_credential` 原本的回落语义；
+/// 2. **opencode-go 且 key 是 `sk-` 形态** —— Go usage API（`/zen/go/v1/usage`）是 Go
+///    额度的权威源。cookie 只是「只能网页登录」账号的兜底：它的 `_server` subscription
+///    RPC 对部分账号返回 `null`，会掉进 billing 的 lite 兜底，把有额度的 Go 账号误报成
+///    按量计费账号。
+///
+/// ponytail: 这就是「cookie 优先、空则回落 key」的完整判据。调用方**不要**再自己写一遍
+/// 回落 —— 2026-09-15 漏掉第 1 条导致 5 个 auth 为空的账号拿着空凭据探测，静默返回空余额。
+pub fn balance_uses_api_key(kind: BalanceKind, balance_auth: &str, api_key: &str) -> bool {
+    balance_auth.is_empty() || (matches!(kind, BalanceKind::OpenCodeGo) && looks_like_api_key(api_key))
 }
 
 /// Fetch and normalize the balance for one account. Never fails with Err on
@@ -608,7 +612,7 @@ async fn fetch_api123(key: &str, endpoints: &[String]) -> Result<Value> {
         })
         .unwrap_or_else(|| "https://api123go.com".into());
     let url = format!("{}/v1/usage", base.trim_end_matches('/'));
-    let (_, v) = get_json(
+    let (status, v) = get_json(
         &url,
         &[
             ("authorization", format!("Bearer {}", key.trim())),
@@ -616,6 +620,14 @@ async fn fetch_api123(key: &str, endpoints: &[String]) -> Result<Value> {
         ],
     )
     .await?;
+    // 非 2xx 也是 JSON（401 API_KEY_REQUIRED / Cloudflare 错误页都有 body），照常解析会得到
+    // 「窗口为空但 ok:true」的假余额 —— 用户看到的就是一个没有数字的卡片，看不出失败。
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return Err(anyhow!("API Key 无效或已过期（HTTP {}）", status.as_u16()));
+    }
+    if !status.is_success() {
+        return Err(anyhow!("HTTP {}: {}", status.as_u16(), truncate_for_err(&v.to_string())));
+    }
     Ok(api123_result(&v))
 }
 
