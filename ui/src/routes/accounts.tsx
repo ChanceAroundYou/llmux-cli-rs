@@ -850,6 +850,7 @@ export default function Accounts() {
                 <option value="opencode-go">OpenCode Go</option>
                 <option value="opencode-zen">OpenCode Zen</option>
                 <option value="api123">API123</option>
+                <option value="teamorouter">TeamoRouter</option>
                 <option value="bailian">阿里百炼</option>
                 <option value="none">{t('accounts.balanceDisabled', '禁用查询')}</option>
               </select>
@@ -1010,6 +1011,7 @@ export default function Accounts() {
                 <option value="opencode-go">OpenCode Go</option>
                 <option value="opencode-zen">OpenCode Zen</option>
                 <option value="api123">API123</option>
+                <option value="teamorouter">TeamoRouter</option>
                 <option value="bailian">阿里百炼</option>
                 <option value="none">{t('accounts.balanceDisabled', '禁用查询')}</option>
               </select>

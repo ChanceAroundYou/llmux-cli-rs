@@ -28,6 +28,7 @@ pub enum BalanceKind {
     OpenCodeGo,
     OpenCodeZen,
     Api123,
+    Teamorouter,
     Bailian,
 }
 
@@ -42,6 +43,7 @@ impl BalanceKind {
             Self::OpenCodeGo => "opencode-go",
             Self::OpenCodeZen => "opencode-zen",
             Self::Api123 => "api123",
+            Self::Teamorouter => "teamorouter",
             Self::Bailian => "bailian",
         }
     }
@@ -64,6 +66,7 @@ pub fn detect_kind(provider_id: &str, endpoints: &[&str], balance_provider: &str
             "opencode-go" | "opencode_go" => Some(BalanceKind::OpenCodeGo),
             "opencode-zen" | "opencode_zen" | "zen" => Some(BalanceKind::OpenCodeZen),
             "api123" => Some(BalanceKind::Api123),
+            "teamorouter" => Some(BalanceKind::Teamorouter),
             "bailian" | "dashscope" | "aliyun" | "aliyun-bailian" => Some(BalanceKind::Bailian),
             _ => None, // "none"/unknown → disabled
         };
@@ -100,6 +103,7 @@ pub fn detect_kind(provider_id: &str, endpoints: &[&str], balance_provider: &str
                     }
                 }
                 h if h.contains("api123go.com") => Some(BalanceKind::Api123),
+                h if h.contains("teamorouter.cn") => Some(BalanceKind::Teamorouter),
                 h if h.contains("dashscope.aliyuncs.com")
                     || h.contains("bailian.aliyuncs.com")
                     || h.contains("aliyuncs.com")
@@ -185,6 +189,7 @@ pub async fn fetch_balance(kind: BalanceKind, credential: &str, endpoints: &[Str
         }
         BalanceKind::OpenCodeZen => fetch_opencode_zen(credential).await,
         BalanceKind::Api123 => fetch_api123(credential, endpoints).await,
+        BalanceKind::Teamorouter => fetch_teamorouter(credential, endpoints).await,
         BalanceKind::Bailian => fetch_bailian(credential, endpoints).await,
     }
     .unwrap_or_else(|e| err_result(kind.as_str(), &e.to_string()))
@@ -739,6 +744,94 @@ pub fn api123_result(v: &Value) -> Value {
             .join(" · ")
     };
     ok_result("api123", summary, detail, json!(windows_json), json!([]))
+}
+
+// ─── TeamoRouter (teamorouter.cn) ────────────────────────────────────────────
+
+/// 预付费 USD 钱包（无订阅窗口），`GET /v1/billing/me/balance` 用账户自己的
+/// `sk-teamo-…` key 直接鉴权 —— 不需要 cookie，所以走 `balance_uses_api_key` 的
+/// 「cookie 为空 → 用 key」分支即可，无需特判。
+async fn fetch_teamorouter(key: &str, endpoints: &[String]) -> Result<Value> {
+    let base = endpoints
+        .iter()
+        .find_map(|ep| {
+            let u = url::Url::parse(ep).ok()?;
+            if u.host_str()?.contains("teamorouter.cn") {
+                Some(u.origin().ascii_serialization())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| "https://api.teamorouter.cn".into());
+    let url = format!("{}/v1/billing/me/balance", base.trim_end_matches('/'));
+    let (status, v) = get_json(
+        &url,
+        &[
+            ("authorization", format!("Bearer {}", key.trim())),
+            ("accept", "application/json".into()),
+        ],
+    )
+    .await?;
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return Err(anyhow!("API Key 无效或已过期（HTTP {}）", status.as_u16()));
+    }
+    if !status.is_success() {
+        return Err(anyhow!(
+            "HTTP {}: {}",
+            status.as_u16(),
+            truncate_for_err(&v.to_string())
+        ));
+    }
+    Ok(teamorouter_result(&v))
+}
+
+/// Pure: build the TeamoRouter balance result from the `GET /v1/billing/me/balance`
+/// payload. Exposed for contract tests.
+///
+/// 金额字段同时有字符串（`available_balance`）与数值（`availableBalance`）两种形态，
+/// 数值优先、字符串兜底 —— 字符串兜底是为了防上游某天只回其中一种。
+pub fn teamorouter_result(v: &Value) -> Value {
+    if let Some(code) = v.get("code").and_then(Value::as_i64) {
+        if code != 0 {
+            let msg = v.get("message").and_then(Value::as_str).unwrap_or("未知错误");
+            return err_result("teamorouter", &format!("上游返回 code={code}: {msg}"));
+        }
+    }
+    let data = match v.get("data") {
+        Some(d) => d,
+        None => return err_result("teamorouter", "响应缺少 data"),
+    };
+
+    let num = |camel: &str, snake: &str| -> Option<f64> {
+        data.get(camel).and_then(Value::as_f64).or_else(|| {
+            data.get(snake)
+                .and_then(Value::as_str)
+                .and_then(|s| s.trim().parse::<f64>().ok())
+        })
+    };
+
+    let Some(available) = num("availableBalance", "available_balance") else {
+        return err_result("teamorouter", "缺少 available_balance");
+    };
+    let frozen = num("frozenBalance", "frozen_balance").unwrap_or(0.0);
+    let spent = num("lifetimeSpent", "lifetime_spent").unwrap_or(0.0);
+    let currency = data
+        .get("currency")
+        .and_then(Value::as_str)
+        .unwrap_or("USD");
+
+    let rows = vec![
+        json!({"label": "可用余额", "value": format!("{:.2} {currency}", available)}),
+        json!({"label": "冻结", "value": format!("{:.2} {currency}", frozen)}),
+        json!({"label": "累计消费", "value": format!("{:.2} {currency}", spent)}),
+    ];
+    ok_result(
+        "teamorouter",
+        format!("${available:.2}"),
+        format!("累计消费 ${spent:.2}"),
+        json!([]),
+        json!(rows),
+    )
 }
 
 // ─── Bailian / DashScope ─────────────────────────────────────────────────
