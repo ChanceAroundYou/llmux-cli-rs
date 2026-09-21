@@ -5,6 +5,15 @@
 
 ## [Unreleased]
 
+### Changed
+
+- **`usage_logs` body 保留期 3 天 → 1 天**（`BODY_RETAIN_DAYS`，默认 `1`，可覆盖）：
+  `request_body`/`response_body` 只在最近 1 天内可查详情，超期在写日志时置 NULL 回收；
+  **行与统计永久保留**，不影响用量/计费/账号面板。非法值或 `<=0` 一律回退默认，
+  不提供"无限保留"语义（防误配置导致 DB 无界增长）。
+  起因：`usage_logs` 的 body 是 870MB 库里的绝对大头（实测 req 554MB + resp 158MB），
+  且只有 3 天前的会留下，压到 1 天后 `VACUUM` 可把文件缩回百 MB 量级。
+
 ### Security
 
 - **移除硬编码的管理员登录凭据**：`auth.rs` 此前把生产用户名/密码写成
@@ -24,6 +33,21 @@
     应当改掉。
 
 ### Added
+
+- **TeamoRouter（teamorouter.cn）余额查询**：新增 `balance_provider = "teamorouter"`
+  （`BalanceKind::Teamorouter`），走 `GET /v1/billing/me/balance`，用账户自己的
+  `sk-teamo-…` key 直接 Bearer 鉴权 —— 预付费 USD 钱包，无订阅窗口，与 OpenRouter
+  一样是「剩余金额」卡片。
+  - 端点 host 自动检测：`teamorouter.cn` → TeamoRouter，所以 `balance_provider`
+    留空的账号（如 57）无需改配置即可探测。
+  - 金额字段同时存在字符串（`available_balance`）与数值（`availableBalance`）两种
+    形态，数值优先、字符串兜底；`code != 0`、缺 `data`、缺 `available_balance`
+    一律返回 `ok:false`（不退化成「没有数字但 ok:true」的空卡片）；401/403 与
+    其他非 2xx 分别给出明确报错。
+  - 新增合约测试 `teamorouter_detected_explicitly_and_by_host`、
+    `teamorouter_balance_real_payload`、`teamorouter_string_only_payload_still_parses`、
+    `teamorouter_bad_payload_reports_error_not_empty_card`（23 个 balance 合约测试全绿）。
+  - UI 余额来源下拉新增「TeamoRouter」选项；服务端 create/update 白名单同步。
 
 - **流式转换诊断日志（排查截断用）**：`anthropic_to_openai_streaming` 增加流级
   debug 日志（upstream 启停、是否收到 `[DONE]`、EOF 剩余 buffer、每条 finish 事件、
