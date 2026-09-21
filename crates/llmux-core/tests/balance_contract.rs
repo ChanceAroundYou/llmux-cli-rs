@@ -6,7 +6,7 @@
 use llmux_core::balance::{
     balance_credential, balance_uses_api_key, commandcode_result, detect_kind, oc_parse_billing_balance,
     oc_parse_billing_balance_loose, oc_parse_subscription, oc_parse_subscription_goat,
-    oc_scan_balance_any_text, BalanceKind,
+    oc_scan_balance_any_text, teamorouter_result, BalanceKind,
 };
 
 #[test]
@@ -307,4 +307,79 @@ fn zen_billing_scan_no_false_positive() {
     // "balance" 只出现在错误句子里（后面没有冒号+数字）→ 不得误判为余额。
     assert_eq!(oc_scan_balance_any_text(r#"{"error":"no balance to show"}"#), None);
     assert_eq!(oc_scan_balance_any_text(r#"{"balance":null}"#), None);
+}
+
+// ─── TeamoRouter ─────────────────────────────────────────────────────────────
+
+#[test]
+fn teamorouter_detected_explicitly_and_by_host() {
+    assert!(matches!(
+        detect_kind("custom", &[], "teamorouter"),
+        Some(BalanceKind::Teamorouter)
+    ));
+    // 自动检测：UI 建号时 provider_id='custom'，只有 host 能作信号
+    assert!(matches!(
+        detect_kind("custom", &["https://api.teamorouter.cn/v1"], ""),
+        Some(BalanceKind::Teamorouter)
+    ));
+    assert_eq!(BalanceKind::Teamorouter.as_str(), "teamorouter");
+}
+
+#[test]
+fn teamorouter_balance_real_payload() {
+    // 2026-09-21 生产实测（account 57）原样
+    let v = teamorouter_result(&serde_json::json!({
+        "code": 0,
+        "message": "success",
+        "data": {
+            "user_id": "org:117492",
+            "total_balance": "4.99838720",
+            "frozen_balance": "0.00000000",
+            "available_balance": "4.99838720",
+            "lifetime_spent": "0.00151068",
+            "status": "ACTIVE",
+            "totalBalance": 4.9983872,
+            "frozenBalance": 0,
+            "availableBalance": 4.9983872,
+            "lifetimeSpent": 0.00151068,
+            "currency": "USD",
+            "expired_time_deadline": 1789985672i64
+        }
+    }));
+    assert_eq!(v["ok"], true, "{v}");
+    assert_eq!(v["provider"], "teamorouter");
+    assert_eq!(v["summary"], "$5.00");
+    assert_eq!(v["detail"], "累计消费 $0.00");
+    assert_eq!(v["windows"].as_array().unwrap().len(), 0);
+    assert_eq!(v["rows"][0]["value"], "5.00 USD");
+    assert_eq!(v["rows"][2]["value"], "0.00 USD");
+}
+
+#[test]
+fn teamorouter_string_only_payload_still_parses() {
+    // 上游若只回字符串形态（无 camelCase 数值字段），仍须解析出金额
+    let v = teamorouter_result(&serde_json::json!({
+        "code": 0,
+        "data": {"available_balance": "12.5", "frozen_balance": "1.25", "lifetime_spent": "30"}
+    }));
+    assert_eq!(v["ok"], true, "{v}");
+    assert_eq!(v["summary"], "$12.50");
+    assert_eq!(v["rows"][1]["value"], "1.25 USD");
+    assert_eq!(v["rows"][2]["value"], "30.00 USD");
+}
+
+#[test]
+fn teamorouter_bad_payload_reports_error_not_empty_card() {
+    // code != 0 与缺字段都必须 ok:false —— 绝不能退化成「没有数字但 ok:true」的空卡片
+    let v = teamorouter_result(&serde_json::json!({"code": 40001, "message": "unauthorized"}));
+    assert_eq!(v["ok"], false);
+    assert!(v["error"].as_str().unwrap().contains("40001"), "{v}");
+
+    let v = teamorouter_result(&serde_json::json!({"code": 0, "data": {"status": "ACTIVE"}}));
+    assert_eq!(v["ok"], false);
+    assert!(v["error"].as_str().unwrap().contains("available_balance"), "{v}");
+
+    let v = teamorouter_result(&serde_json::json!({"code": 0}));
+    assert_eq!(v["ok"], false);
+    assert!(v["error"].as_str().unwrap().contains("data"), "{v}");
 }
