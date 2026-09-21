@@ -78,22 +78,34 @@ pub fn iso8601_now() -> String {
 
 // Cap stored request/response bodies: success stays compact (DB-friendly),
 // failure gets 500k so a 350k hermes dump is fully queryable. Bodies are
-// kept only 3 days — rows/stats remain.
+// kept only BODY_RETAIN_DAYS days (default 1) — rows/stats remain.
 const REQUEST_BODY_CAP_SUCCESS: usize = 32_000;
 const REQUEST_BODY_CAP_FAILURE: usize = 500_000;
 const RESPONSE_BODY_CAP_SUCCESS: usize = 16_000;
 const RESPONSE_BODY_CAP_FAILURE: usize = 500_000;
 
-// Bodies serve the recent log-detail view only; null them after 3 days so
-// usage_logs growth stays bounded (rows/stats are kept).
-const BODY_RETENTION_MS: i64 = 3 * 86_400_000;
+// Bodies serve the recent log-detail view only; null them after the retention
+// window so usage_logs growth stays bounded (rows/stats are kept).
+// 默认 1 天；BODY_RETAIN_DAYS 可覆盖（风格同 LOG_RETAIN_DAYS）。
+// 非法值 / <=0 一律回退默认，不提供"无限保留"语义，避免误配置导致 DB 无界增长。
+const BODY_RETAIN_DAYS_DEFAULT: i64 = 1;
+
+fn body_retain_days_from(raw: Option<&str>) -> i64 {
+    raw.and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|d| *d > 0)
+        .unwrap_or(BODY_RETAIN_DAYS_DEFAULT)
+}
+
+fn body_retention_ms() -> i64 {
+    body_retain_days_from(std::env::var("BODY_RETAIN_DAYS").ok().as_deref()) * 86_400_000
+}
 
 async fn prune_old_bodies(pool: &sqlx::SqlitePool) {
     let cutoff = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
-        - BODY_RETENTION_MS;
+        - body_retention_ms();
     if let Err(e) = sqlx::query(
         "UPDATE usage_logs SET request_body = NULL, response_body = NULL \
          WHERE timestamp < ? AND (request_body IS NOT NULL OR response_body IS NOT NULL)",
@@ -446,5 +458,21 @@ mod tests {
         let out = smart_truncate_body(Some(json_body), false, 32_000, 500_000).unwrap();
         assert!(out.chars().count() <= 500_000);
         assert!(out.chars().count() > 32_000, "failure should not be capped at 32k");
+    }
+
+    #[test]
+    fn body_retain_days_defaults_to_one() {
+        // 默认 1 天：未设置环境变量时不得回退到旧的 3 天
+        assert_eq!(body_retain_days_from(None), 1);
+    }
+
+    #[test]
+    fn body_retain_days_env_override_and_invalid_fallback() {
+        assert_eq!(body_retain_days_from(Some("7")), 7);
+        assert_eq!(body_retain_days_from(Some(" 2 ")), 2);
+        // 非法 / 0 / 负数一律回退默认，不存在"无限保留"语义
+        for bad in ["", "abc", "0", "-5", "3.5"] {
+            assert_eq!(body_retain_days_from(Some(bad)), 1, "bad input {bad:?}");
+        }
     }
 }
