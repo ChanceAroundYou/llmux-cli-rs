@@ -5,7 +5,46 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **拨测探 `/v1/messages` 时改用 Anthropic 请求体**：此前无论探哪个协议都发 OpenAI
+  形状的体，上游按形状拒收（command 返回
+  `Model X must be called via /provider/v1/messages (Anthropic Messages shape)`），
+  9 个 `claude-*` 模型因此被误报成「模型不可用」。请求头本已正确
+  （`x-api-key` + `anthropic-version`），只改体。
+
+- **聚合探活按别名的真实 `upstream_api` 探测**：`aggregate_probe.rs` 此前写死
+  `DownstreamMode::Chat`，配了 `responses` 的别名（如 `op`）会被拿 Chat 去比对，
+  每轮必报「配置可能写错了」。
+
+- **🧭 配置误报的第二成因**：修完上一条仍误报，因为判据用的是
+  `supported.first()` —— 而 `supported` 按 `PROTOCOL_PRIORITY` 排序，恒为 Chat。
+  语义应是「**按配置去连，连不上**才算写错」，改为检查配置的协议是否在
+  `supported` 内。
+
+- **真实流量 429 触发冷却**：此前 429 只做 `continue` 到下一候选，而聚合别名
+  普遍只有 1 个候选，等于直接 502；且 429 从不写冷却，配额耗尽的模型会被重打
+  一整天（实测 Ling 每日 100 次配额耗尽后，从 15:35 空转到 17:22）。现复用既有
+  `model_probe_suspensions` 表与 `is_suspended`/`note_failure`，
+  7 个重试分支全覆盖（`SUSPEND_AFTER_FAILURES=2`、冷却 30 分钟）；
+  成功时沿用既有的 `clear_suspension` 自动解除。
+
+- **429 区分配额与瞬时**：仅对配额类（`quota`/`usage limit`/`余额`/`额度` 等）
+  记冷却；`temporarily unavailable` 这类瞬时抖动照常透传给调用方。
+  早期版本对所有 429 一律冷却 30 分钟，实测把 `poolside` 冻结 8 分钟、
+  零成功、61 个 502 —— 分类比处理本身更关键。
+
+- **全部候选因冷却被跳过时回 429 + `Retry-After`**，而非笼统的 502：
+  502 对调用方是「网关坏了」，会立刻重试；而此时明确知道它该等多久。
+
 ### Changed
+
+- **别名/聚合保存后的自动验证改到后台**（`tokio::spawn`）：此前逐候选同步探测
+  （每个最长 30s）拖住保存接口，多候选时可达数分钟。响应不再回 `verified`
+  字段，UI 改为提示「已保存，正在后台检测账户连通性」并在 30s 后刷新 health。
+
+- **补齐 i18n 键 `models.verifyBackground`**（zh/en）：上一条的 UI 提示在英文界面
+  会回落到中文兜底文案。
 
 - **`usage_logs` body 保留期 3 天 → 1 天**（`BODY_RETAIN_DAYS`，默认 `1`，可覆盖）：
   `request_body`/`response_body` 只在最近 1 天内可查详情，超期在写日志时置 NULL 回收；
