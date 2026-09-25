@@ -8,7 +8,7 @@
 //! `image` url sources.
 
 use serde_json::{json, Map, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 // ---------------------------------------------------------------------------
 // Request conversion: Anthropic Messages → OpenAI Chat Completions
@@ -339,13 +339,21 @@ pub fn openai_to_anthropic_response(openai_body: &Value, resolved_model: &str) -
     }
 
     if let Some(tcs) = message.get("tool_calls").and_then(Value::as_array) {
-        for tc in tcs {
+        let mut malformed: Vec<usize> = Vec::new();
+        for (i, tc) in tcs.iter().enumerate() {
             let id = tc.get("id").and_then(Value::as_str).unwrap_or_default();
             let name = tc
                 .get("function")
                 .and_then(|f| f.get("name"))
                 .and_then(Value::as_str)
                 .unwrap_or_default();
+            // The Anthropic SDK refuses a message carrying a tool_use block
+            // with an empty id or name, losing the whole reply — not just this
+            // call. Defaulting to "" here manufactures exactly that block.
+            if id.is_empty() || name.is_empty() {
+                malformed.push(i);
+                continue;
+            }
             let args = tc
                 .get("function")
                 .and_then(|f| f.get("arguments"))
@@ -353,6 +361,9 @@ pub fn openai_to_anthropic_response(openai_body: &Value, resolved_model: &str) -
                 .unwrap_or("");
             let input = serde_json::from_str::<Value>(args).unwrap_or_else(|_| json!({}));
             content.push(json!({ "type": "tool_use", "id": id, "name": name, "input": input }));
+        }
+        if !malformed.is_empty() {
+            tracing::warn!(?malformed, "upstream tool_calls missing id/name; dropped");
         }
     }
 
@@ -449,6 +460,17 @@ pub struct OpenAISseConverter {
     pending_stop_reason: Option<String>,
     terminal_error: Option<String>,
     last_usage: Option<Value>,
+    /// tool index → (id, name, buffered arguments-so-far), held until **both**
+    /// the id and the name are known. Some upstreams (observed:
+    /// deepseek-v4.1-flash via command) stream
+    /// `{"index":0,"function":{"arguments":"…"}}` fragments with no `id` /
+    /// `name` anywhere in the response. Emitting a block on `index` alone
+    /// produced `id:""`/`name:""` tool_use blocks, which the Anthropic SDK
+    /// rejects ("tool_calls without a complete id and function name") — a hard
+    /// client error the gateway had logged as a 200. Never open speculatively.
+    pending_tools: HashMap<usize, (String, String, String)>,
+    /// tool indices that were opened and are awaiting `content_block_stop`.
+    live_tools: Vec<usize>,
     finished: bool,
 }
 
@@ -465,6 +487,8 @@ impl OpenAISseConverter {
             pending_stop_reason: None,
             terminal_error: None,
             last_usage: None,
+            pending_tools: HashMap::new(),
+            live_tools: Vec::new(),
             finished: false,
         }
     }
@@ -599,7 +623,10 @@ impl OpenAISseConverter {
                 }
             }
 
-            // Tool call fragments.
+            // Tool call fragments. A block may only be opened once its `id`
+            // AND `name` are known — see `pending_tools`. Arguments that
+            // arrive before that are held back and flushed on open, so the
+            // block still carries the complete input.
             if let Some(tcs) = delta.get("tool_calls").and_then(Value::as_array) {
                 for tc in tcs {
                     let Some(tc_index) = tc.get("index").and_then(Value::as_i64) else {
@@ -607,38 +634,69 @@ impl OpenAISseConverter {
                     };
                     let tc_index = tc_index as usize;
                     let block_index = if self.thinking_started { 2 } else { 1 } + tc_index;
+                    let id = tc.get("id").and_then(Value::as_str).unwrap_or_default();
+                    let name = tc
+                        .get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let args = tc
+                        .get("function")
+                        .and_then(|f| f.get("arguments"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+
+                    // Not open yet: absorb whatever identity arrived plus any
+                    // arguments so far, and only open once complete.
                     if !self.tool_indices.contains(&tc_index) {
+                        let slot = self.pending_tools.entry(tc_index).or_default();
+                        if !id.is_empty() {
+                            slot.0 = id.to_string();
+                        }
+                        if !name.is_empty() {
+                            slot.1 = name.to_string();
+                        }
+                        if !args.is_empty() {
+                            slot.2.push_str(args);
+                        }
+                        let (pid, pname, buffered) = &self.pending_tools[&tc_index];
+                        if pid.is_empty() || pname.is_empty() {
+                            // Still incomplete — emit nothing yet.
+                            continue;
+                        }
+                        let (pid, pname, buffered) = (pid.clone(), pname.clone(), buffered.clone());
+                        self.pending_tools.remove(&tc_index);
                         self.tool_indices.insert(tc_index);
-                        let id = tc.get("id").and_then(Value::as_str).unwrap_or_default();
-                        let name = tc
-                            .get("function")
-                            .and_then(|f| f.get("name"))
-                            .and_then(Value::as_str)
-                            .unwrap_or_default();
+                        self.live_tools.push(tc_index);
                         events.push(sse_event(
                             "content_block_start",
                             json!({
                                 "type": "content_block_start",
                                 "index": block_index,
-                                "content_block": { "type": "tool_use", "id": id, "name": name, "input": {} }
+                                "content_block": { "type": "tool_use", "id": pid, "name": pname, "input": {} }
                             }),
                         ));
-                    }
-                    if let Some(args) = tc
-                        .get("function")
-                        .and_then(|f| f.get("arguments"))
-                        .and_then(Value::as_str)
-                    {
-                        if !args.is_empty() {
+                        if !buffered.is_empty() {
                             events.push(sse_event(
                                 "content_block_delta",
                                 json!({
                                     "type": "content_block_delta",
                                     "index": block_index,
-                                    "delta": { "type": "input_json_delta", "partial_json": args }
+                                    "delta": { "type": "input_json_delta", "partial_json": buffered }
                                 }),
                             ));
                         }
+                        continue;
+                    }
+                    if !args.is_empty() {
+                        events.push(sse_event(
+                            "content_block_delta",
+                            json!({
+                                "type": "content_block_delta",
+                                "index": block_index,
+                                "delta": { "type": "input_json_delta", "partial_json": args }
+                            }),
+                        ));
                     }
                 }
             }
@@ -704,7 +762,7 @@ impl OpenAISseConverter {
             ));
         }
 
-        let mut sorted: Vec<usize> = self.tool_indices.iter().copied().collect();
+        let mut sorted: Vec<usize> = self.live_tools.clone();
         sorted.sort_unstable();
         for tc_index in sorted {
             let block_index = if self.thinking_started { 2 } else { 1 } + tc_index;
@@ -712,6 +770,22 @@ impl OpenAISseConverter {
                 "content_block_stop",
                 json!({ "type": "content_block_stop", "index": block_index }),
             ));
+        }
+        // Tools whose id/name never arrived were never opened, so there is
+        // nothing to close. Warn loudly: the model loses a call the user
+        // asked for, which is worth knowing about in the logs.
+        if !self.pending_tools.is_empty() {
+            let orphans: Vec<usize> = {
+                let mut v: Vec<usize> = self.pending_tools.keys().copied().collect();
+                v.sort_unstable();
+                v
+            };
+            tracing::warn!(
+                model = %self.model,
+                ?orphans,
+                "upstream streamed tool_calls without a complete id/name; dropped"
+            );
+            self.pending_tools.clear();
         }
 
         let mut delta_usage = Map::new();

@@ -637,3 +637,217 @@ fn sse_data_payload_extraction() {
     assert_eq!(sse_data_payload("data: [DONE]\n\n"), Some("[DONE]"));
     assert_eq!(sse_data_payload("event: ping\n\n"), None);
 }
+
+// ---------------------------------------------------------------------------
+// Regression: tool_calls without a complete id and function name
+// ---------------------------------------------------------------------------
+
+/// The Anthropic SDK rejects a message whose tool_use block has an empty id or
+/// name outright, so a stream that never supplies them must produce no block at
+/// all — not a block with `id: ""` / `name: ""`. Reproduces the real
+/// deepseek-v4.1-flash stream: `{"index":0,"function":{"arguments":"…"}}`
+/// repeated, with no id/name anywhere.
+#[test]
+fn sse_never_opens_a_tool_block_without_id_and_name() {
+    let mut conv = OpenAISseConverter::new("m");
+    let mut all = Vec::new();
+    // Arguments stream in with index but no identity.
+    for frag in ["m", " json", ".t", "ool", "\":1}"] {
+        all.extend(conv.feed(&json!({
+            "choices": [{
+                "index": 0,
+                "delta": {"tool_calls": [{"index": 0, "function": {"arguments": frag}}]},
+                "finish_reason": null
+            }]
+        })));
+    }
+    all.extend(conv.feed(&json!({
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]
+    })));
+    all.extend(conv.finish());
+
+    let text: Vec<&str> = all.iter().map(|s| s.as_str()).collect();
+    assert!(
+        !text.iter().any(|s| s.contains("\"type\":\"tool_use\"")),
+        "must not emit a nameless tool_use block: {text:?}"
+    );
+    // …and no dangling content_block_stop for a block that never opened.
+    let stops = text.iter().filter(|s| s.contains("content_block_stop")).count();
+    let starts = text.iter().filter(|s| s.contains("content_block_start")).count();
+    assert_eq!(starts, stops, "every started block must be closed: {text:?}");
+}
+
+/// Identity arriving in a *later* fragment still opens the block, and the
+/// arguments buffered before that point are flushed so the input is complete.
+#[test]
+fn sse_buffers_arguments_until_id_and_name_arrive() {
+    let mut conv = OpenAISseConverter::new("m");
+    let mut all = Vec::new();
+    all.extend(conv.feed(&json!({
+        "choices": [{
+            "index": 0,
+            "delta": {"tool_calls": [{"index": 0, "function": {"arguments": "{\"a\":"}}]},
+            "finish_reason": null
+        }]
+    })));
+    // Identity only now.
+    all.extend(conv.feed(&json!({
+        "choices": [{
+            "index": 0,
+            "delta": {"tool_calls": [
+                {"index": 0, "id": "call_1", "function": {"name": "Bash", "arguments": "1}"}}
+            ]},
+            "finish_reason": null
+        }]
+    })));
+    all.extend(conv.feed(&json!({
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]
+    })));
+    all.extend(conv.finish());
+
+    let text: Vec<&str> = all.iter().map(|s| s.as_str()).collect();
+    let start = text.iter().find(|s| s.contains("\"type\":\"tool_use\"")).unwrap_or_else(|| {
+        panic!("block must open once id+name arrive: {text:?}")
+    });
+    assert!(start.contains("call_1") && start.contains("Bash"), "id/name missing: {start}");
+    // Both halves of the arguments must survive, in order.
+    let joined: String = text
+        .iter()
+        .filter(|s| s.contains("input_json_delta"))
+        .copied()
+        .collect::<Vec<&str>>()
+        .concat();
+    assert!(
+        joined.contains("{\\\"a\\\":") && joined.contains("1}"),
+        "buffered arguments must be flushed with the rest: {joined}"
+    );
+}
+
+/// A well-formed tool call must be unaffected by the buffering (the common case).
+#[test]
+fn sse_complete_tool_call_is_unaffected() {
+    let mut conv = OpenAISseConverter::new("m");
+    let mut all = conv.feed(&json!({
+        "choices": [{
+            "index": 0,
+            "delta": {"tool_calls": [
+                {"index": 0, "id": "call_1", "function": {"name": "Bash", "arguments": "{}"}}
+            ]},
+            "finish_reason": null
+        }]
+    }));
+    all.extend(conv.feed(&json!({
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]
+    })));
+    all.extend(conv.finish());
+
+    let text: Vec<&str> = all.iter().map(|s| s.as_str()).collect();
+    let start = text.iter().find(|s| s.contains("\"type\":\"tool_use\"")).expect("must open immediately");
+    assert!(start.contains("call_1") && start.contains("Bash"), "bad start: {start}");
+    assert!(
+        text.iter().any(|s| s.contains("content_block_stop") && s.contains("\"index\":1")),
+        "opened tool block must be closed: {text:?}"
+    );
+}
+
+/// One malformed tool among several must not suppress the good ones.
+#[test]
+fn sse_malformed_tool_does_not_hide_a_valid_sibling() {
+    let mut conv = OpenAISseConverter::new("m");
+    let mut all = conv.feed(&json!({
+        "choices": [{
+            "index": 0,
+            "delta": {"tool_calls": [
+                {"index": 1, "id": "call_ok", "function": {"name": "Bash", "arguments": "{}"}}
+            ]},
+            "finish_reason": null
+        }]
+    }));
+    // index 0 is nameless and never resolves.
+    for frag in ["{", "\"x\":1}"] {
+        all.extend(conv.feed(&json!({
+            "choices": [{
+                "index": 0,
+                "delta": {"tool_calls": [{"index": 0, "function": {"arguments": frag}}]},
+                "finish_reason": null
+            }]
+        })));
+    }
+    all.extend(conv.feed(&json!({
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]
+    })));
+    all.extend(conv.finish());
+
+    let text: Vec<&str> = all.iter().map(|s| s.as_str()).collect();
+    assert!(
+        text.iter().any(|s| s.contains("\"type\":\"tool_use\"") && s.contains("call_ok")),
+        "valid sibling must survive: {text:?}"
+    );
+    assert!(
+        !text.iter().any(|s| s.contains("\"id\":\"\"")),
+        "no empty-id tool_use may be emitted: {text:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Regression: non-streaming tool_calls missing id or name
+// ---------------------------------------------------------------------------
+
+/// `openai_to_anthropic_response` must drop a tool_calls entry that has no id
+/// or no name rather than emit a `tool_use` block the SDK will reject. The
+/// rest of the message still has to come through.
+#[test]
+fn nonstream_drops_tool_call_missing_id_or_name() {
+    for bad in [
+        json!({"index": 0, "function": {"name": "Bash", "arguments": "{}"}}),
+        json!({"index": 0, "id": "call_1", "function": {"arguments": "{}"}}),
+        json!({"index": 0, "function": {"arguments": "{}"}}),
+    ] {
+        let out = openai_to_anthropic_response(
+            &json!({
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "text kept",
+                        "tool_calls": [bad]
+                    },
+                    "finish_reason": "tool_calls"
+                }]
+            }),
+            "m",
+        );
+        let text = out.to_string();
+        assert!(
+            !text.contains("\"type\":\"tool_use\""),
+            "malformed tool_call must be dropped, got: {text}"
+        );
+        assert!(text.contains("text kept"), "rest of the message must survive: {text}");
+    }
+}
+
+/// A valid tool_call must still convert normally, and a valid sibling must
+/// survive alongside a dropped one.
+#[test]
+fn nonstream_keeps_valid_tool_calls_and_valid_siblings() {
+    let out = openai_to_anthropic_response(
+        &json!({
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [
+                        {"index": 0, "function": {"name": "Nameless", "arguments": "{}"}},
+                        {"index": 1, "id": "call_ok", "function": {"name": "Bash", "arguments": "{\"a\":1}"}}
+                    ]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }),
+        "m",
+    );
+    let text = out.to_string();
+    assert!(text.contains("call_ok") && text.contains("Bash"), "valid call must survive: {text}");
+    assert!(!text.contains("Nameless"), "nameless call must be dropped: {text}");
+}

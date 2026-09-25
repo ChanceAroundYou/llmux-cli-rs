@@ -118,14 +118,26 @@ fn convert_openai_message(msg: &Value) -> Option<Value> {
 
     // Assistant tool_calls → tool_use blocks in content.
     let mut tool_use_blocks: Vec<Value> = Vec::new();
+    let mut malformed_tools: Vec<usize> = Vec::new();
     if let Some(tcs) = msg.get("tool_calls").and_then(Value::as_array) {
-        for tc in tcs {
+        for (i, tc) in tcs.iter().enumerate() {
+            // A tool_use block without an id or a name is rejected outright by
+            // the Anthropic SDK ("tool_calls without a complete id and
+            // function name"). Some upstreams omit them entirely; defaulting to
+            // "" here just manufactures an invalid block, so drop it and let
+            // the rest of the message through. ponytail: one `tracing::warn!`
+            // is the whole observability story — raise the ceiling to
+            // usage_logs if a model starts doing this often.
             let id = tc.get("id").and_then(Value::as_str).unwrap_or_default();
             let name = tc
                 .get("function")
                 .and_then(|f| f.get("name"))
                 .and_then(Value::as_str)
                 .unwrap_or_default();
+            if id.is_empty() || name.is_empty() {
+                malformed_tools.push(i);
+                continue;
+            }
             let args = tc
                 .get("function")
                 .and_then(|f| f.get("arguments"))
@@ -136,6 +148,9 @@ fn convert_openai_message(msg: &Value) -> Option<Value> {
                 "type": "tool_use", "id": id, "name": name, "input": input
             }));
         }
+    }
+    if !malformed_tools.is_empty() {
+        tracing::warn!(?malformed_tools, "upstream tool_calls missing id/name; dropped");
     }
 
     // Assistant reasoning_content → thinking block.
@@ -455,7 +470,10 @@ impl AnthropicSseConverter {
                     .and_then(Value::as_str)
                     .unwrap_or_default();
                 if block_type == "tool_use" {
-                    self.tool_indices.insert(index);
+                    // An id or name the upstream didn't send can't be papered
+                    // over with "": the OpenAI consumer on the other end keys
+                    // tool_calls by id and dispatches on name, so an empty pair
+                    // is worse than no call at all. Drop it.
                     let id = event
                         .get("content_block")
                         .and_then(|b| b.get("id"))
@@ -466,21 +484,26 @@ impl AnthropicSseConverter {
                         .and_then(|b| b.get("name"))
                         .and_then(Value::as_str)
                         .unwrap_or_default();
-                    let tc_index = self.tool_calls_index(index);
-                    out.push(openai_chunk(&json!({
-                        "choices": [{
-                            "index": 0,
-                            "delta": {
-                                "tool_calls": [{
-                                    "index": tc_index,
-                                    "id": id,
-                                    "type": "function",
-                                    "function": { "name": name, "arguments": "" }
-                                }]
-                            },
-                            "finish_reason": null
-                        }]
-                    })));
+                    if id.is_empty() || name.is_empty() {
+                        tracing::warn!(index, "upstream tool_use without id/name; dropped");
+                    } else {
+                        self.tool_indices.insert(index);
+                        let tc_index = self.tool_calls_index(index);
+                        out.push(openai_chunk(&json!({
+                            "choices": [{
+                                "index": 0,
+                                "delta": {
+                                    "tool_calls": [{
+                                        "index": tc_index,
+                                        "id": id,
+                                        "type": "function",
+                                        "function": { "name": name, "arguments": "" }
+                                    }]
+                                },
+                                "finish_reason": null
+                            }]
+                        })));
+                    }
                 }
             }
             "content_block_delta" => {
@@ -510,20 +533,25 @@ impl AnthropicSseConverter {
                         }
                     }
                     Some("input_json_delta") => {
-                        if let Some(pj) = delta.get("partial_json").and_then(Value::as_str) {
-                            let tc_index = self.tool_calls_index(index);
-                            out.push(openai_chunk(&json!({
-                                "choices": [{
-                                    "index": 0,
-                                    "delta": {
-                                        "tool_calls": [{
-                                            "index": tc_index,
-                                            "function": { "arguments": pj }
-                                        }]
-                                    },
-                                    "finish_reason": null
-                                }]
-                            })));
+                        // Only stream arguments for a block we actually opened;
+                        // otherwise a dropped tool_use would still leak
+                        // argument deltas with no id/name to attach them to.
+                        if self.tool_indices.contains(&index) {
+                            if let Some(pj) = delta.get("partial_json").and_then(Value::as_str) {
+                                let tc_index = self.tool_calls_index(index);
+                                out.push(openai_chunk(&json!({
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": {
+                                            "tool_calls": [{
+                                                "index": tc_index,
+                                                "function": { "arguments": pj }
+                                            }]
+                                        },
+                                        "finish_reason": null
+                                    }]
+                                })));
+                            }
                         }
                     }
                     _ => {}

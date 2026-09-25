@@ -7,6 +7,21 @@
 
 ### Fixed
 
+- **不再发出缺 id / name 的 `tool_use` 块**：客户端报
+  `Model provider returned tool_calls without a complete id and function name`——
+  这是**客户端 SDK 的校验**，网关侧 `usage_logs` 一条都没记（请求被记成干净的 200），
+  实际是 llmux 自己造出来的畸形数据。根因：转换器见到带 `index` 的 tool_call
+  fragment 就开块，缺失的 id/name 用 `unwrap_or_default()` 填成空串。实测
+  deepseek-v4.1-flash 经 command 上游会推
+  `{"index":0,"function":{"arguments":"…"}}` 且**整条流里 id/name 一次都不出现**
+  （扫最近 600 条带 tool_calls 的流，683 个 fragment 属此类）。Anthropic SDK 见到
+  空 id/name 直接拒收整条消息，损失的不只是那一个 tool call。
+  改为**id 和 name 都到齐才开块**，其间到达的 arguments 先缓冲、开门时一并补发；
+  始终不全的则丢弃并 `warn`（模型确实丢了一个调用，日志里要看得见）。四条路径
+  一并修：流式 `OpenAISseConverter`、非流式 `openai_to_anthropic_response` 与
+  `convert_openai_message`、反向 SSE `AnthropicSseConverter`（含其
+  `input_json_delta` 孤儿 delta）、以及 responses 的 `response_function_call`。
+
 - **还原被双重编码的 `reasoning_details`**：客户端把 OpenRouter 的这个扩展字段
   （schema 是对象数组）`json.dumps` 进了 string，如
   `"[{\"type\":\"reasoning.text\",…}]"`。llmux 走 Passthrough 原样转发，上游按 schema

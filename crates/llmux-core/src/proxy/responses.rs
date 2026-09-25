@@ -767,6 +767,15 @@ fn response_function_call(item: &Value) -> Option<(&str, &str, &str, &str)> {
     let item_id = item.get("id").and_then(Value::as_str)?;
     let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or(item_id);
     let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
+    // A name-less function_call can't become a tool_use block: the Anthropic
+    // SDK rejects the message outright ("tool_calls without a complete id and
+    // function name"), so refusing here keeps the rest of the reply usable.
+    // Both the streaming and non-streaming responses paths funnel through this
+    // one chokepoint.
+    if call_id.is_empty() || name.is_empty() {
+        tracing::warn!(item_id, "responses function_call without a name; dropped");
+        return None;
+    }
     let arguments = item.get("arguments").and_then(Value::as_str).unwrap_or_default();
     Some((item_id, call_id, name, arguments))
 }
