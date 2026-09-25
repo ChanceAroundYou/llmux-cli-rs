@@ -7,6 +7,18 @@
 
 ### Fixed
 
+- **还原被双重编码的 `reasoning_details`**：客户端把 OpenRouter 的这个扩展字段
+  （schema 是对象数组）`json.dumps` 进了 string，如
+  `"[{\"type\":\"reasoning.text\",…}]"`。llmux 走 Passthrough 原样转发，上游按 schema
+  校验直接 400（`Invalid input: expected array, received string`，param 指向
+  `messages.N.reasoning_details`）→ 网关 502。随会话变长反复复现（实测 param 从
+  `messages.326` 漂到 `messages.416`）。入站清洗（`sanitize_chat_messages`）现在能
+  解析回数组就就地还原，解析不出则删字段——它是辅助 reasoning 元数据，删掉最坏只
+  损失一段轨迹，留着则整轮对话直接失败。**白名单式**：只对 `reasoning_details` 生效，
+  `content` 本就是 string 且合法地可能是 `"[1, 2, 3]"` 这类字面量正文，无差别还原会
+  静默篡改用户内容。`/v1/messages` 入口此前零清洗（ingress==target 时同样透传），
+  一并接上。
+
 - **拨测探 `/v1/messages` 时改用 Anthropic 请求体**：此前无论探哪个协议都发 OpenAI
   形状的体，上游按形状拒收（command 返回
   `Model X must be called via /provider/v1/messages (Anthropic Messages shape)`），

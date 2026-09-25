@@ -46,8 +46,12 @@ pub async fn messages(
     Extension(auth): Extension<AuthContext>,
     axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
     headers: HeaderMap,
-    Json(body): Json<Value>,
+    Json(mut body): Json<Value>,
 ) -> Response {
+    // Messages ingress 同样可能带畸形 `tool_calls: []` / 字符串化的
+    // `reasoning_details`（ingress==target 时走 Passthrough 原样转发）。
+    // 无该字段即 no-op。
+    llmux_core::proxy::sanitize_chat_messages(&mut body);
     let raw_model = body["model"].as_str().unwrap_or_default().to_string();
     // Aggregate aliases keep their dedicated paths (V-anchored failover).
     if let Ok(Some(agg)) = state.resolve_aggregate_cached(&raw_model).await {

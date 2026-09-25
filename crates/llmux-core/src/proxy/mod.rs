@@ -61,17 +61,44 @@ pub fn extract_anthropic_usage_from_json(data: &Value) -> AnthropicUsage {
     }
 }
 
-/// OpenAI chat 请求体清洗：assistant 消息上的 `tool_calls: []` 空数组会被严格
-/// 上游（DeepSeek、Console Go 等）以 minLength 1 拒绝 → 400 → 网关 502。
-/// 空数组语义等价于"无工具调用"，直接删字段对任何上游都安全。
-pub fn strip_empty_tool_calls(body: &mut Value) {
+/// OpenAI chat 请求体清洗，修两类会被严格上游按 schema 拒收的畸形字段
+/// （400 → 网关 502），同一个 bug 的两个面：
+///
+/// 1. assistant 消息上的 `tool_calls: []` 空数组被严格上游（DeepSeek、Console Go
+///    等）以 minLength 1 拒绝。空数组语义等价于"无工具调用"，直接删字段对任何
+///    上游都安全。
+/// 2. `reasoning_details`（OpenRouter 扩展，schema 是对象数组）被客户端**双重
+///    编码**成 JSON 字符串，例如
+///    `"[{\"type\":\"reasoning.text\",\"text\":\"…\"}]"`。原样转发必然 400。
+///    能解析回数组就还原；解析不出就删——它是辅助 reasoning 元数据，删掉最坏只
+///    损失一段轨迹（assistant 的 `content`/`tool_calls` 完好），留着则整轮对话
+///    直接失败。
+///
+/// 还原只对上面这一个白名单字段生效，**不做「任何能解析成 JSON 的字符串都还原」**
+/// —— `content` 本就是 string，且完全合法地可能是 `"[1, 2, 3]"` 这种字面量正文，
+/// 无差别还原会静默篡改用户内容。
+pub fn sanitize_chat_messages(body: &mut Value) {
     let Some(msgs) = body.get_mut("messages").and_then(Value::as_array_mut) else {
         return;
     };
     for m in msgs {
-        if let Some(obj) = m.as_object_mut() {
-            if obj.get("tool_calls").and_then(Value::as_array).is_some_and(Vec::is_empty) {
-                obj.remove("tool_calls");
+        let Some(obj) = m.as_object_mut() else { continue };
+        if obj.get("tool_calls").and_then(Value::as_array).is_some_and(Vec::is_empty) {
+            obj.remove("tool_calls");
+        }
+        // Only a string is suspect — a real array is already schema-valid.
+        if matches!(obj.get("reasoning_details"), Some(Value::String(_))) {
+            let restored = match obj.get("reasoning_details").and_then(Value::as_str) {
+                Some(s) => serde_json::from_str::<Value>(s).ok().filter(Value::is_array),
+                None => None,
+            };
+            match restored {
+                Some(arr) => {
+                    obj.insert("reasoning_details".to_string(), arr);
+                }
+                None => {
+                    obj.remove("reasoning_details");
+                }
             }
         }
     }
@@ -120,7 +147,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn strip_empty_tool_calls_removes_only_empty_arrays() {
+    fn sanitize_removes_empty_tool_calls() {
         let mut body = json!({
             "model": "od",
             "messages": [
@@ -132,7 +159,7 @@ mod tests {
                 {"role": "tool", "tool_call_id": "call_1", "content": "ok"}
             ]
         });
-        strip_empty_tool_calls(&mut body);
+        sanitize_chat_messages(&mut body);
         let msgs = body["messages"].as_array().unwrap();
         assert!(msgs[1].get("tool_calls").is_none(), "空数组应被删除");
         assert!(msgs[2]["tool_calls"].is_array(), "非空 tool_calls 应保留");
@@ -142,9 +169,92 @@ mod tests {
     }
 
     #[test]
-    fn strip_empty_tool_calls_noop_without_messages() {
+    fn sanitize_noop_without_messages() {
         let mut body = json!({"model": "m", "max_tokens": 10});
-        strip_empty_tool_calls(&mut body);
+        sanitize_chat_messages(&mut body);
         assert_eq!(body["model"], "m");
+    }
+
+    #[test]
+    fn sanitize_restores_stringified_reasoning_details() {
+        // 线上真实故障：客户端把数组 json.dumps 进 string 字段，上游按
+        // "expected array, received string" 拒收（messages.416.reasoning_details）。
+        let mut body = json!({
+            "model": "od",
+            "messages": [{
+                "role": "assistant",
+                "content": "修好了。",
+                "reasoning_details": "[{\"type\":\"reasoning.text\",\"text\":\"let me write\",\"index\":0}]"
+            }]
+        });
+        sanitize_chat_messages(&mut body);
+        let rd = &body["messages"][0]["reasoning_details"];
+        assert!(rd.is_array(), "应还原成数组，实际 {}", rd);
+        assert_eq!(rd[0]["type"], "reasoning.text");
+        assert_eq!(rd[0]["text"], "let me write");
+        assert_eq!(body["messages"][0]["content"], "修好了。", "content 不得受影响");
+    }
+
+    #[test]
+    fn sanitize_keeps_valid_reasoning_details_array() {
+        let mut body = json!({
+            "model": "od",
+            "messages": [{
+                "role": "assistant",
+                "content": "ok",
+                "reasoning_details": [{"type": "reasoning.text", "text": "t"}]
+            }]
+        });
+        sanitize_chat_messages(&mut body);
+        assert!(body["messages"][0]["reasoning_details"].is_array(), "合法数组应原样保留");
+        assert_eq!(body["messages"][0]["reasoning_details"][0]["text"], "t");
+    }
+
+    #[test]
+    fn sanitize_drops_unparseable_reasoning_details() {
+        // 留原值必然 400；删掉最坏只损失 reasoning 轨迹，content 仍可用。
+        for bad in ["not json", "42", "{\"type\":\"x\"}", "null"] {
+            let mut body = json!({
+                "model": "od",
+                "messages": [{
+                    "role": "assistant",
+                    "content": "keep me",
+                    "reasoning_details": bad
+                }]
+            });
+            sanitize_chat_messages(&mut body);
+            assert!(
+                body["messages"][0].get("reasoning_details").is_none(),
+                "非数组的 {bad:?} 应被删除"
+            );
+            assert_eq!(body["messages"][0]["content"], "keep me", "content 必须保留");
+        }
+    }
+
+    #[test]
+    fn sanitize_never_touches_content_that_looks_like_json() {
+        // 防回归：白名单式还原的核心理由。content 本就是 string，
+        // "[1, 2, 3]" 这类字面量正文必须逐字节不变。
+        let mut body = json!({
+            "model": "od",
+            "messages": [
+                {"role": "user", "content": "[1, 2, 3]"},
+                {"role": "assistant", "content": "{\"a\": 1}"},
+                {"role": "user", "content": "普通文本"}
+            ]
+        });
+        let before = body["messages"].clone();
+        sanitize_chat_messages(&mut body);
+        assert_eq!(body["messages"], before, "content 形似 JSON 时消息体必须完全不变");
+    }
+
+    #[test]
+    fn sanitize_does_not_add_field_to_messages_without_it() {
+        let mut body = json!({
+            "model": "od",
+            "messages": [{"role": "assistant", "content": "x"}]
+        });
+        sanitize_chat_messages(&mut body);
+        assert!(body["messages"][0].get("reasoning_details").is_none(), "不得新增字段");
     }
 }

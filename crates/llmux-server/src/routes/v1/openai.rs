@@ -48,9 +48,10 @@ pub async fn chat_completions(
     headers: HeaderMap,
     Json(mut body): Json<Value>,
 ) -> Response {
-    // 客户端历史消息可能带 `tool_calls: []`（hermes 曾踩中，DeepSeek/
-    // Console Go 上游以 minLength 1 拒绝 → 400 → 502）。透传前统一清洗。
-    llmux_core::proxy::strip_empty_tool_calls(&mut body);
+    // 客户端历史消息可能带 `tool_calls: []` 或双重编码成字符串的
+    // `reasoning_details`（hermes 曾踩中，DeepSeek/Console Go 上游分别以
+    // minLength 1、expected array 拒绝 → 400 → 502）。透传前统一清洗。
+    llmux_core::proxy::sanitize_chat_messages(&mut body);
     // Resolve early to check upstream_api — chat ingress may be routed to responses upstream
     let raw_model = body.get("model").and_then(Value::as_str).unwrap_or("");
     // Aggregate alias takes precedence over ordinary alias/prefix
