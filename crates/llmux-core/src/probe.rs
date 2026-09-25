@@ -117,10 +117,18 @@ pub fn build_probe_request(account: &Account, model: &str, protocol: Protocol) -
         "messages": [{"role": "user", "content": PROBE_PROMPT}],
         "max_tokens": PROBE_MAX_TOKENS
     });
-    let body = if protocol == Protocol::Responses {
-        crate::proxy::responses::chat_to_responses(&chat_body, model)
-    } else {
-        chat_body
+    // 每个协议要发**它自己形状**的请求体。探 /v1/messages 却发 OpenAI 体
+    // 会被上游按形状拒掉（command: "Model X must be called via
+    // /provider/v1/messages (Anthropic Messages shape)"），误报成模型不可用。
+    let body = match protocol {
+        Protocol::Responses => crate::proxy::responses::chat_to_responses(&chat_body, model),
+        // Anthropic Messages 形状：top-level max_tokens + system 可选。
+        Protocol::Messages => json!({
+            "model": model,
+            "max_tokens": PROBE_MAX_TOKENS,
+            "messages": [{"role": "user", "content": PROBE_PROMPT}]
+        }),
+        Protocol::Chat => chat_body,
     };
     build_passthrough_with_beta(account, protocol, &body, None)
 }
@@ -225,10 +233,7 @@ pub async fn run_probe(
     ProbeOutcome {
         native: false,
         protocols: probes,
-        mismatched_config: supported
-            .first()
-            .copied()
-            .and_then(|best| mismatch(best, mode, account)),
+        mismatched_config: mismatch(&supported, mode, account),
         supported,
     }
 }
@@ -327,14 +332,18 @@ async fn native_probe(
     }
 }
 
-/// 探测出的首选协议与该别名配置的协议不同 —— 只提示，不改配置。
-fn mismatch(probed: Protocol, mode: DownstreamMode, account: &Account) -> Option<Protocol> {
+/// 探测出的可用协议里，别名**实际配置**的那个不通 → 提示配置可能写错。
+///
+/// 比的不是「优先级最高的可用协议」（`supported.first()`，恒为 Chat）：配了
+/// Responses 的别名只要 chat 也通，`first()` 永远是 Chat，于是每次都误报。
+/// 语义应是「我按配置去连，连不上」—— 配的协议不在 supported 里才算写错。
+fn mismatch(supported: &[Protocol], mode: DownstreamMode, account: &Account) -> Option<Protocol> {
     if mode == DownstreamMode::Default {
         // Default 模式下路由本身就按账户端点推导，不存在“配错”。
         return None;
     }
     let configured = target_protocol(Protocol::Chat, mode, account);
-    (configured != probed).then_some(configured)
+    (!supported.contains(&configured)).then_some(configured)
 }
 
 // ---------------------------------------------------------------------------
@@ -766,15 +775,48 @@ mod tests {
     }
 
     #[test]
+    fn messages_probe_uses_anthropic_body_shape() {
+        // 回归：探 /v1/messages 却发 OpenAI 体，上游会按形状拒掉
+        // （command: "Model X must be called via /provider/v1/messages
+        // (Anthropic Messages shape)"），9 个 claude-* 模型因此被误报不可用。
+        let a = account("command", "https://api.commandcode.ai/provider/v1", None, Some("https://api.commandcode.ai/provider/v1"));
+        let req = build_probe_request(&a, "claude-sonnet-5", Protocol::Messages);
+        assert_eq!(req.body["max_tokens"].as_i64(), Some(PROBE_MAX_TOKENS));
+        assert_eq!(req.body["messages"][0]["role"].as_str(), Some("user"));
+        // 形状与 Chat 探测同形，但要确认没落进 responses 分支
+        assert!(req.body.get("input").is_none(), "messages 不该用 responses 的 input 形状");
+    }
+
+    #[test]
+    fn chat_probe_keeps_openai_body_shape() {
+        // 对照：Chat 仍是 OpenAI 形状（上面那条不能改坏这条）
+        let a = account("command", "https://api.commandcode.ai/provider/v1", None, None);
+        let req = build_probe_request(&a, "poolside/laguna-s-2.1-free", Protocol::Chat);
+        assert_eq!(req.body["max_tokens"].as_i64(), Some(PROBE_MAX_TOKENS));
+        assert_eq!(req.body["messages"][0]["role"].as_str(), Some("user"));
+    }
+
+    #[test]
     fn probe_reports_config_mismatch_without_changing_it() {
-        // 别名配 chat，但探出来 chat 不通、messages 通 → 提示配置，不替用户改
+        // 别名配 chat，但 chat 探不通、messages 通 → 提示配置，不替用户改
         let a = account("copilot", "http://gw/v1", Some("http://gw/v1"), Some("http://gw/v1"));
-        assert_eq!(
-            mismatch(Protocol::Messages, DownstreamMode::Chat, &a),
-            Some(Protocol::Chat)
-        );
-        assert_eq!(mismatch(Protocol::Chat, DownstreamMode::Chat, &a), None);
-        assert_eq!(mismatch(Protocol::Messages, DownstreamMode::Default, &a), None);
+        // supported = [messages]（chat 挂了），配的是 chat → 报 chat 配错
+        assert_eq!(mismatch(&[Protocol::Messages], DownstreamMode::Chat, &a), Some(Protocol::Chat));
+        // supported 含 chat → 配的 chat 通了，不报
+        assert_eq!(mismatch(&[Protocol::Chat, Protocol::Messages], DownstreamMode::Chat, &a), None);
+        assert_eq!(mismatch(&[Protocol::Messages], DownstreamMode::Default, &a), None);
+    }
+
+    #[test]
+    fn responses_config_with_responses_probe_is_not_a_mismatch() {
+        // 回归 1：聚合探测写死 Chat 模式 → 配了 responses 的别名被误报。
+        // 回归 2：supported 按优先级排序（chat 在前），所以 first() 恒是 chat；
+        // 配 responses 而 chat 也通时曾每轮误报。语义应是「配的协议探不通」。
+        let a = account("api123", "http://gw/v1", Some("http://gw/v1"), Some("http://gw/v1"));
+        let supported = [Protocol::Chat, Protocol::Responses];
+        assert_eq!(mismatch(&supported, DownstreamMode::Responses, &a), None);
+        // 配 responses 但只有 chat 通 → 这才是真的配错
+        assert_eq!(mismatch(&[Protocol::Chat], DownstreamMode::Responses, &a), Some(Protocol::Responses));
     }
 
     #[test]
@@ -809,3 +851,4 @@ mod tests {
         );
     }
 }
+

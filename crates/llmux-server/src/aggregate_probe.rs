@@ -48,14 +48,14 @@ async fn run_probe_round(
     master_key: &str,
     aggregate_router: &Arc<Mutex<llmux_core::aggregate::AggregateRouter>>,
 ) -> anyhow::Result<()> {
-    let rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT alias, candidates FROM aggregate_aliases",
+    let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
+        "SELECT alias, candidates, upstream_api FROM aggregate_aliases",
     )
     .fetch_all(pool)
     .await
     .unwrap_or_default();
 
-    for (alias, candidates_json) in rows {
+    for (alias, candidates_json, upstream_api) in rows {
         let candidates = match llmux_core::aggregate::parse_candidates(&candidates_json) {
             Ok(v) => v,
             Err(e) => {
@@ -70,8 +70,12 @@ async fn run_probe_round(
         let active = aggregate_router.lock().unwrap().get_active(&alias);
         let active = active.min(len.saturating_sub(1));
 
+        // 按别名**实际配置**的协议探测。此前写死 Chat：配了 responses 的
+        // 别名（如 op）会拿 Chat 去比对，误报「配置可能写错了」。
+        let mode = llmux_core::protocol::DownstreamMode::from_str(upstream_api.as_deref().unwrap_or("chat"));
+
         // Dual-phase probe
-        let v_prime = probe_dual_phase(&alias, &candidates, active, pool, master_key).await;
+        let v_prime = probe_dual_phase(&alias, &candidates, active, mode, pool, master_key).await;
 
         let switched = if let Some(vp) = v_prime {
             let mut guard = aggregate_router.lock().unwrap();
@@ -101,6 +105,7 @@ async fn probe_dual_phase(
     alias: &str,
     candidates: &[AggregateCandidate],
     active: usize,
+    mode: llmux_core::protocol::DownstreamMode,
     pool: &sqlx::SqlitePool,
     master_key: &str,
 ) -> Option<usize> {
@@ -115,7 +120,7 @@ async fn probe_dual_phase(
         let pool = pool.clone();
         let master_key = master_key.to_string();
         futs.push(async move {
-            let alive = probe_candidate(&cand, &pool, &master_key).await;
+            let alive = probe_candidate(&cand, mode, &pool, &master_key).await;
             (idx, alive)
         });
     }
@@ -136,7 +141,7 @@ async fn probe_dual_phase(
     // Stage 2: active+1..len sequential, first alive
     for idx in (active + 1)..candidates.len() {
         let cand = &candidates[idx];
-        if probe_candidate(cand, pool, master_key).await {
+        if probe_candidate(cand, mode, pool, master_key).await {
             tracing::debug!("🔍 [agg:{}] stage2 hit V={}", alias, idx);
             return Some(idx);
         }
@@ -149,6 +154,7 @@ async fn probe_dual_phase(
 
 async fn probe_candidate(
     cand: &AggregateCandidate,
+    mode: llmux_core::protocol::DownstreamMode,
     pool: &sqlx::SqlitePool,
     master_key: &str,
 ) -> bool {
@@ -192,7 +198,7 @@ async fn probe_candidate(
             &account,
             &cand.model,
             &provider_type,
-            llmux_core::protocol::DownstreamMode::Chat,
+            mode,
         ),
     )
     .await
