@@ -1,3 +1,4 @@
+use axum::response::IntoResponse;
 use llmux_core::adapters;
 use serde_json::Value;
 use std::sync::LazyLock;
@@ -14,6 +15,93 @@ pub fn normalize_base_url(value: &str) -> String {
         t.to_string()
     } else {
         format!("https://{t}")
+    }
+}
+
+/// 该 (账户, 模型) 是否因配额/限流处于冷却期。
+///
+/// 真实流量也要查这张表：上游 429 时我们只能原样透传，重打一次就再吃一次
+/// 429。配额类错误（"resets at 00:00"）当天必然不会自愈，冷却到自然恢复为止。
+pub async fn rate_limit_suspended(
+    pool: &sqlx::SqlitePool,
+    account_id: i64,
+    model: &str,
+) -> bool {
+    llmux_core::probe::is_suspended(pool, account_id, model).await
+}
+
+/// 上游 429 是否是**真配额耗尽**（当天不会自愈），值得冷却。
+///
+/// 429 有两类，不能一视同仁：
+/// * 配额类 —— "resets at 00:00" / "usage limit" / "quota" / "余额不足"。
+///   重打必然再吃 429，冷却是对的。
+/// * 瞬时类 —— "temporarily unavailable"、"overloaded"、上游抖动。这类
+///   下一秒就好了，冷却 30 分钟会把本来能服务的模型误杀成 502
+///   （实测 poolside 429 连着 8 分钟零成功，而它本可以重试成功）。
+///
+/// 只对配额类记冷却。瞬时 429 仍照常透传给调用方，交给它自己重试。
+pub fn is_quota_exhausted(error_body: &str) -> bool {
+    let b = error_body.to_ascii_lowercase();
+    const QUOTA_MARKERS: [&str; 9] = [
+        "quota",
+        "usage limit",
+        "rate limit",
+        "ratelimit",
+        "insufficient",
+        "余额",
+        "额度",
+        "billing",
+        "credit balance",
+    ];
+    QUOTA_MARKERS.iter().any(|m| b.contains(m))
+}
+
+/// 上游回了配额类 429 就记一次失败；连续两次进入 30 分钟冷却。
+///
+/// 成功时 `spawn_log_usage_ip` 已有的 `clear_suspension` 会解除。
+pub async fn note_rate_limit(
+    pool: &sqlx::SqlitePool,
+    account_id: i64,
+    model: &str,
+    error: &str,
+) {
+    if !is_quota_exhausted(error) {
+        tracing::debug!("⏭️  瞬时 429，不冷却：{} | 账户 {}", model, account_id);
+        return;
+    }
+    if llmux_core::probe::note_failure(pool, account_id, model, Some(error)).await {
+        tracing::warn!(
+            "⏸️  {} | 账户 {} 配额耗尽，冷却 {} 分钟",
+            model, account_id, llmux_core::probe::SUSPEND_SECS / 60
+        );
+    }
+}
+
+/// 全部候选都因冷却被跳过时，回 429 + Retry-After，而不是笼统的 502。
+///
+/// 502 对调用方是"网关坏了"，会立刻重试 —— 而我们明确知道它该等。回 429
+/// 带上剩余秒数，客户端（和它们的上游 SDK）才知道该退避多久。
+pub fn rate_limited_response(message: &str, is_anthropic: bool) -> axum::response::Response {
+    let retry_after = llmux_core::probe::SUSPEND_SECS.to_string();
+    if is_anthropic {
+        (
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            [(axum::http::header::RETRY_AFTER, retry_after)],
+            axum::Json(serde_json::json!({
+                "type": "error",
+                "error": { "type": "rate_limit_error", "message": message }
+            })),
+        )
+            .into_response()
+    } else {
+        (
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            [(axum::http::header::RETRY_AFTER, retry_after)],
+            axum::Json(serde_json::json!({
+                "error": { "message": message, "type": "rate_limit_error" }
+            })),
+        )
+            .into_response()
     }
 }
 
@@ -473,6 +561,28 @@ mod tests {
         // 非法 / 0 / 负数一律回退默认，不存在"无限保留"语义
         for bad in ["", "abc", "0", "-5", "3.5"] {
             assert_eq!(body_retain_days_from(Some(bad)), 1, "bad input {bad:?}");
+        }
+    }
+
+    #[test]
+    fn quota_429_cools_down_but_transient_429_does_not() {
+        // 回归：曾对所有 429 一律冷却 30 分钟。poolside 的 429 全是
+        // 「temporarily unavailable」抖动，冷却期间 8 分钟零成功 ——
+        // 把本可服务的模型误杀成 502。只有配额类才该冷却。
+        for quota in [
+            r#"{"error":{"message":"You've used all 100 free Ling requests for today. Your quota resets at 2026-09-25T00:00:00.000Z.","type":"rate_limit_error"}}"#,
+            r#"{"error":{"message":"You've reached your 5-hour usage limit for your plan.","type":"rate_limit_error"}}"#,
+            r#"{"type":"error","error":{"type":"GoUsageLimitError","message":"Monthly usage limit reached. Resets in 7 days."}}"#,
+            "您的DeepSeek v4.1 flash福利版今日免费额度已耗尽，明日刷新。",
+        ] {
+            assert!(is_quota_exhausted(quota), "should cool: {quota}");
+        }
+        for transient in [
+            r#"{"error":{"message":"Upstream model provider is temporarily unavailable. Please try again in a moment.","type":"rate_limit_error"}}"#,
+            r#"{"error":{"message":"overloaded_error"}}"#,
+            "Provider returned 502 Bad Gateway",
+        ] {
+            assert!(!is_quota_exhausted(transient), "should NOT cool: {transient}");
         }
     }
 }

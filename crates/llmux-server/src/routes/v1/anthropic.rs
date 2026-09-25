@@ -165,6 +165,12 @@ pub async fn messages(
     let mut last_error: Option<String> = None;
 
     for account in &ordered_accounts {
+        // 配额/限流冷却中的账户跳过，见 openai.rs 183 行同处注释。
+        if super::helpers::rate_limit_suspended(&state.pool, account.id, &model_resolution.target_model).await {
+            tracing::debug!("⏸️  跳过 {} | 账户 {}：冷却中", model_resolution.target_model, account.alias);
+            last_error = Some(format!("Account {} rate limited, cooling down", account.alias));
+            continue;
+        }
         // Endpoint resolution via protocol::endpoint_for: Messages prefers
         // messages_endpoint/anthropic_base_url; Chat reads base_url (0012).
         let anthropic_base = llmux_core::protocol::endpoint_for(
@@ -301,6 +307,18 @@ pub async fn messages(
                     account.id,
                     status.as_u16()
                 );
+                // 429 = 配额/限流。这条分支直接 continue 不落库，所以冷却
+                // 得在这儿记 —— 否则重打一次吃一次 429，配额耗尽的模型会被
+                // 反复打一整天。
+                if status.as_u16() == 429 {
+                    super::helpers::note_rate_limit(
+                        &state.pool,
+                        account.id,
+                        &model_resolution.target_model,
+                        &last_error.clone().unwrap_or_default(),
+                    )
+                    .await;
+                }
                 if let Some(tx) = &state.tui_tx {
                     let _ = tx.send(TuiEvent::Retry {
                         account: account.alias.clone(),
@@ -647,6 +665,14 @@ async fn dispatch_aggregate_anthropic(
 
     for i in active..len {
         let cand = &agg.candidates[i];
+        // 配额/限流冷却中的候选直接跳过 —— 配额类错误当天不会自愈，
+        // 重打只是再吃一次 429，还把整条链拖成 502。
+        if crate::routes::v1::helpers::rate_limit_suspended(&state.pool, cand.account_id, &cand.model).await {
+            tracing::debug!("⏸️  [agg:{}] 跳过 {} | 账户 {}：冷却中", alias, cand.model, cand.account_id);
+            last_error = Some(format!("Candidate {} ({}) rate limited, cooling down", i, cand.model));
+            state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len);
+            continue;
+        }
         let account = match get_account_by_id(&state.pool, cand.account_id, &state.master_key).await {
             Ok(Some(a)) => a,
             Ok(None) => { state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); last_error = Some(format!("Candidate {} account {} not found or inactive", i, cand.account_id)); continue; }
@@ -731,6 +757,10 @@ async fn dispatch_aggregate_anthropic(
             last_error = Some(format!("Provider returned {status}: {error_body}"));
             if is_retryable_status(status.as_u16()) {
                 tracing::warn!("🔀 [agg:{}] Account {} failed ({}) — trying next...", alias, account.alias, status.as_u16());
+                // 429 → 记冷却，见同文件 297 行注释。
+                if status.as_u16() == 429 {
+                    super::helpers::note_rate_limit(&state.pool, account.id, &cand.model, &error_body).await;
+                }
                 state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len);
                 continue;
             }
@@ -802,6 +832,10 @@ async fn dispatch_aggregate_anthropic(
         crate::routes::v1::helpers::spawn_log_usage(state.pool.clone(), acc, agg.candidates[0].model.clone(), String::new(), 0, 0, 0, 0, latency_ms, false, Some(error_msg.clone()), Some(body.to_string()), None, Some(latency_ms), false);
     }
     send_tui_request(&state.tui_tx, "/v1/messages", 502, start, &agg.alias);
+    // 全部候选都因冷却被跳过 → 回 429 + Retry-After，让调用方退避而不是立刻重试
+    if error_msg.contains("cooling down") {
+        return crate::routes::v1::helpers::rate_limited_response(&error_msg, is_anthropic);
+    }
     middleware::send_error(&error_msg, "upstream_error", StatusCode::BAD_GATEWAY, is_anthropic)
 }
 

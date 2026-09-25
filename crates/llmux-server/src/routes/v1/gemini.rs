@@ -130,6 +130,12 @@ pub async fn gemini(
     let mut last_error: Option<String> = None;
 
     for account in &ordered_accounts {
+        // 配额/限流冷却中的账户跳过，见 openai.rs 183 行同处注释。
+        if super::helpers::rate_limit_suspended(&state.pool, account.id, &model_resolution.target_model).await {
+            tracing::debug!("⏸️  跳过 {} | 账户 {}：冷却中", model_resolution.target_model, account.alias);
+            last_error = Some(format!("Account {} rate limited, cooling down", account.alias));
+            continue;
+        }
         let is_custom_base = account.base_url.as_deref().is_some_and(|u| !u.is_empty());
         let default_base = "https://generativelanguage.googleapis.com/v1beta";
         let base_url = normalize_base_url(
@@ -240,6 +246,16 @@ pub async fn gemini(
                     account.id,
                     status.as_u16()
                 );
+                // 429 → 记冷却，见 anthropic.rs 同处注释。
+                if status.as_u16() == 429 {
+                    super::helpers::note_rate_limit(
+                        &state.pool,
+                        account.id,
+                        &model_resolution.target_model,
+                        &last_error.clone().unwrap_or_default(),
+                    )
+                    .await;
+                }
                 if let Some(tx) = &state.tui_tx {
                     let _ = tx.send(TuiEvent::Retry {
                         account: account.alias.clone(),
