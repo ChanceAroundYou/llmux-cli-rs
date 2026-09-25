@@ -397,6 +397,7 @@
     "testing": "拨测中...",
     "testingQueue": "测试中 ({{current}}/{{total}})...",
     "testAllDesc": "在后台顺序拨测当前筛选出的所有模型",
+    "verifyBackground": "已保存，正在后台检测账户连通性，结果稍后显示在卡片状态里。",
     "noAccountsConnected": "未连接任何账户",
     "apiUnavailable": "API 不可用，可通过上方「笔」按钮手动添加别名",
     "noModelsFound": "该厂商下未找到任何模型",

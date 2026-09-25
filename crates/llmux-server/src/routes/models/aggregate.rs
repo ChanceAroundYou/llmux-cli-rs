@@ -228,23 +228,29 @@ pub async fn set_aggregate_alias(
                 *cache = None;
             }
             tracing::info!("🔀 Set aggregate alias {} ({} candidates)", alias, parsed.len());
-            // 保存后自动验证每个候选：探到的协议只记录 + 提示，不改配置。
-            // 一个聚合里的候选可以各走各的协议（实测 go5 上 muse-spark 只服
-            // /v1/responses、mimo 只服 /chat/completions），所以按候选逐个探。
-            let mut verified = Vec::new();
-            if let Ok(typed) = parse_candidates(&candidates_json) {
-                for cand in &typed {
+            // 验证改到后台：探测逐个走、每个最长 30s，放响应里会让保存接口
+            // 卡住（聚合多候选时尤其明显）。结果写 model_test_results，
+            // UI 卡片稍后经 health/summary 展示。
+            let bg_state = state.clone();
+            let bg_candidates = candidates_json.clone();
+            let bg_alias = alias.clone();
+            tokio::spawn(async move {
+                let Ok(typed) = parse_candidates(&bg_candidates) else { return };
+                for cand in typed {
                     let ids = vec![cand.account_id];
                     let mut row =
-                        super::verify::verify_targets(&state, &cand.model, None, &ids).await;
+                        super::verify::verify_targets(&bg_state, &cand.model, None, &ids).await;
                     if let Some(v) = row.pop() {
-                        verified.push(v);
+                        tracing::info!(
+                            "🔀 [aggregate:{bg_alias}] verify {}/{}: {}",
+                            cand.model,
+                            cand.account_id,
+                            match v["success"].as_bool() { Some(true) => "OK", Some(false) => "FAILED", _ => "?" },
+                        );
                     }
                 }
-            }
-            let mut resp =
-                json!({ "success": true, "message": "Aggregate alias set successfully" });
-            resp["verified"] = super::verify::attach(verified)["verified"].clone();
+            });
+            let resp = json!({ "success": true, "message": "Aggregate alias set successfully" });
             Json(resp).into_response()
         }
         Err(e) => crate::error::simple_error(

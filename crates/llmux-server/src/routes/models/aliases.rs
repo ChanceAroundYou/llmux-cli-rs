@@ -67,7 +67,7 @@ pub async fn set_model_alias(
         if let Ok(mut cache) = state.models_cache.lock() { *cache = None; }
         tracing::info!("🏷️ Overwrote aggregate alias '{}' with ordinary alias (confirmed)", alias);
     }
-    let provider_id = body.get("provider_id").and_then(Value::as_str);
+    let provider_id: Option<String> = body.get("provider_id").and_then(Value::as_str).map(|s| s.to_string());
 
     // Parse account_ids: JSON array like [1,5] or comma-separated "1,5"
     let account_ids = body.get("account_ids").and_then(|v| {
@@ -92,7 +92,7 @@ pub async fn set_model_alias(
     )
     .bind(&alias)
     .bind(&target_model)
-    .bind(provider_id)
+    .bind(provider_id.clone())
     .bind(&account_ids)
     .bind(preferred_account_id)
     .bind(&upstream_api)
@@ -107,14 +107,17 @@ pub async fn set_model_alias(
             state.invalidate_model_cache(&alias);
             tracing::info!("🏷️ Set alias {} -> {} (provider: {:?}), cache invalidated", alias, target_model, provider_id);
             // 保存后自动验证：探到的协议只记录 + 提示，不改配置。
+            // 后台跑，别拖慢保存接口（多账户时逐个探可达数分钟）。
             let ids: Vec<i64> = account_ids
                 .as_deref()
                 .and_then(|s| serde_json::from_str::<Vec<i64>>(s).ok())
                 .unwrap_or_default();
-            let verified =
-                super::verify::verify_targets(&state, &target_model, provider_id, &ids).await;
-            let mut resp = json!({ "success": true, "message": "Alias set successfully" });
-            resp["verified"] = super::verify::attach(verified)["verified"].clone();
+            let bg_state = state.clone();
+            let target_model = target_model.clone();
+            tokio::spawn(async move {
+                super::verify::verify_targets(&bg_state, &target_model, provider_id.as_deref(), &ids).await;
+            });
+            let resp = json!({ "success": true, "message": "Alias set successfully" });
             Json(resp).into_response()
         },
         Err(e) => crate::error::simple_error(

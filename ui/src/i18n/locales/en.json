@@ -395,6 +395,7 @@
     "testing": "Testing...",
     "testingQueue": "Testing ({{current}}/{{total}})...",
     "testAllDesc": "Test all filtered models sequentially in backend",
+    "verifyBackground": "Saved. Checking account connectivity in the background; results will appear in the card status shortly.",
     "noAccountsConnected": "No accounts connected",
     "apiUnavailable": "API unavailable, use the pencil button above to manually add aliases",
     "noModelsFound": "No models found in this provider",

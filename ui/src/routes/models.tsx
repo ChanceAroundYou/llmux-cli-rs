@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useMemo } from 'react';
+import React, { useEffect, useState, useMemo, useRef } from 'react';
 import { apiFetch } from "@/lib/api";
 import { useModelsStore } from '../stores/models';
 import {
@@ -128,6 +128,15 @@ export default function Models() {
   const [testAllConfirm, setTestAllConfirm] = useState(false);
   const [testAllScope, setTestAllScope] = useState<TestScope>('aliases');
   const [queueNotice, setQueueNotice] = useState<{ scope: TestScope; label: string; count: number } | null>(null);
+  // 别名/聚合保存后的后台验证提示（服务端已改为后台探测）
+  const [bgVerifyHint, setBgVerifyHint] = useState<string | null>(null);
+  const bgVerifyTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const showBgVerifyHint = () => {
+    setBgVerifyHint(t('models.verifyBackground', '已保存，正在后台检测账户连通性，结果稍后显示在卡片状态里。'));
+    clearTimeout(bgVerifyTimer.current ?? undefined);
+    // 探测全部收尾后刷新 health，卡片状态即可见，无需手动刷新
+    bgVerifyTimer.current = setTimeout(() => { setBgVerifyHint(null); fetchHealth(); }, 30_000);
+  };
   const [aliasToDelete, setAliasToDelete] = useState<{id: number, name: string} | null>(null);
   const [aggregateToDelete, setAggregateToDelete] = useState<{id: number, name: string} | null>(null);
   const [overwriteConfirm, setOverwriteConfirm] = useState<{ kind: 'ordinary'|'aggregate', alias: string, pending: any } | null>(null);
@@ -400,6 +409,7 @@ export default function Models() {
         undefined,
         aliasForm.downstreamMode || 'default'
       );
+      showBgVerifyHint();
       setIsModalOpen(false);
       setEditingAliasId(null);
       setAliasForm({ alias: '', target: '', provider: '', selectedAccountIds: [], preferredAccountId: null, downstreamMode: 'default' });
@@ -456,6 +466,7 @@ export default function Models() {
     }
     try {
       await saveAggregateAlias(aggregateForm.alias.trim(), candidates, undefined, undefined, aggregateForm.downstreamMode || 'default');
+      showBgVerifyHint();
       closeAggregateModal();
     } catch (err: any) {
       if (err?.status === 409 && err?.conflict === 'ordinary') {
@@ -491,6 +502,13 @@ export default function Models() {
            </Button>
         </div>
       </div>
+
+      {bgVerifyHint && (
+        <div className="flex items-center gap-2 text-sm text-muted-foreground bg-primary/10 border border-primary/20 rounded-lg px-3 py-2">
+          <Zap size={14} className="animate-pulse text-primary" />
+          {bgVerifyHint}
+        </div>
+      )}
 
       {/* Aliases Section (Condensed) */}
       <div className="space-y-4">
