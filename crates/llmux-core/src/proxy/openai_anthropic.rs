@@ -118,7 +118,7 @@ fn convert_openai_message(msg: &Value) -> Option<Value> {
 
     // Assistant tool_calls → tool_use blocks in content.
     let mut tool_use_blocks: Vec<Value> = Vec::new();
-    let mut malformed_tools: Vec<usize> = Vec::new();
+    let mut malformed_tools: Vec<Value> = Vec::new();
     if let Some(tcs) = msg.get("tool_calls").and_then(Value::as_array) {
         for (i, tc) in tcs.iter().enumerate() {
             // A tool_use block without an id or a name is rejected outright by
@@ -135,7 +135,11 @@ fn convert_openai_message(msg: &Value) -> Option<Value> {
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             if id.is_empty() || name.is_empty() {
-                malformed_tools.push(i);
+                malformed_tools.push(json!({
+                    "index": i,
+                    "has_id": !id.is_empty(),
+                    "has_name": !name.is_empty(),
+                }));
                 continue;
             }
             let args = tc
@@ -150,7 +154,11 @@ fn convert_openai_message(msg: &Value) -> Option<Value> {
         }
     }
     if !malformed_tools.is_empty() {
-        tracing::warn!(?malformed_tools, "upstream tool_calls missing id/name; dropped");
+        tracing::warn!(
+            dropped = malformed_tools.len(),
+            ?malformed_tools,
+            "upstream tool_calls missing id/name; dropped"
+        );
     }
 
     // Assistant reasoning_content → thinking block.
@@ -485,7 +493,12 @@ impl AnthropicSseConverter {
                         .and_then(Value::as_str)
                         .unwrap_or_default();
                     if id.is_empty() || name.is_empty() {
-                        tracing::warn!(index, "upstream tool_use without id/name; dropped");
+                        tracing::warn!(
+                            index,
+                            has_id = !id.is_empty(),
+                            has_name = !name.is_empty(),
+                            "upstream tool_use without id/name; dropped"
+                        );
                     } else {
                         self.tool_indices.insert(index);
                         let tc_index = self.tool_calls_index(index);

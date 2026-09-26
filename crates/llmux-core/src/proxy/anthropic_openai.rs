@@ -339,7 +339,7 @@ pub fn openai_to_anthropic_response(openai_body: &Value, resolved_model: &str) -
     }
 
     if let Some(tcs) = message.get("tool_calls").and_then(Value::as_array) {
-        let mut malformed: Vec<usize> = Vec::new();
+        let mut malformed: Vec<Value> = Vec::new();
         for (i, tc) in tcs.iter().enumerate() {
             let id = tc.get("id").and_then(Value::as_str).unwrap_or_default();
             let name = tc
@@ -351,7 +351,12 @@ pub fn openai_to_anthropic_response(openai_body: &Value, resolved_model: &str) -
             // with an empty id or name, losing the whole reply — not just this
             // call. Defaulting to "" here manufactures exactly that block.
             if id.is_empty() || name.is_empty() {
-                malformed.push(i);
+                malformed.push(json!({
+                    "index": i,
+                    "has_id": !id.is_empty(),
+                    "has_name": !name.is_empty(),
+                    "keys": tc.as_object().map(|o| o.keys().cloned().collect::<Vec<_>>()),
+                }));
                 continue;
             }
             let args = tc
@@ -363,7 +368,12 @@ pub fn openai_to_anthropic_response(openai_body: &Value, resolved_model: &str) -
             content.push(json!({ "type": "tool_use", "id": id, "name": name, "input": input }));
         }
         if !malformed.is_empty() {
-            tracing::warn!(?malformed, "upstream tool_calls missing id/name; dropped");
+            tracing::warn!(
+                model = %resolved_model,
+                dropped = malformed.len(),
+                ?malformed,
+                "upstream tool_calls missing id/name; dropped"
+            );
         }
     }
 
@@ -773,15 +783,27 @@ impl OpenAISseConverter {
         }
         // Tools whose id/name never arrived were never opened, so there is
         // nothing to close. Warn loudly: the model loses a call the user
-        // asked for, which is worth knowing about in the logs.
+        // asked for, which is worth knowing about in the logs. The per-tool
+        // shape is included because the *reason* differs by upstream (some
+        // send arguments-only fragments forever, others send an id but no
+        // name) and that distinction is the whole diagnosis.
         if !self.pending_tools.is_empty() {
-            let orphans: Vec<usize> = {
-                let mut v: Vec<usize> = self.pending_tools.keys().copied().collect();
-                v.sort_unstable();
-                v
-            };
+            let mut orphans: Vec<Value> = self
+                .pending_tools
+                .iter()
+                .map(|(idx, (id, name, args))| {
+                    json!({
+                        "index": idx,
+                        "has_id": !id.is_empty(),
+                        "has_name": !name.is_empty(),
+                        "buffered_args": args.len(),
+                    })
+                })
+                .collect();
+            orphans.sort_by_key(|v| v["index"].as_u64().unwrap_or(0));
             tracing::warn!(
                 model = %self.model,
+                dropped = orphans.len(),
                 ?orphans,
                 "upstream streamed tool_calls without a complete id/name; dropped"
             );

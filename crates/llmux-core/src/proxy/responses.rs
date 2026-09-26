@@ -773,7 +773,12 @@ fn response_function_call(item: &Value) -> Option<(&str, &str, &str, &str)> {
     // Both the streaming and non-streaming responses paths funnel through this
     // one chokepoint.
     if call_id.is_empty() || name.is_empty() {
-        tracing::warn!(item_id, "responses function_call without a name; dropped");
+        tracing::warn!(
+            item_id,
+            has_call_id = !call_id.is_empty(),
+            has_name = !name.is_empty(),
+            "responses function_call without a name; dropped"
+        );
         return None;
     }
     let arguments = item.get("arguments").and_then(Value::as_str).unwrap_or_default();
