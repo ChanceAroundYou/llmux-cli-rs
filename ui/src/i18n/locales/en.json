@@ -471,6 +471,7 @@
     "expandAll": "Expand all",
     "collapseAll": "Collapse all",
     "truncated": "(truncated, showing prefix only)",
+    "loadMore": "Load more",
     "time": "Time",
     "model": "Model",
     "account": "Account",

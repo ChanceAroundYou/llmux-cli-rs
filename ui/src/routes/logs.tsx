@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState, useMemo } from 'react';
+import React, { useCallback, useEffect, useRef, useState, useMemo } from 'react';
 import { apiFetch } from '../lib/api';
 import { useTranslation } from 'react-i18next';
 import { useSearchParams } from 'react-router-dom';
@@ -64,6 +64,32 @@ const PAGE_SIZE = 50;
 type RangeKey = '24h' | '7d' | 'all';
 type SortKey = 'time' | 'model' | 'account' | 'input' | 'output' | 'cache' | 'elapsed' | 'ttft' | 'tps';
 
+interface BodyPart {
+  text: string;
+  nextOffset: number | null;
+  total: number;
+  loading: boolean;
+}
+
+const emptyPart = (): BodyPart => ({ text: '', nextOffset: null, total: 0, loading: false });
+
+// 详情弹窗里的单个 body（request 或 response）。
+// 一次拉全量在大 body 下会让首屏卡住（成功响应可达 16KB、失败 500KB，
+// 放大后更多），所以按 CHUNK 逐段取，滚到底再续。
+const CHUNK = 32 * 1024;
+
+const fetchBodyPart = async (id: number, part: 'request' | 'response', offset: number): Promise<BodyPart> => {
+  const res = await apiFetch(`/api/activity/${id}?part=${part}&offset=${offset}&limit=${CHUNK}`);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const d = await res.json();
+  return {
+    text: d.chunk || '',
+    nextOffset: typeof d.next_offset === 'number' ? d.next_offset : null,
+    total: typeof d.total === 'number' ? d.total : 0,
+    loading: false,
+  };
+};
+
 export default function Logs() {
   const { t } = useTranslation();
   const [logs, setLogs] = useState<LogEntry[]>([]);
@@ -78,7 +104,14 @@ export default function Logs() {
   const [pageInput, setPageInput] = useState('');
   const [detailLog, setDetailLog] = useState<LogEntry | null>(null);
   const [detailData, setDetailData] = useState<{ request_body: string | null; response_body: string | null; client_ip?: string | null } | null>(null);
-  const [detailLoading, setDetailLoading] = useState(false);
+  const [parts, setParts] = useState<{ request: BodyPart; response: BodyPart }>({ request: emptyPart(), response: emptyPart() });
+  // 正在拉取的段。用 ref 而不是 state：loadMore 的前置判断必须**同步**读到
+  // 「已在拉」，而 setState 要到下一次渲染才可见——同一 tick 里连发两次
+  // onScroll 会各自读到旧的 nextOffset，从同一 offset 拉两遍并把内容追加两次。
+  const inFlight = useRef<{ request: boolean; response: boolean }>({ request: false, response: false });
+  // 当前打开的日志 id。异步回调据此判断「我还在这个弹窗里吗」——不检查的话，
+  // 快速切到下一条时，上一条还在途的响应会覆盖新条目的分段。
+  const detailIdRef = useRef<number | null>(null);
   const [searchParams, setSearchParams] = useSearchParams();
   const [blockOpen, setBlockOpen] = useState({ request: true, response: true });
   const [allExpanded, setAllExpanded] = useState<boolean | undefined>(undefined);
@@ -100,17 +133,49 @@ export default function Logs() {
 
   const openLogDetail = async (log: LogEntry) => {
     setDetailLog(log);
+    detailIdRef.current = log.id;
+    inFlight.current = { request: false, response: false };
     setDetailData(null);
-    setDetailLoading(true);
+    setParts({ request: { ...emptyPart(), loading: true }, response: { ...emptyPart(), loading: true } });
     try {
-      const res = await apiFetch(`/api/activity/${log.id}`);
-      if (res.ok) setDetailData(await res.json());
-    } catch (err) { console.error('Failed to fetch log detail', err); }
-    finally { setDetailLoading(false); }
+      // 元信息用 ?meta=1（**不带 body**），body 走分段接口 —— 三者并行，首屏不等 body。
+      const [metaRes, req, resp] = await Promise.all([
+        apiFetch(`/api/activity/${log.id}?meta=1`),
+        fetchBodyPart(log.id, 'request', 0),
+        fetchBodyPart(log.id, 'response', 0),
+      ]);
+      if (detailIdRef.current !== log.id) return;   // 已切到别的日志，丢弃
+      if (metaRes.ok) setDetailData(await metaRes.json());
+      setParts({ request: req, response: resp });
+    } catch (err) {
+      if (detailIdRef.current !== log.id) return;
+      console.error('Failed to fetch log detail', err);
+      setParts({ request: emptyPart(), response: emptyPart() });
+    }
+  };
+
+  // 滚动到底部时续拉下一段。
+  const loadMore = async (part: 'request' | 'response') => {
+    if (inFlight.current[part]) return;            // 同步去重，见 inFlight 的注释
+    const id = detailIdRef.current;
+    const cur = parts[part];
+    if (id === null || cur.loading || cur.nextOffset === null) return;
+    inFlight.current[part] = true;
+    setParts(p => ({ ...p, [part]: { ...p[part], loading: true } }));
+    try {
+      const next = await fetchBodyPart(id, part, cur.nextOffset);
+      if (detailIdRef.current !== id) return;
+      setParts(p => ({ ...p, [part]: { ...next, text: p[part].text + next.text } }));
+    } catch (err) {
+      if (detailIdRef.current === id) console.error(`Failed to load more ${part}`, err);
+    } finally {
+      inFlight.current[part] = false;
+    }
   };
 
   const closeLogDetail = () => {
     setDetailLog(null);
+    detailIdRef.current = null;
     setSearchParams({}, { replace: true });
   };
 
@@ -440,8 +505,47 @@ export default function Logs() {
                 </span>
               </button>
               {blockOpen[key] && (
-                <div className="bg-muted/50 border border-border rounded-lg p-3 max-h-[50vh] overflow-y-auto overflow-x-hidden">
-                  {detailLoading ? '…' : <JsonView key={`${key}-${treeKey}`} text={detailData?.[key === 'request' ? 'request_body' : 'response_body'] || ''} allExpanded={allExpanded} truncatedNotice={t('logs.truncated')} />}
+                <div
+                  className="bg-muted/50 border border-border rounded-lg p-3 max-h-[50vh] overflow-y-auto overflow-x-hidden"
+                  onScroll={e => {
+                    // 滚到底部（留 64px 余量）才续拉，避免一进弹窗就连发十几段
+                    const el = e.currentTarget;
+                    if (el.scrollTop + el.clientHeight >= el.scrollHeight - 64) loadMore(key);
+                  }}
+                >
+                  {parts[key].loading && !parts[key].text ? (
+                    <div className="py-6 text-center text-muted-foreground text-xs">
+                      <Loader2 className="inline animate-spin mr-2" size={14} />{t('logs.loading')}
+                    </div>
+                  ) : (
+                    <>
+                      <JsonView
+                        key={`${key}-${treeKey}`}
+                        text={parts[key].text}
+                        allExpanded={allExpanded}
+                        truncatedNotice={t('logs.truncated')}
+                      />
+                      {parts[key].nextOffset !== null && (
+                        <div className="mt-2 flex items-center justify-center gap-2">
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            className="h-7 text-xs"
+                            disabled={parts[key].loading}
+                            onClick={() => loadMore(key)}
+                          >
+                            {parts[key].loading
+                              ? <Loader2 className="inline animate-spin mr-1" size={12} />
+                              : <ChevronRight size={12} className="mr-1 rotate-90" />}
+                            {t('logs.loadMore')}
+                            <span className="ml-1 text-muted-foreground/60">
+                              {parts[key].text.length}/{parts[key].total}
+                            </span>
+                          </Button>
+                        </div>
+                      )}
+                    </>
+                  )}
                 </div>
               )}
             </div>

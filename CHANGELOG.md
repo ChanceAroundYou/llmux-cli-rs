@@ -66,6 +66,40 @@
 
 ### Changed
 
+- **文件日志迁到 NAS，DB 只留截断视图**：新增 `LOG_DIR` 环境变量与数据目录解耦
+  （未设置时回退 `DATA_DIR`），线上 compose 指向 `/data/llmux-logs`
+  （bind 源 `/mnt/openwrt/log-archive/llmux`，CIFS）。`llmux_db.db` 仍留本地盘
+  ——NAS 适合放日志，不适合放要频繁随机写的 SQLite。`cleanup_old_logs` 跟着
+  `LOG_DIR` 走，`LOG_RETAIN_DAYS` 7 → 30；CIFS 掉线不会补跑启动时清理，另配
+  `/root/scripts/llmux-log-retain.sh` 兜底。
+
+- **`smart_truncate_body` 超限时改为只保留头部**（此前保留头尾各半、丢弃中间）：
+  被丢掉的恰恰是 SSE 诊断价值最高的中段——`message_start` 在头，tool_call 的
+  开场块（`id` + `function.name`）常在中间，尾部是参数增量。保留头尾各半时，
+  一条 24 万字符的流只剩「尾部起点」可读，读日志的人看不到开场块就会误判成
+  「上游没发 id/name」。标记文案同步改成 `kept head`；messages 数组的兜底压缩
+  仍留头尾（结构化数组两端都有用），但标记明说 `MIDDLE DROPPED`。
+
+- **三条流式路径把完整上游响应体落进文件日志**（`full upstream body (N bytes,
+  account=…)`，受 `RUST_LOG=llmux=debug` 控制）：此前 `usage_logs.response_body`
+  成功仅 16KB/32KB，DB 截断后完整数据就真的没了，「要完整日志去文件里找」无从
+  谈起。
+
+- **日志详情改为分段按需加载**：`GET /api/activity/:id` 新增可选
+  `?part=request|response&offset=N&limit=M`（默认 32KB，上限 512KB）与 `?meta=1`，
+  返回 `{part, offset, next_offset, total, chunk, eof}`。不带 `part` 时行为
+  逐字节不变（既有合约测试依赖）。`offset` 以字节计但切分落在 char 边界，
+  多字节内容不会被切碎。前端滚动到底或点「加载更多」续拉下一段。
+
+### Fixed
+
+- **`deploy.sh` 的 `run()` 把进度横幅打到 stdout**：该函数有 `x="$(run …)"`
+  的捕获用法（7b 日志目录校验），横幅会混进命令输出。改到 stderr。
+  同时 7b 有两处实际不成立的检查：拿**容器内**路径 `/data/llmux-logs` 去
+  **宿主机**上 `ls`（两边路径不同，必然失败），以及 CIFS 掉线时 bind 源会被
+  重建为一个全新的空目录——「可写」并不能证明落在 NAS 上，改为从 Mounts 取
+  宿主机源路径并在其下确认真实的 `llmux.log.*`。
+
 - **别名/聚合保存后的自动验证改到后台**（`tokio::spawn`）：此前逐候选同步探测
   （每个最长 30s）拖住保存接口，多候选时可达数分钟。响应不再回 `verified`
   字段，UI 改为提示「已保存，正在后台检测账户连通性」并在 30s 后刷新 health。

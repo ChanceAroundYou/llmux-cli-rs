@@ -45,10 +45,16 @@ async fn main() -> anyhow::Result<()> {
                 let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
                 std::path::PathBuf::from(home).join(".config").join("llmux")
             });
+        // 日志目录与数据目录可以分开：DATA_DIR 放 SQLite 库（必须本地盘），
+        // LOG_DIR 放 llmux.log（可以指向大容量 NAS）。未设置时沿用 DATA_DIR。
+        let log_dir = std::env::var("LOG_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| data_dir.clone());
         std::fs::create_dir_all(&data_dir).ok();
-        // Rolling daily appender writes `<data_dir>/llmux.log.YYYY-MM-DD`; survives
-        // container recreate (data dir is a persistent mount) and never grows unbounded.
-        let file_writer = tracing_appender::rolling::daily(&data_dir, "llmux.log");
+        std::fs::create_dir_all(&log_dir).ok();
+        // Rolling daily appender writes `<log_dir>/llmux.log.YYYY-MM-DD`; survives
+        // container recreate (log dir is a persistent mount) and never grows unbounded.
+        let file_writer = tracing_appender::rolling::daily(&log_dir, "llmux.log");
 
         use tracing_subscriber::layer::SubscriberExt;
         use tracing_subscriber::util::SubscriberInitExt;
@@ -91,7 +97,13 @@ async fn start(port_override: Option<u16>, use_tui: bool) -> anyhow::Result<()> 
     let effective_port = port_override.unwrap_or(config.port);
 
     std::fs::create_dir_all(&config.data_dir)?;
-    cleanup_old_logs(&config.data_dir);
+    // 轮转清理走 LOG_DIR（未设置即 DATA_DIR），与 appender 写入的目录保持一致 ——
+    // 否则日志挪到 NAS 后会在这里对着空目录删文件。
+    let log_dir = std::env::var("LOG_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| config.data_dir.clone());
+    std::fs::create_dir_all(&log_dir).ok();
+    cleanup_old_logs(&log_dir);
     let database_url = sqlite_url_from_path(&config.database_path);
     let pool = connect_sqlite(&database_url).await?;
     init_db(&pool).await?;

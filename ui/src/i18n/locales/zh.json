@@ -472,6 +472,7 @@
     "expandAll": "展开全部",
     "collapseAll": "收起全部",
     "truncated": "（内容已截断，仅显示前缀）",
+    "loadMore": "加载更多",
     "time": "时间",
     "model": "模型",
     "account": "账户",

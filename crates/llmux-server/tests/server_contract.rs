@@ -439,6 +439,112 @@ async fn activity_detail_returns_captured_bodies_and_404() {
     assert_eq!(body["response_body"], r#"{"choices":[{"message":{"content":"hello"}}]}"#);
 }
 
+/// `?part=` 分段读取：body 放大后单条可达数 MB，一次全量返回会让详情弹窗首屏卡住。
+/// 不带 part 的旧行为由上一个用例守住，这里只验证分段与续拉。
+#[tokio::test]
+async fn activity_detail_serves_body_in_char_safe_chunks() {
+    use http::header;
+    let state = llmux_server::test_state().await;
+    let app = llmux_server::app(state.clone());
+    // 故意含多字节字符，验证按 char 而非 byte 切分（byte 切会切碎 UTF-8）
+    let long = "中文abc".repeat(2000);
+    let id: i64 = sqlx::query_scalar(
+        "INSERT INTO usage_logs (timestamp, account_id, provider_id, model, input_tokens, output_tokens, latency_ms, success, error_message, request_body, response_body, is_test) \
+         VALUES (?, NULL, ?, ?, 0, 0, 1, 1, NULL, ?, NULL, 0) RETURNING id",
+    )
+    .bind(1_700_000_000_000i64)
+    .bind("openai")
+    .bind("gpt-4o")
+    .bind(&long)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap();
+
+    let login_req = Request::builder()
+        .method(Method::POST)
+        .uri("/api/auth/login")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::json!({"username":"admin","password":"admin"}).to_string(),
+        ))
+        .unwrap();
+    let login_resp = llmux_server::test_request(app.clone(), login_req).await;
+    let cookie = extract_session_cookie(&login_resp).expect("session cookie");
+
+    async fn get(uri: String, app: axum::Router, cookie: String) -> (StatusCode, Value) {
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(uri)
+            .header(header::COOKIE, cookie)
+            .body(Body::empty())
+            .unwrap();
+        let resp = llmux_server::test_request(app, req).await;
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        (status, serde_json::from_slice::<Value>(&bytes).unwrap())
+    }
+
+    // 第一段
+    let (st, first) = get(
+        format!("/api/activity/{id}?part=request&limit=1000"),
+        app.clone(),
+        cookie.clone(),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(first["part"], "request");
+    assert_eq!(first["offset"], 0);
+    assert_eq!(first["total"], long.len());
+    let chunk = first["chunk"].as_str().unwrap();
+    // limit 以**字符**计（保证 UTF-8 完整），故字节数可大于 limit：
+    // "中文abc" 每 6 字符含 6 字节，1000 字符 = 1803 字节。
+    assert!(!chunk.is_empty(), "首段不得为空");
+    assert!(
+        chunk.len() <= 1803,
+        "字节数应恰为 1000 个字符的宽度，超出说明切分没按 char 边界：{}",
+        chunk.len()
+    );
+    assert_eq!(chunk.chars().count(), 1000, "应恰好切出 limit 个字符");
+    assert!(long.starts_with(chunk), "首段必须是原文的前缀");
+
+    // 用 next_offset 续拉，直到 eof；所有片段拼起来 === 原文
+    let mut acc = String::new();
+    let mut offset = 0usize;
+    loop {
+        let (st, r) = get(
+            format!("/api/activity/{id}?part=request&offset={offset}&limit=1000"),
+            app.clone(),
+            cookie.clone(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        acc.push_str(r["chunk"].as_str().unwrap());
+        if r["eof"] == true {
+            assert!(r["next_offset"].is_null(), "eof 后不应再给 next_offset");
+            break;
+        }
+        offset = r["next_offset"].as_u64().unwrap() as usize;
+    }
+    assert_eq!(acc, long, "按 next_offset 逐段拼接必须还原出完整原文");
+
+    // response 为 NULL 时不炸
+    let (st, empty) = get(
+        format!("/api/activity/{id}?part=response"),
+        app.clone(),
+        cookie.clone(),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(empty["total"], 0);
+    assert_eq!(empty["eof"], true);
+    assert_eq!(empty["chunk"], "");
+
+    // 未知 part → 400
+    let (st, bad) = get(format!("/api/activity/{id}?part=nope"), app, cookie).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    assert_eq!(bad["error"].as_str().unwrap(), "unknown part: nope");
+}
+
 #[tokio::test]
 async fn root_ui_and_non_api_paths_use_spa_fallback() {
     for path in ["/", "/ui", "/ui/", "/dashboard/settings"] {

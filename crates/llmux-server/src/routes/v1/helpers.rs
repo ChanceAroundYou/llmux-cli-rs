@@ -300,13 +300,15 @@ fn smart_truncate_body(
                         return Some(compressed);
                     }
                     if per_field_limit <= 20 {
-                        // 已压到 20 仍超 cap — 此时再做“头尾留 JSON”兜底
+                        // 已压到 20 仍超 cap — 此时保留头尾兜底。
+                        // 与下方 SSE 分支不同：这里是有结构的消息数组，头是 system
+                        // 提示、尾是最近几轮，两者都有诊断价值，所以两端都留。
+                        // 但**必须说清中间被丢了**，否则读的人会以为看到的是全文
+                        // （本仓库就因此把一条 24 万字符的流误读成「上游没发 id/name」）。
                         let count = compressed.chars().count();
                         let marker = format!(
-                            "\n…[truncated {} chars: compressed still {} > cap {}]…\n",
+                            "\n…[truncated {} chars, kept head+tail; MIDDLE DROPPED]…\n",
                             count - cap,
-                            count,
-                            cap
                         );
                         let budget = cap.saturating_sub(marker.chars().count());
                         let half = budget / 2;
@@ -323,13 +325,18 @@ fn smart_truncate_body(
             }
         }
     }
+    // 超限就砍尾、只留头部 —— 绝不砍中间。
+    //
+    // 曾在这里保留头尾各半、丢弃中间，代价是**诊断价值最高的中段被静默删除**：
+    // 一条 24 万字符的 SSE 里，head 是 reasoning 噪音、tail 是 tool_call 参数增量，
+    // 而 tool_call 的开场块（`id` + `function.name`）正好在中间。读日志的人只会
+    // 看到「首条片段没有 id/name」，从而误判成「上游没发」——而它其实发了。
+    // 头部才是 SSE 的证据所在（message_start、第一条 tool_call 的完整形态）。
     let count = trimmed.chars().count();
-    let marker = format!("\n…[truncated {} chars]…\n", count - cap);
+    let marker = format!("\n…[truncated {} chars, kept head]…\n", count - cap);
     let budget = cap.saturating_sub(marker.chars().count());
-    let half = budget / 2;
-    let head: String = trimmed.chars().take(half).collect();
-    let tail: String = trimmed.chars().skip(count - (budget - half)).collect();
-    Some(format!("{head}{marker}{tail}"))
+    let head: String = trimmed.chars().take(budget).collect();
+    Some(format!("{head}{marker}"))
 }
 
 /// Client IP of the current request (set by RequestLogMiddleware's task-local).
@@ -519,6 +526,64 @@ pub async fn log_usage(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── 截断必须保留 SSE 的证据（tool_call 开场块） ──────────────────
+    // 回归起因：曾「保留头尾、丢弃中间」，把 tool_call 的 `id`/`name` 所在的中段
+    // 静默删掉，读日志的人据此误判「上游不发 id/name」。SSE 的证据在头部。
+
+    #[test]
+    fn sse_over_cap_keeps_the_head_not_head_and_tail() {
+        // 头 = 完整开场块；中 = 超长噪音；尾 = 收尾
+        let opener = r#"data: {"index":0,"id":"call_abc","function":{"name":"Bash","arguments":""}}"#;
+        let body = format!("{opener}\n{}", "x".repeat(40_000));
+        let out = smart_truncate_body(Some(body.clone()), true, 2_000, 500_000).unwrap();
+        assert!(
+            out.contains("call_abc") && out.contains("\"name\":\"Bash\""),
+            "tool_call 开场块必须保留，它是被误判为「上游没发」的那部分"
+        );
+    }
+
+    #[test]
+    fn sse_truncation_marker_declares_head_only() {
+        let body = "y".repeat(10_000);
+        let out = smart_truncate_body(Some(body), true, 2_000, 500_000).unwrap();
+        assert!(
+            out.contains("kept head"),
+            "标记必须说明保留的是头部，否则读者会以为看到的是全文：{out}"
+        );
+        assert!(
+            !out.contains("MIDDLE DROPPED"),
+            "纯 SSE 不走 messages 分支，不该带该标记"
+        );
+    }
+
+    #[test]
+    fn body_under_cap_is_returned_untouched() {
+        // 既有行为：先 trim 再判超限（首尾空白不算内容），此处照此断言。
+        let body = "  data: {\"a\":1}  ";
+        let out = smart_truncate_body(Some(body.to_string()), true, 16_000, 500_000).unwrap();
+        assert_eq!(out, "data: {\"a\":1}", "未超限必须原样返回（仅去首尾空白）");
+    }
+
+    #[test]
+    fn messages_fallback_marker_admits_the_middle_is_gone() {
+        // 构造压到极限仍超 cap 的消息数组，逼它走 head+tail 兜底
+        let mut msgs = Vec::new();
+        for i in 0..400 {
+            msgs.push(serde_json::json!({
+                "role": "user",
+                "content": format!("msg-{i}-{}", "q".repeat(300)),
+            }));
+        }
+        let body = serde_json::json!({ "messages": msgs }).to_string();
+        let out = smart_truncate_body(Some(body), true, 1_000, 500_000).unwrap();
+        if out.contains("truncated") {
+            assert!(
+                out.contains("MIDDLE DROPPED"),
+                "messages 兜底走的是头尾保留，必须明说中间被丢：{out}"
+            );
+        }
+    }
 
     #[test]
     fn success_long_body_compresses_fields_not_tail() {
