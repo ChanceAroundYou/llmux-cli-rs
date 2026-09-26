@@ -7,6 +7,42 @@
 
 ### Fixed
 
+- **重复的 `finish_reason: "tool_calls"` 终止事件导致客户端误报**。客户端报
+  `Model provider returned tool_calls without a complete id and function name`，
+  但**它从未收到缺 id/name 的调用**——真凶是上游把一条流用**两次**
+  `finish_reason: "tool_calls"` 收尾，且第二次落在空 delta 上。
+
+  实测（2026-09-26 16:30 之后 296 条未截断的流）：`stealth/space-bunny-alpha`
+  **279/279** 条都是两个终止事件，形态为
+
+  ```
+  ev  TC idx=0 id='c5abfdc7-…' name='Bash'      ← 开场片，身份齐全
+  ev  TC idx=0 arguments 续片                     ← 正常续片
+  ev  finish_reason='tool_calls'  delta={}        ← 第一次终止
+  ev  finish_reason='tool_calls'  delta={}        ← 第二次终止（多余）
+  ```
+
+  严格客户端在第一个终止事件上交付并清空缓冲，第二个到达时缓冲已空，
+  `validToolCalls === 0`，而该流此前已产出正文，于是抛出上面那条**驴唇不对马嘴的
+  报错**。这也解释了此前一系列误判：报错时间点（16:40/16:41/16:48/17:12）对应的流
+  逐条核对后**结构完全合法**——不是数据畸形，是多了一个终止事件。
+
+  两端都修：
+
+  - **网关**（`openai.rs` 透传路径）：转发前按**整事件**判定，第二次的空终止事件
+    不再下发给客户端。原先是收到上游字节即原样转发（性能考虑，不解析），现改为先把
+    完整事件切出来再转发——实测上游以 `\n\n` 分隔（`data:` 数 = `\n\n` 数 + 1），
+    故按事件缓冲**不引入延迟**，末尾无终止符的残片（通常是 `data: [DONE]`）在流末
+    单独补发。带 tool_calls 的终止事件永远放行——那是真的新调用，不是重复。
+  - **客户端**（hermes `openai-compatible.ts`）：`toolCalls` 为空且已处理过一次
+    终止事件时，跳过而非报错。
+
+  > **更正**：此前把 agnes 判为元凶（其续片带 `type` 却不带 `id`，280 条），
+  > 同样是误判。agnes 的那些流里 arguments **恰好包含本客户端源码的文本**
+  > （`parallel`、`→ (\\S+) →` 等），是我自己 dump 出来的分析脚本被回显进日志造成的
+  > 自我污染。`type` 无 `id` 的续片在 OpenAI 分片协议里并不违规，客户端按拼装后的
+  > 调用校验，不按分片。
+
 - **不再发出缺 id / name 的 `tool_use` 块**：客户端报
   `Model provider returned tool_calls without a complete id and function name`——
   这是**客户端 SDK 的校验**，网关侧 `usage_logs` 一条都没记（请求被记成干净的 200），

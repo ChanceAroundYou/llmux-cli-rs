@@ -1339,6 +1339,48 @@ async fn dispatch_aggregate_openai(
 // Streaming helpers
 // ---------------------------------------------------------------------------
 
+/// Decide whether one SSE event should be forwarded to the client.
+///
+/// Some upstreams close a stream with **two** consecutive
+/// `finish_reason: "tool_calls"` events on empty deltas (measured: 279/279
+/// `stealth/space-bunny-alpha` streams on 2026-09-26). The duplicate is not part
+/// of the OpenAI streaming contract, and a strict client that clears its
+/// tool-call buffer on the first terminator reads the second one as an empty
+/// buffer and reports "tool_calls without a complete id and function name" —
+/// blaming a defect it never received.
+///
+/// So: the first `tool_calls` terminator passes; a later one that repeats it and
+/// carries no tool calls of its own is withheld. A terminator that *does* carry
+/// tool_calls is always forwarded — that is a real new call, not a duplicate.
+fn should_forward_event(event_text: &str, saw_tool_call_finish: &mut bool) -> bool {
+    let Some(payload) = sse_data_payload(event_text) else {
+        return true;
+    };
+    let Ok(parsed) = serde_json::from_str::<Value>(payload) else {
+        return true;
+    };
+    let Some(choice) = parsed
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|a| a.first())
+    else {
+        return true;
+    };
+    if choice.get("finish_reason").and_then(Value::as_str) != Some("tool_calls") {
+        return true;
+    }
+    let carries_tool_calls = choice
+        .get("delta")
+        .and_then(|d| d.get("tool_calls"))
+        .and_then(Value::as_array)
+        .is_some_and(|a| !a.is_empty());
+    if carries_tool_calls || !*saw_tool_call_finish {
+        *saw_tool_call_finish = true;
+        return true;
+    }
+    false
+}
+
 /// Passthrough streaming for OpenAI-compatible responses.
 /// Bytes are forwarded as-is (SSE) but the stream is also parsed for
 /// observability: `finish_reason`, `usage`, and truncation (`[DONE]` / null
@@ -1366,6 +1408,10 @@ async fn openai_streaming_passthrough(
         let mut last_finish: Option<String> = None;
         let mut last_usage: Option<Value> = None;
         let mut ttft_ms: Option<i64> = None;
+        // Set once a `finish_reason: "tool_calls"` event has gone upstream, so a
+        // second one on an empty delta is recognised as a redundant terminator.
+        let mut saw_tool_call_finish = false;
+        let mut dropped_dup_finishes: u64 = 0;
 
         tracing::debug!("[openai:{model}] upstream stream started (account={})", account.alias);
 
@@ -1373,51 +1419,54 @@ async fn openai_streaming_passthrough(
             match chunk {
                 Ok(c) => {
                     chunks += 1;
-                    // forward raw bytes to client before parsing
-                    let sent = tx.send(Ok(Bytes::from(c.to_vec()))).await.is_ok();
-                    if sent && ttft_ms.is_none() {
-                        ttft_ms = Some(start.elapsed().as_millis() as i64);
-                    }
-                    if !sent {
-                        return;
-                    }
                     buffer.extend_from_slice(&c);
                     received.extend_from_slice(&c);
+                    // Forward only whole events, so a redundant terminator can be
+                    // withheld before the client ever sees it. Partial data stays
+                    // buffered until its `\n\n` arrives — verified: upstreams
+                    // delimit with a blank line, so this costs no latency.
+                    let mut client_gone = false;
                     for event_text in parse_sse_chunks(&mut buffer, 0) {
-                        let Some(payload) = sse_data_payload(&event_text) else {
-                            continue;
-                        };
-                        if payload.trim() == "[DONE]" {
-                            saw_done = true;
+                        if !should_forward_event(&event_text, &mut saw_tool_call_finish) {
+                            dropped_dup_finishes += 1;
                             continue;
                         }
-                        let Ok(parsed) = serde_json::from_str::<Value>(payload) else {
-                            continue;
-                        };
-                        if let Some(u) = parsed.get("usage") {
-                            if u.is_object() {
-                                last_usage = Some(u.clone());
-                            }
-                        }
-                        if let Some(choice) = parsed
-                            .get("choices")
-                            .and_then(Value::as_array)
-                            .and_then(|a| a.first())
-                        {
-                            if let Some(fr) = choice.get("finish_reason") {
-                                if fr.is_null() {
-                                    last_finish = None;
-                                } else if let Some(s) = fr.as_str() {
-                                    if !s.is_empty() {
-                                        last_finish = Some(s.to_string());
+                        if let Some(payload) = sse_data_payload(&event_text) {
+                            if payload.trim() == "[DONE]" {
+                                saw_done = true;
+                            } else if let Ok(parsed) = serde_json::from_str::<Value>(payload) {
+                                if let Some(u) = parsed.get("usage") {
+                                    if u.is_object() {
+                                        last_usage = Some(u.clone());
+                                    }
+                                }
+                                if let Some(choice) = parsed
+                                    .get("choices")
+                                    .and_then(Value::as_array)
+                                    .and_then(|a| a.first())
+                                {
+                                    if let Some(fr) = choice.get("finish_reason") {
+                                        if fr.is_null() {
+                                            last_finish = None;
+                                        } else if let Some(s) = fr.as_str() {
+                                            if !s.is_empty() {
+                                                last_finish = Some(s.to_string());
+                                            }
+                                        }
                                     }
                                 }
                             }
-                            // some gateways emit usage alongside the last choice
-                            if let Some(u) = parsed.get("usage") {
-                                last_usage = Some(u.clone());
-                            }
                         }
+                        if !tx.send(Ok(Bytes::from(event_text.into_bytes()))).await.is_ok() {
+                            client_gone = true;
+                            break;
+                        }
+                        if ttft_ms.is_none() {
+                            ttft_ms = Some(start.elapsed().as_millis() as i64);
+                        }
+                    }
+                    if client_gone {
+                        return;
                     }
                 }
                 Err(e) => {
@@ -1431,7 +1480,10 @@ async fn openai_streaming_passthrough(
             }
         }
 
-        // drain any complete events still buffered
+        // Drain any complete events still buffered. The read loop above already
+        // forwarded everything it parsed; anything left here arrived in a chunk
+        // that ended mid-event and only completed at EOF, so it is bookkeeping
+        // only (the trailing partial below is what actually goes to the client).
         loop {
             let events = parse_sse_chunks(&mut buffer, 0);
             if events.is_empty() {
@@ -1469,9 +1521,16 @@ async fn openai_streaming_passthrough(
             }
         }
 
-        // trailing partial without blank-line terminator
+        // trailing partial without blank-line terminator — forward it too, or the
+        // final event (commonly `data: [DONE]`) would never reach the client.
         if !buffer.is_empty() {
             let text = String::from_utf8_lossy(&buffer).to_string();
+            let keep = should_forward_event(&text, &mut saw_tool_call_finish);
+            if !keep {
+                dropped_dup_finishes += 1;
+            } else {
+                let _ = tx.send(Ok(Bytes::from(buffer.clone()))).await.is_ok();
+            }
             if let Some(payload) = sse_data_payload(&text) {
                 if payload.trim() == "[DONE]" {
                     saw_done = true;
@@ -1492,6 +1551,13 @@ async fn openai_streaming_passthrough(
                     }
                 }
             }
+        }
+
+        if dropped_dup_finishes > 0 {
+            tracing::debug!(
+                "[openai:{model}] dropped {dropped_dup_finishes} redundant tool_calls terminator(s) (account={})",
+                account.alias
+            );
         }
 
         let (raw_prompt, completion_tokens) = match &last_usage {
@@ -1578,6 +1644,76 @@ async fn openai_streaming_passthrough(
         .body(body)
         .unwrap()
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_forward_event;
+
+    fn ev(delta: &str, finish: &str) -> String {
+        format!("data: {{\"choices\":[{{\"index\":0,\"delta\":{delta},\"finish_reason\":{finish}}}]}}\n\n")
+    }
+
+    /// The exact shape measured from stealth/space-bunny-alpha: a well-formed
+    /// tool call, then TWO `tool_calls` terminators on empty deltas. The second
+    /// is what made a strict client report "tool_calls without a complete id
+    /// and function name" — the call it had already delivered was fine.
+    #[test]
+    fn a_repeated_empty_tool_calls_terminator_is_withheld() {
+        let opener = ev(
+            r#"{"tool_calls":[{"index":0,"id":"c5abfdc7","type":"function","function":{"name":"Bash","arguments":""}}]}"#,
+            "null",
+        );
+        let finish = ev("{}", r#""tool_calls""#);
+        let mut seen = false;
+        assert!(should_forward_event(&opener, &mut seen));
+        assert!(should_forward_event(&finish, &mut seen), "first terminator passes");
+        assert!(
+            !should_forward_event(&finish, &mut seen),
+            "duplicate terminator on an empty delta is withheld"
+        );
+    }
+
+    /// A terminator that carries its own tool_calls is a real new call and must
+    /// never be swallowed, however many terminators came before it.
+    #[test]
+    fn a_terminator_carrying_tool_calls_is_always_forwarded() {
+        let finish = ev("{}", r#""tool_calls""#);
+        let second_call = ev(
+            r#"{"tool_calls":[{"index":1,"id":"c5abfdc8","type":"function","function":{"name":"Read","arguments":""}}]}"#,
+            r#""tool_calls""#,
+        );
+        let mut seen = false;
+        assert!(should_forward_event(&finish, &mut seen));
+        assert!(should_forward_event(&second_call, &mut seen));
+        assert!(should_forward_event(&second_call, &mut seen));
+    }
+
+    /// Non-tool_calls finish reasons, `[DONE]`, content and malformed payloads
+    /// are untouched — the filter only ever drops the one redundant event.
+    #[test]
+    fn everything_except_the_duplicate_terminator_passes_through() {
+        let mut seen = false;
+        for e in [
+            ev(r#"{"content":"hi"}"#, "null"),
+            ev("{}", r#""stop""#),
+            ev("{}", r#""length""#),
+            "data: [DONE]\n\n".to_string(),
+            "data: not-json\n\n".to_string(),
+            ": keep-alive comment\n\n".to_string(),
+        ] {
+            assert!(should_forward_event(&e, &mut seen), "should pass: {e:?}");
+        }
+    }
+
+    /// The filter must not change what a single-terminator stream looks like:
+    /// the common case has exactly one and is forwarded untouched.
+    #[test]
+    fn a_single_terminator_stream_is_unchanged() {
+        let mut seen = false;
+        assert!(should_forward_event(&ev("{}", r#""tool_calls""#), &mut seen));
+        assert!(seen);
+    }
 }
 
 /// Retry an OpenAI chat/completions request through the account's Anthropic
