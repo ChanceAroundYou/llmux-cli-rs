@@ -11,16 +11,38 @@
   `Model provider returned tool_calls without a complete id and function name`——
   这是**客户端 SDK 的校验**，网关侧 `usage_logs` 一条都没记（请求被记成干净的 200），
   实际是 llmux 自己造出来的畸形数据。根因：转换器见到带 `index` 的 tool_call
-  fragment 就开块，缺失的 id/name 用 `unwrap_or_default()` 填成空串。实测
-  deepseek-v4.1-flash 经 command 上游会推
-  `{"index":0,"function":{"arguments":"…"}}` 且**整条流里 id/name 一次都不出现**
-  （扫最近 600 条带 tool_calls 的流，683 个 fragment 属此类）。Anthropic SDK 见到
+  fragment 就开块，缺失的 id/name 用 `unwrap_or_default()` 填成空串。Anthropic SDK 见到
   空 id/name 直接拒收整条消息，损失的不只是那一个 tool call。
-  改为**id 和 name 都到齐才开块**，其间到达的 arguments 先缓冲、开门时一并补发；
-  始终不全的则丢弃并 `warn`（模型确实丢了一个调用，日志里要看得见）。四条路径
-  一并修：流式 `OpenAISseConverter`、非流式 `openai_to_anthropic_response` 与
+  改为**id 和 name 都到齐才开块**，其间到达的 arguments 先缓冲、开门时一并补发。
+  四条路径一并修：流式 `OpenAISseConverter`、非流式 `openai_to_anthropic_response` 与
   `convert_openai_message`、反向 SSE `AnthropicSseConverter`（含其
   `input_json_delta` 孤儿 delta）、以及 responses 的 `response_function_call`。
+
+  > **更正**：本条此前引用「deepseek-v4.1-flash 整条流里 id/name 一次都不出现
+  > （600 条流 / 683 个 fragment）」作为实测依据。**该结论是错的**，来源是
+  > `smart_truncate_body` 丢弃长 SSE 的中段，而 tool_call 的开场块正在中段
+  > （详见下方「只保留头部」一条）。改用未截断的完整流重测（2026-09-26）：
+  > **178/178 个 tool_call delta 的 id 与 name 都齐全，且都在首条 delta 上**，
+  > orphan 告警 0 次。下面「兜底」一条描述的才是真实剩下的失效模式。
+
+- **tool_call 身份缺失的兜底：能补就补，补不了才丢，且等待有上限**。原先流末尾
+  对残留一律丢弃（`warn`），可恢复的调用也一起赔进去。现在按**字段可恢复性**
+  分别处理，因为两者根本不对称：
+
+  - `name` 必须是客户端声明过的工具名，**无法凭空编造**（拿请求里的工具列表去猜、
+    「只有一个工具就假定是它」会在多工具场景直接调错）→ 缺失即丢弃并 `warn`。
+  - `id` 只是关联串，**对两端都无语义** → 缺失就现编一个 `toolu_…` 照常开门，
+    缓冲的 arguments 一并补发，调用得以保全。
+
+  **等待上限 30s**（`TOOL_IDENTITY_TIMEOUT_MS`）：此前若 id/name 永不到齐会一直
+  缓冲到流结束才整条丢弃，等待无边界。现在每收到一批数据就检查一次，超期按上述
+  三分类结算。注意这不是「等 30s 再开始吐」——转换器由上游字节驱动，无法真正 sleep；
+  它限的是**缓冲的时长**，正常流（实测 id+name 就在首条 delta）零延迟。
+  超时锚点取**该 fragment 首次出现**的时刻而非最后一个 arguments 增量，否则
+  持续滴参数的流可以无限推迟截止时间。
+  流末尾与流中超时走同一套判定（`resolve_pending`），两条路径不会走偏。
+  新增 7 条测试：三种判定、锚点语义、未到截止不强制、流末尾补 id 的块要正常
+  `content_block_stop`、无名调用不产生悬空 stop。
 
 - **还原被双重编码的 `reasoning_details`**：客户端把 OpenRouter 的这个扩展字段
   （schema 是对象数组）`json.dumps` 进了 string，如

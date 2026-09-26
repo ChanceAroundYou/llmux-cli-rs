@@ -455,6 +455,68 @@ fn detail_cached_tokens(usage: &Value) -> Option<i64> {
 // Streaming SSE state machine: OpenAI chunks → Anthropic SSE events
 // ---------------------------------------------------------------------------
 
+/// How long a tool_call fragment may stay incomplete before the converter
+/// stops waiting for an identity. Deliberately generous: a slow-but-correct
+/// upstream must never lose a call, so this only fires for streams that are
+/// genuinely stuck. Measured 2026-09-26: every tool_call seen in production
+/// carried id+name on its **first** delta, and the orphan warn never fired —
+/// so the deadline is headroom, not a tuned value.
+const TOOL_IDENTITY_TIMEOUT_MS: u64 = 30_000;
+
+/// A tool_call whose identity has not fully arrived yet.
+struct PendingTool {
+    id: String,
+    name: String,
+    args: String,
+    /// Epoch millis of the first fragment for this index — the timeout anchor.
+    first_seen_ms: u64,
+}
+
+/// Resolve a `PendingTool` now that we can no longer wait.
+///
+/// The two fields are deliberately treated differently, because they are not
+/// symmetric in recoverability:
+///
+/// - `name` must be one the client declared. There is no way to invent it, and
+///   guessing (e.g. "if there is only one tool, it must be that one") silently
+///   calls the wrong function. So a missing name ends the call.
+/// - `id` is an opaque correlation string with no meaning to either side, so a
+///   missing one is simply made up. That is strictly better than dropping: the
+///   call survives with a real name and a synthesized id.
+///
+/// This is the "补上" path — the point being that a recoverable gap should be
+/// recovered, not thrown away.
+enum Resolution {
+    /// Complete: open the block (or the missing id was synthesized).
+    Open { id: String, name: String, args: String, synthesized_id: bool },
+    /// Unrecoverable: the name never arrived. Drop the call and let the caller
+    /// warn — emitting it would have the SDK reject the whole message.
+    Drop { reason: &'static str },
+}
+
+fn resolve_pending(p: &PendingTool) -> Resolution {
+    if p.name.is_empty() {
+        return Resolution::Drop { reason: "missing_function_name" };
+    }
+    if p.id.is_empty() {
+        // Anthropic ids are conventionally `toolu_…`; any opaque unique string
+        // is valid to the SDK, and this one only has to be unique within the
+        // message.
+        return Resolution::Open {
+            id: format!("toolu_{}", uuid_simple()),
+            name: p.name.clone(),
+            args: p.args.clone(),
+            synthesized_id: true,
+        };
+    }
+    Resolution::Open {
+        id: p.id.clone(),
+        name: p.name.clone(),
+        args: p.args.clone(),
+        synthesized_id: false,
+    }
+}
+
 /// Stateful converter from OpenAI stream chunks to Anthropic SSE events.
 /// `feed` returns Anthropic event strings (`event: <type>\ndata: <json>\n\n`)
 /// to emit for each OpenAI chunk; `finish` closes open blocks and terminates
@@ -470,15 +532,18 @@ pub struct OpenAISseConverter {
     pending_stop_reason: Option<String>,
     terminal_error: Option<String>,
     last_usage: Option<Value>,
-    /// tool index → (id, name, buffered arguments-so-far), held until **both**
-    /// the id and the name are known. Some upstreams (observed:
-    /// deepseek-v4.1-flash via command) stream
-    /// `{"index":0,"function":{"arguments":"…"}}` fragments with no `id` /
-    /// `name` anywhere in the response. Emitting a block on `index` alone
+    /// tool index → (id, name, buffered arguments-so-far, first-seen epoch ms),
+    /// held until the block can be opened safely. Emitting on `index` alone
     /// produced `id:""`/`name:""` tool_use blocks, which the Anthropic SDK
     /// rejects ("tool_calls without a complete id and function name") — a hard
     /// client error the gateway had logged as a 200. Never open speculatively.
-    pending_tools: HashMap<usize, (String, String, String)>,
+    ///
+    /// The `first_seen` stamp is the timeout anchor: measured from when the
+    /// fragment **first appeared**, not from the last argument increment, so a
+    /// stream that keeps dribbling arguments cannot postpone the deadline
+    /// forever (the arguments arriving say nothing about whether the identity
+    /// will).
+    pending_tools: HashMap<usize, PendingTool>,
     /// tool indices that were opened and are awaiting `content_block_stop`.
     live_tools: Vec<usize>,
     finished: bool,
@@ -659,22 +724,30 @@ impl OpenAISseConverter {
                     // Not open yet: absorb whatever identity arrived plus any
                     // arguments so far, and only open once complete.
                     if !self.tool_indices.contains(&tc_index) {
-                        let slot = self.pending_tools.entry(tc_index).or_default();
+                        let now = now_ms();
+                        let slot = self.pending_tools.entry(tc_index).or_insert_with(|| PendingTool {
+                            id: String::new(),
+                            name: String::new(),
+                            args: String::new(),
+                            first_seen_ms: now,
+                        });
                         if !id.is_empty() {
-                            slot.0 = id.to_string();
+                            slot.id = id.to_string();
                         }
                         if !name.is_empty() {
-                            slot.1 = name.to_string();
+                            slot.name = name.to_string();
                         }
                         if !args.is_empty() {
-                            slot.2.push_str(args);
+                            slot.args.push_str(args);
                         }
-                        let (pid, pname, buffered) = &self.pending_tools[&tc_index];
+                        let (pid, pname, buffered) = {
+                            let s = &self.pending_tools[&tc_index];
+                            (s.id.clone(), s.name.clone(), s.args.clone())
+                        };
                         if pid.is_empty() || pname.is_empty() {
                             // Still incomplete — emit nothing yet.
                             continue;
                         }
-                        let (pid, pname, buffered) = (pid.clone(), pname.clone(), buffered.clone());
                         self.pending_tools.remove(&tc_index);
                         self.tool_indices.insert(tc_index);
                         self.live_tools.push(tc_index);
@@ -724,7 +797,95 @@ impl OpenAISseConverter {
             }
         }
 
+        events.extend(self.expire_stalled_tools(now_ms()));
+
         events
+    }
+
+    /// Give up on tool_calls that have been waiting for an identity past the
+    /// deadline. Called on every chunk, so a stream that stays alive but stuck
+    /// (arguments trickling, identity never arriving) still gets resolved
+    /// instead of buffering until the connection dies.
+    ///
+    /// This is a bound on the *wait*, not a pause: the converter is driven by
+    /// whatever bytes arrive, so "waiting 30s" can only mean "keep buffering
+    /// across chunks until 30s have passed". There is no way to actually sleep
+    /// here, and none is wanted — the client is being streamed to.
+    fn expire_stalled_tools(&mut self, now_ms: u64) -> Vec<String> {
+        if self.pending_tools.is_empty() {
+            return Vec::new();
+        }
+        let due: Vec<usize> = self
+            .pending_tools
+            .iter()
+            .filter(|(_, p)| now_ms.saturating_sub(p.first_seen_ms) >= TOOL_IDENTITY_TIMEOUT_MS)
+            .map(|(i, _)| *i)
+            .collect();
+        if due.is_empty() {
+            return Vec::new();
+        }
+        let mut events = Vec::new();
+        for idx in due {
+            let Some(p) = self.pending_tools.remove(&idx) else {
+                continue;
+            };
+            events.extend(self.emit_resolved(idx, &p, "identity_timeout"));
+        }
+        events
+    }
+
+    /// Emit (or discard) one resolved tool_call. `trigger` only shapes the log
+    /// line — the decision comes from the field asymmetry in `resolve_pending`.
+    fn emit_resolved(&mut self, tc_index: usize, p: &PendingTool, trigger: &'static str) -> Vec<String> {
+        let block_index = if self.thinking_started { 2 } else { 1 } + tc_index;
+        match resolve_pending(p) {
+            Resolution::Drop { reason } => {
+                tracing::warn!(
+                    model = %self.model,
+                    index = tc_index,
+                    reason,
+                    trigger,
+                    has_id = !p.id.is_empty(),
+                    has_name = !p.name.is_empty(),
+                    buffered_args = p.args.len(),
+                    "dropping tool_call: function name never arrived"
+                );
+                Vec::new()
+            }
+            Resolution::Open { id, name, args, synthesized_id } => {
+                if synthesized_id {
+                    tracing::warn!(
+                        model = %self.model,
+                        index = tc_index,
+                        trigger,
+                        name = %name,
+                        buffered_args = args.len(),
+                        "upstream omitted tool_call id; synthesized one so the call is not lost"
+                    );
+                }
+                self.tool_indices.insert(tc_index);
+                self.live_tools.push(tc_index);
+                let mut events = vec![sse_event(
+                    "content_block_start",
+                    json!({
+                        "type": "content_block_start",
+                        "index": block_index,
+                        "content_block": { "type": "tool_use", "id": id, "name": name, "input": {} }
+                    }),
+                )];
+                if !args.is_empty() {
+                    events.push(sse_event(
+                        "content_block_delta",
+                        json!({
+                            "type": "content_block_delta",
+                            "index": block_index,
+                            "delta": { "type": "input_json_delta", "partial_json": args }
+                        }),
+                    ));
+                }
+                events
+            }
+        }
     }
 
     /// End-of-stream: close open blocks, emit `message_delta` (real usage when
@@ -757,6 +918,19 @@ impl OpenAISseConverter {
 
         let mut events = Vec::new();
 
+        // Tools still waiting for an identity are resolved **before** the stop
+        // events below: resolving may open a block (a synthesized id is enough
+        // to make the call usable), and that block then needs its
+        // content_block_stop like any other. Same decision as the mid-stream
+        // timeout, so the two paths cannot drift.
+        if !self.pending_tools.is_empty() {
+            let mut pending: Vec<(usize, PendingTool)> = self.pending_tools.drain().collect();
+            pending.sort_by_key(|(i, _)| *i);
+            for (idx, p) in pending {
+                events.extend(self.emit_resolved(idx, &p, "stream_end"));
+            }
+        }
+
         // Close blocks in order: text first (its thinking sibling was already
         // closed at open time), then tools.
         if self.text_block_started {
@@ -780,34 +954,6 @@ impl OpenAISseConverter {
                 "content_block_stop",
                 json!({ "type": "content_block_stop", "index": block_index }),
             ));
-        }
-        // Tools whose id/name never arrived were never opened, so there is
-        // nothing to close. Warn loudly: the model loses a call the user
-        // asked for, which is worth knowing about in the logs. The per-tool
-        // shape is included because the *reason* differs by upstream (some
-        // send arguments-only fragments forever, others send an id but no
-        // name) and that distinction is the whole diagnosis.
-        if !self.pending_tools.is_empty() {
-            let mut orphans: Vec<Value> = self
-                .pending_tools
-                .iter()
-                .map(|(idx, (id, name, args))| {
-                    json!({
-                        "index": idx,
-                        "has_id": !id.is_empty(),
-                        "has_name": !name.is_empty(),
-                        "buffered_args": args.len(),
-                    })
-                })
-                .collect();
-            orphans.sort_by_key(|v| v["index"].as_u64().unwrap_or(0));
-            tracing::warn!(
-                model = %self.model,
-                dropped = orphans.len(),
-                ?orphans,
-                "upstream streamed tool_calls without a complete id/name; dropped"
-            );
-            self.pending_tools.clear();
         }
 
         let mut delta_usage = Map::new();
@@ -909,4 +1055,166 @@ pub fn sse_data_payload(event_text: &str) -> Option<&str> {
 fn uuid_simple() -> String {
     use uuid::Uuid;
     Uuid::new_v4().simple().to_string()
+}
+
+/// Epoch millis, for the tool-identity deadline. A clock before the epoch
+/// clamps to 0, which only makes the timeout unreachable — the safe direction,
+/// since it degrades to the old "wait for end of stream" behaviour.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pending(id: &str, name: &str, args: &str) -> PendingTool {
+        PendingTool {
+            id: id.to_string(),
+            name: name.to_string(),
+            args: args.to_string(),
+            first_seen_ms: 0,
+        }
+    }
+
+    /// id and name are not equally recoverable: name cannot be invented, id can.
+    #[test]
+    fn resolve_synthesizes_a_missing_id_but_keeps_the_name() {
+        match resolve_pending(&pending("", "Bash", "{\"a\":1}")) {
+            Resolution::Open { id, name, args, synthesized_id } => {
+                assert!(synthesized_id, "id was missing, so it must be flagged synthesized");
+                assert!(!id.is_empty(), "a synthesized id must still be a real id");
+                assert_eq!(name, "Bash");
+                assert_eq!(args, "{\"a\":1}");
+            }
+            Resolution::Drop { reason } => panic!("must not drop: a real name is present ({reason})"),
+        }
+    }
+
+    /// Nothing to invent from — the call is unrecoverable, and emitting it
+    /// would have the SDK reject the whole message.
+    #[test]
+    fn resolve_drops_when_the_name_is_missing_even_with_an_id() {
+        match resolve_pending(&pending("call_1", "", "{}")) {
+            Resolution::Drop { reason } => assert_eq!(reason, "missing_function_name"),
+            Resolution::Open { .. } => panic!("must not open a nameless tool_use block"),
+        }
+    }
+
+    /// The normal case must be untouched: no synthesis, no drop.
+    #[test]
+    fn resolve_passes_through_a_complete_tool_call() {
+        match resolve_pending(&pending("call_1", "Edit", "{}")) {
+            Resolution::Open { id, name, args, synthesized_id } => {
+                assert!(!synthesized_id);
+                assert_eq!(id, "call_1");
+                assert_eq!(name, "Edit");
+                assert_eq!(args, "{}");
+            }
+            Resolution::Drop { reason } => panic!("must not drop a complete call ({reason})"),
+        }
+    }
+
+    /// The deadline must be measured from first sight, not from the last
+    /// argument increment — otherwise a stream that keeps dribbling arguments
+    /// postpones the deadline forever.
+    #[test]
+    fn expiry_is_anchored_to_first_sight_not_the_latest_fragment() {
+        let mut conv = OpenAISseConverter::new("m");
+        // First fragment: name arrives, id never does. Stamps first_seen_ms.
+        conv.feed(&json!({
+            "choices": [{
+                "index": 0,
+                "delta": {"tool_calls": [{"index": 0, "function": {"name": "Bash", "arguments": "{"}}]},
+                "finish_reason": null
+            }]
+        }));
+
+        // Well past the deadline, but the pending entry is young in this test's
+        // clock unless we move it back. Age it directly.
+        let aged = now_ms() - TOOL_IDENTITY_TIMEOUT_MS - 1;
+        conv.pending_tools.get_mut(&0).unwrap().first_seen_ms = aged;
+
+        let evs = conv.expire_stalled_tools(now_ms());
+        let text: Vec<&str> = evs.iter().map(|s| s.as_str()).collect();
+        assert!(
+            text.iter().any(|s| s.contains("content_block_start") && s.contains("tool_use")),
+            "an expired-but-named call must be recovered, not dropped: {text:?}"
+        );
+        assert!(
+            text.iter().any(|s| s.contains("input_json_delta")),
+            "buffered arguments must be flushed on the synthesized open: {text:?}"
+        );
+        assert!(conv.pending_tools.is_empty(), "expired entry must be removed");
+    }
+
+    /// Below the deadline nothing is forced — a slow but correct upstream keeps
+    /// its chance to deliver the real id.
+    #[test]
+    fn nothing_is_expired_before_the_deadline() {
+        let mut conv = OpenAISseConverter::new("m");
+        conv.feed(&json!({
+            "choices": [{
+                "index": 0,
+                "delta": {"tool_calls": [{"index": 0, "function": {"name": "Bash", "arguments": "{"}}]},
+                "finish_reason": null
+            }]
+        }));
+        assert!(conv.expire_stalled_tools(now_ms()).is_empty());
+        assert_eq!(conv.pending_tools.len(), 1, "must still be waiting");
+    }
+
+    /// A block opened at end-of-stream still needs its content_block_stop.
+    /// Regression: resolving pending after the stop loop left it dangling.
+    #[test]
+    fn a_call_recovered_at_stream_end_is_properly_closed() {
+        let mut conv = OpenAISseConverter::new("m");
+        let mut all = Vec::new();
+        // name but no id — recoverable, so it must open…
+        all.extend(conv.feed(&json!({
+            "choices": [{
+                "index": 0,
+                "delta": {"tool_calls": [{"index": 0, "function": {"name": "Bash", "arguments": "{}"}}]},
+                "finish_reason": "tool_calls"
+            }]
+        })));
+        // …and stay open until finish() resolves it.
+        all.extend(conv.finish());
+
+        let text: Vec<&str> = all.iter().map(|s| s.as_str()).collect();
+        let starts = text.iter().filter(|s| s.contains("content_block_start") && s.contains("tool_use")).count();
+        let stops = text.iter().filter(|s| s.contains("content_block_stop")).count();
+        assert_eq!(starts, 1, "a named call must be recovered at stream end: {text:?}");
+        assert_eq!(stops, 1, "every started block must be closed: {text:?}");
+    }
+
+    /// A nameless call is still dropped even at end-of-stream, and leaves no
+    /// dangling stop event behind.
+    #[test]
+    fn a_nameless_call_at_stream_end_is_dropped_without_dangling_stop() {
+        let mut conv = OpenAISseConverter::new("m");
+        let mut all = Vec::new();
+        all.extend(conv.feed(&json!({
+            "choices": [{
+                "index": 0,
+                "delta": {"tool_calls": [{"index": 0, "function": {"arguments": "{\"a\":1}"}}]},
+                "finish_reason": "tool_calls"
+            }]
+        })));
+        all.extend(conv.finish());
+
+        let text: Vec<&str> = all.iter().map(|s| s.as_str()).collect();
+        // Match the content block, not the bare word: `stop_reason` is also
+        // "tool_use" and would false-positive here.
+        assert!(
+            !text.iter().any(|s| s.contains("\"type\":\"tool_use\"")),
+            "nameless call must not open: {text:?}"
+        );
+        let starts = text.iter().filter(|s| s.contains("content_block_start")).count();
+        let stops = text.iter().filter(|s| s.contains("content_block_stop")).count();
+        assert_eq!(starts, stops, "every started block must be closed: {text:?}");
+    }
 }

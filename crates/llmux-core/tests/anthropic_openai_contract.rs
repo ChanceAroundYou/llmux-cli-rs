@@ -643,10 +643,17 @@ fn sse_data_payload_extraction() {
 // ---------------------------------------------------------------------------
 
 /// The Anthropic SDK rejects a message whose tool_use block has an empty id or
-/// name outright, so a stream that never supplies them must produce no block at
-/// all — not a block with `id: ""` / `name: ""`. Reproduces the real
-/// deepseek-v4.1-flash stream: `{"index":0,"function":{"arguments":"…"}}`
-/// repeated, with no id/name anywhere.
+/// name outright, so a stream that never supplies a *name* must produce no block
+/// at all — not a block with `id: ""` / `name: ""`.
+///
+/// Note the earlier version of this test was justified by a claim that turned
+/// out to be false: that deepseek-v4.1-flash "streams arguments-only fragments
+/// with no id/name anywhere". That was an artifact of `smart_truncate_body`
+/// discarding the middle of long SSE bodies, where the opener lives. Measured
+/// against untruncated logs (2026-09-26): 178/178 tool_call deltas carried both
+/// id and name, on the **first** delta. This test now covers the genuine
+/// failure mode — a name that genuinely never arrives — which a missing id can
+/// no longer reach, because the converter synthesizes one.
 #[test]
 fn sse_never_opens_a_tool_block_without_id_and_name() {
     let mut conv = OpenAISseConverter::new("m");
