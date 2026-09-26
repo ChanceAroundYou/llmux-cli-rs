@@ -1521,6 +1521,21 @@ async fn openai_streaming_passthrough(
             last_finish,
             buffer.len()
         );
+        // This path forwards upstream bytes to the client **verbatim** — it
+        // parses only for usage accounting, and never repairs a tool_call. So
+        // it is the one route where a malformed tool_use block reaches the
+        // client exactly as the upstream sent it, and therefore the one place
+        // worth reading when a client reports "tool_calls without a complete id
+        // and function name". Without this, the whole route is invisible: the
+        // other three streaming paths log their full body, this one did not.
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            tracing::debug!(
+                "[openai:{model}] full upstream body ({} bytes, account={}): {}",
+                received.len(),
+                account.alias,
+                String::from_utf8_lossy(&received)
+            );
+        }
         if final_truncated {
             tracing::warn!(
                 "[openai:{model}] stream truncated: account={} finish_reason=null chunks={} saw_done={} empty={empty_content} overflow={overflow}",
