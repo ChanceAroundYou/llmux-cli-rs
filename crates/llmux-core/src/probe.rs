@@ -150,11 +150,29 @@ async fn send_probe(
     }
     let start = std::time::Instant::now();
     let result = req.json(&request.body).send().await;
-    let latency_ms = start.elapsed().as_millis() as i64;
     match result {
         Ok(resp) => {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+            // body 必须读出来才知道上游到底答了什么。**读失败不能当成功**：
+            // 曾经这里 `unwrap_or_default()` 把「header 到了但 body 超时」吞成空体，
+            // 于是 10s 超时的探测被记成 `ok=true`（日志里 1000+ 次 `10001ms | OK`）。
+            let body = match resp.text().await {
+                Ok(b) => b,
+                Err(e) => {
+                    // 采样点在读完之后 —— 之前在 `send()` 之后立刻采样，记的是
+                    // 「到收到 header 为止」，超时请求的耗时会明显偏小。
+                    let latency_ms = start.elapsed().as_millis() as i64;
+                    return ProtocolProbe {
+                        protocol,
+                        ok: false,
+                        status: status.as_u16(),
+                        error: format!("Failed to read response body: {e}"),
+                        body: String::new(),
+                        latency_ms,
+                    };
+                }
+            };
+            let latency_ms = start.elapsed().as_millis() as i64;
             let ok = status.is_success();
             let error = if ok {
                 String::new()
@@ -177,14 +195,17 @@ async fn send_probe(
                 latency_ms,
             }
         }
-        Err(e) => ProtocolProbe {
-            protocol,
-            ok: false,
-            status: 0,
-            error: format!("Request failed: {e}"),
-            body: String::new(),
-            latency_ms,
-        },
+        Err(e) => {
+            let latency_ms = start.elapsed().as_millis() as i64;
+            ProtocolProbe {
+                protocol,
+                ok: false,
+                status: 0,
+                error: format!("Request failed: {e}"),
+                body: String::new(),
+                latency_ms,
+            }
+        }
     }
 }
 
@@ -303,11 +324,25 @@ async fn native_probe(
     }
     let start = std::time::Instant::now();
     let result = req.json(&request.body).send().await;
-    let latency_ms = start.elapsed().as_millis() as i64;
     match result {
         Ok(resp) => {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+            // 同 `send_probe`：读 body 失败必须判失败，不能吞成空体成功。
+            let body = match resp.text().await {
+                Ok(b) => b,
+                Err(e) => {
+                    let latency_ms = start.elapsed().as_millis() as i64;
+                    return ProtocolProbe {
+                        protocol,
+                        ok: false,
+                        status: status.as_u16(),
+                        error: format!("Failed to read response body: {e}"),
+                        body: String::new(),
+                        latency_ms,
+                    };
+                }
+            };
+            let latency_ms = start.elapsed().as_millis() as i64;
             ProtocolProbe {
                 protocol,
                 ok: status.is_success(),
@@ -321,14 +356,17 @@ async fn native_probe(
                 latency_ms,
             }
         }
-        Err(e) => ProtocolProbe {
-            protocol,
-            ok: false,
-            status: 0,
-            error: format!("Request failed: {e}"),
-            body: String::new(),
-            latency_ms,
-        },
+        Err(e) => {
+            let latency_ms = start.elapsed().as_millis() as i64;
+            ProtocolProbe {
+                protocol,
+                ok: false,
+                status: 0,
+                error: format!("Request failed: {e}"),
+                body: String::new(),
+                latency_ms,
+            }
+        }
     }
 }
 
@@ -849,6 +887,111 @@ mod tests {
             join("https://api.anthropic.com/v1", "v1/messages"),
             "https://api.anthropic.com/v1/messages"
         );
+    }
+
+    // 回归：上游吐了 header 就 200，但 body 迟迟不来 → reqwest 超时。
+    // 曾经 `resp.text().await.unwrap_or_default()` 把超时吞成空体，于是
+    // `ok` 仍按 header 判成 true，日志里出现上千次「10001ms | OK」——
+    // 那些模型其实一个 token 都没答出来。必须判失败。
+
+    /// 起一个「立刻回 200 header，然后 body 永远不发」的服务器。
+    async fn spawn_stalling_upstream() -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = match listener.accept().await {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            // 先把请求头读完（否则客户端还在等 response），再只回 header。
+            let mut buf = [0u8; 2048];
+            let _ = socket.read(&mut buf).await;
+            let _ = socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 200\r\n\r\n")
+                .await;
+            let _ = socket.flush().await;
+            // body 一个字节都不给，让客户端侧超时。
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        });
+        format!("http://{addr}")
+    }
+
+    /// 起一个「正常 200 + 完整 body」的服务器（反向对照）。
+    async fn spawn_ok_upstream() -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = match listener.accept().await {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            let mut buf = [0u8; 2048];
+            let _ = socket.read(&mut buf).await;
+            let body = br#"{"choices":[{"message":{"content":"OK"}}]}"#;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            let _ = socket.write_all(head.as_bytes()).await;
+            let _ = socket.write_all(body).await;
+            let _ = socket.flush().await;
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn body_timeout_is_not_counted_as_a_working_protocol() {
+        let base = spawn_stalling_upstream().await;
+        let a = account("stall", &base, None, None);
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(400))
+            .build()
+            .unwrap();
+
+        let p = send_probe(&client, &a, "muse", Protocol::Chat).await;
+
+        assert!(!p.ok, "读 body 超时必须判失败，不能因为 header 是 200 就算可用");
+        assert!(
+            p.error.contains("Failed to read response body"),
+            "错误信息要指明是读 body 失败，实际：{}",
+            p.error
+        );
+    }
+
+    #[tokio::test]
+    async fn native_body_timeout_is_not_counted_as_a_working_protocol() {
+        // native_probe 是另一份 send 逻辑，同样有这个 bug，一起回归。
+        let base = spawn_stalling_upstream().await;
+        let mut a = account("stall", &base, None, None);
+        a.provider_id = "anthropic".into();
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(400))
+            .build()
+            .unwrap();
+
+        let p = native_probe(&client, &a, "muse", "anthropic").await;
+
+        assert!(!p.ok, "native 探测读 body 超时同样必须判失败");
+        assert!(p.error.contains("Failed to read response body"), "实际：{}", p.error);
+    }
+
+    #[tokio::test]
+    async fn a_real_2xx_response_still_counts_as_ok() {
+        // 反向对照：正常 200 + 完整 body 不能被上面那条修复误伤。
+        let base = spawn_ok_upstream().await;
+        let a = account("good", &base, None, None);
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+
+        let p = send_probe(&client, &a, "muse", Protocol::Chat).await;
+
+        assert!(p.ok, "正常 2xx 必须仍然判为可用，实际：{}", p.error);
     }
 }
 
