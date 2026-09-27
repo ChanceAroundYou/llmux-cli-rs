@@ -1217,7 +1217,8 @@ pub(crate) async fn responses_to_anthropic_streaming(
                 String::from_utf8_lossy(&received)
             );
         }
-        crate::routes::v1::helpers::spawn_log_usage_ip(pool.clone(), account.clone(), model.clone(), provider_id.clone(), input_tokens, output_tokens, cache_read, cache_create, latency_ms, conv.is_done(), if conv.is_done() { None } else { Some("Responses upstream ended without terminal event".to_string()) }, request_body, Some(String::from_utf8_lossy(&received).into_owned()), ttft_ms, true, client_ip)
+        let complete = conv.is_done() && !conv.is_failed();
+        crate::routes::v1::helpers::spawn_log_usage_ip(pool.clone(), account.clone(), model.clone(), provider_id.clone(), input_tokens, output_tokens, cache_read, cache_create, latency_ms, complete, if complete { None } else if conv.is_failed() { Some("Upstream SSE reported a failure event".to_string()) } else { Some("Responses upstream ended without terminal event".to_string()) }, request_body, Some(String::from_utf8_lossy(&received).into_owned()), ttft_ms, true, client_ip)
     });
     let body = Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx));
     Response::builder().status(StatusCode::OK).header("content-type", "text/event-stream").header("cache-control", "no-cache").header("connection", "keep-alive").body(body).unwrap().into_response()

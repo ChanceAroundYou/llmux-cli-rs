@@ -815,6 +815,11 @@ pub struct ResponsesToChatConverter {
     incomplete_max_tokens: bool,
     terminal: bool,
     finished: bool,
+    /// 上游明确报了错（`response.failed` / `error` / `response.error`，或
+    /// `response.incomplete` 且不是撞 max_tokens）。与 `terminal` 分开：
+    /// 错误事件同样要终止流，所以 `terminal=true`，但**不能**因此被当成
+    /// 成功记账（否则会写 success=1 并解除账户冷却）。
+    failed: bool,
 }
 
 impl ResponsesToChatConverter {
@@ -834,6 +839,7 @@ impl ResponsesToChatConverter {
             incomplete_max_tokens: false,
             terminal: false,
             finished: false,
+            failed: false,
         }
     }
 
@@ -895,6 +901,9 @@ impl ResponsesToChatConverter {
 
     pub fn is_done(&self) -> bool { self.terminal }
 
+    /// 上游报了错 —— 记账时不能算成功（`is_done()` 只表示「流可以停了」）。
+    pub fn is_failed(&self) -> bool { self.failed }
+
     pub fn usage_tokens(&self) -> (i64, i64) {
         let usage = self.last_usage.as_ref();
         let raw = usage.and_then(|u| u.get("input_tokens").or_else(|| u.get("prompt_tokens"))).and_then(Value::as_i64).unwrap_or(0);
@@ -946,6 +955,7 @@ impl ResponsesToChatConverter {
             self.terminal = true;
             self.incomplete_max_tokens = incomplete_reason(&data) == Some("max_output_tokens");
             if !self.incomplete_max_tokens {
+                self.failed = true;
                 out.push(format!("data: {}\n\n", json!({"error":{"message":response_event_error(&data),"type":"server_error"}})));
                 out.push("data: [DONE]\n\n".to_string());
                 self.finished = true;
@@ -953,6 +963,7 @@ impl ResponsesToChatConverter {
         } else if etype == "response.failed" || etype == "error" || etype == "response.error" {
             self.terminal = true;
             self.finished = true;
+            self.failed = true;
             out.push(format!("data: {}\n\n", json!({"error":{"message":response_event_error(&data),"type":"server_error"}})));
             out.push("data: [DONE]\n\n".to_string());
         }
@@ -985,6 +996,8 @@ pub struct ResponsesToAnthropicConverter {
     incomplete_max_tokens: bool,
     terminal: bool,
     finished: bool,
+    /// 见 `ResponsesToChatConverter::failed`。
+    failed: bool,
 }
 
 impl ResponsesToAnthropicConverter {
@@ -992,7 +1005,7 @@ impl ResponsesToAnthropicConverter {
         Self {
             message_id: format!("msg_{}", uuid_simple()), model: model.to_string(), started: false,
             text_index: None, text: String::new(), next_content_index: 0, function_calls: HashMap::new(),
-            last_usage: None, incomplete_max_tokens: false, terminal: false, finished: false,
+            last_usage: None, incomplete_max_tokens: false, terminal: false, finished: false, failed: false,
         }
     }
 
@@ -1053,6 +1066,9 @@ impl ResponsesToAnthropicConverter {
 
     pub fn is_done(&self) -> bool { self.terminal }
 
+    /// 上游报了错 —— 记账时不能算成功（`is_done()` 只表示「流可以停了」）。
+    pub fn is_failed(&self) -> bool { self.failed }
+
     pub fn usage_tokens(&self) -> (i64, i64) {
         let usage = self.last_usage.as_ref();
         let raw = usage.and_then(|u| u.get("input_tokens").or_else(|| u.get("prompt_tokens"))).and_then(Value::as_i64).unwrap_or(0);
@@ -1104,11 +1120,13 @@ impl ResponsesToAnthropicConverter {
             self.incomplete_max_tokens = incomplete_reason(&data) == Some("max_output_tokens");
             if !self.incomplete_max_tokens {
                 self.finished = true;
+                self.failed = true;
                 out.push(sse_event("error", json!({"type":"error","error":{"type":"api_error","message":response_event_error(&data)}})));
             }
         } else if etype == "response.failed" || etype == "error" || etype == "response.error" {
             self.terminal = true;
             self.finished = true;
+            self.failed = true;
             out.push(sse_event("error", json!({"type":"error","error":{"type":"api_error","message":response_event_error(&data)}})));
         }
         out
@@ -1397,5 +1415,77 @@ mod tests {
         assert!(output.starts_with("event: message_start"));
         assert!(output.contains("event: content_block_start"));
         assert!(output.contains("event: content_block_stop"));
+    }
+
+    // 错误事件同样要终止流（is_done），但**不能**被当成成功记账（is_failed）。
+    // 曾经只设 terminal，调用侧用 is_done() 写 success=1 并解除账户冷却。
+
+    #[test]
+    fn chat_converter_marks_response_failed_as_failed_and_done() {
+        let mut converter = ResponsesToChatConverter::new("muse");
+        let failed = "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"boom\"}}}\n\n";
+        let _ = converter.feed(failed);
+
+        assert!(converter.is_done(), "错误事件应终止流");
+        assert!(converter.is_failed(), "response.failed 必须判为失败");
+    }
+
+    #[test]
+    fn chat_converter_marks_error_event_as_failed() {
+        let mut converter = ResponsesToChatConverter::new("muse");
+        let _ = converter.feed("event: error\ndata: {\"type\":\"error\",\"message\":\"boom\"}\n\n");
+
+        assert!(converter.is_done());
+        assert!(converter.is_failed());
+    }
+
+    #[test]
+    fn anthropic_converter_marks_response_failed_as_failed_and_done() {
+        let mut converter = ResponsesToAnthropicConverter::new("muse");
+        let failed = "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"boom\"}}}\n\n";
+        let _ = converter.feed(failed);
+
+        assert!(converter.is_done());
+        assert!(converter.is_failed());
+    }
+
+    #[test]
+    fn anthropic_converter_marks_error_event_as_failed() {
+        let mut converter = ResponsesToAnthropicConverter::new("muse");
+        let _ = converter.feed("event: error\ndata: {\"type\":\"error\",\"message\":\"boom\"}\n\n");
+
+        assert!(converter.is_done());
+        assert!(converter.is_failed());
+    }
+
+    #[test]
+    fn completed_stream_is_not_marked_failed() {
+        let mut chat = ResponsesToChatConverter::new("muse");
+        let _ = chat.feed("event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"output\":[]}}\n\n");
+        assert!(chat.is_done());
+        assert!(!chat.is_failed(), "正常完成不该算失败");
+
+        let mut anth = ResponsesToAnthropicConverter::new("muse");
+        let _ = anth.feed("event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"output\":[]}}\n\n");
+        assert!(anth.is_done());
+        assert!(!anth.is_failed());
+    }
+
+    #[test]
+    fn max_token_incomplete_is_not_marked_failed() {
+        // 撞 max_tokens 是正常收尾，不该记成失败。
+        let mut converter = ResponsesToChatConverter::new("muse");
+        let _ = converter.feed("event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"response\":{\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n");
+
+        assert!(converter.is_done());
+        assert!(!converter.is_failed(), "max_output_tokens 收尾不该算失败");
+    }
+
+    #[test]
+    fn non_token_incomplete_is_marked_failed() {
+        let mut converter = ResponsesToChatConverter::new("muse");
+        let _ = converter.feed("event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"response\":{\"incomplete_details\":{\"reason\":\"content_filter\"}}}\n\n");
+
+        assert!(converter.is_failed(), "非 token 上限的 incomplete 是真失败");
     }
 }

@@ -431,11 +431,15 @@ async fn gemini_streaming_passthrough(
         let mut received: Vec<u8> = Vec::with_capacity(4096);
         let mut sse = response.bytes_stream();
         let mut ttft_ms: Option<i64> = None;
+        // 成功与否必须推导，不能写死 true —— 读错误 break 出去之后照样会走到
+        // 下面的记账，之前那行字面量 `true` 把「流到一半断了」也记成了成功。
+        let mut stream_failed: Option<String> = None;
         while let Some(chunk) = sse.next().await {
             let chunk = match chunk {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::warn!("[gemini:{model}] upstream stream read error: {e}");
+                    stream_failed = Some(format!("Upstream stream read error: {e}"));
                     break;
                 }
             };
@@ -445,6 +449,10 @@ async fn gemini_streaming_passthrough(
                 ttft_ms = Some(start.elapsed().as_millis() as i64);
             }
             if !sent { return; }
+        }
+        // 上游一秒都没吐就 EOF：空 200，不算服务成功。
+        if stream_failed.is_none() && received.is_empty() {
+            stream_failed = Some("Upstream stream closed without sending any data".to_string());
         }
         let latency_ms = start.elapsed().as_millis() as i64;
         let resp_body = String::from_utf8_lossy(&received).into_owned();
@@ -458,8 +466,8 @@ async fn gemini_streaming_passthrough(
             0,
             0,
             latency_ms,
-            true,
-            None,
+            stream_failed.is_none(),
+            stream_failed,
             request_body,
             Some(resp_body),
             ttft_ms, true, client_ip,

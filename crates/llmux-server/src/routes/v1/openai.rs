@@ -706,9 +706,9 @@ async fn responses_to_chat_streaming(
         }
         let (prompt_tokens, completion_tokens) = converter.usage_tokens();
         let (cache_read, cache_create) = converter.usage_cache();
-        let complete = converter.is_done();
+        let complete = converter.is_done() && !converter.is_failed();
         let latency_ms = start.elapsed().as_millis() as i64;
-        spawn_log_usage_ip(pool.clone(), account.clone(), model.clone(), account.provider_id.clone(), prompt_tokens, completion_tokens, cache_read, cache_create, latency_ms, complete, if complete { None } else { Some(format!("Responses upstream ended without terminal event after {chunks} chunks")) }, request_body, Some(String::from_utf8_lossy(&received).into_owned()), ttft_ms, true, client_ip)
+        spawn_log_usage_ip(pool.clone(), account.clone(), model.clone(), account.provider_id.clone(), prompt_tokens, completion_tokens, cache_read, cache_create, latency_ms, complete, if complete { None } else if converter.is_failed() { Some("Upstream SSE reported a failure event".to_string()) } else { Some(format!("Responses upstream ended without terminal event after {chunks} chunks")) }, request_body, Some(String::from_utf8_lossy(&received).into_owned()), ttft_ms, true, client_ip)
     });
     let body = Body::from_stream(ReceiverStream::new(rx));
     Response::builder().status(StatusCode::OK).header("content-type", "text/event-stream").header("cache-control", "no-cache").header("connection", "keep-alive").body(body).unwrap().into_response()
