@@ -431,7 +431,12 @@ pub(crate) async fn dispatch_with_conversion(
         }
     }
     { let mut r = state.dispatch_router.lock().unwrap(); r.record_result(&dispatch_key, &dispatch_meta, None, false); }
-    let error_msg = last_error.unwrap_or_else(|| "All accounts exhausted".to_string());
+    let error_msg = last_error.clone().unwrap_or_else(|| "All accounts exhausted".to_string());
+    // 耗尽也要落库 —— 之前这条路径不记，前端失败率面板完全看不到这些 502。
+    if let Some(account) = ordered_accounts.first() {
+        let latency_ms = start.elapsed().as_millis() as i64;
+        spawn_log_usage(state.pool.clone(), (*account).clone(), model_name.clone(), res.provider_id.clone(), 0, 0, 0, 0, latency_ms, false, Some(error_msg.clone()), Some(patched.to_string()), None, Some(latency_ms), false);
+    }
     send_tui_request(&state.tui_tx, normalized_uri.path(), 502, start, &model_name);
     // 全部账户都因冷却被跳过 → 回 429 + Retry-After
     if error_msg.contains("cooling down") {
@@ -631,7 +636,14 @@ pub(crate) async fn dispatch_aggregate_with_conversion(
     }
     let switched = state.aggregate_router.lock().unwrap().record_request_all_failed(&alias, len);
     if switched { tracing::info!("🔀 [agg:{}] all failed — V reset to 0", alias); }
-    let error_msg = last_error.unwrap_or_else(|| "All aggregate candidates exhausted".to_string());
+    let error_msg = last_error.clone().unwrap_or_else(|| "All aggregate candidates exhausted".to_string());
+    // 同上：耗尽也落库，否则聚合链路的失败在前端不可见。
+    let latency_ms = start.elapsed().as_millis() as i64;
+    if let Some(cand) = agg.candidates.first() {
+        if let Ok(Some(acc)) = get_account_by_id(&state.pool, cand.account_id, &state.master_key).await {
+            spawn_log_usage(state.pool.clone(), acc, cand.model.clone(), String::new(), 0, 0, 0, 0, latency_ms, false, Some(error_msg.clone()), Some(body.to_string()), None, Some(latency_ms), false);
+        }
+    }
     send_tui_request(&state.tui_tx, normalized_uri.path(), 502, start, &agg.alias);
     // 全部候选都因冷却被跳过 → 回 429 + Retry-After，让调用方退避而不是立刻重试
     if error_msg.contains("cooling down") {
