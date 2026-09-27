@@ -180,6 +180,9 @@ pub(crate) async fn dispatch_with_conversion(
 
     let start = Instant::now();
     let mut last_error: Option<String> = None;
+    // 上游最后回的状态码。耗尽时用它决定回 429（该退避）还是 502（网关问题）——
+    // 瞬时 429 不冷却，`last_error` 里没有 "cooling down"，只能靠这个判断。
+    let mut last_status: Option<u16> = None;
 
     for account in &ordered_accounts {
         // 配额/限流冷却中的账户跳过。裸模型名走的就是这条路径 —— Ling
@@ -291,6 +294,7 @@ pub(crate) async fn dispatch_with_conversion(
                 }
             }
             last_error = Some(format!("Provider returned {status}: {error_body}"));
+            last_status = Some(status.as_u16());
             if is_retryable_status(status.as_u16()) {
                 // 429 → 记冷却，见 anthropic.rs 同处注释。
                 if status.as_u16() == 429 {
@@ -437,9 +441,11 @@ pub(crate) async fn dispatch_with_conversion(
         let latency_ms = start.elapsed().as_millis() as i64;
         spawn_log_usage(state.pool.clone(), (*account).clone(), model_name.clone(), res.provider_id.clone(), 0, 0, 0, 0, latency_ms, false, Some(error_msg.clone()), Some(patched.to_string()), None, Some(latency_ms), false);
     }
-    send_tui_request(&state.tui_tx, normalized_uri.path(), 502, start, &model_name);
-    // 全部账户都因冷却被跳过 → 回 429 + Retry-After
-    if error_msg.contains("cooling down") {
+    let exhausted_status = if error_msg.contains("cooling down") { Some(429) } else { last_status };
+    send_tui_request(&state.tui_tx, normalized_uri.path(), if exhausted_status == Some(429) { 429 } else { 502 }, start, &model_name);
+    // 全部账户都因 429 耗尽（冷却跳过 or 上游回 429）→ 回 429 + Retry-After，
+    // 让调用方退避。502 对它是「网关坏了」，会立刻重试再吃一次 429。
+    if exhausted_status == Some(429) {
         return super::helpers::rate_limited_response(&error_msg, is_anthropic);
     }
     middleware::send_error(&error_msg, "upstream_error", StatusCode::BAD_GATEWAY, is_anthropic)
@@ -528,6 +534,7 @@ pub(crate) async fn dispatch_aggregate_with_conversion(
     let mode = DownstreamMode::from_str(agg.upstream_api.as_str());
     let start = Instant::now();
     let mut last_error: Option<String> = None;
+    let mut last_status: Option<u16> = None;
     let mut hit_index: Option<usize> = None;
     let mut hit_stream_resp: Option<reqwest::Response> = None;
     let mut hit_data: Option<Value> = None;
@@ -575,6 +582,7 @@ pub(crate) async fn dispatch_aggregate_with_conversion(
                 tracing::warn!("[agg:{}] candidate {} responses unsupported, default={:?}", alias, i, fb);
             }
             last_error = Some(format!("Provider returned {status}: {error_body}"));
+            last_status = Some(status.as_u16());
             if is_retryable_status(status.as_u16()) {
                 // 429 → 记冷却，见 anthropic.rs 同处注释。
                 if status.as_u16() == 429 {
@@ -644,9 +652,10 @@ pub(crate) async fn dispatch_aggregate_with_conversion(
             spawn_log_usage(state.pool.clone(), acc, cand.model.clone(), String::new(), 0, 0, 0, 0, latency_ms, false, Some(error_msg.clone()), Some(body.to_string()), None, Some(latency_ms), false);
         }
     }
-    send_tui_request(&state.tui_tx, normalized_uri.path(), 502, start, &agg.alias);
-    // 全部候选都因冷却被跳过 → 回 429 + Retry-After，让调用方退避而不是立刻重试
-    if error_msg.contains("cooling down") {
+    let exhausted_status = if error_msg.contains("cooling down") { Some(429) } else { last_status };
+    send_tui_request(&state.tui_tx, normalized_uri.path(), if exhausted_status == Some(429) { 429 } else { 502 }, start, &agg.alias);
+    // 全部候选都因 429 耗尽（冷却跳过 or 上游回 429）→ 回 429 + Retry-After，让调用方退避而不是立刻重试
+    if exhausted_status == Some(429) {
         return super::helpers::rate_limited_response(&error_msg, is_anthropic);
     }
     middleware::send_error(&error_msg, "upstream_error", StatusCode::BAD_GATEWAY, is_anthropic)
@@ -859,6 +868,7 @@ async fn openai_dispatch(
 
     let start = Instant::now();
     let mut last_error: Option<String> = None;
+    let mut last_status: Option<u16> = None;
 
     for account in &ordered_accounts {
         // 配额/限流冷却中的账户跳过，见 183 行同处注释。
@@ -959,6 +969,7 @@ async fn openai_dispatch(
         if !status.is_success() {
             let error_body = response.text().await.unwrap_or_default();
             last_error = Some(format!("Provider returned {status}: {error_body}"));
+            last_status = Some(status.as_u16());
 
             if is_retryable_status(status.as_u16()) {
                 tracing::warn!(
@@ -1137,7 +1148,11 @@ async fn openai_dispatch(
             Some(log_req_body.clone()),
             None, Some(latency_ms), false);
     }
-    send_tui_request(&state.tui_tx, normalized_uri.path(), 502, start, &model_resolution.target_model);
+    let exhausted_status = if error_msg.contains("cooling down") { Some(429) } else { last_status };
+    send_tui_request(&state.tui_tx, normalized_uri.path(), if exhausted_status == Some(429) { 429 } else { 502 }, start, &model_resolution.target_model);
+    if exhausted_status == Some(429) {
+        return super::helpers::rate_limited_response(&error_msg, is_anthropic);
+    }
     middleware::send_error(
         &error_msg,
         "upstream_error",
@@ -1180,6 +1195,7 @@ async fn dispatch_aggregate_openai(
     let alias = agg.alias.clone();
     let active = agg.active.min(len.saturating_sub(1));
     let mut last_error: Option<String> = None;
+    let mut last_status: Option<u16> = None;
     let mut hit_index: Option<usize> = None;
     let mut hit_account: Option<adapters::Account> = None;
     let mut hit_data: Option<Value> = None;
@@ -1253,6 +1269,7 @@ async fn dispatch_aggregate_openai(
         if !status.is_success() {
             let error_body = response.text().await.unwrap_or_default();
             last_error = Some(format!("Provider returned {status}: {error_body}"));
+            last_status = Some(status.as_u16());
             if is_retryable_status(status.as_u16()) {
                 tracing::warn!("🔀 [agg:{}] Account {} failed ({}) — trying next...", alias, account.alias, status.as_u16());
                 // 429 → 记冷却，见 anthropic.rs 同处注释。
@@ -1339,9 +1356,10 @@ async fn dispatch_aggregate_openai(
             spawn_log_usage(state.pool.clone(), acc, agg.candidates[0].model.clone(), String::new(), 0, 0, 0, 0, latency_ms, false, Some(error_msg.clone()), Some(body.to_string()), None, Some(latency_ms), false);
         }
     }
-    send_tui_request(&state.tui_tx, normalized_uri.path(), 502, start, &agg.alias);
-    // 全部候选都因冷却被跳过 → 回 429 + Retry-After，让调用方退避而不是立刻重试
-    if error_msg.contains("cooling down") {
+    let exhausted_status = if error_msg.contains("cooling down") { Some(429) } else { last_status };
+    send_tui_request(&state.tui_tx, normalized_uri.path(), if exhausted_status == Some(429) { 429 } else { 502 }, start, &agg.alias);
+    // 全部候选都因 429 耗尽（冷却跳过 or 上游回 429）→ 回 429 + Retry-After，让调用方退避而不是立刻重试
+    if exhausted_status == Some(429) {
         return super::helpers::rate_limited_response(&error_msg, is_anthropic);
     }
     middleware::send_error(&error_msg, "upstream_error", StatusCode::BAD_GATEWAY, is_anthropic)

@@ -167,6 +167,8 @@ pub async fn messages(
 
     let start = Instant::now();
     let mut last_error: Option<String> = None;
+    // 上游最后回的状态码，耗尽时据此回 429 还是 502（见 openai.rs 同处注释）。
+    let mut last_status: Option<u16> = None;
 
     for account in &ordered_accounts {
         // 配额/限流冷却中的账户跳过，见 openai.rs 183 行同处注释。
@@ -303,6 +305,7 @@ pub async fn messages(
         if !status.is_success() {
             let error_body = response.text().await.unwrap_or_default();
             last_error = Some(format!("Provider returned {status}: {error_body}"));
+            last_status = Some(status.as_u16());
 
             if is_retryable_status(status.as_u16()) {
                 tracing::warn!(
@@ -508,7 +511,11 @@ pub async fn messages(
             Some(body.to_string()),
             None, Some(latency_ms), false);
     }
-    send_tui_request(&state.tui_tx, "/v1/messages", 502, start, &model_resolution.target_model);
+    let exhausted_status = if error_msg.contains("cooling down") { Some(429) } else { last_status };
+    send_tui_request(&state.tui_tx, "/v1/messages", if exhausted_status == Some(429) { 429 } else { 502 }, start, &model_resolution.target_model);
+    if exhausted_status == Some(429) {
+        return super::helpers::rate_limited_response(&error_msg, is_anthropic);
+    }
     middleware::send_error(&error_msg, "upstream_error", StatusCode::BAD_GATEWAY, is_anthropic)
 }
 
@@ -660,6 +667,7 @@ async fn dispatch_aggregate_anthropic(
     let active = agg.active.min(len.saturating_sub(1));
     let start = Instant::now();
     let mut last_error: Option<String> = None;
+    let mut last_status: Option<u16> = None;
     let mut hit: Option<usize> = None;
 
     // Pre-build a flag for streaming hit response (need account/model for passthrough)
@@ -759,6 +767,7 @@ async fn dispatch_aggregate_anthropic(
         if !status.is_success() {
             let error_body = response.text().await.unwrap_or_default();
             last_error = Some(format!("Provider returned {status}: {error_body}"));
+            last_status = Some(status.as_u16());
             if is_retryable_status(status.as_u16()) {
                 tracing::warn!("🔀 [agg:{}] Account {} failed ({}) — trying next...", alias, account.alias, status.as_u16());
                 // 429 → 记冷却，见同文件 297 行注释。
@@ -835,9 +844,10 @@ async fn dispatch_aggregate_anthropic(
     } else if let Ok(Some(acc)) = get_account_by_id(&state.pool, agg.candidates[0].account_id, &state.master_key).await {
         crate::routes::v1::helpers::spawn_log_usage(state.pool.clone(), acc, agg.candidates[0].model.clone(), String::new(), 0, 0, 0, 0, latency_ms, false, Some(error_msg.clone()), Some(body.to_string()), None, Some(latency_ms), false);
     }
-    send_tui_request(&state.tui_tx, "/v1/messages", 502, start, &agg.alias);
-    // 全部候选都因冷却被跳过 → 回 429 + Retry-After，让调用方退避而不是立刻重试
-    if error_msg.contains("cooling down") {
+    let exhausted_status = if error_msg.contains("cooling down") { Some(429) } else { last_status };
+    send_tui_request(&state.tui_tx, "/v1/messages", if exhausted_status == Some(429) { 429 } else { 502 }, start, &agg.alias);
+    // 全部候选都因 429 耗尽（冷却跳过 or 上游回 429）→ 回 429 + Retry-After，让调用方退避而不是立刻重试
+    if exhausted_status == Some(429) {
         return crate::routes::v1::helpers::rate_limited_response(&error_msg, is_anthropic);
     }
     middleware::send_error(&error_msg, "upstream_error", StatusCode::BAD_GATEWAY, is_anthropic)
