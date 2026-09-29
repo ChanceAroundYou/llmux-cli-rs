@@ -169,12 +169,16 @@ pub async fn messages(
     let mut last_error: Option<String> = None;
     // 上游最后回的状态码，耗尽时据此回 429 还是 502（见 openai.rs 同处注释）。
     let mut last_status: Option<u16> = None;
+    // 耗尽成因分类：全因配额冷却 vs 掺了别的原因（见 helpers::exhausted_status）
+    let mut cooled_skips = 0usize;
+    let mut failed_candidates = 0usize;
 
     for account in &ordered_accounts {
         // 配额/限流冷却中的账户跳过，见 openai.rs 183 行同处注释。
         if super::helpers::rate_limit_suspended(&state.pool, account.id, &model_resolution.target_model).await {
             tracing::debug!("⏸️  跳过 {} | 账户 {}：冷却中", model_resolution.target_model, account.alias);
             last_error = Some(format!("Account {} rate limited, cooling down", account.alias));
+            cooled_skips += 1;
             continue;
         }
         // Endpoint resolution via protocol::endpoint_for: Messages prefers
@@ -249,6 +253,7 @@ pub async fn messages(
             Err(e) => {
                 tracing::error!("📡 Failed to build provider request: {e}");
                 last_error = Some(format!("Failed to build provider request: {e}"));
+                failed_candidates += 1;
                 if let Some(tx) = &state.tui_tx {
                     let _ = tx.send(TuiEvent::Retry {
                         account: account.alias.clone(),
@@ -260,6 +265,7 @@ pub async fn messages(
                     let mut router = state.dispatch_router.lock().unwrap();
                     router.record_result(&dispatch_key, &dispatch_meta, None, false);
                 }
+                failed_candidates += 1;
                 continue;
             }
         };
@@ -286,6 +292,7 @@ pub async fn messages(
             Err(e) => {
                 tracing::error!("📡 provider request failed: {e}");
                 last_error = Some(format!("Provider request failed: {e}"));
+                failed_candidates += 1;
                 if let Some(tx) = &state.tui_tx {
                     let _ = tx.send(TuiEvent::Retry {
                         account: account.alias.clone(),
@@ -297,6 +304,7 @@ pub async fn messages(
                     let mut router = state.dispatch_router.lock().unwrap();
                     router.record_result(&dispatch_key, &dispatch_meta, None, false);
                 }
+                failed_candidates += 1;
                 continue;
             }
         };
@@ -337,6 +345,7 @@ pub async fn messages(
                     let mut router = state.dispatch_router.lock().unwrap();
                     router.record_result(&dispatch_key, &dispatch_meta, None, false);
                 }
+                failed_candidates += 1;
                 continue;
             }
 
@@ -405,6 +414,7 @@ pub async fn messages(
             Ok(b) => b,
             Err(e) => {
                 last_error = Some(format!("Failed to read response: {e}"));
+                failed_candidates += 1;
                 continue;
             }
         };
@@ -413,6 +423,7 @@ pub async fn messages(
             Ok(v) => v,
             Err(e) => {
                 last_error = Some(format!("Failed to parse response: {e}"));
+                failed_candidates += 1;
                 continue;
             }
         };
@@ -511,7 +522,11 @@ pub async fn messages(
             Some(body.to_string()),
             None, Some(latency_ms), false);
     }
-    let exhausted_status = if error_msg.contains("cooling down") { Some(429) } else { last_status };
+    let exhausted_status = super::helpers::exhausted_status(
+        cooled_skips,
+        cooled_skips + failed_candidates,
+        last_status,
+    );
     send_tui_request(&state.tui_tx, "/v1/messages", if exhausted_status == Some(429) { 429 } else { 502 }, start, &model_resolution.target_model);
     if exhausted_status == Some(429) {
         return super::helpers::rate_limited_response(&error_msg, is_anthropic);
@@ -668,6 +683,9 @@ async fn dispatch_aggregate_anthropic(
     let start = Instant::now();
     let mut last_error: Option<String> = None;
     let mut last_status: Option<u16> = None;
+    // 耗尽成因分类：全因配额冷却 vs 掺了别的原因（见 helpers::exhausted_status）
+    let mut cooled_skips = 0usize;
+    let mut failed_candidates = 0usize;
     let mut hit: Option<usize> = None;
 
     // Pre-build a flag for streaming hit response (need account/model for passthrough)
@@ -682,13 +700,14 @@ async fn dispatch_aggregate_anthropic(
         if crate::routes::v1::helpers::rate_limit_suspended(&state.pool, cand.account_id, &cand.model).await {
             tracing::debug!("⏸️  [agg:{}] 跳过 {} | 账户 {}：冷却中", alias, cand.model, cand.account_id);
             last_error = Some(format!("Candidate {} ({}) rate limited, cooling down", i, cand.model));
+            cooled_skips += 1;
             state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len);
             continue;
         }
         let account = match get_account_by_id(&state.pool, cand.account_id, &state.master_key).await {
             Ok(Some(a)) => a,
-            Ok(None) => { state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); last_error = Some(format!("Candidate {} account {} not found or inactive", i, cand.account_id)); continue; }
-            Err(e) => { state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); last_error = Some(format!("Failed to load account {}: {e}", cand.account_id)); continue; }
+            Ok(None) => { state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); last_error = Some(format!("Candidate {} account {} not found or inactive", i, cand.account_id)); failed_candidates += 1; continue; }
+            Err(e) => { state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); last_error = Some(format!("Failed to load account {}: {e}", cand.account_id)); failed_candidates += 1; continue; }
         };
 
         // Patch body model
@@ -753,14 +772,14 @@ async fn dispatch_aggregate_anthropic(
             }
         };
 
-        let provider_request = match provider_request { Ok(r) => r, Err(e) => { tracing::error!("📡 [agg:{}] build request failed: {e}", alias); last_error = Some(format!("Failed to build provider request: {e}")); state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); continue; } };
+        let provider_request = match provider_request { Ok(r) => r, Err(e) => { tracing::error!("📡 [agg:{}] build request failed: {e}", alias); last_error = Some(format!("Failed to build provider request: {e}")); state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); failed_candidates += 1; continue; } };
 
         tracing::info!("🔀 [agg:{} V={}] {} → {} → {} {}", alias, active, account.alias, cand.model, provider_request.url, if is_conversion { "[anthropic→openai]" } else { "" });
         if let Some(tx) = &state.tui_tx { let _ = tx.send(TuiEvent::Dispatch { timestamp: time::OffsetDateTime::now_utc().format(&DISPATCH_TIME_FMT).unwrap_or_default(), account: account.alias.clone(), model: cand.model.clone(), url: provider_request.url.clone(), tag: Some(format!("agg:{alias}")) }); }
 
         let response = match execute_provider_request(&provider_request).await {
             Ok(r) => r,
-            Err(e) => { tracing::error!("📡 [agg:{}] provider request failed: {e}", alias); last_error = Some(format!("Provider request failed: {e}")); state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); continue; }
+            Err(e) => { tracing::error!("📡 [agg:{}] provider request failed: {e}", alias); last_error = Some(format!("Provider request failed: {e}")); state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); failed_candidates += 1; continue; }
         };
 
         let status = response.status();
@@ -775,11 +794,13 @@ async fn dispatch_aggregate_anthropic(
                     super::helpers::note_rate_limit(&state.pool, account.id, &cand.model, &error_body).await;
                 }
                 state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len);
+                failed_candidates += 1;
                 continue;
             }
             // non-retryable — try next candidate as well (failover down the chain)
             tracing::warn!("🔀 [agg:{}] Account {} failed ({}) — trying next (non-retryable): {}", alias, account.alias, status.as_u16(), error_body.chars().take(200).collect::<String>());
             state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len);
+            failed_candidates += 1;
             continue;
         }
 
@@ -791,8 +812,8 @@ async fn dispatch_aggregate_anthropic(
             break;
         }
 
-        let body_bytes = match response.bytes().await { Ok(b) => b, Err(e) => { last_error = Some(format!("Failed to read response: {e}")); state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); continue; } };
-        let data: Value = match serde_json::from_slice(&body_bytes) { Ok(v) => v, Err(e) => { last_error = Some(format!("Failed to parse response: {e}")); state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); continue; } };
+        let body_bytes = match response.bytes().await { Ok(b) => b, Err(e) => { last_error = Some(format!("Failed to read response: {e}")); state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); failed_candidates += 1; continue; } };
+        let data: Value = match serde_json::from_slice(&body_bytes) { Ok(v) => v, Err(e) => { last_error = Some(format!("Failed to parse response: {e}")); state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); failed_candidates += 1; continue; } };
 
         let latency_ms = start.elapsed().as_millis() as i64;
         if is_conversion {
@@ -844,7 +865,11 @@ async fn dispatch_aggregate_anthropic(
     } else if let Ok(Some(acc)) = get_account_by_id(&state.pool, agg.candidates[0].account_id, &state.master_key).await {
         crate::routes::v1::helpers::spawn_log_usage(state.pool.clone(), acc, agg.candidates[0].model.clone(), String::new(), 0, 0, 0, 0, latency_ms, false, Some(error_msg.clone()), Some(body.to_string()), None, Some(latency_ms), false);
     }
-    let exhausted_status = if error_msg.contains("cooling down") { Some(429) } else { last_status };
+    let exhausted_status = crate::routes::v1::helpers::exhausted_status(
+        cooled_skips,
+        cooled_skips + failed_candidates,
+        last_status,
+    );
     send_tui_request(&state.tui_tx, "/v1/messages", if exhausted_status == Some(429) { 429 } else { 502 }, start, &agg.alias);
     // 全部候选都因 429 耗尽（冷却跳过 or 上游回 429）→ 回 429 + Retry-After，让调用方退避而不是立刻重试
     if exhausted_status == Some(429) {

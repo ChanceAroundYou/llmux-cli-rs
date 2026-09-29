@@ -183,6 +183,9 @@ pub(crate) async fn dispatch_with_conversion(
     // 上游最后回的状态码。耗尽时用它决定回 429（该退避）还是 502（网关问题）——
     // 瞬时 429 不冷却，`last_error` 里没有 "cooling down"，只能靠这个判断。
     let mut last_status: Option<u16> = None;
+    // 耗尽成因分类：全因配额冷却 vs 掺了别的原因（见 helpers::exhausted_status）
+    let mut cooled_skips = 0usize;
+    let mut failed_candidates = 0usize;
 
     for account in &ordered_accounts {
         // 配额/限流冷却中的账户跳过。裸模型名走的就是这条路径 —— Ling
@@ -190,6 +193,7 @@ pub(crate) async fn dispatch_with_conversion(
         if super::helpers::rate_limit_suspended(&state.pool, account.id, &model_name).await {
             tracing::debug!("⏸️  跳过 {} | 账户 {}：冷却中", model_name, account.alias);
             last_error = Some(format!("Account {} rate limited, cooling down", account.alias));
+            cooled_skips += 1;
             continue;
         }
         // Per-account target computation (Task 6): routing decision table.
@@ -199,6 +203,7 @@ pub(crate) async fn dispatch_with_conversion(
         // through to build_passthrough's api.openai.com fallback URL.
         if !llmux_core::protocol::supports(account, target) {
             last_error = Some(format!("Account {} does not support {:?} target", account.alias, target));
+            failed_candidates += 1;
             continue;
         }
 
@@ -227,6 +232,7 @@ pub(crate) async fn dispatch_with_conversion(
             Ok(b) => b,
             Err(e) => {
                 last_error = Some(format!("Request conversion failed: {e}"));
+                failed_candidates += 1;
                 continue;
             }
         };
@@ -252,6 +258,7 @@ pub(crate) async fn dispatch_with_conversion(
                 tracing::error!("🔀 Account {} (id={}) request failed: {e}", account.alias, account.id);
                 last_error = Some(format!("Provider request failed: {e}"));
                 if account.id == preferred_id { let mut r = state.dispatch_router.lock().unwrap(); r.record_result(&dispatch_key, &dispatch_meta, None, false); }
+                failed_candidates += 1;
                 continue;
             }
         };
@@ -301,6 +308,7 @@ pub(crate) async fn dispatch_with_conversion(
                     super::helpers::note_rate_limit(&state.pool, account.id, &model_name, &error_body).await;
                 }
                 if account.id == preferred_id { let mut r = state.dispatch_router.lock().unwrap(); r.record_result(&dispatch_key, &dispatch_meta, None, false); }
+                failed_candidates += 1;
                 continue;
             }
             let latency_ms = start.elapsed().as_millis() as i64;
@@ -319,8 +327,8 @@ pub(crate) async fn dispatch_with_conversion(
                 return openai_streaming_passthrough(response, &model_name, account, state.pool.clone(), start, Some(forward_body.to_string())).await;
             }
             (Back::Passthrough, false) => {
-                let body_bytes = match response.bytes().await { Ok(b) => b, Err(e) => { last_error = Some(format!("Failed to read response: {e}")); continue; } };
-                let data: Value = match serde_json::from_slice(&body_bytes) { Ok(v) => v, Err(e) => { last_error = Some(format!("Failed to parse response: {e}")); continue; } };
+                let body_bytes = match response.bytes().await { Ok(b) => b, Err(e) => { last_error = Some(format!("Failed to read response: {e}")); failed_candidates += 1; continue; } };
+                let data: Value = match serde_json::from_slice(&body_bytes) { Ok(v) => v, Err(e) => { last_error = Some(format!("Failed to parse response: {e}")); failed_candidates += 1; continue; } };
                 let latency_ms = start.elapsed().as_millis() as i64;
                 let (prompt_tokens, completion_tokens, cache_read, cache_create) = passthrough_usage(&data);
                 spawn_log_usage(state.pool.clone(), (*account).clone(), model_name.clone(), res.provider_id.clone(), prompt_tokens, completion_tokens, cache_read, cache_create, latency_ms, true, None, Some(forward_body.to_string()), Some(data.to_string()), Some(latency_ms), false);
@@ -334,8 +342,8 @@ pub(crate) async fn dispatch_with_conversion(
                 return responses_to_chat_streaming(response, &model_name, account, state.pool.clone(), start, Some(forward_body.to_string())).await;
             }
             (Back::ChatFromResponses, false) => {
-                let body_bytes = match response.bytes().await { Ok(b) => b, Err(e) => { last_error = Some(format!("Failed to read response: {e}")); continue; } };
-                let data: Value = match serde_json::from_slice(&body_bytes) { Ok(v) => v, Err(e) => { last_error = Some(format!("Failed to parse response: {e}")); continue; } };
+                let body_bytes = match response.bytes().await { Ok(b) => b, Err(e) => { last_error = Some(format!("Failed to read response: {e}")); failed_candidates += 1; continue; } };
+                let data: Value = match serde_json::from_slice(&body_bytes) { Ok(v) => v, Err(e) => { last_error = Some(format!("Failed to parse response: {e}")); failed_candidates += 1; continue; } };
                 let chat_resp = responses_to_chat(&data, &model_name);
                 let (raw_prompt, completion_tokens) = adapters::usage_from_openai_response_body(&chat_resp);
                 let (cache_read, _) = cache_usage_from_openai(&data["usage"]);
@@ -352,8 +360,8 @@ pub(crate) async fn dispatch_with_conversion(
             // and reply non-streaming. ponytail ceiling: SSE for Responses→{Chat,Messages}
             // needs dedicated state machines; add when a client needs live tokens here.
             (Back::ResponsesFromChat, _) => {
-                let body_bytes = match response.bytes().await { Ok(b) => b, Err(e) => { last_error = Some(format!("Failed to read response: {e}")); continue; } };
-                let data: Value = match serde_json::from_slice(&body_bytes) { Ok(v) => v, Err(e) => { last_error = Some(format!("Failed to parse response: {e}")); continue; } };
+                let body_bytes = match response.bytes().await { Ok(b) => b, Err(e) => { last_error = Some(format!("Failed to read response: {e}")); failed_candidates += 1; continue; } };
+                let data: Value = match serde_json::from_slice(&body_bytes) { Ok(v) => v, Err(e) => { last_error = Some(format!("Failed to parse response: {e}")); failed_candidates += 1; continue; } };
                 let resp_body = chat_resp_to_responses_resp(&data, &model_name);
                 let (raw_prompt, completion_tokens) = adapters::usage_from_openai_response_body(&data);
                 let (cache_read, _) = cache_usage_from_openai(&data["usage"]);
@@ -366,8 +374,8 @@ pub(crate) async fn dispatch_with_conversion(
                 return Json(resp_body).into_response();
             }
             (Back::ResponsesFromMessages, _) => {
-                let body_bytes = match response.bytes().await { Ok(b) => b, Err(e) => { last_error = Some(format!("Failed to read response: {e}")); continue; } };
-                let data: Value = match serde_json::from_slice(&body_bytes) { Ok(v) => v, Err(e) => { last_error = Some(format!("Failed to parse response: {e}")); continue; } };
+                let body_bytes = match response.bytes().await { Ok(b) => b, Err(e) => { last_error = Some(format!("Failed to read response: {e}")); failed_candidates += 1; continue; } };
+                let data: Value = match serde_json::from_slice(&body_bytes) { Ok(v) => v, Err(e) => { last_error = Some(format!("Failed to parse response: {e}")); failed_candidates += 1; continue; } };
                 let resp_body = anthropic_resp_to_responses_resp(&data, &model_name);
                 let (prompt_tokens, completion_tokens) = (data["usage"]["input_tokens"].as_i64().unwrap_or(0), data["usage"]["output_tokens"].as_i64().unwrap_or(0));
                 let cache_read = data["usage"]["cache_read_input_tokens"].as_i64().unwrap_or(0);
@@ -384,8 +392,8 @@ pub(crate) async fn dispatch_with_conversion(
                 return super::anthropic::anthropic_to_openai_streaming(response, &model_name, account, state.pool.clone(), &account.provider_id, start, Some(forward_body.to_string())).await;
             }
             (Back::ChatFromMessages, false) => {
-                let body_bytes = match response.bytes().await { Ok(b) => b, Err(e) => { last_error = Some(format!("Failed to read response: {e}")); continue; } };
-                let data: Value = match serde_json::from_slice(&body_bytes) { Ok(v) => v, Err(e) => { last_error = Some(format!("Failed to parse response: {e}")); continue; } };
+                let body_bytes = match response.bytes().await { Ok(b) => b, Err(e) => { last_error = Some(format!("Failed to read response: {e}")); failed_candidates += 1; continue; } };
+                let data: Value = match serde_json::from_slice(&body_bytes) { Ok(v) => v, Err(e) => { last_error = Some(format!("Failed to parse response: {e}")); failed_candidates += 1; continue; } };
                 let chat_resp = anthropic_to_openai_response(&data, &model_name);
                 let (raw_prompt, completion_tokens) = adapters::usage_from_openai_response_body(&chat_resp);
                 let (cache_read, _) = cache_usage_from_openai(&chat_resp["usage"]);
@@ -403,8 +411,8 @@ pub(crate) async fn dispatch_with_conversion(
                 return super::anthropic::responses_to_anthropic_streaming(response, &model_name, account, state.pool.clone(), &account.provider_id, start, Some(forward_body.to_string())).await;
             }
             (Back::MessagesFromResponses, false) => {
-                let body_bytes = match response.bytes().await { Ok(b) => b, Err(e) => { last_error = Some(format!("Failed to read response: {e}")); continue; } };
-                let data: Value = match serde_json::from_slice(&body_bytes) { Ok(v) => v, Err(e) => { last_error = Some(format!("Failed to parse response: {e}")); continue; } };
+                let body_bytes = match response.bytes().await { Ok(b) => b, Err(e) => { last_error = Some(format!("Failed to read response: {e}")); failed_candidates += 1; continue; } };
+                let data: Value = match serde_json::from_slice(&body_bytes) { Ok(v) => v, Err(e) => { last_error = Some(format!("Failed to parse response: {e}")); failed_candidates += 1; continue; } };
                 let anth_resp = responses_to_anthropic(&data, &model_name);
                 let (input_tokens, output_tokens, cache_read, cache_create) = anthropic_usage(&data);
                 let latency_ms = start.elapsed().as_millis() as i64;
@@ -419,8 +427,8 @@ pub(crate) async fn dispatch_with_conversion(
                 return super::anthropic::anthropic_to_openai_streaming(response, &model_name, account, state.pool.clone(), &account.provider_id, start, Some(forward_body.to_string())).await;
             }
             (Back::MessagesFromChat, false) => {
-                let body_bytes = match response.bytes().await { Ok(b) => b, Err(e) => { last_error = Some(format!("Failed to read response: {e}")); continue; } };
-                let data: Value = match serde_json::from_slice(&body_bytes) { Ok(v) => v, Err(e) => { last_error = Some(format!("Failed to parse response: {e}")); continue; } };
+                let body_bytes = match response.bytes().await { Ok(b) => b, Err(e) => { last_error = Some(format!("Failed to read response: {e}")); failed_candidates += 1; continue; } };
+                let data: Value = match serde_json::from_slice(&body_bytes) { Ok(v) => v, Err(e) => { last_error = Some(format!("Failed to parse response: {e}")); failed_candidates += 1; continue; } };
                 let anth_resp = openai_to_anthropic_response(&data, &model_name);
                 let (raw_prompt, completion_tokens) = adapters::usage_from_openai_response_body(&data);
                 let (cache_read, _) = cache_usage_from_openai(&data["usage"]);
@@ -441,7 +449,11 @@ pub(crate) async fn dispatch_with_conversion(
         let latency_ms = start.elapsed().as_millis() as i64;
         spawn_log_usage(state.pool.clone(), (*account).clone(), model_name.clone(), res.provider_id.clone(), 0, 0, 0, 0, latency_ms, false, Some(error_msg.clone()), Some(patched.to_string()), None, Some(latency_ms), false);
     }
-    let exhausted_status = if error_msg.contains("cooling down") { Some(429) } else { last_status };
+    let exhausted_status = super::helpers::exhausted_status(
+        cooled_skips,
+        cooled_skips + failed_candidates,
+        last_status,
+    );
     send_tui_request(&state.tui_tx, normalized_uri.path(), if exhausted_status == Some(429) { 429 } else { 502 }, start, &model_name);
     // 全部账户都因 429 耗尽（冷却跳过 or 上游回 429）→ 回 429 + Retry-After，
     // 让调用方退避。502 对它是「网关坏了」，会立刻重试再吃一次 429。
@@ -535,6 +547,9 @@ pub(crate) async fn dispatch_aggregate_with_conversion(
     let start = Instant::now();
     let mut last_error: Option<String> = None;
     let mut last_status: Option<u16> = None;
+    // 耗尽成因分类：全因配额冷却 vs 掺了别的原因（见 helpers::exhausted_status）
+    let mut cooled_skips = 0usize;
+    let mut failed_candidates = 0usize;
     let mut hit_index: Option<usize> = None;
     let mut hit_stream_resp: Option<reqwest::Response> = None;
     let mut hit_data: Option<Value> = None;
@@ -545,13 +560,14 @@ pub(crate) async fn dispatch_aggregate_with_conversion(
         if crate::routes::v1::helpers::rate_limit_suspended(&state.pool, cand.account_id, &cand.model).await {
             tracing::debug!("⏸️  [agg:{}] 跳过 {} | 账户 {}：冷却中", alias, cand.model, cand.account_id);
             last_error = Some(format!("Candidate {} ({}) rate limited, cooling down", i, cand.model));
+            cooled_skips += 1;
             state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len);
             continue;
         }
         let account = match get_account_by_id(&state.pool, cand.account_id, &state.master_key).await {
             Ok(Some(a)) => a,
-            Ok(None) => { state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); last_error = Some(format!("Candidate {} account {} not found", i, cand.account_id)); continue; }
-            Err(e) => { state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); last_error = Some(format!("Failed to load account {}: {e}", cand.account_id)); continue; }
+            Ok(None) => { state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); last_error = Some(format!("Candidate {} account {} not found", i, cand.account_id)); failed_candidates += 1; continue; }
+            Err(e) => { state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); last_error = Some(format!("Failed to load account {}: {e}", cand.account_id)); failed_candidates += 1; continue; }
         };
         // Per-candidate target computation (Task 6).
         let target = target_protocol(ingress, mode, &account);
@@ -560,6 +576,7 @@ pub(crate) async fn dispatch_aggregate_with_conversion(
             // (Explicit responses aggregates resolve uniformly in practice.)
             state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len);
             last_error = Some(format!("Candidate {} account {} cannot serve Responses target", i, cand.account_id));
+            failed_candidates += 1;
             continue;
         }
         let translated = match ingress {
@@ -571,7 +588,7 @@ pub(crate) async fn dispatch_aggregate_with_conversion(
         tracing::info!("🔀 [agg:{} V={}] {} → {} → {} [{:?}→responses]", alias, active, account.alias, cand.model, provider_request.url, ingress);
         let response = match execute_provider_request(&provider_request).await {
             Ok(r) => r,
-            Err(e) => { state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); last_error = Some(format!("Provider request failed: {e}")); continue; }
+            Err(e) => { state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); last_error = Some(format!("Provider request failed: {e}")); failed_candidates += 1; continue; }
         };
         let status = response.status();
         if !status.is_success() {
@@ -588,10 +605,11 @@ pub(crate) async fn dispatch_aggregate_with_conversion(
                 if status.as_u16() == 429 {
                     super::helpers::note_rate_limit(&state.pool, account.id, &cand.model, &error_body).await;
                 }
-                state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); continue;
+                state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); failed_candidates += 1; continue;
             }
             tracing::warn!("🔀 [agg:{}] Account {} (id={}) failed ({}) — trying next (non-retryable): {}", alias, account.alias, account.id, status.as_u16(), error_body.chars().take(200).collect::<String>());
             state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len);
+            failed_candidates += 1;
             continue;
         }
         if streaming {
@@ -600,7 +618,7 @@ pub(crate) async fn dispatch_aggregate_with_conversion(
         }
         let body_bytes = match response.bytes().await {
             Ok(b) => b,
-            Err(e) => { last_error = Some(format!("Failed to read response: {e}")); state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); continue; }
+            Err(e) => { last_error = Some(format!("Failed to read response: {e}")); state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); failed_candidates += 1; continue; }
         };
         let data: Value = match serde_json::from_slice(&body_bytes) {
             Ok(v) => v,
@@ -652,7 +670,11 @@ pub(crate) async fn dispatch_aggregate_with_conversion(
             spawn_log_usage(state.pool.clone(), acc, cand.model.clone(), String::new(), 0, 0, 0, 0, latency_ms, false, Some(error_msg.clone()), Some(body.to_string()), None, Some(latency_ms), false);
         }
     }
-    let exhausted_status = if error_msg.contains("cooling down") { Some(429) } else { last_status };
+    let exhausted_status = crate::routes::v1::helpers::exhausted_status(
+        cooled_skips,
+        cooled_skips + failed_candidates,
+        last_status,
+    );
     send_tui_request(&state.tui_tx, normalized_uri.path(), if exhausted_status == Some(429) { 429 } else { 502 }, start, &agg.alias);
     // 全部候选都因 429 耗尽（冷却跳过 or 上游回 429）→ 回 429 + Retry-After，让调用方退避而不是立刻重试
     if exhausted_status == Some(429) {
@@ -869,12 +891,16 @@ async fn openai_dispatch(
     let start = Instant::now();
     let mut last_error: Option<String> = None;
     let mut last_status: Option<u16> = None;
+    // 耗尽成因分类：全因配额冷却 vs 掺了别的原因（见 helpers::exhausted_status）
+    let mut cooled_skips = 0usize;
+    let mut failed_candidates = 0usize;
 
     for account in &ordered_accounts {
         // 配额/限流冷却中的账户跳过，见 183 行同处注释。
         if super::helpers::rate_limit_suspended(&state.pool, account.id, &model_resolution.target_model).await {
             tracing::debug!("⏸️  跳过 {} | 账户 {}：冷却中", model_resolution.target_model, account.alias);
             last_error = Some(format!("Account {} rate limited, cooling down", account.alias));
+            cooled_skips += 1;
             continue;
         }
         // Resolve the upstream URL via the new *_endpoint columns (with legacy
@@ -960,6 +986,7 @@ async fn openai_dispatch(
                     let mut router = state.dispatch_router.lock().unwrap();
                     router.record_result(&dispatch_key, &dispatch_meta, None, false);
                 }
+                failed_candidates += 1;
                 continue;
             }
         };
@@ -999,6 +1026,7 @@ async fn openai_dispatch(
                     let mut router = state.dispatch_router.lock().unwrap();
                     router.record_result(&dispatch_key, &dispatch_meta, None, false);
                 }
+                failed_candidates += 1;
                 continue;
             }
             // Some provider gateways (GitHub Copilot) serve GPT-5.x models only
@@ -1085,6 +1113,7 @@ async fn openai_dispatch(
             Ok(b) => b,
             Err(e) => {
                 last_error = Some(format!("Failed to read response: {e}"));
+                failed_candidates += 1;
                 continue;
             }
         };
@@ -1093,6 +1122,7 @@ async fn openai_dispatch(
             Ok(v) => v,
             Err(e) => {
                 last_error = Some(format!("Failed to parse response: {e}"));
+                failed_candidates += 1;
                 continue;
             }
         };
@@ -1148,7 +1178,11 @@ async fn openai_dispatch(
             Some(log_req_body.clone()),
             None, Some(latency_ms), false);
     }
-    let exhausted_status = if error_msg.contains("cooling down") { Some(429) } else { last_status };
+    let exhausted_status = super::helpers::exhausted_status(
+        cooled_skips,
+        cooled_skips + failed_candidates,
+        last_status,
+    );
     send_tui_request(&state.tui_tx, normalized_uri.path(), if exhausted_status == Some(429) { 429 } else { 502 }, start, &model_resolution.target_model);
     if exhausted_status == Some(429) {
         return super::helpers::rate_limited_response(&error_msg, is_anthropic);
@@ -1196,6 +1230,9 @@ async fn dispatch_aggregate_openai(
     let active = agg.active.min(len.saturating_sub(1));
     let mut last_error: Option<String> = None;
     let mut last_status: Option<u16> = None;
+    // 耗尽成因分类：全因配额冷却 vs 掺了别的原因（见 helpers::exhausted_status）
+    let mut cooled_skips = 0usize;
+    let mut failed_candidates = 0usize;
     let mut hit_index: Option<usize> = None;
     let mut hit_account: Option<adapters::Account> = None;
     let mut hit_data: Option<Value> = None;
@@ -1203,16 +1240,30 @@ async fn dispatch_aggregate_openai(
 
     for i in active..len {
         let cand = &agg.candidates[i];
+        // 真配额耗尽冷却中的候选跳过。缺这一步会让本函数每轮都重试一个已
+        // 知没配额的账户：同族的 dispatch_aggregate_with_conversion(545 行)、
+        // anthropic(682)、以及三条直连路径都有，唯独这条漏了。配额是按天
+        // 重置的，不跳的话 30 分钟里的每个请求都在吃同一个 429。
+        // 冷却由 note_rate_limit 写入，本函数自己也会写（429 分支）。
+        if super::helpers::rate_limit_suspended(&state.pool, cand.account_id, &cand.model).await {
+            tracing::debug!("⏸️  [agg:{}] 跳过 {} | 账户 {}：冷却中", alias, cand.model, cand.account_id);
+            last_error = Some(format!("Candidate {} ({}) rate limited, cooling down", i, cand.model));
+            cooled_skips += 1;
+            state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len);
+            continue;
+        }
         let account = match get_account_by_id(&state.pool, cand.account_id, &state.master_key).await {
             Ok(Some(a)) => a,
             Ok(None) => {
                 state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len);
                 last_error = Some(format!("Candidate {} account {} not found or inactive", i, cand.account_id));
+                failed_candidates += 1;
                 continue;
             }
             Err(e) => {
                 state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len);
                 last_error = Some(format!("Failed to load account {}: {e}", cand.account_id));
+                failed_candidates += 1;
                 continue;
             }
         };
@@ -1261,6 +1312,7 @@ async fn dispatch_aggregate_openai(
                 last_error = Some(format!("Provider request failed: {e}"));
                 state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len);
                 if let Some(tx) = &state.tui_tx { let _ = tx.send(TuiEvent::Retry { account: account.alias.clone(), status: 0, message: format!("Network error: {e}") }); }
+                failed_candidates += 1;
                 continue;
             }
         };
@@ -1278,6 +1330,7 @@ async fn dispatch_aggregate_openai(
                 }
                 state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len);
                 if let Some(tx) = &state.tui_tx { let _ = tx.send(TuiEvent::Retry { account: account.alias.clone(), status: status.as_u16(), message: error_body.clone() }); }
+                failed_candidates += 1;
                 continue;
             }
             if endpoint == "chat/completions" && is_unsupported_api_for_model(&error_body) && llmux_core::protocol::endpoint_for(&account, llmux_core::protocol::Protocol::Messages).is_some() {
@@ -1295,6 +1348,7 @@ async fn dispatch_aggregate_openai(
             state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len);
             // For non-retryable upstream errors, we still continue to next candidate (spec: failover down the list)
             // But to avoid hiding the upstream error when all candidates fail with non-retryable, we keep last_error.
+            failed_candidates += 1;
             continue;
         }
 
@@ -1306,8 +1360,8 @@ async fn dispatch_aggregate_openai(
             break;
         }
 
-        let body_bytes = match response.bytes().await { Ok(b) => b, Err(e) => { last_error = Some(format!("Failed to read response: {e}")); state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); continue; } };
-        let data: Value = match serde_json::from_slice(&body_bytes) { Ok(v) => v, Err(e) => { last_error = Some(format!("Failed to parse response: {e}")); state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); continue; } };
+        let body_bytes = match response.bytes().await { Ok(b) => b, Err(e) => { last_error = Some(format!("Failed to read response: {e}")); state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); failed_candidates += 1; continue; } };
+        let data: Value = match serde_json::from_slice(&body_bytes) { Ok(v) => v, Err(e) => { last_error = Some(format!("Failed to parse response: {e}")); state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); failed_candidates += 1; continue; } };
         let (prompt_tokens, completion_tokens, cache_read, cache_create) = passthrough_usage(&data);
         let latency_ms = start.elapsed().as_millis() as i64;
         spawn_log_usage(state.pool.clone(), account.clone(), cand.model.clone(), account.provider_id.clone(), prompt_tokens, completion_tokens, cache_read, cache_create, latency_ms, true, None, Some(body.to_string()), Some(data.to_string()), Some(latency_ms), false);
@@ -1356,7 +1410,11 @@ async fn dispatch_aggregate_openai(
             spawn_log_usage(state.pool.clone(), acc, agg.candidates[0].model.clone(), String::new(), 0, 0, 0, 0, latency_ms, false, Some(error_msg.clone()), Some(body.to_string()), None, Some(latency_ms), false);
         }
     }
-    let exhausted_status = if error_msg.contains("cooling down") { Some(429) } else { last_status };
+    let exhausted_status = super::helpers::exhausted_status(
+        cooled_skips,
+        cooled_skips + failed_candidates,
+        last_status,
+    );
     send_tui_request(&state.tui_tx, normalized_uri.path(), if exhausted_status == Some(429) { 429 } else { 502 }, start, &agg.alias);
     // 全部候选都因 429 耗尽（冷却跳过 or 上游回 429）→ 回 429 + Retry-After，让调用方退避而不是立刻重试
     if exhausted_status == Some(429) {

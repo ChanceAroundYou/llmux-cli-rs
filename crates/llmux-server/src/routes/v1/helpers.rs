@@ -18,16 +18,21 @@ pub fn normalize_base_url(value: &str) -> String {
     }
 }
 
-/// 该 (账户, 模型) 是否因配额/限流处于冷却期。
+/// 该 (账户, 模型) 是否因**真配额耗尽**处于冷却期，真实流量应跳过。
 ///
 /// 真实流量也要查这张表：上游 429 时我们只能原样透传，重打一次就再吃一次
 /// 429。配额类错误（"resets at 00:00"）当天必然不会自愈，冷却到自然恢复为止。
+///
+/// 读的是 `traffic_suspended_until` 而不是探活侧的 `suspended_until`（0023 起）：
+/// 探活连败说明的是「上游不认这个模型了」，跟账户有没有配额无关，挡真实流量
+/// 是误伤 —— 客户端会收到一个配额充足账户的 429 + `Retry-After: 1800`，
+/// 还会白白挡掉本可以成功的 failover。
 pub async fn rate_limit_suspended(
     pool: &sqlx::SqlitePool,
     account_id: i64,
     model: &str,
 ) -> bool {
-    llmux_core::probe::is_suspended(pool, account_id, model).await
+    llmux_core::probe::is_traffic_suspended(pool, account_id, model).await
 }
 
 /// 上游 429 是否是**真配额耗尽**（当天不会自愈），值得冷却。
@@ -69,7 +74,15 @@ pub async fn note_rate_limit(
         tracing::debug!("⏭️  瞬时 429，不冷却：{} | 账户 {}", model, account_id);
         return;
     }
-    if llmux_core::probe::note_failure(pool, account_id, model, Some(error)).await {
+    if llmux_core::probe::note_failure(
+        pool,
+        account_id,
+        model,
+        Some(error),
+        llmux_core::probe::FailureKind::Quota,
+    )
+    .await
+    {
         tracing::warn!(
             "⏸️  {} | 账户 {} 配额耗尽，冷却 {} 分钟",
             model, account_id, llmux_core::probe::SUSPEND_SECS / 60
@@ -77,10 +90,29 @@ pub async fn note_rate_limit(
     }
 }
 
-/// 全部候选都因冷却被跳过时，回 429 + Retry-After，而不是笼统的 502。
+/// 全部候选耗尽后该回给客户端的状态码。
 ///
-/// 502 对调用方是"网关坏了"，会立刻重试 —— 而我们明确知道它该等。回 429
-/// 带上剩余秒数，客户端（和它们的上游 SDK）才知道该退避多久。
+/// 只有**每一个**候选都因配额冷却被跳过时才回 429 —— 502 对调用方是"网关坏了"，
+/// 会立刻重试，而全冷却时我们明确知道它该等；回 429 带上剩余秒数，客户端
+/// （和它们的上游 SDK）才知道该退避多久。掺了别的原因失败（401/网络/非配额
+/// 429）就按那个状态回。
+///
+/// 早前各 dispatcher 靠 `error_msg.contains("cooling down")` 判断，而
+/// `last_error` 会被后一个候选覆盖：候选 0 认证失败、候选 1 恰好冷却中时，
+/// 留下来的恰好是冷却那条，一个认证失败就被报成 429 + `Retry-After`。
+/// 显式数一遍就没有这个顺序依赖。
+///
+/// `failed` 是本次耗尽的候选总数（走到这里说明没有一个命中），`cooled` 是其中
+/// 因冷却跳过的个数。
+pub fn exhausted_status(cooled: usize, failed: usize, last_status: Option<u16>) -> Option<u16> {
+    if cooled > 0 && cooled == failed {
+        Some(429)
+    } else {
+        last_status
+    }
+}
+
+/// 全部候选都因 429 耗尽（冷却跳过 or 上游回 429）→ 回 429 + Retry-After，让调用方退避而不是立刻重试
 pub fn rate_limited_response(message: &str, is_anthropic: bool) -> axum::response::Response {
     let retry_after = llmux_core::probe::SUSPEND_SECS.to_string();
     if is_anthropic {
@@ -627,6 +659,21 @@ mod tests {
         for bad in ["", "abc", "0", "-5", "3.5"] {
             assert_eq!(body_retain_days_from(Some(bad)), 1, "bad input {bad:?}");
         }
+    }
+
+    #[test]
+    fn all_cooled_is_429_but_a_single_other_failure_is_not() {
+        // 全员冷却 → 429 + Retry-After，客户端该退避。
+        assert_eq!(exhausted_status(2, 2, Some(401)), Some(429));
+        assert_eq!(exhausted_status(1, 1, None), Some(429));
+        // 掺了别的原因就该按那个原因回，不能因为「最后一个候选恰好在冷却中」
+        // 就把一次 401 报成 429 —— 客户端会白等 30 分钟。
+        assert_eq!(exhausted_status(1, 2, Some(401)), Some(401));
+        assert_eq!(exhausted_status(0, 2, Some(500)), Some(500));
+        // 没人被冷却过（冷的那次已经过期放行）→ 沿用上游状态。
+        assert_eq!(exhausted_status(0, 1, Some(429)), Some(429));
+        // 全冷却但上游也报过状态码时仍以 429 为准（该退避的语义优先）。
+        assert_eq!(exhausted_status(3, 3, Some(502)), Some(429));
     }
 
     #[test]

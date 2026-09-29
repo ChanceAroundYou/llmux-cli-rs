@@ -128,12 +128,16 @@ pub async fn gemini(
 
     let start = Instant::now();
     let mut last_error: Option<String> = None;
+    // 耗尽成因分类：全因配额冷却 vs 掺了别的原因（见 helpers::exhausted_status）
+    let mut cooled_skips = 0usize;
+    let mut failed_candidates = 0usize;
 
     for account in &ordered_accounts {
         // 配额/限流冷却中的账户跳过，见 openai.rs 183 行同处注释。
         if super::helpers::rate_limit_suspended(&state.pool, account.id, &model_resolution.target_model).await {
             tracing::debug!("⏸️  跳过 {} | 账户 {}：冷却中", model_resolution.target_model, account.alias);
             last_error = Some(format!("Account {} rate limited, cooling down", account.alias));
+            cooled_skips += 1;
             continue;
         }
         let is_custom_base = account.base_url.as_deref().is_some_and(|u| !u.is_empty());
@@ -230,6 +234,7 @@ pub async fn gemini(
                     let mut router = state.dispatch_router.lock().unwrap();
                     router.record_result(&dispatch_key, &dispatch_meta, None, false);
                 }
+                failed_candidates += 1;
                 continue;
             }
         };
@@ -267,6 +272,7 @@ pub async fn gemini(
                     let mut router = state.dispatch_router.lock().unwrap();
                     router.record_result(&dispatch_key, &dispatch_meta, None, false);
                 }
+                failed_candidates += 1;
                 continue;
             }
             let latency_ms = start.elapsed().as_millis() as i64;
@@ -321,6 +327,7 @@ pub async fn gemini(
             Ok(b) => b,
             Err(e) => {
                 last_error = Some(format!("Failed to read response: {e}"));
+                failed_candidates += 1;
                 continue;
             }
         };
@@ -329,6 +336,7 @@ pub async fn gemini(
             Ok(v) => v,
             Err(e) => {
                 last_error = Some(format!("Failed to parse response: {e}"));
+                failed_candidates += 1;
                 continue;
             }
         };
@@ -380,6 +388,18 @@ pub async fn gemini(
             Some(error_msg.clone()),
             Some(body.to_string()),
             None, Some(latency_ms), false);
+    }
+    // 与其余 5 个 dispatcher 同一套判定：全因配额冷却 → 429 + Retry-After，
+    // 掺了别的原因 → 按那个状态。此前 Gemini 无条件回 502，全冷却时客户端
+    // 会当成「网关坏了」立刻重试，再吃一轮 429。
+    let exhausted_status = super::helpers::exhausted_status(
+        cooled_skips,
+        cooled_skips + failed_candidates,
+        None,
+    );
+    if exhausted_status == Some(429) {
+        send_tui_request(&state.tui_tx, "/v1beta/models/...", 429, start, &model_resolution.target_model);
+        return super::helpers::rate_limited_response(&error_msg, false);
     }
     send_tui_request(&state.tui_tx, "/v1beta/models/...", 502, start, &model_resolution.target_model);
     middleware::send_error(

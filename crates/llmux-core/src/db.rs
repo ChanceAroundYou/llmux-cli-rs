@@ -25,6 +25,7 @@ pub const MIGRATION_0019: &str = include_str!("migrations/0019_model_test_result
 pub const MIGRATION_0020: &str = include_str!("migrations/0020_merge_protocol_cache.sql");
 pub const MIGRATION_0021: &str = include_str!("migrations/0021_model_probe_suspension.sql");
 pub const MIGRATION_0022: &str = include_str!("migrations/0022_admin_credentials.sql");
+pub const MIGRATION_0023: &str = include_str!("migrations/0023_probe_suspension_traffic_cooldown.sql");
 
 pub async fn connect_sqlite(database_url: &str) -> Result<SqlitePool> {
     let options = SqliteConnectOptions::from_str(database_url)?
@@ -73,6 +74,7 @@ pub async fn init_db(pool: &SqlitePool) -> Result<()> {
         ("0020", MIGRATION_0020),
         ("0021", MIGRATION_0021),
         ("0022", MIGRATION_0022),
+        ("0023", MIGRATION_0023),
     ];
     for (name, sql) in &migrations {
         for statement in sql.split(';') {
@@ -94,7 +96,34 @@ pub async fn init_db(pool: &SqlitePool) -> Result<()> {
             }
         }
     }
+    assert_suspension_columns(pool).await;
     Ok(())
+}
+
+/// 0023 加的两列是「探活失败不挡生产流量」这层保护的地基，而上面的迁移循环会
+/// 吞掉所有非「duplicate column」错误。于是 ALTER 一旦失败（库只读、被锁、
+/// 磁盘满），服务照常启动，而 `is_traffic_suspended` 的 `.ok().flatten()` 把查询
+/// 错误变成「未冷却」—— 看着一切正常，实际是配额冷却整个失效。
+///
+/// 这里只**大声告警**，不阻断启动：改 init_db 的错误语义会波及全部 23 个迁移，
+/// 任何一个在某个部署上出岔子都会让网关起不来，那是更大的事故。schema 由
+/// `core_contract::migration_0023_*` 钉在 CI 上，这里负责线上可诊断。
+async fn assert_suspension_columns(pool: &SqlitePool) {
+    for col in ["traffic_suspended_until", "consecutive_quota_failures"] {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pragma_table_info('model_probe_suspensions') WHERE name = ?",
+        )
+        .bind(col)
+        .fetch_one(pool)
+        .await
+        .unwrap_or(-1);
+        if n != 1 {
+            tracing::error!(
+                "🔴 迁移 0023 未生效：model_probe_suspensions.{col} 缺失。\
+                 配额冷却将整个失效（上游 429 会被反复重打）。请检查数据库是否可写。"
+            );
+        }
+    }
 }
 
 pub fn sqlite_url_from_path(path: &std::path::Path) -> String {

@@ -47,6 +47,50 @@ pub struct ProtocolProbe {
     pub latency_ms: i64,
 }
 
+impl ProtocolProbe {
+    /// 本次探测真实消耗的 (input_tokens, output_tokens)。
+    ///
+    /// 上游没给 usage 或体解析不出来时返回 (0, 0) —— 调用方据此落账，
+    /// 宁可不记也不能瞎猜。失败探测一律 (0, 0)：错误体里没有 usage。
+    pub fn usage(&self) -> (i64, i64) {
+        if !self.ok || self.body.is_empty() {
+            return (0, 0);
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&self.body) else {
+            return (0, 0);
+        };
+        usage_from_body(&v)
+    }
+}
+
+/// 从四家上游的响应体里取 (input, output) token。
+///
+/// 三个字段形状各写一处就够，别处不要再写：
+/// * OpenAI Chat —— `usage.prompt_tokens` / `usage.completion_tokens`
+/// * Anthropic Messages / OpenAI Responses —— `usage.input_tokens` / `usage.output_tokens`
+/// * Gemini `generateContent` —— `usageMetadata.promptTokenCount` / `candidatesTokenCount`
+///   （native 探活的体形状，见 `native_probe`）
+///
+/// 前两者都要容忍对方字段名：真实上游（Console Go 等）同一路径两种命名都出现过。
+fn usage_from_body(v: &serde_json::Value) -> (i64, i64) {
+    let g = |path: &str| -> Option<i64> { v.pointer(path).and_then(|x| x.as_i64()) };
+
+    // Gemini：先判 key，避免把不存在的 usageMetadata 误当 0。
+    if v.get("usageMetadata").is_some() {
+        return (
+            g("/usageMetadata/promptTokenCount").unwrap_or(0),
+            g("/usageMetadata/candidatesTokenCount").unwrap_or(0),
+        );
+    }
+    let input = g("/usage/prompt_tokens")
+        .or_else(|| g("/usage/input_tokens"))
+        .unwrap_or(0);
+    let output = g("/usage/completion_tokens")
+        .or_else(|| g("/usage/output_tokens"))
+        .unwrap_or(0);
+    (input, output)
+}
+
 #[derive(Debug, Clone)]
 pub struct ProbeOutcome {
     /// 该 provider 用自己的端点形式（anthropic 的 /v1/messages、gemini 的
@@ -102,6 +146,21 @@ impl ProbeOutcome {
             .find(|p| !p.ok)
             .map(|p| p.error.clone())
             .unwrap_or_default()
+    }
+
+    /// 本轮探测**全部成功协议**真实消耗的 (input_tokens, output_tokens) 之和。
+    ///
+    /// 一次 run_probe 会并发探 chat/messages/responses 三个端点，所以这是三次
+    /// 真实生成的合计 —— 拨测落账要用这个数，不是单个协议的数。失败协议不计入
+    /// （没拿到 usage）。native provider 只有一个协议，自然就是它自己。
+    pub fn total_usage(&self) -> (i64, i64) {
+        self.protocols
+            .iter()
+            .filter(|p| p.ok)
+            .fold((0, 0), |acc, p| {
+                let (i, o) = p.usage();
+                (acc.0 + i, acc.1 + o)
+            })
     }
 }
 
@@ -492,12 +551,47 @@ fn sort_by_priority(iter: impl Iterator<Item = Protocol>) -> Vec<Protocol> {
 //
 // 冷却按 30 分钟逐次递增：失败 → 暂停到 now+30m；到期后再试再失败 → +30m。
 // `consecutive_failures` 不断累积，UI 据此显示「已连续失败 N 次」。
+//
+// **两列冷却，两个门（0023 拆分的由来）**：
+// 探活失败和真实配额 429 曾经共用一个 `suspended_until` 和一个计数器，于是
+// 「上游下架某模型」会连带把生产流量冷却 30 分钟，还回 429 + Retry-After ——
+// 账户配额明明充足。现在两侧各记各的：
+//
+// | 触发 | suspended_until / consecutive_failures | traffic_suspended_until / consecutive_quota_failures |
+// |---|---|---|
+// | 探活失败（含手动/校验/后台） | ✅ 涨；到阈值开冷却 | ❌ 完全不碰 |
+// | 真实流量配额类 429 | ✅ 涨；到阈值开冷却（配额真没了，再探也白花钱） | ✅ 涨；到阈值开冷却 |
+//
+// 两侧都遵守 `SUSPEND_AFTER_FAILURES`。**冷却和计数器都必须分开**：只拆冷却
+// 列而共用计数的话，「1 次探活失败 + 1 次配额 429」就凑够阈值，单次配额 429
+// 照样开挡 —— 要修的 bug 从计数器后门回来了。
+//
+// 探活侧由 `is_suspended` 读（后台探活 + 批量队列），流量侧由
+// `is_traffic_suspended` 读（v1 的真实请求路径）。任一成功都走
+// `clear_suspension` 整条 DELETE，两侧一起解除。
 
 /// 连续失败多少次后进入暂停。2 次：单次失败可能只是上游抖动，不值得停。
 pub const SUSPEND_AFTER_FAILURES: i64 = 2;
 
 /// 每次暂停的时长（30 分钟，逐次递增）。
 pub const SUSPEND_SECS: i64 = 30 * 60;
+
+/// 这次失败该不该记在生产流量的账上。
+///
+/// 探活失败**永远不算** —— 探的是「流量到来之前上游还认不认这个模型」，
+/// 它挂了不代表账户没配额，拿它去挡真实请求就是误伤（模块注释一直承诺
+/// 「只拦自动拨测」，这次把承诺兑现）。真实配额 429 才算。
+///
+/// 核心库不认识 429 的错误体（那是 `server::v1::helpers::is_quota_exhausted`
+/// 的活），所以这个意图只能由调用方在越过那道分类器之后显式传进来 ——
+/// 显式传，不设 `Default`：写错方向的后果是挡住还能用的账户。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureKind {
+    /// 探活 / 手动拨测 / 保存校验失败：只冷却自动拨测。
+    Probe,
+    /// 真实流量吃到配额类 429：探活和流量两侧都冷却。
+    Quota,
+}
 
 /// 一条 (账户, 模型) 的暂停状态。
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -506,6 +600,12 @@ pub struct ProbeSuspension {
     pub model: String,
     pub consecutive_failures: i64,
     pub suspended_until: i64,
+    /// 生产流量的冷却到期时间。与 `suspended_until` 分开：探活连败不该挡真实
+    /// 请求（见模块注释）。0/过去 = 不挡流量。
+    pub traffic_suspended_until: i64,
+    /// 真实流量配额类 429 的连续次数。与 `consecutive_failures` 分开计数 ——
+    /// 共用的话「1 次探活失败 + 1 次配额 429」就够阈值开挡。
+    pub consecutive_quota_failures: i64,
     pub first_suspended_at: i64,
     pub last_error: Option<String>,
 }
@@ -514,6 +614,14 @@ impl ProbeSuspension {
     /// 当前是否处于冷却期（`now_ms` 之前到期的都不算）。
     pub fn is_suspended(&self, now_ms: i64) -> bool {
         self.suspended_until > now_ms
+    }
+
+    /// 是否应当跳过该 (账户, 模型) 的**真实流量**。
+    ///
+    /// 只看 `traffic_suspended_until` —— 由 `note_failure(.., Quota)` 写，
+    /// 探活失败从不写。给 UI 用；v1 路由读的是 `is_traffic_suspended`。
+    pub fn is_traffic_suspended(&self, now_ms: i64) -> bool {
+        self.traffic_suspended_until > now_ms
     }
 
     /// 距离冷却结束还有多少秒（未暂停为 0）。
@@ -532,7 +640,8 @@ fn now_ms() -> i64 {
 /// 批量读暂停状态，供 health/角标与自动拨测剪枝用。
 pub async fn load_suspensions(pool: &sqlx::SqlitePool) -> BTreeMap<(i64, String), ProbeSuspension> {
     let rows: Vec<ProbeSuspension> = sqlx::query_as(
-        "SELECT account_id, model, consecutive_failures, suspended_until, first_suspended_at, last_error \
+        "SELECT account_id, model, consecutive_failures, suspended_until, \
+         traffic_suspended_until, consecutive_quota_failures, first_suspended_at, last_error \
          FROM model_probe_suspensions",
     )
     .fetch_all(pool)
@@ -543,7 +652,10 @@ pub async fn load_suspensions(pool: &sqlx::SqlitePool) -> BTreeMap<(i64, String)
         .collect()
 }
 
-/// 该 (账户, 模型) 当前是否被暂停自动拨测。
+/// 该 (账户, 模型) 当前是否被暂停**自动拨测**。
+///
+/// 注意与 `is_traffic_suspended` 的分工：探活侧只关心「要不要再花钱探它」，
+/// 生产流量的取舍不在这里做（见模块注释里那张两列的表）。
 pub async fn is_suspended(pool: &sqlx::SqlitePool, account_id: i64, model: &str) -> bool {
     let until: Option<i64> = sqlx::query_scalar(
         "SELECT suspended_until FROM model_probe_suspensions \
@@ -558,78 +670,177 @@ pub async fn is_suspended(pool: &sqlx::SqlitePool, account_id: i64, model: &str)
     until.unwrap_or(0) > now_ms()
 }
 
-/// 记一次失败：累加连续失败数，达到阈值即（重新）暂停 30 分钟。
+/// 该 (账户, 模型) 当前是否该跳过**真实流量**。
 ///
-/// 返回值是**本次是否正好进入/延长了暂停**，仅供调用方决定是否打日志。
-pub async fn note_failure(
+/// 与 `is_suspended` 分开读 `traffic_suspended_until`：探活连败（上游下架了
+/// 这个模型）不挡生产流量，只有真实配额 429 才挡。挡错了的后果是客户端拿到
+/// 一个毫无道理的 429 + `Retry-After: 1800`，而账户配额其实满的。
+///
+/// **查询失败按「冷却中」处理**（与 `is_suspended` 相反）。这里 fail-closed 是
+/// 有意的：查询出错意味着 0023 的列可能没建出来，此时若放行，配额冷却整个
+/// 失效 —— 已耗尽配额的账户会被反复重打，而且日志上一个错都没有。反过来
+/// 「误挡」最多让一个账户在故障期间少接点流量，代价小得多。
+/// 探活侧不这么做：那里 fail-closed 意味着一场 DB 抖动就停掉全部后台探活。
+pub async fn is_traffic_suspended(
     pool: &sqlx::SqlitePool,
     account_id: i64,
     model: &str,
-    error: Option<&str>,
 ) -> bool {
-    let now = now_ms();
-    let row: Option<(i64, i64)> = sqlx::query_as(
-        "SELECT consecutive_failures, suspended_until FROM model_probe_suspensions \
+    match sqlx::query_scalar::<_, i64>(
+        "SELECT traffic_suspended_until FROM model_probe_suspensions \
          WHERE account_id = ? AND model = ?",
     )
     .bind(account_id)
     .bind(model)
     .fetch_optional(pool)
     .await
-    .ok()
-    .flatten();
-
-    let (failures, was_until) = row.unwrap_or((0, 0));
-    let failures = failures + 1;
-
-    if failures < SUSPEND_AFTER_FAILURES {
-        // 还没到阈值：只记数，不暂停。
-        let _ = sqlx::query(
-            "INSERT INTO model_probe_suspensions \
-             (account_id, model, consecutive_failures, suspended_until, first_suspended_at, last_error) \
-             VALUES (?, ?, ?, 0, 0, ?) \
-             ON CONFLICT(account_id, model) DO UPDATE SET \
-               consecutive_failures = excluded.consecutive_failures, \
-               last_error = excluded.last_error",
-        )
-        .bind(account_id)
-        .bind(model)
-        .bind(failures)
-        .bind(error)
-        .execute(pool)
-        .await;
-        return false;
+    {
+        Ok(v) => v.unwrap_or(0) > now_ms(),
+        Err(e) => {
+            tracing::error!(
+                "🔴 读 {} | 账户 {} 的流量冷却状态失败，按冷却处理：{e}。\
+                 若 0023 迁移未生效，配额冷却将整个失效。",
+                model,
+                account_id
+            );
+            true
+        }
     }
+}
 
-    // 到阈值：暂停到 now + 30min。已在冷却中的话从**现在**重新起算（每次到期后
-    // 再失败就再 +30min，而不是叠加在旧到期时间上无限延长）。
+/// 记一次失败。返回值是**本次是否正好进入/延长了暂停**，仅供调用方决定是否打日志。
+///
+/// 两个计数器各涨各的（`consecutive_failures` / `consecutive_quota_failures`），
+/// 各自到 `SUSPEND_AFTER_FAILURES` 才武装自己那一侧 —— 计数器共用的话
+/// 「1 次探活失败 + 1 次配额 429」就能凑够阈值，单次配额 429 照样开挡。
+///
+/// 配额的 UPSERT 用 `MAX(existing, excluded)` 而不是直接覆盖：探活与真实流量
+/// 都会调它，两者可以交错。冷却只会「延长」语义，用 MAX 免得先写的一方
+/// 把后写一方的更长冷却截短（后写的 `now` 更晚，MAX 也自然偏向它）。
+/// 探活侧沿用原有的「从现在重新起算」语义 —— 那条路径历史上是单来源的，
+/// 改成 MAX 会让「冷却中又失败」不再顺延，与 0021 起的既有测试相悖。
+pub async fn note_failure(
+    pool: &sqlx::SqlitePool,
+    account_id: i64,
+    model: &str,
+    error: Option<&str>,
+    kind: FailureKind,
+) -> bool {
+    let now = now_ms();
     let until = now + SUSPEND_SECS * 1000;
-    let first_at = if was_until <= now { now } else {
-        // 还在冷却里又失败：保持首次暂停时间
-        let existing: Option<i64> = sqlx::query_scalar(
-            "SELECT first_suspended_at FROM model_probe_suspensions WHERE account_id = ? AND model = ?",
-        ).bind(account_id).bind(model).fetch_optional(pool).await.ok().flatten();
-        existing.filter(|v| *v > 0).unwrap_or(now)
-    };
-    let _ = sqlx::query(
-        "INSERT INTO model_probe_suspensions \
-         (account_id, model, consecutive_failures, suspended_until, first_suspended_at, last_error) \
-         VALUES (?, ?, ?, ?, ?, ?) \
-         ON CONFLICT(account_id, model) DO UPDATE SET \
-           consecutive_failures = excluded.consecutive_failures, \
-           suspended_until = excluded.suspended_until, \
-           first_suspended_at = excluded.first_suspended_at, \
-           last_error = excluded.last_error",
-    )
-    .bind(account_id)
-    .bind(model)
-    .bind(failures)
-    .bind(until)
-    .bind(first_at)
-    .bind(error)
-    .execute(pool)
-    .await;
-    true
+    // 两侧分开报：配额 429 会同时动两侧（探活侧也该停探），只报一个布尔值
+    // 会让调用方漏打一半日志。
+    let (mut probe_changed, mut traffic_changed) = (false, false);
+
+    match kind {
+        FailureKind::Probe => {
+            // 同样用 SQL 原子自增。探活并不总是单来源：`probe_candidate` 对一个
+            // 别名的候选是并发跑的，手动拨测队列也会与后台轮次重叠，读-改-写
+            // 丢一次计数就等于让「已下架模型」多挨一轮 300s 的真实请求 ——
+            // 而多探一轮不只是慢，是继续烧上游配额。
+            //
+            // 到期与首次暂停时间都用 CASE 就地算，不读出来在 Rust 里判断：
+            // 读-改-写必须先 SELECT 才能算 first_at，而那一步本身就有竞态。
+            //
+            // 两列流量侧的字面量 0 只出现在 INSERT 分支（无历史行，计数从 1
+            // 起，不到阈值）；`DO UPDATE SET` 里**完全不出现**流量侧两列，
+            // 所以探活失败既不能武装也不能覆盖真实配额冷却 —— 这是 0023
+            // 拆列的全部意义所在。
+            let _ = sqlx::query(
+                "INSERT INTO model_probe_suspensions \
+                 (account_id, model, consecutive_failures, suspended_until, traffic_suspended_until, consecutive_quota_failures, first_suspended_at, last_error) \
+                 VALUES (?, ?, 1, 0, 0, 0, 0, ?) \
+                 ON CONFLICT(account_id, model) DO UPDATE SET \
+                   consecutive_failures = consecutive_failures + 1, \
+                   suspended_until = CASE \
+                     WHEN consecutive_failures + 1 >= ? THEN ? \
+                     ELSE suspended_until END, \
+                   first_suspended_at = CASE \
+                     WHEN consecutive_failures + 1 >= ? AND (suspended_until <= ? OR first_suspended_at <= 0) \
+                     THEN ? ELSE MAX(first_suspended_at, ?) END, \
+                   last_error = excluded.last_error",
+            )
+            .bind(account_id)
+            .bind(model)
+            .bind(error)
+            .bind(SUSPEND_AFTER_FAILURES)
+            .bind(until)
+            .bind(SUSPEND_AFTER_FAILURES)
+            .bind(now)
+            .bind(now)
+            .bind(now)
+            .execute(pool)
+            .await;
+            // 自增后的值读回来，只为决定要不要打日志。
+            let after: Option<i64> = sqlx::query_scalar(
+                "SELECT consecutive_failures FROM model_probe_suspensions \
+                 WHERE account_id = ? AND model = ?",
+            )
+            .bind(account_id)
+            .bind(model)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten();
+            probe_changed = after.is_some_and(|n| n >= SUSPEND_AFTER_FAILURES);
+        }
+        FailureKind::Quota => {
+            // 计数用 SQL 原子自增（`col = col + 1`），不在 Rust 里读出来加一。
+            // 真实流量下同一 (账户,模型) 的并发 429 很常见：读-改-写会让两个
+            // 请求都读到 n、都写 n+1，丢一次失败，配额冷却迟迟不开挡 —— 而这
+            // 正是本函数要挡的东西。SQLite 单条 UPSERT 本身是原子的。
+            //
+            // 冷却到期时间用 CASE 表达式就地算：自增后 >= 阈值才写新到期，
+            // 否则保留原值（可能正冷着，不该被一次未到阈值的失败清掉）。
+            // INSERT 分支（无历史行）计数从 1 起，1 < 阈值，所以三列都写 0；
+            // 真的开挡发生在第二次的 CONFLICT 分支。
+            let _ = sqlx::query(
+                "INSERT INTO model_probe_suspensions \
+                 (account_id, model, consecutive_failures, suspended_until, traffic_suspended_until, consecutive_quota_failures, first_suspended_at, last_error) \
+                 VALUES (?, ?, 1, 0, 0, 1, 0, ?) \
+                 ON CONFLICT(account_id, model) DO UPDATE SET \
+                   consecutive_failures = consecutive_failures + 1, \
+                   consecutive_quota_failures = consecutive_quota_failures + 1, \
+                   suspended_until = CASE \
+                     WHEN consecutive_failures + 1 >= ? THEN ? \
+                     ELSE suspended_until END, \
+                   first_suspended_at = CASE \
+                     WHEN consecutive_failures + 1 >= ? AND (suspended_until <= ? OR first_suspended_at <= 0) \
+                     THEN ? ELSE first_suspended_at END, \
+                   traffic_suspended_until = MAX(traffic_suspended_until, \
+                     CASE WHEN consecutive_quota_failures + 1 >= ? THEN ? ELSE 0 END), \
+                   last_error = excluded.last_error",
+            )
+            .bind(account_id)
+            .bind(model)
+            .bind(error)
+            .bind(SUSPEND_AFTER_FAILURES)
+            .bind(until)
+            .bind(SUSPEND_AFTER_FAILURES)
+            .bind(now)
+            .bind(now)
+            .bind(SUSPEND_AFTER_FAILURES)
+            .bind(until)
+            .execute(pool)
+            .await;
+            // 自增后的值读回来，只为决定要不要打日志。
+            let after: Option<(i64, i64)> = sqlx::query_as(
+                "SELECT consecutive_failures, consecutive_quota_failures \
+                 FROM model_probe_suspensions WHERE account_id = ? AND model = ?",
+            )
+            .bind(account_id)
+            .bind(model)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten();
+            if let Some((pf, qf)) = after {
+                probe_changed = pf >= SUSPEND_AFTER_FAILURES;
+                traffic_changed = qf >= SUSPEND_AFTER_FAILURES;
+            }
+        }
+    }
+    probe_changed || traffic_changed
 }
 
 /// 记一次成功：清掉计数与暂停。
@@ -644,6 +855,76 @@ pub async fn clear_suspension(pool: &sqlx::SqlitePool, account_id: i64, model: &
     .bind(model)
     .execute(pool)
     .await;
+}
+
+// ---------------------------------------------------------------------------
+// 真实流量作为存活信号（被动优先）
+//
+// 后台聚合探活每 300s 跑一轮，对每个候选发真实生成请求 —— 每轮可达几十个。
+// 但「这个 (账户, 模型) 最近好不好用」这个事实，真实流量已经完整回答了：
+// 成功路径已在 `helpers::spawn_log_usage_ip` 里解除冷却，失败路径已在
+// `AggregateRouter` 的 3-confirm 里驱动迁移。这里把最近一条真实流量读出来，
+// 让后台探活在「刚被流量证实过」的候选上直接采信，不再白发请求。
+//
+// 探活保留的独有价值只剩一个：**流量到来之前先探一下**（预热/预切换）。
+// 冷门候选与新加候选仍走主动探测。
+
+/// 采信真实流量的新鲜度窗口。取 2× 默认探活间隔（300s）：刚被流量打成功的
+/// 候选至少覆盖接下来一轮探活。
+pub const TRAFFIC_FRESHNESS_MS: i64 = 10 * 60 * 1000;
+
+/// 最近一条**真实流量**（`is_test = 0`）的结果。
+#[derive(Debug, Clone)]
+pub struct TrafficSignal {
+    pub success: bool,
+    pub latency_ms: i64,
+    pub error: Option<String>,
+    /// 毫秒时间戳。
+    pub at_ms: i64,
+}
+
+impl TrafficSignal {
+    /// 该信号是否可直接采信为「候选健康」—— 不必再发探测请求。
+    ///
+    /// 只有**成功**才直接采信。流量刚失败仍要发一次主动探测：真实流量失败
+    /// 可能是瞬时 429 / 网络抖动，直接判死会让 3-confirm 误迁移。这与
+    /// `helpers::is_quota_exhausted` 区分配额类/瞬时类 429 是同一个思路。
+    pub fn usable_as_alive(&self) -> bool {
+        self.success
+    }
+}
+
+/// 该 (账户, 模型) 最近一次真实流量的结果；**在窗口内**才返回 Some。
+///
+/// 走 `idx_usage_logs_account_model (account_id, model, id)`（0014 迁移），
+/// 逐候选单行查询，随探活轮次并发执行，开销可忽略。
+/// `is_test = 1` 的拨测行一律排除 —— 那是探活自己写的，拿它当存活信号是自证。
+pub async fn recent_traffic(
+    pool: &sqlx::SqlitePool,
+    account_id: i64,
+    model: &str,
+    within_ms: i64,
+) -> Option<TrafficSignal> {
+    let cutoff = now_ms() - within_ms;
+    let row: Option<(i64, i64, Option<String>, i64)> = sqlx::query_as(
+        "SELECT success, latency_ms, error_message, timestamp FROM usage_logs \
+         WHERE account_id = ? AND model = ? AND is_test = 0 AND timestamp >= ? \
+         ORDER BY id DESC LIMIT 1",
+    )
+    .bind(account_id)
+    .bind(model)
+    .bind(cutoff)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+
+    row.map(|(success, latency_ms, error, at_ms)| TrafficSignal {
+        success: success != 0,
+        latency_ms,
+        error,
+        at_ms,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -992,6 +1273,188 @@ mod tests {
         let p = send_probe(&client, &a, "muse", Protocol::Chat).await;
 
         assert!(p.ok, "正常 2xx 必须仍然判为可用，实际：{}", p.error);
+    }
+
+    // -----------------------------------------------------------------------
+    // 真实流量存活信号
+    // -----------------------------------------------------------------------
+
+    async fn traffic_pool() -> sqlx::SqlitePool {
+        let pool = crate::db::connect_sqlite("sqlite::memory:").await.unwrap();
+        crate::db::init_db(&pool).await.unwrap();
+        pool
+    }
+
+    /// 插一条 usage_logs。`at` 是距今毫秒数（负 = 过去）。
+    async fn insert_log(
+        pool: &sqlx::SqlitePool,
+        account_id: i64,
+        model: &str,
+        success: i64,
+        is_test: i64,
+        age_ms: i64,
+    ) {
+        let ts = now_ms() - age_ms;
+        sqlx::query(
+            "INSERT INTO usage_logs (timestamp, account_id, provider_id, model, latency_ms, success, is_test) \
+             VALUES (?, ?, 'p', ?, 120, ?, ?)",
+        )
+        .bind(ts)
+        .bind(account_id)
+        .bind(model)
+        .bind(success)
+        .bind(is_test)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn recent_traffic_ignores_probe_rows() {
+        // 只有拨测记录时必须返回 None —— 拿探活自己写的行当存活信号是自证。
+        let pool = traffic_pool().await;
+        insert_log(&pool, 1, "m1", 1, 1, 0).await;
+
+        assert!(
+            recent_traffic(&pool, 1, "m1", TRAFFIC_FRESHNESS_MS)
+                .await
+                .is_none(),
+            "is_test=1 的行不能算真实流量"
+        );
+    }
+
+    #[tokio::test]
+    async fn recent_traffic_returns_fresh_success_and_respects_window() {
+        let pool = traffic_pool().await;
+        insert_log(&pool, 1, "m1", 1, 0, 1_000).await; // 1 秒前，成功
+        insert_log(&pool, 1, "stale", 1, 0, 60_000 * 60_000).await; // 远在窗口外
+
+        let fresh = recent_traffic(&pool, 1, "m1", TRAFFIC_FRESHNESS_MS)
+            .await
+            .expect("窗口内的成功流量应返回 Some");
+        assert!(fresh.success);
+        assert!(fresh.usable_as_alive());
+        assert_eq!(fresh.latency_ms, 120);
+        assert!(fresh.at_ms <= now_ms());
+
+        assert!(
+            recent_traffic(&pool, 1, "stale", TRAFFIC_FRESHNESS_MS)
+                .await
+                .is_none(),
+            "窗口外的流量不能当新鲜信号"
+        );
+        assert!(
+            recent_traffic(&pool, 1, "never-touched", TRAFFIC_FRESHNESS_MS)
+                .await
+                .is_none(),
+            "从无流量的组合应返回 None，交给主动探测"
+        );
+    }
+
+    #[tokio::test]
+    async fn recent_traffic_takes_the_newest_row() {
+        let pool = traffic_pool().await;
+        insert_log(&pool, 1, "m1", 1, 0, 5_000).await; // 早，先成功
+        insert_log(&pool, 1, "m1", 0, 0, 1_000).await; // 晚，后失败
+
+        let latest = recent_traffic(&pool, 1, "m1", TRAFFIC_FRESHNESS_MS)
+            .await
+            .unwrap();
+        assert!(!latest.success, "应取最新一条，而不是任一条");
+        assert!(
+            !latest.usable_as_alive(),
+            "流量刚失败不能直接采信为存活 —— 还要补一次主动探测区分抖动与真死"
+        );
+    }
+
+    #[tokio::test]
+    async fn traffic_window_covers_a_default_probe_round() {
+        // 回归：窗口至少要够覆盖一整轮探活间隔，否则「刚被打成功」的候选
+        // 下一轮仍会被白发一次请求，降耗就白做了。
+        assert!(TRAFFIC_FRESHNESS_MS >= 300_000);
+    }
+
+    // -----------------------------------------------------------------------
+    // 探测用量解析
+    // -----------------------------------------------------------------------
+
+    fn probe_with_body(p: Protocol, ok: bool, body: &str) -> ProtocolProbe {
+        ProtocolProbe {
+            protocol: p,
+            ok,
+            status: if ok { 200 } else { 500 },
+            error: String::new(),
+            body: body.to_string(),
+            latency_ms: 10,
+        }
+    }
+
+    #[test]
+    fn usage_parses_all_four_upstream_body_shapes() {
+        // OpenAI Chat
+        assert_eq!(
+            probe_with_body(Protocol::Chat, true, r#"{"usage":{"prompt_tokens":5,"completion_tokens":2}}"#).usage(),
+            (5, 2)
+        );
+        // Anthropic Messages
+        assert_eq!(
+            probe_with_body(Protocol::Messages, true, r#"{"usage":{"input_tokens":7,"output_tokens":3}}"#).usage(),
+            (7, 3)
+        );
+        // OpenAI Responses
+        assert_eq!(
+            probe_with_body(Protocol::Responses, true, r#"{"usage":{"input_tokens":6,"output_tokens":1}}"#).usage(),
+            (6, 1)
+        );
+        // Gemini generateContent（native 探活的体形状，没有 usage 键）
+        assert_eq!(
+            probe_with_body(Protocol::Chat, true, r#"{"usageMetadata":{"promptTokenCount":9,"candidatesTokenCount":4}}"#).usage(),
+            (9, 4)
+        );
+    }
+
+    #[test]
+    fn usage_is_zero_when_absent_or_unparseable_or_failed() {
+        // 上游没给 usage
+        assert_eq!(probe_with_body(Protocol::Chat, true, r#"{"choices":[]}"#).usage(), (0, 0));
+        // 体不是 JSON（回显时可能拿到截断的原文）
+        assert_eq!(probe_with_body(Protocol::Chat, true, "OK").usage(), (0, 0));
+        // 失败探测：错误体里没有 usage，不该被算成花费
+        assert_eq!(
+            probe_with_body(Protocol::Chat, false, r#"{"error":{"message":"boom"}}"#).usage(),
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn total_usage_sums_every_successful_protocol() {
+        // 一次 run_probe 并发探三个端点 = 三次真实生成，落账要的是合计数。
+        let out = ProbeOutcome {
+            native: false,
+            protocols: vec![
+                probe_with_body(Protocol::Chat, true, r#"{"usage":{"prompt_tokens":5,"completion_tokens":2}}"#),
+                probe_with_body(Protocol::Messages, true, r#"{"usage":{"input_tokens":5,"output_tokens":3}}"#),
+                probe_with_body(Protocol::Responses, false, r#"{"error":{"message":"nope"}}"#),
+            ],
+            supported: vec![Protocol::Chat, Protocol::Messages],
+            mismatched_config: None,
+        };
+        assert_eq!(out.total_usage(), (10, 5), "失败协议不计入");
+    }
+
+    #[test]
+    fn total_usage_of_native_provider_is_just_that_one_call() {
+        let out = ProbeOutcome {
+            native: true,
+            protocols: vec![probe_with_body(
+                Protocol::Messages,
+                true,
+                r#"{"usage":{"input_tokens":5,"output_tokens":2}}"#,
+            )],
+            supported: Vec::new(),
+            mismatched_config: None,
+        };
+        assert_eq!(out.total_usage(), (5, 2));
     }
 }
 

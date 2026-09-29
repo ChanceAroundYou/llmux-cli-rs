@@ -78,16 +78,25 @@ pub(crate) async fn persist_test_result(
     // 后台聚合探活（每 300s 一轮、近 20 个候选）不写 —— 会把真实请求淹掉，
     // 它的结果在模型卡片角标里已经能看到。
     if !matches!(source, probe::TestSource::Aggregate) {
+        // 记**真实**用量，别再写死 0：拨测是真发上游生成请求的（每协议一次，
+        // 配齐三协议就是三次），记 0 等于把这笔开销在本地账上抹掉，用户既无法
+        // 核对也无法判断拨测划不划算。上游没回 usage 时解析为 0 —— 宁可不记也
+        // 不能瞎猜，与 `ProtocolProbe::usage` 的口径一致。
+        let (input_tokens, output_tokens) = outcome
+            .map(|o| o.total_usage())
+            .unwrap_or((0, 0));
         let _ = sqlx::query(
             "INSERT INTO usage_logs \
              (timestamp, account_id, provider_id, model, input_tokens, output_tokens, \
               latency_ms, success, error_message, is_stream, is_test) \
-             VALUES (?, ?, ?, ?, 0, 0, ?, ?, ?, 0, 1)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 1)",
         )
         .bind(now_ms)
         .bind(account.id)
         .bind(&account.provider_id)
         .bind(model)
+        .bind(input_tokens)
+        .bind(output_tokens)
         .bind(latency_ms)
         .bind(if success { 1 } else { 0 })
         .bind(error)
@@ -98,10 +107,22 @@ pub(crate) async fn persist_test_result(
     // 连续失败 → 暂停自动拨测；成功 → 解除暂停。所有探测路径都经这里，
     // 所以「显式调用成功也能救回模型」是自动成立的（真实流量走 proxy，成功时
     // 另行调用 probe::clear_suspension —— 见 v1/helpers.rs）。
+    //
+    // `FailureKind::Probe`：拨测失败**不**冷却生产流量。上游把这个模型下架了
+    // （却仍留在 /v1/models），探活每轮都失败很正常，但账户配额可能好得很 ——
+    // 早前这里和真实配额 429 共用一个计数器，结果下架一个模型就把真实流量
+    // 挡 30 分钟还回 429。真实配额 429 走 v1/helpers.rs 的 note_rate_limit。
     if success {
         probe::clear_suspension(pool, account.id, model).await;
     } else {
-        let newly = probe::note_failure(pool, account.id, model, error).await;
+        let newly = probe::note_failure(
+            pool,
+            account.id,
+            model,
+            error,
+            probe::FailureKind::Probe,
+        )
+        .await;
         if newly {
             tracing::warn!(
                 "⏸️  {} | {} 连续失败，暂停自动拨测 {} 分钟",
@@ -116,7 +137,7 @@ pub(crate) async fn persist_test_result(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use llmux_core::probe::TestSource;
+    use llmux_core::probe::{ProtocolProbe, TestSource};
 
     async fn pool() -> sqlx::SqlitePool {
         let pool = llmux_core::db::connect_sqlite("sqlite::memory:").await.unwrap();
@@ -184,6 +205,93 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(results, 3);
+    }
+
+    /// 拨测行必须记**真实** token，不能写死 0 —— 拨测是真发上游生成请求的，
+    /// 记 0 等于把这笔开销在本地账上抹掉，用户既无法核对也无法判断是否值得。
+    /// 三协议全通时是三次真实生成的合计。
+    #[tokio::test]
+    async fn probe_log_rows_carry_real_token_usage() {
+        let pool = pool().await;
+        let outcome = llmux_core::probe::ProbeOutcome {
+            native: false,
+            protocols: vec![
+                ProtocolProbe {
+                    protocol: llmux_core::protocol::Protocol::Chat,
+                    ok: true,
+                    status: 200,
+                    error: String::new(),
+                    body: r#"{"usage":{"prompt_tokens":5,"completion_tokens":2}}"#.into(),
+                    latency_ms: 100,
+                },
+                ProtocolProbe {
+                    protocol: llmux_core::protocol::Protocol::Messages,
+                    ok: true,
+                    status: 200,
+                    error: String::new(),
+                    body: r#"{"usage":{"input_tokens":5,"output_tokens":3}}"#.into(),
+                    latency_ms: 120,
+                },
+                ProtocolProbe {
+                    protocol: llmux_core::protocol::Protocol::Responses,
+                    ok: false,
+                    status: 500,
+                    error: "boom".into(),
+                    body: r#"{"error":{"message":"boom"}}"#.into(),
+                    latency_ms: 90,
+                },
+            ],
+            supported: vec![
+                llmux_core::protocol::Protocol::Chat,
+                llmux_core::protocol::Protocol::Messages,
+            ],
+            mismatched_config: None,
+        };
+
+        persist_test_result(
+            &pool, &account(), "m1", true, 120, None, Some(&outcome), TestSource::Manual,
+        )
+        .await;
+
+        let (input, output): (i64, i64) = sqlx::query_as(
+            "SELECT input_tokens, output_tokens FROM usage_logs WHERE model = 'm1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((input, output), (10, 5), "应记成功协议的合计用量，失败协议不计");
+    }
+
+    /// 反向对照：上游没回 usage 时记 0，不能瞎猜。
+    #[tokio::test]
+    async fn probe_log_rows_fall_back_to_zero_without_upstream_usage() {
+        let pool = pool().await;
+        let outcome = llmux_core::probe::ProbeOutcome {
+            native: false,
+            protocols: vec![ProtocolProbe {
+                protocol: llmux_core::protocol::Protocol::Chat,
+                ok: true,
+                status: 200,
+                error: String::new(),
+                body: r#"{"choices":[]}"#.into(),
+                latency_ms: 100,
+            }],
+            supported: vec![llmux_core::protocol::Protocol::Chat],
+            mismatched_config: None,
+        };
+
+        persist_test_result(
+            &pool, &account(), "m1", true, 100, None, Some(&outcome), TestSource::Manual,
+        )
+        .await;
+
+        let (input, output): (i64, i64) = sqlx::query_as(
+            "SELECT input_tokens, output_tokens FROM usage_logs WHERE model = 'm1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((input, output), (0, 0));
     }
 
     /// 方案 A 的状态机：单次失败不停、连续失败才停、成功即解除。
@@ -267,6 +375,241 @@ mod tests {
         assert!(until > now, "到期后再失败应重新暂停");
         assert!(until <= now + llmux_core::probe::SUSPEND_SECS * 1000 + 5_000);
         assert!(first > now - 60_000, "首次暂停时间应重置为本次，而不是沿用过期值");
+    }
+
+    /// 回归：探活失败曾与真实配额 429 共用一个 `suspended_until`，于是上游
+    /// 下架某模型（仍留在 /v1/models）→ 探活连败 2 次 → **生产流量**被挡
+    /// 30 分钟，客户端拿到 429 + Retry-After:1800，而账户配额其实充足。
+    /// 探活侧冷却照旧（它正是为省掉死模型的探活请求而存在的），流量侧必须干净。
+    #[tokio::test]
+    async fn probe_failures_suspend_probing_but_not_production_traffic() {
+        let pool = pool().await;
+        let acc = account();
+        let m = "delisted-model";
+        for _ in 0..2 {
+            persist_test_result(
+                &pool,
+                &acc,
+                m,
+                false,
+                100,
+                Some("model not found"),
+                None,
+                TestSource::Aggregate,
+            )
+            .await;
+        }
+
+        // 探活侧：仍然暂停 —— 这正是它该干的事，别让死模型每轮再刷一次红点。
+        assert!(
+            llmux_core::probe::is_suspended(&pool, 7, m).await,
+            "探活连败两次后应暂停自动拨测"
+        );
+        // 流量侧：必须放行。真实流量不查探活侧那一列了。
+        assert!(
+            !crate::routes::v1::helpers::rate_limit_suspended(&pool, 7, m).await,
+            "探活失败不得冷却生产流量（账户配额可能完好）"
+        );
+    }
+
+    /// 反向回归：真配额 429 该挡的还是要挡。两侧都冷却，且互不覆盖 ——
+    /// 配额冷却不该被后来的探活失败清掉。
+    #[tokio::test]
+    async fn quota_429_cools_down_traffic_too_and_survives_later_probe_failures() {
+        let pool = pool().await;
+        let m = "ling-free";
+        for _ in 0..2 {
+            crate::routes::v1::helpers::note_rate_limit(
+                &pool,
+                7,
+                m,
+                r#"{"error":{"message":"You've used all 100 free Ling requests for today. Your quota resets at 2026-09-30T00:00:00.000Z."}}"#,
+            )
+            .await;
+        }
+        assert!(
+            crate::routes::v1::helpers::rate_limit_suspended(&pool, 7, m).await,
+            "配额耗尽必须冷却生产流量，否则每个请求都白吃一个 429"
+        );
+
+        // 探活侧同样冷却（配额真没了，再探也是白花钱），且不影响流量侧。
+        assert!(llmux_core::probe::is_suspended(&pool, 7, m).await);
+        for _ in 0..2 {
+            llmux_core::probe::note_failure(
+                &pool,
+                7,
+                m,
+                Some("upstream probe failed"),
+                llmux_core::probe::FailureKind::Probe,
+            )
+            .await;
+        }
+        assert!(
+            crate::routes::v1::helpers::rate_limit_suspended(&pool, 7, m).await,
+            "探活失败不得把已有的配额冷却清掉"
+        );
+
+        // 一次成功（真实流量）整条清掉，两侧同时放行。
+        llmux_core::probe::clear_suspension(&pool, 7, m).await;
+        assert!(!crate::routes::v1::helpers::rate_limit_suspended(&pool, 7, m).await);
+        assert!(!llmux_core::probe::is_suspended(&pool, 7, m).await);
+    }
+
+    /// 单次失败不立冷却 —— 两侧都不该因为一次偶发 429 就开始挡流量。
+    #[tokio::test]
+    async fn a_single_quota_429_does_not_start_the_traffic_cooldown() {
+        let pool = pool().await;
+        crate::routes::v1::helpers::note_rate_limit(
+            &pool,
+            7,
+            "m",
+            r#"{"error":{"message":"You have reached your 5-hour usage limit."}}"#,
+        )
+        .await;
+        assert!(
+            !crate::routes::v1::helpers::rate_limit_suspended(&pool, 7, "m").await,
+            "阈值是连续 2 次，单次不应冷却"
+        );
+    }
+
+    /// 回归：只拆冷却列而**共用计数器**时，「1 次探活失败 + 1 次配额 429」
+    /// 就能凑够阈值 —— 单次配额 429 照样开挡，要修的 bug 从计数器后门回来。
+    /// 两侧必须各数各的。
+    #[tokio::test]
+    async fn probe_and_quota_failures_count_separately() {
+        let pool = pool().await;
+        let acc = account();
+        let m = "mixed";
+
+        // 探活失败 1 次：只涨探活侧。
+        persist_test_result(&pool, &acc, m, false, 100, Some("probe err"), None, TestSource::Aggregate)
+            .await;
+
+        // 配额 429 只有 1 次 —— 配着上面那 1 次探活失败，共同计数器会到 2。
+        crate::routes::v1::helpers::note_rate_limit(
+            &pool,
+            7,
+            m,
+            r#"{"error":{"message":"You've used all 100 free Ling requests for today. Your quota resets at 2026-09-30T00:00:00.000Z."}}"#,
+        )
+        .await;
+        assert!(
+            !crate::routes::v1::helpers::rate_limit_suspended(&pool, 7, m).await,
+            "1 次配额 429 配 1 次探活失败不得开挡：探活的失败不该替配额数到阈值"
+        );
+
+        // 配额侧自己的第 2 次才开挡。
+        crate::routes::v1::helpers::note_rate_limit(
+            &pool,
+            7,
+            m,
+            r#"{"error":{"message":"You've used all 100 free Ling requests for today. Your quota resets at 2026-09-30T00:00:00.000Z."}}"#,
+        )
+        .await;
+        assert!(
+            crate::routes::v1::helpers::rate_limit_suspended(&pool, 7, m).await,
+            "连续 2 次配额 429 应开挡"
+        );
+    }
+
+    /// `is_traffic_suspended` 在**查询出错**时按「冷却中」处理（fail-closed）。
+    /// 若放行，0023 的列没建出来时配额冷却整个失效且日志无痕；误挡的代价只是
+    /// 一个账户在故障期间少接流量。探活侧相反 —— 那里的 fail-closed 会让一场
+    /// DB 抖动停掉全部后台探活。
+    #[tokio::test]
+    async fn traffic_cooldown_read_fails_closed_on_query_error() {
+        let pool = pool().await;
+        // 建一个缺列的表来模拟 schema 缺失 / DB 故障
+        let bad = llmux_core::db::connect_sqlite("sqlite::memory:").await.unwrap();
+        sqlx::query("CREATE TABLE model_probe_suspensions (account_id INTEGER, model TEXT)")
+            .execute(&bad)
+            .await
+            .unwrap();
+        assert!(
+            llmux_core::probe::is_traffic_suspended(&bad, 7, "m").await,
+            "查询出错必须按冷却处理，否则 0023 没生效时保护整个消失"
+        );
+        // 正常库上无行 = 不冷却，确认这不是「永远 true」
+        assert!(!llmux_core::probe::is_traffic_suspended(&pool, 7, "m").await);
+    }
+
+    /// 回归：计数曾是「读出来 +1 再写回」。真实流量下同一 (账户,模型) 的并发
+    /// 429 很常见，两个请求都读到 n、都写 n+1 就丢一次失败 —— 配额冷却迟迟
+    /// 不开挡，而开挡正是这个函数存在的理由。改成 SQL 原子自增后必须两个都算数。
+    #[tokio::test]
+    async fn concurrent_quota_429s_do_not_lose_a_count() {
+        let pool = pool().await;
+        let err = r#"{"error":{"message":"Daily quota exhausted. Your quota resets at 00:00."}}"#;
+        // 两条「同时」到达的配额 429
+        let (a, b) = tokio::join!(
+            crate::routes::v1::helpers::note_rate_limit(&pool, 7, "m", err),
+            crate::routes::v1::helpers::note_rate_limit(&pool, 7, "m", err),
+        );
+        let _ = (a, b);
+        assert!(
+            crate::routes::v1::helpers::rate_limit_suspended(&pool, 7, "m").await,
+            "两次并发配额 429 必须都计数并开挡，丢一次就等于白挨一个 429"
+        );
+        let n: i64 = sqlx::query_scalar(
+            "SELECT consecutive_quota_failures FROM model_probe_suspensions",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(n, 2, "计数应精确为 2（不多不少）");
+    }
+
+    /// 配额 429 也会累计**探活侧**的冷却（配额真没了，再探是白花钱），但探活
+    /// 侧只由自己的次数决定 —— 2 次配额 429 后探活侧就该停探，不必等探活也失败。
+    #[tokio::test]
+    async fn quota_failures_also_arm_the_probe_side_but_keep_counters_apart() {
+        let pool = pool().await;
+        for _ in 0..2 {
+            crate::routes::v1::helpers::note_rate_limit(
+                &pool,
+                7,
+                "m",
+                r#"{"error":{"message":"Daily quota exhausted."}}"#,
+            )
+            .await;
+        }
+        assert!(
+            llmux_core::probe::is_suspended(&pool, 7, "m").await,
+            "配额耗尽时探活侧也该停 —— 再探只是白花钱"
+        );
+        let (probe_f, quota_f): (i64, i64) = sqlx::query_as(
+            "SELECT consecutive_failures, consecutive_quota_failures FROM model_probe_suspensions",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((probe_f, quota_f), (2, 2), "两侧各自计数到 2");
+    }
+
+    /// 探活侧的计数也必须是原子的。后台探活对同一别名的候选**并发**跑，
+    /// 手动拨测队列又会与后台轮次重叠 —— 读-改-写下两个失败都读到 n、都写 n+1，
+    /// 丢一次意味着「已下架模型」在计数到阈值前还会多挨若干轮 300s 的真实
+    /// 生成请求，而那每一轮都在烧上游配额（本模块存在的理由正是省掉它）。
+    #[tokio::test]
+    async fn concurrent_probe_failures_do_not_lose_a_count() {
+        let pool = pool().await;
+        let acc = account();
+        let (a, b) = tokio::join!(
+            persist_test_result(&pool, &acc, "m", false, 100, Some("x"), None, TestSource::Aggregate),
+            persist_test_result(&pool, &acc, "m", false, 100, Some("x"), None, TestSource::Aggregate),
+        );
+        let _ = (a, b);
+        assert!(
+            llmux_core::probe::is_suspended(&pool, 7, "m").await,
+            "两次并发探活失败必须都计数并开挡"
+        );
+        let n: i64 = sqlx::query_scalar(
+            "SELECT consecutive_failures FROM model_probe_suspensions",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(n, 2, "计数应精确为 2（不多不少）");
     }
 }
 

@@ -56,6 +56,13 @@ pub struct AggregateResolution {
 // Router state machine — V-anchored with 3-confirm stabilization
 // ---------------------------------------------------------------------------
 
+/// 探活退避的**基准值**，也是退避翻倍与初始的下限。
+/// 语义是「健康时隔多久探一次」—— 别名的 `interval_secs` 若比它大，
+/// 由后台探活取两者较大者（见 `server::aggregate_probe::is_due`）。
+pub const PROBE_BACKOFF_BASE_SECS: u64 = 300;
+/// 退避翻倍的上限。
+pub const PROBE_BACKOFF_MAX_SECS: u64 = 600;
+
 #[derive(Debug, Clone)]
 pub struct AggregateEntry {
     pub active: usize,
@@ -72,7 +79,7 @@ impl Default for AggregateEntry {
             active: 0,
             pending_target: None,
             confirm_count: 0,
-            probe_backoff_secs: 300,
+            probe_backoff_secs: PROBE_BACKOFF_BASE_SECS,
             last_probe: Instant::now(),
             last_status: Vec::new(),
         }
@@ -87,6 +94,21 @@ pub struct AggregateRouter {
 impl AggregateRouter {
     pub fn get_active(&self, alias: &str) -> usize {
         self.entries.get(alias).map(|e| e.active).unwrap_or(0)
+    }
+
+    /// 该别名当前的探活退避秒数。后台探活按别名各自排期时用（见
+    /// `server::aggregate_probe`）—— 取全局最大值会让一个连续全失败的别名
+    /// 把健康的别名一起拖慢，方向正好相反。
+    pub fn get_backoff_secs(&self, alias: &str) -> u64 {
+        self.entries.get(alias).map(|e| e.probe_backoff_secs).unwrap_or(0)
+    }
+
+    /// 距上次探该别名过了多少秒；从未探过则返回一个很大的值（= 立即可探）。
+    pub fn secs_since_probe(&self, alias: &str, now: Instant) -> u64 {
+        self.entries
+            .get(alias)
+            .map(|e| now.saturating_duration_since(e.last_probe).as_secs())
+            .unwrap_or(u64::MAX / 2)
     }
 
     pub fn remove(&mut self, alias: &str) {
@@ -104,7 +126,7 @@ impl AggregateRouter {
         e.active = target;
         e.pending_target = None;
         e.confirm_count = 0;
-        e.probe_backoff_secs = 300;
+        e.probe_backoff_secs = PROBE_BACKOFF_BASE_SECS;
         e.last_probe = Instant::now();
         if target < e.last_status.len() {
             e.last_status[target] = Some(true);
@@ -159,7 +181,7 @@ impl AggregateRouter {
                 e.pending_target = None;
                 e.confirm_count = 0;
             }
-            e.probe_backoff_secs = 300;
+            e.probe_backoff_secs = PROBE_BACKOFF_BASE_SECS;
             return false;
         }
         // 命中下游候选：按同一 target 连续 3 次才切，不连续则重新计数
@@ -182,7 +204,7 @@ impl AggregateRouter {
                 if e.confirm_count >= 3 {
                     e.pending_target = None;
                     e.confirm_count = 0;
-                    e.probe_backoff_secs = (e.probe_backoff_secs * 2).min(600);
+                    e.probe_backoff_secs = (e.probe_backoff_secs * 2).min(PROBE_BACKOFF_MAX_SECS);
                 }
                 return false;
             }
@@ -212,7 +234,7 @@ impl AggregateRouter {
                 e.confirm_count = 0;
             }
             e.last_probe = Instant::now();
-            e.probe_backoff_secs = 300;
+            e.probe_backoff_secs = PROBE_BACKOFF_BASE_SECS;
             if v_prime < e.last_status.len() {
                 e.last_status[v_prime] = Some(true);
             }
@@ -226,7 +248,7 @@ impl AggregateRouter {
     /// Record that this probe round was an all-failed 3rd confirmation — double backoff.
     pub fn record_probe_all_failed_confirmed(&mut self, alias: &str, len: usize) {
         let e = self.ensure_entry(alias, len);
-        e.probe_backoff_secs = (e.probe_backoff_secs * 2).min(600);
+        e.probe_backoff_secs = (e.probe_backoff_secs * 2).min(PROBE_BACKOFF_MAX_SECS);
         e.last_probe = Instant::now();
         for v in e.last_status.iter_mut() {
             *v = Some(false);
@@ -244,7 +266,7 @@ impl AggregateRouter {
             e.active = target;
             e.pending_target = None;
             e.confirm_count = 0;
-            e.probe_backoff_secs = 300;
+            e.probe_backoff_secs = PROBE_BACKOFF_BASE_SECS;
             if target < e.last_status.len() {
                 e.last_status[target] = Some(true);
             }

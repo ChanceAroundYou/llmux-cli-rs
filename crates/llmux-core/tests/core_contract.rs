@@ -1,6 +1,6 @@
 use llmux_core::config::AppConfig;
 use llmux_core::crypto::{decrypt_api_key, encrypt_api_key, get_or_create_master_key};
-use llmux_core::db::{connect_sqlite, init_db};
+use llmux_core::db::{connect_sqlite, init_db, INIT_SQL, MIGRATION_0021};
 use llmux_core::export_import::{export_config, import_config, ConfigExport};
 use llmux_core::models::{Account, ApiKey, ModelAlias, Provider, UsageLogParams};
 use llmux_core::settings::SettingsService;
@@ -697,4 +697,96 @@ async fn discovery_prefixed_aggregate_names_resolve_back_to_the_aggregate() {
         .expect("resolve plain aggregate")
         .expect("aggregate should resolve");
     assert_eq!(agg.alias, "of");
+}
+
+/// 0023 给 `model_probe_suspensions` 加的 `traffic_suspended_until` 必须真的建出来。
+///
+/// 这一列是整个「探活失败不挡生产流量」修复的地基，而 `init_db` 用
+/// `let _ = ... .ok().flatten().unwrap_or(0)` 吞掉了所有错误 ——
+/// ALTER 要是没生效，查询会安静地退化成「永不冷却」，看起来一切正常，
+/// 配额耗尽的账户被反复打 429。只有钉住 schema 才看得见。
+#[tokio::test]
+async fn migration_0023_splits_probe_and_traffic_cooldowns() {
+    let pool = memory_db().await;
+    let cols: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_table_info('model_probe_suspensions')")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert!(
+        cols.contains(&"traffic_suspended_until".to_string()),
+        "0023 未生效：traffic_suspended_until 缺失，冷却查询会退化成永不冷却"
+    );
+}
+
+/// 上面那条测的是全新库。线上是**已存在的库**在跑升级：0021 的表里已经有行，
+/// 0023 要在不丢这些行、且不把它们误判成「流量侧已冷却」的前提下加列。
+#[tokio::test]
+async fn migration_0023_upgrades_an_existing_suspension_table_without_armoring_traffic() {
+    // 真的造一个「0021 时代」的库：先只跑 0001 + 0021，再插一行，最后跑 0023。
+    // 直接用 memory_db() 的话 0023 已经跑过了，测到的只是幂等重跑，ALTER 从没
+    // 在缺列的表上执行过 —— 那正是部署时要走的路径。
+    let pool = connect_sqlite("sqlite::memory:").await.expect("connect");
+    for stmt in INIT_SQL.split(';') {
+        let stmt = stmt.trim();
+        if !stmt.is_empty() {
+            sqlx::query(stmt).execute(&pool).await.expect("0001");
+        }
+    }
+    for stmt in MIGRATION_0021.split(';') {
+        let stmt = stmt.trim();
+        if !stmt.is_empty() {
+            sqlx::query(stmt).execute(&pool).await.expect("0021");
+        }
+    }
+    sqlx::query(
+        "INSERT INTO model_probe_suspensions \
+         (account_id, model, consecutive_failures, suspended_until, first_suspended_at, last_error) \
+         VALUES (7, 'delisted', 2, ?, ?, 'model not found')",
+    )
+    .bind(i64::MAX)
+    .bind(i64::MAX)
+    .execute(&pool)
+    .await
+    .expect("0021 时代就该能插入");
+    // 前置断言：升级前两列都确实不存在（只查一列的话，0023 只加了一半也测不出来）。
+    for col in ["traffic_suspended_until", "consecutive_quota_failures"] {
+        let before: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pragma_table_info('model_probe_suspensions') WHERE name = ?",
+        )
+        .bind(col)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(before, 0, "0021 的表不该有 {col}");
+    }
+
+    // 升级
+    init_db(&pool).await.expect("upgrade must not fail");
+
+    let (failures, traffic_until, quota_failures): (i64, i64, i64) = sqlx::query_as(
+        "SELECT consecutive_failures, traffic_suspended_until, consecutive_quota_failures \
+         FROM model_probe_suspensions",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("行必须还在");
+    assert_eq!(failures, 2, "升级不得丢原有计数");
+    assert_eq!(
+        traffic_until, 0,
+        "存量行必须落成「不挡流量」：这条暂停可能正是被探活失败写出来的"
+    );
+    assert_eq!(
+        quota_failures, 0,
+        "配额计数同样从 0 起 —— 老的 consecutive_failures 里可能混着探活失败，\
+         照搬过来会让第一次配额 429 就开挡"
+    );
+    assert!(
+        llmux_core::probe::is_suspended(&pool, 7, "delisted").await,
+        "探活侧仍应保持冷却 —— 0023 不改变原语义"
+    );
+    assert!(
+        !llmux_core::probe::is_traffic_suspended(&pool, 7, "delisted").await,
+        "存量行不得一升级就把生产流量挡掉"
+    );
 }
