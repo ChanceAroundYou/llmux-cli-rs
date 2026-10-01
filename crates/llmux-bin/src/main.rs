@@ -158,6 +158,10 @@ async fn start(port_override: Option<u16>, use_tui: bool) -> anyhow::Result<()> 
     };
     // Spawn aggregate background probe (5 min, V-anchored, 3-confirm)
     llmux_server::aggregate_probe::spawn_aggregate_probe(pool.clone(), master_key.clone(), aggregate_router.clone());
+    // Spawn periodic DB reclaim (6h, only when freelist is actually large).
+    // usage_logs rows are kept forever by design, so SQLite's file never shrinks
+    // on its own — without this it grew to 600 MiB of which 377 MiB was empty.
+    llmux_server::db_vacuum::spawn_db_vacuum(pool.clone());
     let router = app(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], effective_port));

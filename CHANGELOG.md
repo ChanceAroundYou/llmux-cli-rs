@@ -36,7 +36,39 @@
   写入各成功协议的合计值；上游没回 usage 时记 0，不瞎猜。请求日志页（`/api/stats/logs`）
   的 token 列此前就一直在渲染，现在才有非零值。用量面板口径（`is_test = 0`）不变。
 
+### Added
+
+- **定期回收 SQLite 文件里空掉的页**。`usage_logs` 的行永不删除（body 被置 NULL，
+  行与统计永久保留 —— 这是设计决定），而 SQLite 释放的页只进 freelist 等复用，
+  **文件不会自己缩**。2026-10 实测库涨到 600 MiB，其中 377 MiB 是空的。
+  全仓原本唯一的 VACUUM 在 `settings::purge_database` —— 那是「清空数据库」，连
+  accounts / api_keys / model_aliases 一起删，所以**没有一条不丢数据的回收路径**。
+
+  新增 `db_vacuum::spawn_db_vacuum`：每 6h 检查一次，freelist ≥ 32 MiB 才跑
+  `VACUUM` + `wal_checkpoint(TRUNCATE)`，低于阈值直接跳过、闲时零开销。
+  **不需要停容器** —— WAL 模式下 SQLite 自己用锁保证独占（实测 2.8s，容器零重启，
+  期间 `ag`/`ok`/`of` 三个别名真实流量全程 200）。不挂到探活 tick 上：VACUUM
+  重写整个库、随库增大而变长，混在一起会让一次慢回收推迟整轮探活。
+
+  VACUUM 后**量文件大小看不出效果** —— 释放的页先进 WAL 了。必须紧跟
+  `wal_checkpoint(TRUNCATE)` 才落盘；判断成功要看 `PRAGMA freelist_count`。
+
+- **`LOG_RETAIN_DAYS` 的实际默认值此前记错了**。compose 里注入的是 **30**，代码
+  默认才是 7；CLAUDE.md 两处都写成 7。按 7 去做「日志占太多」的判断会得出错误结论。
+  已更正，并注明日志走 NAS（6.4T 大盘）**不占路由器 overlay**。
+
 ### Fixed
+
+- **成功率统计不再全表扫 `usage_logs`**。`/api/health` 与 `/api/dashboard` 的
+  `GROUP BY account_id` 此前**没有时间窗**，而这张表只涨不跌（10.7 万行 / 103 MiB）。
+  两个查询都在首页关键路径上，等于每次打开都付一次全表扫描。
+  现改为**近 30 天**窗口；窗口内零流量的账户回退全历史（走 `account_id` 索引），
+  而不是报 `unknown` —— 后者会让「上个月才配好、这个月没用」的账户显示成无数据。
+  口径取 30 天而非全历史：全历史会把早已修好的问题永久稀释进去，也让新账户的
+  样本被老数据压平。
+
+  两条查询此前是**逐字复制的副本**，各自漂移过一次（`lastSuccess` → `successCount`
+  那次只改了一处）。现抽成 `health::fetch_health_rows` 共用。
 
 - **探活连败不再连带冷却生产流量**。`model_probe_suspensions` 此前只有一列
   `suspended_until`，被**探活失败**和**真实配额 429** 共用。后果：上游把某模型下架

@@ -1,5 +1,6 @@
 pub mod aggregate_probe;
 pub mod app;
+pub mod db_vacuum;
 pub mod error;
 pub mod middleware;
 pub mod routes;

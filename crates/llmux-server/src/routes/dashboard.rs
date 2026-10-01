@@ -132,27 +132,20 @@ async fn fetch_aggregate_aliases(state: &AppState) -> anyhow::Result<Value> {
 }
 
 async fn fetch_health(state: &AppState) -> anyhow::Result<Value> {
-    // Reuse the optimized single-query health (mirrors health::get_health_status).
-    let rows = sqlx::query(
-        "SELECT a.id, a.alias, COALESCE(s.total, 0) AS total, COALESCE(s.success, 0) AS success \
-         FROM accounts a LEFT JOIN (SELECT account_id, COUNT(*) AS total, SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) AS success FROM usage_logs GROUP BY account_id) s ON s.account_id = a.id ORDER BY a.id",
-    )
-    .fetch_all(&state.pool)
-    .await?;
+    // 与 /api/health 共用同一条查询（此前是逐字复制的副本，两边各自漂移过一次）。
+    let rows = super::health::fetch_health_rows(&state.pool).await?;
     let out: Vec<Value> = rows
         .iter()
         .map(|r| {
-            let id: i64 = r.try_get("id").unwrap_or_default();
-            let alias: String = r.try_get("alias").unwrap_or_default();
-            let total: i64 = r.try_get("total").unwrap_or_default();
-            let success: i64 = r.try_get("success").unwrap_or_default();
-            let status = if total > 0 {
-                let rate = success as f64 / total as f64;
-                if rate > 0.9 { "healthy" } else if rate > 0.5 { "degraded" } else { "down" }
-            } else { "unknown" };
-            // `successCount` 而非 `lastSuccess`：装的是成功**次数**，不是时间戳。
-            // 与 health.rs:60 同源同因，改名理由见那里的注释。
-            json!({"id": format!("acc_{id}"), "name": alias, "status": status, "successCount": success, "totalChecks": total})
+            json!({
+                "id": format!("acc_{}", r.id),
+                "name": r.alias,
+                "status": super::health::status_for(r.total, r.success),
+                // `successCount` 而非 `lastSuccess`：装的是成功**次数**，不是时间戳。
+                // 改名理由见 health.rs 里同名字段的注释。
+                "successCount": r.success,
+                "totalChecks": r.total,
+            })
         })
         .collect();
     Ok(Value::Array(out))
