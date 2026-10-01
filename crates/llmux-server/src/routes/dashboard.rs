@@ -150,7 +150,9 @@ async fn fetch_health(state: &AppState) -> anyhow::Result<Value> {
                 let rate = success as f64 / total as f64;
                 if rate > 0.9 { "healthy" } else if rate > 0.5 { "degraded" } else { "down" }
             } else { "unknown" };
-            json!({"id": format!("acc_{id}"), "name": alias, "status": status, "lastSuccess": success, "totalChecks": total})
+            // `successCount` 而非 `lastSuccess`：装的是成功**次数**，不是时间戳。
+            // 与 health.rs:60 同源同因，改名理由见那里的注释。
+            json!({"id": format!("acc_{id}"), "name": alias, "status": status, "successCount": success, "totalChecks": total})
         })
         .collect();
     Ok(Value::Array(out))

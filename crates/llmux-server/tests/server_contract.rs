@@ -931,3 +931,63 @@ async fn admin_credentials_change_requires_current_password_and_takes_effect() {
     assert_eq!(try_login("admin", "admin").await, StatusCode::UNAUTHORIZED, "旧凭据应失效");
     assert_eq!(try_login("ops", "newpass").await, StatusCode::OK, "新凭据应可用");
 }
+
+/// `/api/health` 的字段名契约。
+///
+/// 这个字段曾经叫 `lastSuccess`，装的却是成功**次数**而非时间戳 —— 看到
+/// `free: lastSuccess 40` 的人（包括我自己）必然读成「40 秒前刚成功过」。
+/// 现在叫 `successCount`。改名本身没有功能风险，**风险在改名之后**：将来
+/// 有人再改回去、或 UI 那边开始读它，两边对不上且没有任何测试会红。
+///
+/// 所以这个测试的职责不是「验证数值对」，而是**把字段名钉死**，外加守住
+/// 「绝不能再出现一个看起来像时间戳的计数字段」。
+#[tokio::test]
+async fn health_reports_success_count_under_a_non_timestamp_name() {
+    let state = llmux_server::test_state().await;
+    // 塞一个账户 + 3 条 usage_logs（2 成功 1 失败）→ 成功率 66.7% = degraded。
+    sqlx::query(
+        "INSERT INTO accounts (id, alias, provider_id, api_key, is_active) \
+         VALUES (9001, 'probe-acct', 'test', 'k', 1)",
+    )
+    .execute(&state.pool)
+    .await
+    .unwrap();
+    for (ok, is_test) in [(1, 0), (1, 0), (0, 1)] {
+        sqlx::query(
+            "INSERT INTO usage_logs (timestamp, account_id, provider_id, model, \
+               input_tokens, output_tokens, latency_ms, success, is_test) \
+             VALUES (?, 9001, 'test', 'm', 1, 1, 10, ?, ?)",
+        )
+        .bind(1_700_000_000_000i64)
+        .bind(ok)
+        .bind(is_test)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    }
+
+    let app = llmux_server::app(state);
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/api/health")
+        .body(Body::empty())
+        .unwrap();
+    let resp = llmux_server::test_request(app, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+    let rows: Value = serde_json::from_slice(&body).unwrap();
+    let row = rows
+        .as_array()
+        .and_then(|a| a.iter().find(|r| r["id"] == "acc_9001"))
+        .unwrap_or_else(|| panic!("刚插入的账户应出现在 health 结果里，实际: {rows}"));
+
+    assert_eq!(row["successCount"], json!(2), "2 条成功");
+    assert_eq!(row["totalChecks"], json!(3), "3 条拨测+流量都计入");
+    assert_eq!(row["status"], json!("degraded"), "66.7% 落在 degraded 档");
+    assert!(
+        row.get("lastSuccess").is_none(),
+        "lastSuccess 必须已被 successCount 取代 —— 它装的是次数不是时间戳，\
+         名字会让每个读它的人误读一遍"
+    );
+}

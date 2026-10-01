@@ -89,6 +89,15 @@
   一个已知没配额的账户。现已补上，跳过时同样记 `note_candidate_failure` 并走
   「cooling down」→ 429 的既有出口。
 
+- **`/api/health` 的 `lastSuccess` 字段名误导**。它装的其实是成功**次数**
+  （`SUM(success = 1)`），不是时间戳 —— 看到 `free: lastSuccess 40` 的人必然读成
+  「40 秒前刚成功过」（本次排查就被坑了一次，据此误判 `free` 处于 down）。
+  现更名为 `successCount`，`/api/dashboard` 内同源的 `fetch_health` 一并改。
+  UI 此前不读该字段，所以没有可见故障；但它是个等着坑下一个人的陷阱。
+  改名而非补一个真时间戳：需要「距今多久」的地方（模型健康、请求日志）已从
+  `usage_logs.timestamp` 单独查，该接口的职责就是给出总调用量与成功量供算成功率。
+  ⚠️ **响应字段名变更**：若有外部脚本消费 `/api/health`，需同步改字段名。
+
 - **重复的 `finish_reason: "tool_calls"` 终止事件导致客户端误报**。客户端报
   `Model provider returned tool_calls without a complete id and function name`，
   但**它从未收到缺 id/name 的调用**——真凶是上游把一条流用**两次**

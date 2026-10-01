@@ -57,7 +57,14 @@ pub async fn get_health_status(Extension(state): Extension<AppState>) -> Respons
                 "id": format!("acc_{acc_id}"),
                 "name": alias,
                 "status": status,
-                "lastSuccess": success_count,
+                // 曾经叫 `lastSuccess`，但装的其实是成功**次数**，不是时间戳。
+                // 读的人一定会误读成「最后一次成功距今多久」（本轮就被坑过一次：
+                // 看到 free 的 40 以为是 40 秒前刚成功过）。UI 当时没读这个字段，
+                // 所以没造成可见故障，但它是个等着坑下一个人的陷阱。
+                // 改名而不是补一个真时间戳：真正需要「距今多久」的地方
+                // （模型健康、请求日志）已经从 usage_logs 的 timestamp 单独查了，
+                // 这个接口的职责就是给出总调用量与成功量，供算成功率。
+                "successCount": success_count,
                 "totalChecks": total,
             })
         })
