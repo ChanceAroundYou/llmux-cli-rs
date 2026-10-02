@@ -54,7 +54,21 @@ async fn main() -> anyhow::Result<()> {
         std::fs::create_dir_all(&log_dir).ok();
         // Rolling daily appender writes `<log_dir>/llmux.log.YYYY-MM-DD`; survives
         // container recreate (log dir is a persistent mount) and never grows unbounded.
-        let file_writer = tracing_appender::rolling::daily(&log_dir, "llmux.log");
+        //
+        // `non_blocking()` is load-bearing, not decoration: LOG_DIR is a cifs mount
+        // to the NAS, and the appender's writer is **unbuffered** — every log line
+        // was a synchronous SMB round-trip (~2.5ms measured) on whatever thread
+        // emitted it, including request handlers. Non-blocking moves those writes
+        // to a dedicated thread behind a bounded channel.
+        //
+        // The `guard` MUST outlive the subscriber: dropping it flushes and stops
+        // the worker thread, so letting it drop at end of this block would silently
+        // discard the last buffered lines on every start. Leaking it is the
+        // documented pattern (and correct — the process is exiting anyway).
+        let (file_writer, guard) = tracing_appender::non_blocking(
+            tracing_appender::rolling::daily(&log_dir, "llmux.log"),
+        );
+        let _guard = Box::leak(Box::new(guard));
 
         use tracing_subscriber::layer::SubscriberExt;
         use tracing_subscriber::util::SubscriberInitExt;

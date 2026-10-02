@@ -35,6 +35,9 @@ pub fn spawn_db_vacuum(pool: sqlx::SqlitePool) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(VACUUM_INTERVAL_SECS)).await;
+            // 删过期行放在回收**之前**：先让数据走，freelist 才有东西可收。
+            // 顺序反了的话，这轮刚删出来的页要等 6 小时后下一轮才被 VACUUM。
+            crate::routes::v1::helpers::prune_old_rows(&pool).await;
             if let Err(e) = vacuum_if_needed(&pool).await {
                 // 回收失败不影响服务：文件大一点而已，下一轮再试。
                 tracing::warn!("🧹 定期 VACUUM 失败（下一轮重试）: {e}");

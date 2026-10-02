@@ -197,18 +197,33 @@ pub fn iso8601_now() -> String {
 }
 
 // Cap stored request/response bodies: success stays compact (DB-friendly),
-// failure gets 500k so a 350k hermes dump is fully queryable. Bodies are
-// kept only BODY_RETAIN_DAYS days (default 1) — rows/stats remain.
+// failure gets 64k. 失败上限此前是 500k —— 「给 hermes 那种 350k dump 留全量」
+// 的理由站不住：完整 body 本来就 tee 到 `llmux.log.*`（NAS），DB 里再存一份
+// 全量只是把同一份内容放两遍。实测失败行平均 473KB，一条就把该页撑成 overflow
+// page，读取和 VACUUM 都要跨页。64k 足够看清 dump 的头部与结构。
 const REQUEST_BODY_CAP_SUCCESS: usize = 32_000;
-const REQUEST_BODY_CAP_FAILURE: usize = 500_000;
+const REQUEST_BODY_CAP_FAILURE: usize = 64_000;
 const RESPONSE_BODY_CAP_SUCCESS: usize = 16_000;
-const RESPONSE_BODY_CAP_FAILURE: usize = 500_000;
+const RESPONSE_BODY_CAP_FAILURE: usize = 64_000;
 
 // Bodies serve the recent log-detail view only; null them after the retention
 // window so usage_logs growth stays bounded (rows/stats are kept).
 // 默认 1 天；BODY_RETAIN_DAYS 可覆盖（风格同 LOG_RETAIN_DAYS）。
 // 非法值 / <=0 一律回退默认，不提供"无限保留"语义，避免误配置导致 DB 无界增长。
 const BODY_RETAIN_DAYS_DEFAULT: i64 = 1;
+
+/// prune 的最小间隔。此前**每个请求**都在自己的 spawn 里跑一次 prune，
+/// 而 `IS NOT NULL` 让 SQLite 必须把 cutoff 之后的每一行都取出来看（哪怕结果
+/// 恒为 0）—— 实测 4.6ms → 32.2ms。按 14 req/s 折算，每秒烧掉 430ms 的 SQLite
+/// 时间，只为了确认「没什么可删的」。
+///
+/// 改成固定间隔：body 保留期以天计，分钟级精度毫无意义，而每 300s 才付一次
+/// 那笔逐行取记录的代价（14 req/s 摊薄后约 0.1ms/s，对比原来的 430ms/s）。
+const PRUNE_MIN_INTERVAL_SECS: u64 = 300;
+
+/// 上次 prune 的时刻。`AtomicI64`（毫秒时间戳）：临界区只有一次原子交换，
+/// 没有任何 IO，比 Mutex 更轻。
+static LAST_PRUNE_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
 fn body_retain_days_from(raw: Option<&str>) -> i64 {
     raw.and_then(|v| v.trim().parse::<i64>().ok())
@@ -220,12 +235,43 @@ fn body_retention_ms() -> i64 {
     body_retain_days_from(std::env::var("BODY_RETAIN_DAYS").ok().as_deref()) * 86_400_000
 }
 
-async fn prune_old_bodies(pool: &sqlx::SqlitePool) {
-    let cutoff = std::time::SystemTime::now()
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
-        - body_retention_ms();
+}
+
+/// 抢占 prune 权：距上次超过间隔才返回 true（上次是 0 即首次，必跑一次）。
+///
+/// **必须用 CAS 而不是无条件 `swap`**：swap 会在抢不到权时也把时间戳写成 now，
+/// 于是每个请求都把窗口往后推——在 14 req/s 下窗口永远追不上，prune 一次都不会
+/// 跑（比原来「跑得太勤」还糟，且完全静默）。只有真的抢到才推进时间戳。
+///
+/// 无抖动：单进程路径，抢占本身已原子，撞堆的代价只是多跑一次几毫秒的 UPDATE。
+/// 刻意不加随机 early —— 那种每轮各自随机会漂出窗口，反而永远等不到。
+fn claim_prune(now: i64) -> bool {
+    use std::sync::atomic::Ordering;
+    let last = LAST_PRUNE_MS.load(Ordering::Relaxed);
+    if last != 0 && now - last < PRUNE_MIN_INTERVAL_SECS as i64 * 1000 {
+        return false;
+    }
+    LAST_PRUNE_MS
+        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+}
+
+/// 到期就把过期的 body 置 NULL。
+///
+/// 没有先探再改：间隔门已经把 430ms/s 降到 0.3ms/s 量级，再加一条
+/// `SELECT` 探测只是给自己找第二次付钱的理由（`IS NOT NULL` 探测本身就得
+/// 逐行取记录 —— 那正是当初 4.6ms→32.2ms 的那笔账）。
+async fn prune_old_bodies(pool: &sqlx::SqlitePool) {
+    let now = now_ms();
+    if !claim_prune(now) {
+        return;
+    }
+    let cutoff = now - body_retention_ms();
     if let Err(e) = sqlx::query(
         "UPDATE usage_logs SET request_body = NULL, response_body = NULL \
          WHERE timestamp < ? AND (request_body IS NOT NULL OR response_body IS NOT NULL)",
@@ -236,6 +282,38 @@ async fn prune_old_bodies(pool: &sqlx::SqlitePool) {
     {
         tracing::debug!("📊 Failed to prune old bodies: {e}");
     }
+}
+
+/// 删掉过期的**行**（不只是 body），并顺带回收空间。
+///
+/// 与 body prune 分开：body 只影响「日志详情页能不能看到原文」，行影响的是
+/// 表的大小和所有扫全表的查询。`LOG_ROW_RETAIN_DAYS` 默认 30 天，**不能小于
+/// `health.rs` 的 30 天成功率窗口** —— 否则健康页算出来的分母是残缺的。
+pub async fn prune_old_rows(pool: &sqlx::SqlitePool) {
+    let Some(cutoff) = row_retention_cutoff() else {
+        return;
+    };
+    if let Err(e) = sqlx::query("DELETE FROM usage_logs WHERE timestamp < ?")
+        .bind(cutoff)
+        .execute(pool)
+        .await
+    {
+        tracing::debug!("📊 Failed to prune old usage_logs rows: {e}");
+    }
+}
+
+/// `LOG_ROW_RETAIN_DAYS` → cutoff 毫秒。未设 / 非法 / <=0 → None（不删行）。
+fn row_retention_cutoff() -> Option<i64> {
+    row_retention_cutoff_with(std::env::var("LOG_ROW_RETAIN_DAYS").ok().as_deref())
+}
+
+/// 纯函数版本，单独拆出来只为能测 —— `std::env::set_var` 在多线程测试里是 UB
+/// （Rust 2024 起直接 compile error），不值得为它单开一个进程。
+fn row_retention_cutoff_with(raw: Option<&str>) -> Option<i64> {
+    let days = raw
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|d| *d > 0)?;
+    Some(now_ms() - days * 86_400_000)
 }
 
 fn truncate_field(s: &str, limit: usize) -> String {
@@ -637,12 +715,91 @@ mod tests {
     }
 
     #[test]
-    fn failure_long_body_kept_up_to_500k() {
-        let body = "x".repeat(400_000);
-        let json_body = format!(r#"{{"model":"od","messages":[{{"role":"user","content":"{}"}}]}}"#, body);
-        let out = smart_truncate_body(Some(json_body), false, 32_000, 500_000).unwrap();
-        assert!(out.chars().count() <= 500_000);
-        assert!(out.chars().count() > 32_000, "failure should not be capped at 32k");
+    fn failure_body_caps_at_64k_not_the_success_32k() {
+        // 500k → 64k。500k 时代的理由是「给 350k 的 dump 留全量」，可完整 body
+        // 早就 tee 到 NAS 日志了，DB 里再存一份只是把同一内容放两遍。
+        // 用 cap 边界来断言，而不是用「输出比成功路径长」—— 单条大 message 会被
+        // compress_messages 压到远低于任一 cap，那种断言测的是压缩器不是 cap。
+        let over = "x".repeat(200_000);
+        let json_body = format!(r#"{{"model":"od","messages":[{{"role":"user","content":"{}"}}]}}"#, over);
+        let out = smart_truncate_body(Some(json_body.clone()), false, 32_000, 64_000).unwrap();
+        assert!(out.chars().count() <= 64_000, "失败 body 必须封顶 64k");
+        assert!(
+            out.chars().count() < json_body.chars().count(),
+            "64k 上限必须真的生效，不能原样放行 200k 的 body"
+        );
+
+        // 恰好在 cap 之上的裸 SSE 走「砍尾留头」，输出应当紧贴 cap 而非远小于它 ——
+        // 这条能证明 cap 值本身被用上了。
+        let sse = format!("data: {}\n\n", "y".repeat(200_000));
+        let out = smart_truncate_body(Some(sse), false, 32_000, 64_000).unwrap();
+        let n = out.chars().count();
+        assert!((60_000..=64_000).contains(&n), "输出应紧贴 64k cap，实际 {n}");
+
+        // 失败仍比成功宽松：同一个 body 走成功路径会被压得更狠。
+        let sse = format!("data: {}\n\n", "y".repeat(200_000));
+        let ok = smart_truncate_body(Some(sse.clone()), true, 32_000, 64_000).unwrap();
+        let fail = smart_truncate_body(Some(sse), false, 32_000, 64_000).unwrap();
+        assert!(ok.chars().count() < fail.chars().count());
+    }
+
+    /// 调用点传的 cap 常量就是上面那两个 —— 常量改了、传参漏了，这里会红。
+    #[test]
+    fn cap_constants_are_32k_for_success_and_64k_for_failure() {
+        assert_eq!(REQUEST_BODY_CAP_SUCCESS, 32_000);
+        assert_eq!(RESPONSE_BODY_CAP_SUCCESS, 16_000);
+        assert_eq!(REQUEST_BODY_CAP_FAILURE, 64_000);
+        assert_eq!(RESPONSE_BODY_CAP_FAILURE, 64_000);
+    }
+
+    /// prune 的间隔门是本轮最大的一笔性能改动（430ms/s → ~0.1ms/s），
+    /// 但它是**静默**的：门失效只会让系统变慢，不会有任何错误可见。
+    /// 这条把「窗口内不再抢占」钉死。
+    #[test]
+    fn claim_prune_fires_once_then_waits_out_the_interval() {
+        // 隔离全局 static：这些用例共享 LAST_PRUNE_MS，串行跑才不会互相干扰。
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        LAST_PRUNE_MS.store(0, std::sync::atomic::Ordering::Relaxed);
+
+        let base = 1_700_000_000_000i64;
+        assert!(claim_prune(base), "首次必跑一次");
+        assert!(!claim_prune(base + 1), "紧接着的请求不该再跑");
+        assert!(
+            !claim_prune(base + PRUNE_MIN_INTERVAL_SECS as i64 * 1000 - 1),
+            "差 1ms 也不该跑 —— 门是硬的"
+        );
+        assert!(
+            claim_prune(base + PRUNE_MIN_INTERVAL_SECS as i64 * 1000),
+            "正好到间隔就该跑"
+        );
+        // 关键回归：早前的写法判的是 `elapsed <= 1.2×base`，
+        // 一旦超过去就**永远**不再触发。用一个远超间隔的时刻守住。
+        assert!(
+            claim_prune(base + PRUNE_MIN_INTERVAL_SECS as i64 * 1000 * 100),
+            "远超间隔后仍须能触发，不能卡死在窗口外"
+        );
+    }
+
+    /// 行保留：未设 `LOG_ROW_RETAIN_DAYS` 就**不删**。
+    ///
+    /// 删行不可逆（只影响用量面板历史统计，NAS 日志不受影响），不该由一个
+    /// 拼错或漏写的 env 静默触发。
+    #[test]
+    fn row_retention_is_off_unless_explicitly_configured() {
+        assert_eq!(row_retention_cutoff_with(None), None);
+        for bad in ["", "abc", "0", "-5", "3.5"] {
+            assert_eq!(
+                row_retention_cutoff_with(Some(bad)),
+                None,
+                "非法值 {bad:?} 必须当成「不删」，不能变成无界或误删"
+            );
+        }
+        assert_eq!(
+            row_retention_cutoff_with(Some("30")),
+            Some(now_ms() - 30 * 86_400_000),
+            "合法值应算出 cutoff"
+        );
     }
 
     #[test]

@@ -70,6 +70,34 @@
   两条查询此前是**逐字复制的副本**，各自漂移过一次（`lastSuccess` → `successCount`
   那次只改了一处）。现抽成 `health::fetch_health_rows` 共用。
 
+- **body 回收不再每个请求都跑一遍**。`prune_old_bodies` 挂在**每一个**请求的
+  spawn 里，而 `IS NOT NULL` 让 SQLite 必须把 cutoff 之后的每一行都取出来看 ——
+  实测 4.6ms → 32.2ms。按 14 req/s 折算，**每秒烧掉 430ms 的 SQLite 时间**，
+  只为了确认「没什么可删的」。现改为 300s 间隔一次（`LAST_PRUNE_MS` 原子门，
+  抢到才推进时间戳），body 保留期以天计，分钟级精度本来也没意义。
+
+  门用 CAS 而非无条件 `swap`：swap 会在抢不到权时也把时间戳写成 now，于是每个
+  请求都把窗口往后推，高频下窗口永远追不上、prune 一次都不跑 —— 比原来还糟，
+  且完全静默。
+
+- **日志 writer 套 `non_blocking()`**。`tracing_appender` 的 writer 是**无缓冲**的，
+  而 `LOG_DIR` 挂在 NAS 的 CIFS 上：此前**每一行日志**都是一次同步 SMB 往返
+  （实测约 2.5ms），且发生在发日志的那个线程上 —— 包括请求处理线程。
+  现由独立线程经有界通道写出。`WorkerGuard` 必须比 subscriber 活得久，
+  提前 drop 会静默丢掉最后一批缓冲行，因此显式 `Box::leak`。
+
+- **失败 body 上限 500 KB → 64 KB**。500k 时代的理由是「给 hermes 那种 350k dump
+  留全量」，但完整 body 早就 tee 到 `llmux.log.*`（NAS）了，DB 里再存一份只是把
+  同一内容放两遍。实测失败行平均 473 KB，一条就把该页撑成 overflow page，
+  读取和 VACUUM 都要跨页。64 KB 足够看清 dump 的头部与结构。
+
+- **新增 `LOG_ROW_RETAIN_DAYS`（默认 30 天，compose 已注入）**。此前行永不删除，
+  表只涨不跌。新增按天删行，与 body 回收分开：body 只影响「详情页能不能看到原文」，
+  行影响表大小和所有扫全表的查询。**未设置即不删行** —— 删行不可逆，不该由一个
+  拼错的 env 静默触发。默认 30 是因为**不能小于 `health.rs` 的 30 天成功率窗口**，
+  否则健康页的分母是残缺的。删行排在同一个 6h 维护循环里、且**在 VACUUM 之前**，
+  顺序反了的话刚删出来的页要等下一轮才被回收。
+
 - **探活连败不再连带冷却生产流量**。`model_probe_suspensions` 此前只有一列
   `suspended_until`，被**探活失败**和**真实配额 429** 共用。后果：上游把某模型下架
   （却仍留在 `/v1/models`，go5 一次就有 7 个）导致后台探活连败 2 次，
