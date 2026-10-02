@@ -790,3 +790,109 @@ async fn migration_0023_upgrades_an_existing_suspension_table_without_armoring_t
         "存量行不得一升级就把生产流量挡掉"
     );
 }
+
+/// 0024：删掉 5 个从未被任何查询用上的索引，补一个真正需要的。
+///
+/// 这条钉的是**索引集合本身**。索引删错了不会报错 —— 只是某天某个页面突然变慢，
+/// 而没人知道是哪次迁移干的。把「活着的索引」整个列出来断言，删错就立刻红。
+#[tokio::test]
+async fn migration_0024_prunes_dead_indexes_and_adds_is_test_timestamp() {
+    let pool = memory_db().await;
+
+    let indexes: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'usage_logs' \
+           AND name NOT LIKE 'sqlite_autoindex_%' ORDER BY name",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("list usage_logs indexes");
+
+    // 5 个死索引：逐条 EXPLAIN 过真实查询，从未出现在任何一条计划里。
+    // 每删一行就是每 INSERT 少维护一棵 B 树（实测 5 万行/小时）。
+    for dead in [
+        "idx_usage_logs_model",
+        "idx_usage_logs_timestamp_model",
+        "idx_usage_logs_timestamp_provider",
+        "idx_usage_logs_timestamp",
+        "idx_usage_logs_timestamp_success",
+        // 被新索引顶替：单列 is_test 排不了序，首页查询要另走临时 B 树。
+        "idx_usage_logs_is_test",
+    ] {
+        assert!(
+            !indexes.iter().any(|i| i == dead),
+            "{dead} 应该已被 0024 删掉"
+        );
+    }
+
+    // 4 个有真实查询在用的，一个都不能少 —— 少一个就是线上页面变慢。
+    for alive in [
+        "idx_usage_logs_account_id",
+        "idx_usage_logs_account_model",
+        "idx_usage_logs_account_timestamp",
+        "idx_usage_logs_provider_id",
+        "idx_usage_logs_is_test_timestamp",
+    ] {
+        assert!(
+            indexes.iter().any(|i| i == alive),
+            "{alive} 必须保留（0024 的迁移文件里写着理由）"
+        );
+    }
+
+    // 剩下的索引总数：少了就是有人又加了没测过的索引，多了就是又复活了死索引。
+    assert_eq!(
+        indexes.len(),
+        5,
+        "usage_logs 应当只剩 5 个索引，实际：{indexes:?}"
+    );
+}
+
+/// 新索引必须真能让首页查询免掉临时 B 树排序，否则这次优化等于没做。
+///
+/// 这条比「索引存在」更重要：单列 `is_test` 索引也能定位到行，但排不了序，
+/// 排序被甩给临时 B 树 —— 10 万行实测 54ms 里的大头就在那。索引里带上
+/// `timestamp` 之后降到 0.14ms。要钉住的是**「timestamp 在索引里」**，
+/// 不是列顺序：`(timestamp DESC, is_test)` 实测一样快。
+///
+/// 数据量刻意写成 3000 行：内存库不带统计信息，行数太少时优化器会直接全表扫，
+/// 临时 B 树根本不出现，这个用例就变成永远绿的空断言。
+#[tokio::test]
+async fn migration_0024_makes_the_dashboard_query_a_covering_ordered_scan() {
+    let pool = memory_db().await;
+    for i in 0..3000i64 {
+        sqlx::query(
+            "INSERT INTO usage_logs (timestamp, account_id, provider_id, model, \
+               input_tokens, output_tokens, latency_ms, success, is_test) \
+             VALUES (?, 1, 'p', 'm', 1, 1, 5, 1, 0)",
+        )
+        .bind(1_700_000_000_000i64 + i)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    // 这就是 /api/dashboard 每次打开首页跑的那条 WHERE/ORDER BY。
+    // EXPLAIN QUERY PLAN 返回 (id, parent, notused, detail) 多行，只能顶层执行。
+    let rows = sqlx::query(
+        "EXPLAIN QUERY PLAN \
+         SELECT timestamp, model, success FROM usage_logs WHERE is_test = 0 \
+         ORDER BY timestamp DESC LIMIT 100",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("explain dashboard query");
+    use sqlx::Row;
+    let plan: Vec<String> = rows
+        .iter()
+        .map(|r| r.try_get::<String, _>("detail").unwrap_or_default())
+        .collect();
+    let plan = plan.join(" | ");
+
+    assert!(
+        !plan.contains("USE TEMP B-TREE"),
+        "首页查询仍在临时 B 树上排序，0024 没生效：{plan}"
+    );
+    assert!(
+        plan.contains("idx_usage_logs_is_test_timestamp"),
+        "首页查询没走新加的索引：{plan}"
+    );
+}

@@ -121,8 +121,12 @@ mod tests {
         assert_eq!(reclaim_mib(377 * 256, 4096), 377); // 生产实测：377 MiB
     }
 
-    /// 空闲页为 0 的库：整个函数必须**一次 SQL 都不多跑**，直接返回 false。
+    /// 刚建好、刚写满的库：整个函数必须**一次 SQL 都不多跑**，直接返回 false。
     /// 这条防的是「误触发全库重写」在真实调用路径上发生，而不只是纯函数正确。
+    ///
+    /// 断言的是「远低于阈值」而不是「恰好为 0」：跑迁移的 DDL（建/删索引）本身会
+    /// 留下零星空闲页，早先这里写死 `== 0` 于是在 0024 加索引后立刻红了。
+    /// 真正要钉的是「跳过」这个行为，freelist 是不是精确的 0 并不重要。
     #[tokio::test]
     async fn skips_vacuum_on_a_freshly_written_database() {
         let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
@@ -138,15 +142,21 @@ mod tests {
             .await
             .unwrap();
         }
-        let freelist: i64 = sqlx::query_scalar("SELECT freelist_count FROM pragma_freelist_count()")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(freelist, 0, "刚写满的库不该有空闲页 —— 否则这个用例没测到东西");
+        let (freelist, page_size): (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT freelist_count FROM pragma_freelist_count()), \
+                    (SELECT page_size FROM pragma_page_size())",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            reclaim_mib(freelist, page_size) < VACUUM_MIN_RECLAIM_MIB,
+            "刚写满的库空闲页应远低于阈值，否则这个用例没测到东西（freelist={freelist}）"
+        );
 
         assert!(
             !vacuum_if_needed(&pool).await.unwrap(),
-            "空闲页为 0 时绝不能触发 VACUUM"
+            "空闲页低于阈值时绝不能触发 VACUUM"
         );
         // 行数不变，确认即便真跑了也没伤到数据
         let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM usage_logs")
