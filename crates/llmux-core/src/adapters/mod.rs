@@ -26,12 +26,68 @@ fn get_client() -> &'static reqwest::Client {
     })
 }
 
+/// 首字节超时：**只等到响应头**（body 不在超时范围内），且**只对非流式请求**生效。
+///
+/// 要挡的是这种形状（2026-10-02 生产实测）：上游 TCP 连上了却不吭声，客户端
+/// 一个字都收不到。client 只设了 `connect_timeout(10s)` —— 那只管「连不上」，
+/// 管不了「连上了不说话」，于是请求一路挂到上游自己断开，实测 p50 30.6s、
+/// 最长 340.5s，24h 内 217/1852（12%）是这样失败的。
+///
+/// 为什么不用 builder 的 `.timeout(30s)`：那个是**总时限**，从连上算到 body 读完。
+/// 非流式响应的耗时是 TTFT + 生成，两头都不短 —— 实测 24h 内成功非流式最慢 70.6s，
+/// 有 1/62 超过 30s；更糟的是 400 类失败最慢 40.4s，套上总时限后会被改写成
+/// 「超时」，正好把唯一有诊断价值的错误正文丢掉。
+///
+/// 为什么不给 client 设全局 `read_timeout`：reqwest 0.12 的 `read_timeout` **只挂在
+/// ClientBuilder 上，没有按请求设置的入口**，而 client 是全局单例、还有 SSE 流要跑。
+/// 全局设它会把正常的流式「思考」间隔掐断 —— 成功流式 TTFT p90 就 39.5s。
+/// 首字节和「流已经开始了」是两回事。
+///
+/// ponytail: 30s 是拍的。够覆盖「上游慢但会回」的真实请求（TTFT p99 164s 里
+/// 绝大多数是模型推理不是上游挂起），又能把挂起从 340s 压到 30s。要更准就按
+/// provider 分别配 —— 现在没有 UI 要它。
+const FIRST_BYTE_TIMEOUT_SECS: u64 = 30;
+
+/// 测试里真实等待 30s 太久，用**按比例缩短**的替身：把生产超时等比缩小，
+/// 上游的静默时长按同一比例放大，相对关系不变，断言照样成立。
+///
+/// 不用 `#[tokio::test(start_paused = true)]`：虚拟时钟**不会自己走**。冻结后如果
+/// 唯一的 timer 就是「等上游回话」，那个 timer 永远到不了点，请求只能等到守卫超时 ——
+/// 实测这么写会让「上游静默 90s」的流式用例直接失败。真实时钟 + 1/20 缩放更诚实。
+#[cfg(test)]
+const TEST_TIMEOUT: Duration = Duration::from_millis(FIRST_BYTE_TIMEOUT_SECS * 50);
+
+/// 这个请求会不会让上游以 SSE 流式返回（`bound_first_byte` 取它的反）。
+///
+/// 判据是**我们自己发出去的 body 里 `stream` 是不是 true**，而不是调用点的
+/// `streaming` 变量 —— 后者是「下游要不要流」，两者可以不同（非流式的下游请求
+/// 照样可能让上游流式返回）。发出去的 body 才是上游行为的唯一决定因素，
+/// 所以在这里判一次就够，14 个调用点一个都不用改。
+///
+/// 兼容各协议的大小写与类型：OpenAI/Anthropic/Gemini 都用 `stream` 布尔，
+/// Responses 用 `stream` 布尔。认不出来就当非流式（宁可多套一个超时，
+/// 也不要把一条正常的 SSE 流掐死）。
+fn bound_first_byte_timeout(body: &Value) -> bool {
+    !body.get("stream").and_then(Value::as_bool).unwrap_or(false)
+}
+
 pub async fn execute_provider_request(
     request: &ProviderRequest,
+) -> anyhow::Result<reqwest::Response> {
+    execute_provider_request_with(request, Duration::from_secs(FIRST_BYTE_TIMEOUT_SECS)).await
+}
+
+/// 真正的实现。`first_byte_timeout` 只在 `#[cfg(test)]` 下被调小，生产永远走上面的
+/// 30s —— 提成参数是为了让测试能在秒级内跑完，而不是为了在生产里配置它。
+/// ponytail: 真要按 provider 分别配时再说，现在没有 UI 要它。
+async fn execute_provider_request_with(
+    request: &ProviderRequest,
+    first_byte_timeout: Duration,
 ) -> anyhow::Result<reqwest::Response> {
     let client = get_client();
     let method = reqwest::Method::from_bytes(request.method.as_bytes())?;
     let mut builder = client.request(method, &request.url);
+    let bound_first_byte = bound_first_byte_timeout(&request.body);
     // ponytail: force identity encoding. Upstream SSE streams that get truncated
     // mid-gzip make reqwest abort the whole stream ("error decoding response
     // body"); with identity we receive plaintext and emit partial events instead.
@@ -43,25 +99,39 @@ pub async fn execute_provider_request(
     }
     // GET with a literal "null" body gets rejected by strict upstreams (GitHub
     // API); only attach the JSON body when there is one.
-    if request.body.is_null() {
-        builder.send().await.map_err(|e| {
-            tracing::error!(
-                "🚀❌ Upstream request failed: {} {} - {e}",
-                request.method,
-                request.url
-            );
-            anyhow::anyhow!("{e}")
-        })
+    let send = if request.body.is_null() {
+        builder.send()
     } else {
-        builder.json(&request.body).send().await.map_err(|e| {
-            tracing::error!(
-                "🚀❌ Upstream request failed: {} {} - {e}",
-                request.method,
-                request.url
-            );
-            anyhow::anyhow!("{e}")
-        })
-    }
+        builder.json(&request.body).send()
+    };
+    let response = if bound_first_byte {
+        // 超时只包住 `send()` —— 它在响应头到达时就 resolve，body 不在其内。
+        match tokio::time::timeout(first_byte_timeout, send).await {
+            Ok(r) => r,
+            Err(_) => {
+                tracing::error!(
+                    "🚀❌ Upstream 首字节超时（{}s）: {} {}",
+                    first_byte_timeout.as_secs(),
+                    request.method,
+                    request.url
+                );
+                return Err(anyhow::anyhow!(
+                    "Upstream sent no response headers within {}s",
+                    first_byte_timeout.as_secs()
+                ));
+            }
+        }
+    } else {
+        send.await
+    };
+    response.map_err(|e| {
+        tracing::error!(
+            "🚀❌ Upstream request failed: {} {} - {e}",
+            request.method,
+            request.url
+        );
+        anyhow::anyhow!("{e}")
+    })
 }
 
 /// Console Go (opencode.ai/zen/go/*) rejects inference requests that lack a
@@ -520,5 +590,195 @@ mod console_go_header_tests {
         );
         assert_eq!(explicit["x-opencode-session"], "caller-sess");
         assert_eq!(explicit["user-agent"], "my-ua");
+    }
+}
+
+#[cfg(test)]
+mod first_byte_timeout_tests {
+    use super::*;
+    use serde_json::json;
+    use std::time::Duration;
+
+    /// 起一个「accept 后把请求头读完，然后永远不发任何字节」的上游。
+    async fn spawn_stalling_upstream() -> String {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = match listener.accept().await {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            let mut buf = [0u8; 2048];
+            let _ = socket.read(&mut buf).await;
+            // 读完请求就再不吭声 —— 这正是要挡的「连上了不说话」。
+            std::future::pending::<()>().await;
+        });
+        format!("http://{addr}")
+    }
+
+    /// 起一个「accept 后按 delay 静默，再回 200」的慢上游（反向对照）。
+    async fn spawn_slow_upstream(delay: Duration) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = match listener.accept().await {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            let mut buf = [0u8; 2048];
+            let _ = socket.read(&mut buf).await;
+            tokio::time::sleep(delay).await;
+            let body = br#"{"choices":[{"message":{"content":"OK"}}]}"#;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            let _ = socket.write_all(head.as_bytes()).await;
+            let _ = socket.write_all(body).await;
+            let _ = socket.flush().await;
+        });
+        format!("http://{addr}")
+    }
+
+    fn post(url: &str, body: Value) -> ProviderRequest {
+        ProviderRequest {
+            method: "POST".into(),
+            url: url.into(),
+            headers: BTreeMap::new(),
+            body,
+        }
+    }
+
+    /// 认不出来 `stream` 的一律当**非流式**（宁可多套一个超时）。
+    ///
+    /// 反过来（把认不出的当流式、放过超时）就等于这个特性静默失效 ——
+    /// 而失效是看不见的：请求只是继续挂到 340s，没有任何报错。
+    #[test]
+    fn an_unrecognisable_stream_field_is_treated_as_non_streaming() {
+        // 字符串 "true"（某些客户端会这么发）
+        assert!(bound_first_byte_timeout(&json!({"stream": "true"})));
+        // null
+        assert!(bound_first_byte_timeout(&json!({"stream": null})));
+        // 嵌套在别处，不该被误认
+        assert!(bound_first_byte_timeout(
+            &json!({"extra_body": {"stream": true}})
+        ));
+    }
+
+    /// 超时值本身：够宽到不误伤「慢但会回」的请求，又能把挂起压到可接受范围。
+    #[test]
+    fn the_timeout_is_wide_enough_for_slow_but_real_requests() {
+        // 实测 TTFT p99 是 164s，但那是流式；这条只约束非流式，
+        // 生产上非流式成功请求的延迟远低于此。留足余量，别再往小了调。
+        assert!(FIRST_BYTE_TIMEOUT_SECS >= 30);
+        // 上限：必须显著小于实测的 340s 挂死，否则这特性没意义
+        assert!(FIRST_BYTE_TIMEOUT_SECS <= 60);
+    }
+
+    /// 主断言：**非流式**请求遇到挂死的上游会被超时打断（而不是挂到天荒地老）。
+    ///
+    /// 超时值按 1/50 缩放（`TEST_TIMEOUT` ≈ 1.5s），所以这条真实等待一秒多就结束。
+    ///
+    /// 外层再包一个 30s 的 `timeout`：一旦有人把首字节超时接线删掉，挂死的上游会让
+    /// 这个 await 永远不返回 —— 测试会**挂死**而不是失败。真实回归的症状恰恰就是
+    /// 「请求挂住」，所以这个守卫是必要的，不是多余的。
+    #[tokio::test]
+    async fn a_non_streaming_request_is_cut_off_when_the_upstream_goes_silent() {
+        let url = spawn_stalling_upstream().await;
+        let req = post(&url, json!({"model": "m"}));
+        let err = tokio::time::timeout(
+            Duration::from_secs(30),
+            execute_provider_request_with(&req, TEST_TIMEOUT),
+        )
+        .await
+        .expect("首字节超时被删掉了：挂死的上游会让请求永远挂着（这正是它在生产上的症状）")
+        .expect_err("挂死的上游必须被首字节超时打断");
+        let msg = format!("{err:#}").to_lowercase();
+        assert!(
+            msg.contains("no response headers"),
+            "错误信息要指明是首字节超时，实际拿到：{err:#}"
+        );
+    }
+
+    /// 反向断言：**流式**请求永远不会被这个超时掐断 —— 这是整块改动的安全底线。
+    ///
+    /// 上游 SSE 在两个 chunk 之间可以安静很久（模型「思考」）。实测成功请求
+    /// TTFT p90 39.5s > 30s，全局 30s 超时会把这些正常的长流掐断，症状是
+    /// `error decoding response body` + done=false（历史上踩过）。
+    #[tokio::test]
+    async fn a_streaming_request_is_never_cut_off_by_the_first_byte_timeout() {
+        // 静默时间**超过**超时值 3 倍；流式必须照样拿到响应。
+        let url = spawn_slow_upstream(TEST_TIMEOUT * 3).await;
+        let resp = tokio::time::timeout(
+            Duration::from_secs(30),
+            execute_provider_request_with(&post(&url, json!({"model": "m", "stream": true})), TEST_TIMEOUT),
+        )
+        .await
+        .expect("流式请求不该被首字节超时打断：超时接线要么缺失，要么套到了流式上")
+        .expect("流式请求不该被首字节超时打断");
+        assert!(resp.status().is_success());
+    }
+
+    /// 超时只包住 `send()`，**不包 body 读取** —— 这是换掉 `.timeout()` 的全部理由。
+    ///
+    /// `.timeout(30s)` 是总时限（连上算到 body 读完），实测会把 24h 内最慢 70.6s 的
+    /// 成功非流式请求和 40.4s 的 400 失败请求一起误杀 —— 后者尤其糟：超时错误
+    /// 会把唯一有诊断价值的错误正文吃掉，40 个正常响应也会被说成「超时」。
+    ///
+    /// drip 静默 = `TEST_TIMEOUT * 4`，断言的是「body 读取不受**传进来那个**超时约束」，
+    /// 而不是「不受某个具体秒数约束」。所以任何退化（把 `tokio::time::timeout` 换成
+    /// builder 的 `.timeout`）只要用的是同一个值，这条就会红。
+    #[tokio::test]
+    async fn a_slow_body_is_not_cut_off_once_the_headers_have_arrived() {
+        // 响应头立刻到，body 慢慢给，总耗时远超超时值。
+        let url = spawn_drip_upstream().await;
+        let resp = tokio::time::timeout(
+            Duration::from_secs(30),
+            execute_provider_request_with(&post(&url, json!({"model": "m"})), TEST_TIMEOUT),
+        )
+        .await
+        .expect("响应头到了就不该再受首字节超时约束")
+        .expect("响应头到了就不该再受首字节超时约束");
+        let body = resp.text().await.expect("body 应可完整读完");
+        assert_eq!(
+            body,
+            r#"{"choices":[{"message":{"content":"OK"}}]}"#,
+            "body 必须完整读完（不中途截断）"
+        );
+    }
+
+    /// 起一个「响应头立刻到，body 拆成两半、中间静默很久」的服务器。
+    async fn spawn_drip_upstream() -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const PART1: &[u8] = br#"{"choices":[{"message":{"content":"O"#;
+        const PART2: &[u8] = br#"K"}}]}"#;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = match listener.accept().await {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            let mut buf = [0u8; 2048];
+            let _ = socket.read(&mut buf).await;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                PART1.len() + PART2.len()
+            );
+            let _ = socket.write_all(head.as_bytes()).await;
+            let _ = socket.flush().await;
+            let _ = socket.write_all(PART1).await;
+            let _ = socket.flush().await;
+            // 静默远超 FIRST_BYTE_TIMEOUT_SECS
+            tokio::time::sleep(TEST_TIMEOUT * 4).await;
+            let _ = socket.write_all(PART2).await;
+            let _ = socket.flush().await;
+        });
+        format!("http://{addr}")
     }
 }

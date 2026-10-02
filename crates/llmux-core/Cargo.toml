@@ -28,3 +28,8 @@ tracing.workspace = true
 url.workspace = true
 uuid.workspace = true
 zeroize.workspace = true
+
+[dev-dependencies]
+# test-util 只给测试用：`start_paused = true` 让 30s 的首字节超时在测试里瞬间走完。
+# 放在 dev-dependencies 而不是 workspace 里，`cargo build --release` 就不会带上它。
+tokio = { workspace = true, features = ["test-util"] }

@@ -57,6 +57,81 @@
   默认才是 7；CLAUDE.md 两处都写成 7。按 7 去做「日志占太多」的判断会得出错误结论。
   已更正，并注明日志走 NAS（6.4T 大盘）**不占路由器 overlay**。
 
+### Performance
+
+- **非流式上游请求加首字节超时，挂死的上游从 340s 压到 30s**。原先 client 只设了
+  `connect_timeout(10s)`，那管「连不上」，管不了「**连上了却不吭声**」—— 请求一路
+  挂到上游自己断开。实测 24h 内 **217/1852（12%）** 是这样失败的，p50 **30.6s**、
+  最长 **340.5s**；失败率还和耗时正相关（8s 档 0%、39.3s 档 39%），这就是主流程上
+  最实在的一笔等待。
+
+  超时**只等到响应头**（`tokio::time::timeout` 包住 `send()`，body 读取不在其内），
+  且**只对非流式请求**生效。两个边界都是量出来的，不是拍的：
+
+  - **不用 builder 的 `.timeout()`**：那是总时限（连上算到 body 读完），而非流式响应
+    的耗时是 TTFT + 生成，两头都不短。实测会误杀 **1/62** 成功非流式请求（最慢
+    70.6s），更要命的是 **97 条 400 失败**（最慢 40.4s）—— 超时错误会覆盖掉唯一有
+    诊断价值的响应正文，正好把要查的东西吃掉。
+  - **不给 client 设全局 `read_timeout`**：reqwest 0.12 的 `read_timeout` 只挂在
+    `ClientBuilder` 上、没有按请求设置的入口，而 client 是全局单例且要跑 SSE。
+    全局设它会把正常的流式「思考」间隔掐断 —— 成功流式 TTFT p90 就 **39.5s > 30s**。
+
+  判据是**发出去的 body 里 `stream` 是不是 true**（而不是调用点的 `streaming`
+  变量，那是「下游要不要流」），所以 14 个调用点一个都没改。认不出的 `stream`
+  一律当非流式：反过来会让这个特性**静默失效**，而失效看不见 —— 请求只是继续挂着。
+
+- **删掉 6 个索引、换掉首页查询的排序方式**。`usage_logs` 有 10 个索引，索引合计
+  **14.0 MiB** 而表本身只有 **6.2 MiB** —— 索引是表的 2.3 倍，且每写一行都要更新
+  全部 10 棵 B 树（实测 5 万行/小时）。
+
+  逐条跑 `EXPLAIN QUERY PLAN` 核对全部真实查询后，发现其中 **6 个从未出现在任何
+  一条计划里**，一并删掉（迁移 0024）：
+
+  | 删掉的 | 大小 | 为什么没人用 |
+  |---|---|---|
+  | `idx_usage_logs_model` | 2.00 MiB | 「按 model 聚合」实际走 `is_test` + 临时 B 树 |
+  | `idx_usage_logs_timestamp_model` | 2.48 MiB | 无人使用 |
+  | `idx_usage_logs_timestamp_provider` | 1.49 MiB | 「按 provider 聚合」走的是 `provider_id` 单列 |
+  | `idx_usage_logs_timestamp` | 1.03 MiB | 被 `idx_usage_logs_is_test` 顶掉 |
+  | `idx_usage_logs_timestamp_success` | 1.09 MiB | 无人使用 |
+  | `idx_usage_logs_is_test` | — | 被新索引顶替（单列排不了序） |
+
+  补上 `idx_usage_logs_is_test_timestamp (is_test, timestamp DESC)`。`/api/dashboard`
+  与 `/api/stats/logs` 都是 `WHERE is_test = 0 ORDER BY timestamp DESC LIMIT 100`，
+  此前计划是 `SEARCH ... USING INDEX idx_usage_logs_is_test` +
+  **`USE TEMP B-TREE FOR ORDER BY`**。在生产库副本（10.8 万行）上实测：
+
+  | | 计划 | 耗时 |
+  |---|---|---|
+  | 迁移前 | SEARCH + **TEMP B-TREE** | **79.87 ms** |
+  | 迁移后 | SEARCH，无临时 B 树 | **0.15 ms** |
+
+  这个查询**每次打开首页都付一次**，是本轮最大的一笔。迁移本身在生产库副本上耗时
+  **0.13s**，行数不变（108,164 → 108,164）。
+
+  起作用的只有一件事：**`timestamp` 必须在索引里**。实测 `(timestamp DESC, is_test)`
+  与 `(is_test, timestamp)` 一样快（0.13ms，同样没有临时 B 树 —— SQLite 干脆放弃
+  `is_test` 这个等值条件，直接按索引序往前扫），列顺序和 DESC 都不是关键。
+
+  留下 4 个有真实计划在用的索引，一个都不能动：`account_id`（health.rs 的「窗口内
+  零流量 → 回退全历史」）、`account_model`（probe.rs 最近流量）、`account_timestamp`
+  （health.rs 的 30 天窗口）、`provider_id`（按 provider 聚合）。
+
+  **逐条核对过其余页面没有退化**：accounts 页的成功率聚合（`WHERE is_test = 0 AND
+  timestamp >= ? GROUP BY account_id`）迁移前后同为 44.43ms —— 计划走的是
+  `account_timestamp`，与本轮无关；删行 prune 0.01ms 不变。
+  ⚠️ 做这类对比时必须先 `ANALYZE` 再量：库刚改过索引时 `sqlite_stat1` 仍是旧的，
+  实测会把 accounts 页误报成「37.5ms → 74.3ms 回归」，那只是过期统计。
+
+  净效果：索引 10 → 5，**每次 INSERT 少维护 5 棵 B 树**，释放约 11 MiB 空闲页
+  （下次 6h 循环的 VACUUM 会收掉）。
+
+  ⚠️ `init_db` **没有迁移记录表**，23 个迁移每次启动全部重跑、靠吞掉「already
+  exists」假装幂等。所以这 6 个索引会在每次启动时被 0001/0006/0013 重新建出来、
+  再被 0024 删掉 —— 实测每次启动白花 **0.33s** 建 6 棵 B 树（10.8 万行）。终态正确，
+  不值得为它重构迁移机制；**也绝不要回头改 0001/0006/0013**，那会让已发布的历史
+  迁移与新库对不上。
+
 ### Fixed
 
 - **成功率统计不再全表扫 `usage_logs`**。`/api/health` 与 `/api/dashboard` 的
