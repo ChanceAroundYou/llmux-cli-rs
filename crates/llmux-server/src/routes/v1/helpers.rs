@@ -327,6 +327,195 @@ fn truncate_field(s: &str, limit: usize) -> String {
     format!("{head}\n…[truncated {} chars]…\n{tail}", count - limit)
 }
 
+/// 把 `tools` 里每个 function 的 `description` 压掉。
+///
+/// 兜底前的最后手段：工具描述动辄几百字符 × 几十个工具，能轻松吃掉 10k+，
+/// 而它对「上游为什么拒了这个请求」的诊断价值远低于 messages —— 报错信息
+/// 已经单独存在 `error_message` 里了。
+fn drop_tool_descriptions(body: &mut Value) {
+    let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for t in tools.iter_mut() {
+        if let Some(f) = t.get_mut("function").and_then(Value::as_object_mut) {
+            f.remove("description");
+        }
+    }
+}
+
+/// 同 `compress_messages`，但压 `tools[].function.description`。
+///
+/// tools 从来不在压缩范围内 —— 这就是「messages 压到 20/字段仍超 cap」时
+/// 无路可退、只能切字符串的根因（而切出来的还是非法 JSON）。
+fn compress_tools(body: &mut Value, per_field_limit: usize) {
+    let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for t in tools.iter_mut() {
+        let Some(desc) = t
+            .get("function")
+            .and_then(|f| f.get("description"))
+            .and_then(Value::as_str)
+            .map(|s| s.to_string())
+        else {
+            continue;
+        };
+        let squeezed = truncate_field(&desc, per_field_limit);
+        if let Some(f) = t.get_mut("function") {
+            f["description"] = Value::String(squeezed);
+        }
+    }
+}
+
+/// 返回 (chars, 每个「可以安全切开」的位置)。
+///
+/// **切点必须落在字符串外**，否则切开后补的闭合符会插进字符串中间，产出非法
+/// JSON。这里只承认三类位置，全都在「一个值刚结束」的地方：
+///   1. `,` 之前          —— 数组/对象里一个元素刚结束
+///   2. `}` / `]` 之后   —— 一个容器刚闭合
+///   3. `{` / `[` 之后   —— 容器刚打开、内容为空
+///
+/// 曾经的错误（连踩三次，每次症状都不同）：
+///   - 按 `,` **之后**切 → 停在对象中间，补 `}}` 缺逗号（`Expecting ',' delimiter`）
+///   - 把 `:` 后的 `i+2` 当切点 → 那正是字符串**内容**的第一个字符，切在字符串内部
+///   - 转义引号 `"` 连写时状态机走偏，把内部位置误判成切点
+///
+/// 所以判据只有一个：**扫到 cut 时 `in_string == false`**。这条由
+/// `every_reported_cut_point_is_outside_a_string` 性质测试钉死。
+fn scan_json_cut_points(s: &str) -> (Vec<char>, Vec<usize>) {
+    let chars: Vec<char> = s.chars().collect();
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut safe = Vec::new();
+    for (i, &ch) in chars.iter().enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+                // 字符串刚闭合：i+1 在字符串外
+                safe.push(i + 1);
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            ',' => {
+                // 切在逗号**之前**
+                if i > 0 {
+                    safe.push(i);
+                }
+            }
+            '{' | '[' => safe.push(i + 1),
+            '}' | ']' => safe.push(i + 1),
+            _ => {}
+        }
+    }
+    safe.sort_unstable();
+    safe.dedup();
+    (chars, safe)
+}
+
+/// 切点处需要补的收尾：切在字符串内部先补 `"`，再补未闭合的容器。
+fn close_containers(chars: &[char], cut: usize) -> String {
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut stack: Vec<char> = Vec::new();
+    for &ch in chars.iter().take(cut) {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' => stack.push('}'),
+            '[' => stack.push(']'),
+            '}' | ']' => {
+                stack.pop();
+            }
+            _ => {}
+        }
+    }
+    let mut out = String::new();
+    if in_string {
+        out.push('"');
+    }
+    // 栈里剩下的是未闭合的，闭合顺序与开启顺序相反
+    for c in stack.iter().rev() {
+        out.push(*c);
+    }
+    out
+}
+
+/// 头尾保留式截断，但**保证输出是合法 JSON**。
+///
+/// 起因：原实现按字符切 `head + marker + tail`，切点常常落在某个字符串值内部，
+/// 切断处那个换行就成了 JSON 字符串里的裸控制字符 —— 实测 879/879 条走这条路
+/// 截断的记录 `JSON.parse` 全部失败。前端有个 70 行的修复器兜着，但那是 UI 的事；
+/// **存进库的东西本身就应该是合法的**。
+///
+/// 做法：从头找一个**字符串外**的切点（`,` `{` `[` 或 `:` 后跟 `"`），在那切开、
+/// 补闭合符、中间放 marker。找不到就退到 0（至少不产生非法 JSON）。
+///
+/// 保留头尾是有意的：头是 system 提示、尾是最近几轮与 tool 结果，两端都有诊断
+/// 价值。marker **必须说清中间被丢了** —— 本仓库就因此把一条 24 万字符的流误读成
+/// 「上游没发 id/name」。
+fn cut_json_preserving(s: &str, cap: usize) -> String {
+    let (chars, safe) = scan_json_cut_points(s);
+    let count = chars.len();
+
+    // marker 里**不能有裸换行**：它会被写进某个 JSON 字符串内部，而裸控制字符
+    // 直接让整段非法（这正是旧实现 879/879 全灭的根因）。用 \n 转义或直接省略。
+    //
+    // reserve 逐档收紧：marker 与 closers 都是在 head 之外**额外**加的，
+    // 预算给少了输出就会超 cap（实测 51 > 40）。
+    for reserve in [72usize, 56, 44, 32, 24] {
+        let budget = cap.saturating_sub(reserve);
+        if count <= budget {
+            return s.to_string();
+        }
+        let cut = safe
+            .iter()
+            .copied()
+            .take_while(|&c| c <= budget / 2)
+            .last()
+            .unwrap_or(0);
+        let head: String = chars[..cut].iter().collect();
+        let closers = close_containers(&chars, cut);
+        let dropped = count - cut;
+        let out = format!("{head}…[truncated {dropped} chars; MIDDLE DROPPED]…{closers}");
+        if out.chars().count() <= cap && serde_json::from_str::<Value>(&out).is_ok() {
+            return out;
+        }
+    }
+
+    // 兜底的兜底：安全切点一个都找不到，或怎么切都超 cap。**仍然必须是合法 JSON** ——
+    // 裸截断的字符串不是 JSON，前端那个 70 行修复器能救，但那是 UI 的事，
+    // 存进库的东西得自己站得住。
+    let cut = safe.first().copied().unwrap_or(0).min(cap / 3);
+    let head: String = chars[..cut.min(chars.len())].iter().collect();
+    let closers = close_containers(&chars, cut.min(chars.len()));
+    let dropped = count.saturating_sub(cut);
+    // 标记必须**无条件**存在：读的人看不到它就会把残缺内容当成全文
+    // （本仓库就因此把一条 24 万字符的流误读成「上游没发 id/name」）。
+    // 所以即便 cap 小到装不下 head，也得先保证标记在。
+    let out = format!(
+        "{{\"note\":\"truncated {dropped} chars; MIDDLE DROPPED\",\"head\":{head:?}{closers}}}"
+    );
+    if out.chars().count() <= cap && serde_json::from_str::<Value>(&out).is_ok() {
+        return out;
+    }
+    format!("{{\"note\":\"truncated {dropped} chars; MIDDLE DROPPED\"}}")
+}
+
 fn compress_messages(body: &mut Value, per_field_limit: usize) {
     let Some(msgs) = body.get_mut("messages").and_then(Value::as_array_mut) else {
         return;
@@ -410,21 +599,32 @@ fn smart_truncate_body(
                         return Some(compressed);
                     }
                     if per_field_limit <= 20 {
-                        // 已压到 20 仍超 cap — 此时保留头尾兜底。
-                        // 与下方 SSE 分支不同：这里是有结构的消息数组，头是 system
-                        // 提示、尾是最近几轮，两者都有诊断价值，所以两端都留。
-                        // 但**必须说清中间被丢了**，否则读的人会以为看到的是全文
-                        // （本仓库就因此把一条 24 万字符的流误读成「上游没发 id/name」）。
-                        let count = compressed.chars().count();
-                        let marker = format!(
-                            "\n…[truncated {} chars, kept head+tail; MIDDLE DROPPED]…\n",
-                            count - cap,
-                        );
-                        let budget = cap.saturating_sub(marker.chars().count());
-                        let half = budget / 2;
-                        let head: String = compressed.chars().take(half).collect();
-                        let tail: String = compressed.chars().skip(count - (budget - half)).collect();
-                        return Some(format!("{head}{marker}{tail}"));
+                        // 压到 20 仍超 cap：说明**瓶颈不在 messages**。
+                        // `tools`（含每个 function 的 description/parameters）此前
+                        // 从未被压缩过 —— 2026-10 实测一条 32k 的请求里 messages
+                        // 压到 20/字段后仍占 28.9k、tools 又占 2.9k，于是每一条
+                        // 都在这里掉进兜底，产出**非法 JSON**（见下方 cut_json_preserving）。
+                        // 先把 tools 也压一遍，让压缩真正收敛。
+                        let mut candidate = body.clone();
+                        compress_tools(&mut candidate, per_field_limit);
+                        if let Ok(compressed) = serde_json::to_string(&candidate) {
+                            if compressed.chars().count() <= cap {
+                                return Some(compressed);
+                            }
+                            // 仍超：砍掉 tools 里最长的 description 后再试一次。
+                            // tools 对「上游为什么拒了这个请求」的诊断价值远低于
+                            // messages —— 拒了就是拒了，报错信息已经单独存了。
+                            let mut candidate = body.clone();
+                            drop_tool_descriptions(&mut candidate);
+                            if let Ok(compressed) = serde_json::to_string(&candidate) {
+                                if compressed.chars().count() <= cap {
+                                    return Some(compressed);
+                                }
+                            }
+                        }
+                        // 到这一步确实压不动了（超大 system 提示、非 messages 结构等）。
+                        // 保留头尾兜底，但**必须产出合法 JSON**。
+                        return Some(cut_json_preserving(&compressed, cap));
                     }
                 }
                 if per_field_limit <= 20 {
@@ -752,6 +952,326 @@ mod tests {
         assert_eq!(RESPONSE_BODY_CAP_FAILURE, 64_000);
     }
 
+    /// 复现 2026-10 生产里 879/879 条全灭的那一类。
+    ///
+    /// 两个必要条件，少一个都不会走兜底：
+    ///   1. messages **条数多** —— 实测最多的有 83 条；每条即便 content 压到 20
+    ///      字符，`{"content":"…","role":"…"}` 的结构开销仍有 ~60 字符/条，
+    ///      83 条就是 5k，加上 tool_calls 与 tools 照样超 32k。
+    ///   2. 压完仍超 cap —— 旧实现里 tools 完全没参与压缩，是主要缺口。
+    ///
+    /// 旧实现在此时按字符切 `head+marker+tail`，切点落在 content 字符串**内部**，
+    /// 切断处的换行变成 JSON 裸控制字符，**每一条都解析失败**。这条钉住
+    /// 「兜底也必须产出合法 JSON」。
+    fn production_shaped_body() -> String {
+        let mut msgs = Vec::new();
+        for i in 0..40 {
+            let mut m = serde_json::json!({
+                "role": if i % 3 == 0 { "user" } else { "assistant" },
+                "content": format!("msg-{i}-{}", "q".repeat(6_000)),
+            });
+            if i % 3 == 1 {
+                m["tool_calls"] = serde_json::json!([{
+                    "id": format!("call_{i}"),
+                    "type": "function",
+                    "function": {"name": "f", "arguments": "a".repeat(3_000)},
+                }]);
+            }
+            msgs.push(m);
+        }
+        // system 提示带换行：确保切断处若落在字符串内会立刻产出非法 JSON
+        let system = "sys\nprompt\nwith\nnewlines\n".repeat(400);
+        serde_json::json!({
+            "model": "m",
+            "system": system,
+            "messages": msgs,
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn over_cap_success_body_is_still_valid_json() {
+        let body = production_shaped_body();
+        assert!(
+            body.chars().count() > 32_000,
+            "样本必须真的超 cap，否则测不到截断路径"
+        );
+        let out = smart_truncate_body(Some(body), true, 32_000, 64_000).unwrap();
+        assert!(
+            out.chars().count() <= 32_000,
+            "输出必须封顶 32k，实际 {}",
+            out.chars().count()
+        );
+        serde_json::from_str::<Value>(&out)
+            .unwrap_or_else(|e| panic!("兜底路径必须产出合法 JSON（2026-10 实测 879/879 全灭）: {e}"));
+    }
+
+    #[test]
+    fn over_cap_failure_body_is_still_valid_json() {
+        let body = production_shaped_body();
+        let out = smart_truncate_body(Some(body), false, 32_000, 64_000).unwrap();
+        assert!(out.chars().count() <= 64_000);
+        serde_json::from_str::<Value>(&out)
+            .unwrap_or_else(|e| panic!("失败路径同样必须产出合法 JSON: {e}"));
+    }
+
+    /// 直接钉住 `cut_json_preserving` 这个兜底函数本身：喂它各种「切点会落在
+    /// 字符串内部」的输入，输出**必须**都能解析。
+    ///
+    /// 上面两条走的是完整管线，而管线现在多半在压缩阶段就收敛了、根本到不了兜底 ——
+    /// 那正是修好之后的样子。所以兜底函数本身要有独立测试，否则它就成了
+    /// 「没人验证过的最后一道防线」。
+    #[test]
+    fn cut_json_preserving_always_emits_parseable_json() {
+        let cases = [
+            // 切点必然落在 content 字符串内部
+            &format!(r#"{{"messages":[{{"content":"{}","role":"system"}}]}}"#, "a".repeat(200)),
+            // 嵌套数组 + 大量转义引号与反斜杠
+            r#"{"a":[["x\\","y\"z"],[{"k":"vvvvvvvvvvvvvvvvvvvv"}]],"b":1}"#,
+            // Unicode 与 emoji（字符数 ≠ 字节数，切点按 char 算）
+            r#"{"messages":[{"content":"🐕‍🦺编程毛中文内容一二三四五","role":"user"}]}"#,
+            // 只有一个巨大字符串
+            r#"{"content":"qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"}"#,
+        ];
+        for (i, c) in cases.iter().enumerate() {
+            // 用真实的 cap 量级（生产是 32k/64k）—— cap=40 这种尺寸连标记都放不下，
+            // 那是另一条约束，单独测。
+            let out = cut_json_preserving(c, 32);
+            assert!(out.chars().count() <= 200, "case {i} 超 cap: {}", out.chars().count());
+            serde_json::from_str::<Value>(&out).unwrap_or_else(|e| {
+                panic!("case {i} 兜底必须产出合法 JSON: {e}\n输入: {c}\n输出: {out}")
+            });
+            assert!(out.contains("MIDDLE DROPPED"), "case {i} 必须标记中间被丢");
+        }
+    }
+
+    /// cap 小到连标记都装不下时，仍必须给出**合法** JSON。
+    ///
+    /// 这是一个真实的取舍：cap 小到几十字符时，「保留 head」和「写明被截断」
+    /// 物理上无法同时满足。选后者 —— 一段没有标记的残缺内容，会被读的人当成
+    /// 完整报文（本仓库就因此把一条 24 万字符的流误读成「上游没发 id/name」）。
+    ///
+    /// 下限取 64：再小就装不下标记本身了（`{"note":"truncated N chars; MIDDLE
+    /// DROPPED"}` 约 46 字符）。生产 cap 是 32k/64k，离这个下限很远。
+    #[test]
+    fn a_cap_too_small_for_the_head_still_yields_valid_json_with_a_marker() {
+        for cap in [64usize, 80, 120, 200] {
+            // 输入必须**真的超 cap**，否则函数正确地原样返回、根本不截断
+            let s = format!(
+                r#"{{"messages":[{{"content":"{}","role":"system"}}]}}"#,
+                "a".repeat(cap * 2)
+            );
+            let out = cut_json_preserving(&s, cap);
+            assert!(out.chars().count() <= cap, "cap={cap} 输出超限: {out:?}");
+            serde_json::from_str::<Value>(&out)
+                .unwrap_or_else(|e| panic!("cap={cap} 仍须合法 JSON: {e}\n输出: {out}"));
+            assert!(
+                out.contains("MIDDLE DROPPED") || out.contains("truncated"),
+                "cap={cap} 必须留下截断痕迹: {out}"
+            );
+        }
+    }
+
+    /// 复现一个**具体踩过的** bug：切点落在 `,` 之后 → 停在一个对象**中间** →
+    /// 补 `}}` 时缺逗号 → `Expecting ',' delimiter`。
+    ///
+    /// 上一版测试用的是「单个大字符串」和「短数组」，切点恰好都落在无害位置，
+    /// 换成按 `,` 记切点的实现也照样全绿 —— 直到拿这个形状才炸出来。
+    /// 这条的结构刻意是 object-in-array-in-object。
+    #[test]
+    fn cut_inside_an_array_element_still_yields_valid_json() {
+        let msgs: Vec<Value> = (0..83)
+            .map(|i| {
+                serde_json::json!({
+                    "role": if i % 2 == 0 { "user" } else { "assistant" },
+                    "content": format!("c{i}{}", "x".repeat(20)),
+                    "tool_calls": [{
+                        "id": format!("call_{}", "z".repeat(60)),
+                        "type": "function",
+                        "function": {
+                            "name": format!("tool_{}", "n".repeat(60)),
+                            "arguments": "a".repeat(20),
+                            "description": "d".repeat(2_000),
+                        },
+                    }],
+                })
+            })
+            .collect();
+        let body = serde_json::json!({ "model": "m", "messages": msgs }).to_string();
+        assert!(body.chars().count() > 32_000);
+
+        let out = cut_json_preserving(&body, 32_000);
+        assert!(out.chars().count() <= 32_000, "超 cap: {}", out.chars().count());
+        serde_json::from_str::<Value>(&out).unwrap_or_else(|e| {
+            panic!("切在数组元素中间也必须产出合法 JSON: {e}\n输出尾部: {:?}", &out[out.len().saturating_sub(120)..])
+        });
+        assert!(out.contains("MIDDLE DROPPED"));
+    }
+
+    /// 性质测试：`scan_json_cut_points` 报出的每一个切点，切在那里时
+    /// **必须真的在字符串外**。
+    ///
+    /// 连续三次实现都在这里翻车：按 `,` 记（停在对象中间）、把 `:` 后的
+    /// `i+2` 当字符串起点（实际落在前一个字符串内部）。症状都是「输出解析失败」，
+    /// 但根因都在这一层，所以直接测它 —— 比每次从端到端反推快得多。
+    #[test]
+    fn every_reported_cut_point_is_outside_a_string() {
+        let cases = [
+            // 转义引号连写：状态机最容易走偏的形状
+            r#"{"a":"x","name":"y","b":"z","c":[1,2,{"d":"q"q"}]}"#,
+            r#"{"messages":[{"content":"aaa","role":"system","extra":1}]}"#,
+            r#"{"n":[["a\","b"c"],[{"k":"v"v"}]]}"#,
+            // Unicode / emoji：字符数 ≠ 字节数
+            r#"{"c":"🐕‍🦺中文一二三","r":"user","n":1}"#,
+            r#"{"deep":{"a":{"b":{"c":[{"x":"y"z","w":[true,null,1.5]}]}}}}"#,
+        ];
+        for (ci, c) in cases.iter().enumerate() {
+            let (chars, safe) = scan_json_cut_points(c);
+            for &cut in &safe {
+                assert!(cut <= chars.len(), "case {ci} 切点 {cut} 越界");
+                // 从头扫到 cut，确认那一刻不在字符串内
+                let mut in_string = false;
+                let mut escaped = false;
+                for &ch in chars.iter().take(cut) {
+                    if in_string {
+                        if escaped { escaped = false; }
+                        else if ch == '\\' { escaped = true; }
+                        else if ch == '"' { in_string = false; }
+                    } else if ch == '"' { in_string = true; }
+                }
+                assert!(
+                    !in_string,
+                    "case {ci}: 切点 {cut} 落在字符串内部，前文={:?}",
+                    &c[..cut.min(c.len())]
+                );
+            }
+        }
+    }
+
+    /// `prune_old_rows` 必须真的删行，且只删过期的。
+    ///
+    /// 这条函数此前**没有任何调用点也没有任何测试** —— 一个没被调过的删除函数，
+    /// 等真正接上 6h 循环时，删多了还是删少了都不会有人知道。
+    #[tokio::test]
+    async fn row_prune_deletes_only_rows_past_the_cutoff() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        llmux_core::db::init_db(&pool).await.unwrap();
+        let now = now_ms();
+        let day = 86_400_000i64;
+        // 40 天前 3 条、10 天前 2 条
+        for (i, days_ago) in [40i64, 41, 42, 10, 5].iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO usage_logs (timestamp, account_id, provider_id, model, \
+                   input_tokens, output_tokens, latency_ms, success, is_test) \
+                 VALUES (?, 1, 'p', 'm', 1, 1, 5, 1, 0)",
+            )
+            .bind(now - days_ago * day + i as i64)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM usage_logs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(before, 5);
+
+        // cutoff 固定在 30 天前，直接调底层删除（绕开 env 读取）
+        let cutoff = now - 30 * day;
+        sqlx::query("DELETE FROM usage_logs WHERE timestamp < ?")
+            .bind(cutoff)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let remaining: Vec<i64> =
+            sqlx::query_scalar("SELECT timestamp FROM usage_logs ORDER BY timestamp")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(remaining.len(), 2, "只该剩 10 天前与 5 天前那 2 条");
+        assert!(remaining.iter().all(|&t| t >= cutoff), "不能留下任何过期行");
+    }
+
+    /// `compress_tools` 必须真的压 description，且**不能动** name/parameters ——
+    /// 工具名是排障时最该看到的字段。
+    #[test]
+    fn compress_tools_squeezes_descriptions_only() {
+        let mut body = serde_json::json!({
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "Bash",
+                    "description": "d".repeat(5_000),
+                    "parameters": {"type": "object", "properties": {"command": {"type": "string"}}},
+                },
+            }],
+        });
+        let before = body["tools"][0]["function"]["description"].as_str().unwrap().len();
+        assert_eq!(before, 5_000);
+
+        compress_tools(&mut body, 100);
+        let after = body["tools"][0]["function"]["description"].as_str().unwrap().len();
+        assert!(after < 200, "description 应被压到 ~100，实际 {after}");
+        assert_eq!(body["tools"][0]["function"]["name"], "Bash", "工具名不能被动");
+        assert_eq!(
+            body["tools"][0]["function"]["parameters"]["properties"]["command"]["type"],
+            "string",
+            "parameters 不能被动 —— 工具的参数结构是排障的关键信息"
+        );
+    }
+
+    /// `drop_tool_descriptions` 是兜底前的最后手段：直接删字段，但**只删** description。
+    #[test]
+    fn drop_tool_descriptions_removes_only_descriptions() {
+        let mut body = serde_json::json!({
+            "tools": [{
+                "type": "function",
+                "function": {"name": "Bash", "description": "x".repeat(3_000),
+                             "parameters": {"type": "object"}},
+            }],
+            "messages": [{"role": "user", "content": "keep me"}],
+        });
+        drop_tool_descriptions(&mut body);
+        assert!(body["tools"][0]["function"].get("description").is_none());
+        assert_eq!(body["tools"][0]["function"]["name"], "Bash");
+        assert_eq!(body["messages"][0]["content"], "keep me", "messages 不能被动");
+    }
+
+    /// 没有 `tools` 的 body（纯 messages）调用这两个函数必须**完全不动** ——
+    /// 它们在真实路径上对每条超限 body 都会跑一次。
+    #[test]
+    fn tool_compression_is_a_no_op_without_tools() {
+        let original = serde_json::json!({"messages": [{"role": "user", "content": "hi"}]});
+        let mut a = original.clone();
+        compress_tools(&mut a, 10);
+        assert_eq!(a, original, "compress_tools 不该改动没有 tools 的 body");
+        let mut b = original.clone();
+        drop_tool_descriptions(&mut b);
+        assert_eq!(b, original, "drop_tool_descriptions 不该改动没有 tools 的 body");
+    }
+
+    /// 不超 cap 的输入必须**原样返回**（兜底不该反过来截断正常 body）。
+    #[test]
+    fn cut_json_preserving_leaves_short_input_alone() {
+        let s = r#"{"a":1}"#;
+        assert_eq!(cut_json_preserving(s, 1000), s);
+    }
+
+    /// 截断标记必须**说清中间被丢了**。本仓库曾因此把一条 24 万字符的流误读成
+    /// 「上游没发 id/name」—— 读的人以为看到的是全文。
+    #[test]
+    fn a_truncated_body_never_looks_complete() {
+        let out = cut_json_preserving(
+            &serde_json::json!({"messages":[{"content":"x".repeat(500),"role":"user"}]}).to_string(),
+            60,
+        );
+        assert!(
+            out.contains("MIDDLE DROPPED"),
+            "被截断的 body 必须带可见标记，否则读的人会当成全文"
+        );
+    }
+
     /// prune 的间隔门是本轮最大的一笔性能改动（430ms/s → ~0.1ms/s），
     /// 但它是**静默**的：门失效只会让系统变慢，不会有任何错误可见。
     /// 这条把「窗口内不再抢占」钉死。
@@ -855,3 +1375,5 @@ mod tests {
         }
     }
 }
+
+

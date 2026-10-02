@@ -86,6 +86,24 @@
   现由独立线程经有界通道写出。`WorkerGuard` 必须比 subscriber 活得久，
   提前 drop 会静默丢掉最后一批缓冲行，因此显式 `Box::leak`。
 
+- **截断后的 body 此前一律是非法 JSON**。走「头尾兜底」路径的记录，实测
+  **879/879 条 `JSON.parse` 全部失败**：原实现按字符切 `head+marker+tail`，切点
+  常落在某个字符串值**内部**，marker 里的换行就成了 JSON 字符串中的裸控制字符
+  （`control character (\u0000-\u001F) found`）。
+
+  根因有两层：① 切点不安全；② **`tools` 从来不参与压缩** —— `compress_messages`
+  只碰 `messages`，而生产样本里 `tools` 常占 3–10k，于是「messages 压到 20 字符/字段」
+  仍超 cap，**每一条**都掉进兜底。生产样本最多有 1185 条消息、83 条的批次，
+  光结构开销就压不动。
+
+  修法：切点只在**字符串外**（`scan_json_cut_points`），切完补闭合符；
+  兜底前先把 `tools[].function.description` 也压一遍，还不行就丢掉 description
+  （工具描述对「上游为什么拒了」的诊断价值远低于 messages，错误信息另有 `error_message`）。
+
+  同时给 `scan_json_cut_points` 加了性质测试：它报出的每个切点都必须真的在字符串外。
+  这层连踩三次 —— 按 `,` **之后**切（停在对象中间）、把 `:` 后的 `i+2` 当切点
+  （那正是字符串内容的第一个字符）、转义引号连写时状态机走偏。性质测试一次就抓到了。
+
 - **失败 body 上限 500 KB → 64 KB**。500k 时代的理由是「给 hermes 那种 350k dump
   留全量」，但完整 body 早就 tee 到 `llmux.log.*`（NAS）了，DB 里再存一份只是把
   同一内容放两遍。实测失败行平均 473 KB，一条就把该页撑成 overflow page，
