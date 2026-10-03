@@ -4,6 +4,7 @@ import { useTranslation } from 'react-i18next';
 import { useSearchParams } from 'react-router-dom';
 import { Loader2, ScrollText, ChevronLeft, ChevronRight, Copy, Check } from 'lucide-react';
 import { StatusDot } from '@/components/shared/StatusDot';
+import KeyFilter from '@/components/shared/KeyFilter';
 import { Dialog } from '../components/Modal';
 import { JsonView } from '@/components/shared/JsonTree';
 import { Button } from '@/components/ui/button';
@@ -98,6 +99,8 @@ export default function Logs() {
   const [range, setRange] = useState<RangeKey>('24h');
   const [statusFilter, setStatusFilter] = useState<'all' | 'success' | 'failed'>('all');
   const [modelFilter, setModelFilter] = useState('');
+  // null = 全部密钥（服务端筛选，区别于 modelFilter 的本地过滤）
+  const [keyId, setKeyId] = useState<number | null>(null);
   const [streamMode, setStreamMode] = useState<'all' | 'stream' | 'nonStream'>('all');
   const [page, setPage] = useState(0);
   const [total, setTotal] = useState(0);
@@ -205,6 +208,7 @@ export default function Logs() {
       else if (range === '7d') params.set('start', String(Date.now() - 7 * 24 * 3600 * 1000));
       if (statusFilter !== 'all') params.set('success', statusFilter === 'success' ? '1' : '0');
       if (modelFilter.trim()) params.set('model', modelFilter.trim());
+      if (keyId !== null) params.set('key_id', String(keyId));
       const res = await apiFetch(`/api/stats/logs?${params.toString()}`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
@@ -216,7 +220,7 @@ export default function Logs() {
     } finally {
       setIsLoading(false);
     }
-  }, [range, statusFilter, modelFilter, page]);
+  }, [range, statusFilter, modelFilter, keyId, page]);
 
   useEffect(() => {
     fetchLogs();
@@ -318,6 +322,7 @@ export default function Logs() {
             </Button>
           ))}
         </div>
+        <KeyFilter value={keyId} onChange={id => { setKeyId(id); resetPage(); }} />
         <Input
           value={modelFilter}
           onChange={e => { setModelFilter(e.target.value); resetPage(); }}

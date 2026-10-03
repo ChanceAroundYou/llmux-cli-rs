@@ -37,7 +37,8 @@
     "down": "故障",
     "alias": "别名",
     "logs": "请求日志",
-    "copy": "复制"
+    "copy": "复制",
+    "allKeys": "全部密钥"
   },
   "dashboard": {
     "overview": "系统概览",

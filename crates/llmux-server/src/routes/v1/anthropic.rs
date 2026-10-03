@@ -922,6 +922,8 @@ pub(crate) async fn anthropic_streaming_passthrough(
 
     let (tx, rx) = mpsc::channel::<Result<Bytes, axum::Error>>(64);
     let client_ip = crate::routes::v1::helpers::current_client_ip();
+    // 同 client_ip：流式跑在 tokio::spawn 里，task-local 传不进来，必须在此捕获。
+    let api_key_id = super::helpers::current_api_key_id();
 
     tokio::spawn(async move {
         let mut received: Vec<u8> = Vec::with_capacity(4096);
@@ -977,7 +979,7 @@ pub(crate) async fn anthropic_streaming_passthrough(
             },
             request_body,
             Some(resp_body),
-            ttft_ms, true, client_ip,
+            ttft_ms, true, client_ip, api_key_id,
         )
     });
 
@@ -1012,6 +1014,8 @@ pub(crate) async fn anthropic_to_openai_streaming(
     let (tx, rx) = mpsc::channel::<Result<Bytes, axum::Error>>(64);
     let mut converter = OpenAISseConverter::new(&model);
     let client_ip = crate::routes::v1::helpers::current_client_ip();
+    // 同 client_ip：流式跑在 tokio::spawn 里，task-local 传不进来，必须在此捕获。
+    let api_key_id = crate::routes::v1::helpers::current_api_key_id();
 
     tokio::spawn(async move {
         let mut buffer: Vec<u8> = Vec::with_capacity(4096);
@@ -1170,7 +1174,7 @@ pub(crate) async fn anthropic_to_openai_streaming(
             },
             request_body,
             Some(String::from_utf8_lossy(&received).into_owned()),
-            ttft_ms, true, client_ip,
+            ttft_ms, true, client_ip, api_key_id,
         )
     });
 
@@ -1224,6 +1228,8 @@ pub(crate) async fn responses_to_anthropic_streaming(
     let provider_id = provider_id.to_string();
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, axum::Error>>(64);
     let client_ip = crate::routes::v1::helpers::current_client_ip();
+    // 同 client_ip：流式跑在 tokio::spawn 里，task-local 传不进来，必须在此捕获。
+    let api_key_id = crate::routes::v1::helpers::current_api_key_id();
     tokio::spawn(async move {
         let mut buffer: Vec<u8> = Vec::with_capacity(4096);
         let mut received: Vec<u8> = Vec::with_capacity(4096);
@@ -1273,7 +1279,7 @@ pub(crate) async fn responses_to_anthropic_streaming(
             );
         }
         let complete = conv.is_done() && !conv.is_failed();
-        crate::routes::v1::helpers::spawn_log_usage_ip(pool.clone(), account.clone(), model.clone(), provider_id.clone(), input_tokens, output_tokens, cache_read, cache_create, latency_ms, complete, if complete { None } else if conv.is_failed() { Some("Upstream SSE reported a failure event".to_string()) } else { Some("Responses upstream ended without terminal event".to_string()) }, request_body, Some(String::from_utf8_lossy(&received).into_owned()), ttft_ms, true, client_ip)
+        crate::routes::v1::helpers::spawn_log_usage_ip(pool.clone(), account.clone(), model.clone(), provider_id.clone(), input_tokens, output_tokens, cache_read, cache_create, latency_ms, complete, if complete { None } else if conv.is_failed() { Some("Upstream SSE reported a failure event".to_string()) } else { Some("Responses upstream ended without terminal event".to_string()) }, request_body, Some(String::from_utf8_lossy(&received).into_owned()), ttft_ms, true, client_ip, api_key_id)
     });
     let body = Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx));
     Response::builder().status(StatusCode::OK).header("content-type", "text/event-stream").header("cache-control", "no-cache").header("connection", "keep-alive").body(body).unwrap().into_response()

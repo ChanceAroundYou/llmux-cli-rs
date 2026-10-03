@@ -64,6 +64,7 @@ async fn init_db_creates_fresh_schema_and_seed_providers() {
             "model_probe_suspensions",
             "model_test_results",
             "providers",
+            "reasoning_effort_capabilities",
             "settings",
             "usage_logs",
         ]
@@ -218,7 +219,7 @@ async fn usage_service_logs_usage_updates_limit_cache_and_queries_non_test_data(
         .await
         .expect("log test usage");
 
-    let summary = usage.get_summary(None, None).await.expect("summary");
+    let summary = usage.get_summary(None, None, None).await.expect("summary");
     assert_eq!(summary.total_input, 10);
     assert_eq!(summary.total_output, 20);
     assert_eq!(summary.total_cache_read, 3);
@@ -705,6 +706,35 @@ async fn discovery_prefixed_aggregate_names_resolve_back_to_the_aggregate() {
 /// `let _ = ... .ok().flatten().unwrap_or(0)` 吞掉了所有错误 ——
 /// ALTER 要是没生效，查询会安静地退化成「永不冷却」，看起来一切正常，
 /// 配额耗尽的账户被反复打 429。只有钉住 schema 才看得见。
+#[tokio::test]
+async fn migration_0025_creates_the_reasoning_effort_capability_table() {
+    let pool = memory_db().await;
+    let cols: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_table_info('reasoning_effort_capabilities')")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    for expected in ["provider", "model", "supported", "rejected", "updated_at"] {
+        assert!(
+            cols.contains(&expected.to_string()),
+            "0025 未生效：{expected} 缺失，观测将无处落盘，重启后要重新学一遍"
+        );
+    }
+    // supported / rejected 默认空串：写入侧直接 OVERWRITE 整行，缺列会插入 NULL
+    // 并让读取侧的 `split_list` 拿到空值 —— 这里钉住「可空但有默认值」这个形状。
+    let defaults: Vec<(String, String)> = sqlx::query_as(
+        "SELECT name, dflt_value FROM pragma_table_info('reasoning_effort_capabilities')
+         WHERE name IN ('supported','rejected')",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(defaults.len(), 2, "两列都应带默认值");
+    for (name, default) in defaults {
+        assert_eq!(default, "''", "{name} 的默认值应是空串");
+    }
+}
+
 #[tokio::test]
 async fn migration_0023_splits_probe_and_traffic_cooldowns() {
     let pool = memory_db().await;

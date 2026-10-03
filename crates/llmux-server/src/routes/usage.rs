@@ -12,6 +12,8 @@ use crate::app::AppState;
 #[serde(default)]
 pub struct ActivityQuery {
     pub limit: Option<i64>,
+    /// 按网关密钥筛选。缺省 = 全部。老数据这一列是 NULL，筛不出来，见 StatsQuery::key_id。
+    pub key_id: Option<i64>,
 }
 
 /// Simple activity feed for the dashboard — recent requests without token details.
@@ -28,9 +30,12 @@ pub async fn get_activity(
          FROM usage_logs l
          LEFT JOIN accounts a ON l.account_id = a.id
          WHERE l.is_test = 0
+           AND (? IS NULL OR l.api_key_id = ?)
          ORDER BY l.timestamp DESC
          LIMIT ?",
     )
+    .bind(params.key_id)
+    .bind(params.key_id)
     .bind(limit)
     .fetch_all(&state.pool)
     .await

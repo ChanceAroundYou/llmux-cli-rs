@@ -6,6 +6,7 @@ import { fmtSec, fmtTokens } from '../utils/format';
 import { PageHeader } from '../components/shared/PageHeader';
 import { StatCard } from '../components/shared/StatCard';
 import { EmptyState } from '../components/shared/EmptyState';
+import KeyFilter from '../components/shared/KeyFilter';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
@@ -108,6 +109,8 @@ export default function StatsPage() {
   const [loading, setLoading] = useState(false);
   const [modelFilter, setModelFilter] = useState('');
   const [accountFilter, setAccountFilter] = useState('');
+  // null = 全部密钥。服务端筛选（不是本地文本过滤），所以要进 fetchStats 的依赖。
+  const [keyId, setKeyId] = useState<number | null>(null);
   const [modelSort, setModelSort] = useState<{ key: string; dir: 'asc' | 'desc' }>({ key: 'requests', dir: 'desc' });
   const [accountSort, setAccountSort] = useState<{ key: string; dir: 'asc' | 'desc' }>({ key: 'requests', dir: 'desc' });
 
@@ -128,7 +131,9 @@ export default function StatsPage() {
   const fetchStats = useCallback(async () => {
     setLoading(true);
     try {
-      const res = await apiFetch(`/api/stats?start=${range.start}&end=${range.end}`);
+      const q = new URLSearchParams({ start: String(range.start), end: String(range.end) });
+      if (keyId !== null) q.set('key_id', String(keyId));
+      const res = await apiFetch(`/api/stats?${q.toString()}`);
       if (!res.ok) throw new Error(await res.text());
       const data = await res.json();
       setSummary(data.summary ?? null);
@@ -141,7 +146,7 @@ export default function StatsPage() {
     } finally {
       setLoading(false);
     }
-  }, [range.start, range.end]);
+  }, [range.start, range.end, keyId]);
 
   useEffect(() => { fetchStats(); }, [fetchStats]);
 
@@ -384,12 +389,15 @@ export default function StatsPage() {
 
       {/* Time range */}
       <div className="bg-card border border-border rounded-xl p-4 flex flex-col gap-3">
-        <div className="flex flex-wrap gap-2">
+        <div className="flex flex-wrap gap-2 items-center">
           {(['1h', '24h', '7d', '30d'] as const).map(p => (
             <Button key={p} variant={preset === p ? 'default' : 'outline'} size="sm" onClick={() => applyPreset(p)} className="h-7 px-3 text-xs">
               {t(`usage.presets.${p}`, { defaultValue: p === '1h' ? '近 1 小时' : p === '24h' ? '近 24 小时' : p === '7d' ? '近 7 天' : '近 30 天' })}
             </Button>
           ))}
+          {/* 服务端筛选：与下面表格里的「筛选模型/账号」不同 —— 那两个是对已取回的
+              聚合结果做本地文本过滤，这个是真的改变查询。 */}
+          <KeyFilter value={keyId} onChange={setKeyId} className="ml-auto" />
         </div>
         <div className="flex flex-wrap items-end gap-2">
           <div className="flex flex-col gap-1">

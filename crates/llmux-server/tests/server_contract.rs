@@ -991,3 +991,178 @@ async fn health_reports_success_count_under_a_non_timestamp_name() {
          名字会让每个读它的人误读一遍"
     );
 }
+
+/// 在**已有的** state 上发一次 /api/* 请求。
+///
+/// 不能直接用 request_json —— 它自己 new 一个 test_state()，播种和查询会落到
+/// 两个不同的内存库，查询看到的是空库，断言会莫名其妙地空。
+async fn request_json_on(
+    state: &llmux_server::app::AppState,
+    method: Method,
+    path: &str,
+) -> (StatusCode, Value) {
+    let app = llmux_server::app(state.clone());
+    let cookie = login_and_get_cookie(&app, state).await;
+    let request = Request::builder()
+        .method(method)
+        .uri(path)
+        .header(header::COOKIE, cookie.expect("登录必须拿到 cookie"))
+        .body(Body::empty())
+        .unwrap();
+    let response = llmux_server::test_request(app, request).await;
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+}
+
+/// 播种 + 查询要落在**同一个**内存库。
+///
+/// `test_state()` 走 `SqlitePool::connect("sqlite::memory:")`，池里有多条连接，
+/// 而 SQLite 的裸 `:memory:` **每条连接都是一个独立的库**。用默认池时「播种后能读到」
+/// 只是因为连接恰好被复用 —— 换个时序就读到另一个空库，测试会变成随机的绿/红。
+/// `cache=shared` + max_connections(1) 把这件事变成确定的。
+///
+/// 只给下面这组测试用，不动 test_state() 本身 —— 另有 19 个测试在用它，
+/// 而它们全是单次请求、碰不到这个问题。
+async fn shared_state() -> llmux_server::app::AppState {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite:file:keyid_shared?mode=memory&cache=shared")
+        .await
+        .expect("connect shared in-memory db");
+    llmux_core::db::init_db(&pool)
+        .await
+        .expect("init shared in-memory db");
+    llmux_server::app::AppState {
+        pool,
+        ..llmux_server::test_state().await
+    }
+}
+
+// ── 按网关密钥筛选统计 ─────────────────────────────────────────────
+//
+// 0026 才给 usage_logs 加的 api_key_id，而过滤是**静默**的：拼错 WHERE 不报错，
+// 只少返回或多返回行。所以这三组断言不是「测一下」，是唯一能钉住它的东西。
+//
+// 每组都插两把密钥、每把各一行，再按其中一把筛 —— 只插一行的话，
+// 「过滤压根没生效」也会让 total 恰好等于期望值，测不出东西。
+
+/// 插两把密钥，各自带一条 usage_logs 行。返回两个 key id。
+async fn seed_two_keys_with_logs(state: &llmux_server::app::AppState) -> (i64, i64) {
+    let mut ids = Vec::new();
+    for (name, key, model, input) in [
+        ("alpha", "sk-alpha", "model-alpha", 10i64),
+        ("beta", "sk-beta", "model-beta", 999),
+    ] {
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO api_keys (name, key, allowed_models) VALUES (?, ?, '*') RETURNING id",
+        )
+        .bind(name)
+        .bind(key)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO usage_logs (timestamp, api_key_id, model, input_tokens, output_tokens, latency_ms, success, is_test) \
+             VALUES (?, ?, ?, ?, 5, 10, 1, 0)",
+        )
+        .bind(1_700_000_000_000i64)
+        .bind(id)
+        .bind(model)
+        .bind(input)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        ids.push(id);
+    }
+    (ids[0], ids[1])
+}
+
+#[tokio::test]
+async fn stats_by_key_id_only_aggregates_that_keys_rows() {
+    let state = shared_state().await;
+    let (alpha, _beta) = seed_two_keys_with_logs(&state).await;
+
+    let (status, body) =
+        request_json_on(&state, Method::GET, &format!("/api/stats?start=0&end=99999999999999&key_id={alpha}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // alpha 那行 input=10, beta 那行 input=999。筛 alpha 就绝不能是 999。
+    assert_eq!(
+        body["summary"]["total_input"], json!(10),
+        "只该聚合 alpha 自己的行: {body}"
+    );
+    assert_eq!(body["summary"]["total_requests"], json!(1), "{body}");
+
+    let models: Vec<&str> = body["byModel"]
+        .as_array()
+        .expect("byModel 是数组")
+        .iter()
+        .map(|m| m["model"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(models, vec!["model-alpha"], "byModel 也不该带出 beta: {body}");
+
+    let timeseries = body["timeseries"].as_array().expect("timeseries 是数组");
+    assert_eq!(timeseries.len(), 1, "{body}");
+    assert_eq!(timeseries[0]["input"], json!(10), "{body}");
+}
+
+#[tokio::test]
+async fn stats_logs_by_key_id_narrows_rows_and_total_together() {
+    let state = shared_state().await;
+    let (alpha, _beta) = seed_two_keys_with_logs(&state).await;
+
+    // get_detailed_logs 与 count_detailed_logs 是两份**独立**的 SQL ——
+    // 只测行数会漏掉 total 仍按全量算的情况，分页条数就会自相矛盾。
+    let (status, body) =
+        request_json_on(&state, Method::GET, &format!("/api/stats/logs?start=0&end=99999999999999&key_id={alpha}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["logs"].as_array().map(|a| a.len()), Some(1), "{body}");
+    assert_eq!(body["total"], json!(1), "count 必须跟着过滤一起收窄: {body}");
+    assert_eq!(body["logs"][0]["model"], json!("model-alpha"), "{body}");
+}
+
+#[tokio::test]
+async fn activity_by_key_id_excludes_other_keys_and_null_rows() {
+    let state = shared_state().await;
+    let (alpha, _beta) = seed_two_keys_with_logs(&state).await;
+    // 0026 之前的老行：api_key_id 为 NULL，任何密钥筛选都该排除它。
+    sqlx::query(
+        "INSERT INTO usage_logs (timestamp, api_key_id, model, input_tokens, output_tokens, latency_ms, success, is_test) \
+         VALUES (?, NULL, 'model-legacy', 7, 0, 10, 1, 0)",
+    )
+    .bind(1_700_000_000_000i64)
+    .execute(&state.pool)
+    .await
+    .unwrap();
+
+    let (status, body) =
+        request_json_on(&state, Method::GET, &format!("/api/activity?key_id={alpha}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let entries = body["entries"].as_array().expect("entries 是数组");
+    // 库里共 3 行：alpha 的、beta 的、legacy 的。筛 alpha 只该剩 1 行；
+    // 过滤整个失效时会是 3 行，所以这个 len 断言才是有牙齿的那个。
+    assert_eq!(entries.len(), 1, "{body}");
+    assert_eq!(entries[0]["model"], json!("model-alpha"), "{body}");
+
+    // 同一批数据不加 key_id：必须三行都在。顺带守住「可选参数不改变旧行为」。
+    let (status, all) = request_json_on(&state, Method::GET, "/api/activity").await;
+    assert_eq!(status, StatusCode::OK, "{all}");
+    assert_eq!(all["entries"].as_array().map(|a| a.len()), Some(3), "{all}");
+}
+
+#[tokio::test]
+async fn stats_without_key_id_keeps_returning_every_row() {
+    // 兼容护栏：不带 key_id 必须是旧行为（两把密钥的行都在），
+    // 否则「加个可选参数」就悄悄改变了既有调用方看到的东西。
+    let state = shared_state().await;
+    let _ = seed_two_keys_with_logs(&state).await;
+
+    let (status, body) =
+        request_json_on(&state, Method::GET, "/api/stats?start=0&end=99999999999999").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["summary"]["total_requests"], json!(2), "{body}");
+    assert_eq!(body["summary"]["total_input"], json!(1009), "{body}");
+}

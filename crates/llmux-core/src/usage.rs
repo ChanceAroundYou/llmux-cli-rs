@@ -134,6 +134,7 @@ pub struct DetailedLogQuery {
     pub provider: Option<String>,
     pub success: Option<bool>,
     pub is_stream: Option<bool>,
+    pub api_key_id: Option<i64>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
 }
@@ -205,6 +206,7 @@ impl UsageService {
         &self,
         start_time: Option<i64>,
         end_time: Option<i64>,
+        api_key_id: Option<i64>,
     ) -> Result<UsageSummary> {
         let mut sql = String::from(
             "SELECT
@@ -219,8 +221,10 @@ impl UsageService {
              WHERE is_test = 0",
         );
         append_time_filter(&mut sql, "", start_time, end_time);
+        append_key_filter(&mut sql, "", api_key_id);
         let mut query = sqlx::query(&sql);
         query = bind_time_filter(query, start_time, end_time);
+        query = bind_key_filter(query, api_key_id);
         let row = query.fetch_one(&self.pool).await?;
         let total_input: i64 = row.try_get("total_input")?;
         let total_cache_read: i64 = row.try_get("total_cache_read")?;
@@ -243,8 +247,10 @@ impl UsageService {
              WHERE is_test = 0",
         );
         append_time_filter(&mut raw_sql, "", start_time, end_time);
+        append_key_filter(&mut raw_sql, "", api_key_id);
         let mut raw_query = sqlx::query(&raw_sql);
         raw_query = bind_time_filter(raw_query, start_time, end_time);
+        raw_query = bind_key_filter(raw_query, api_key_id);
         let raw_rows = raw_query.fetch_all(&self.pool).await?;
         let mut latencies: Vec<i64> = Vec::with_capacity(raw_rows.len());
         let mut ttfts: Vec<i64> = Vec::new();
@@ -298,6 +304,7 @@ impl UsageService {
         &self,
         start_time: Option<i64>,
         end_time: Option<i64>,
+        api_key_id: Option<i64>,
     ) -> Result<FailoverStats> {
         let mut failure_sql = String::from(
             "SELECT COUNT(*) AS failed_requests,
@@ -306,13 +313,15 @@ impl UsageService {
              WHERE is_test = 0 AND success = 0",
         );
         append_time_filter(&mut failure_sql, "", start_time, end_time);
+        append_key_filter(&mut failure_sql, "", api_key_id);
         let mut failure_query = sqlx::query(&failure_sql);
         failure_query = bind_time_filter(failure_query, start_time, end_time);
+        failure_query = bind_key_filter(failure_query, api_key_id);
         let failure_row = failure_query.fetch_one(&self.pool).await?;
         let failed_requests: i64 = failure_row.try_get("failed_requests")?;
         let failover_triggers: i64 = failure_row.try_get("failover_triggers")?;
 
-        let summary = self.get_summary(start_time, end_time).await?;
+        let summary = self.get_summary(start_time, end_time, api_key_id).await?;
         let expected_success = summary.total_requests - failed_requests;
         let recovered_requests = (summary.success_requests - expected_success).max(0);
         let failover_success_rate = if failover_triggers > 0 {
@@ -332,6 +341,7 @@ impl UsageService {
         &self,
         start_time: Option<i64>,
         end_time: Option<i64>,
+        api_key_id: Option<i64>,
     ) -> Result<Vec<ProviderBreakdown>> {
         let mut sql = String::from(
             "SELECT provider_id AS id,
@@ -345,8 +355,10 @@ impl UsageService {
              WHERE is_test = 0",
         );
         append_time_filter(&mut sql, "", start_time, end_time);
+        append_key_filter(&mut sql, "", api_key_id);
         let mut query = sqlx::query(&sql);
         query = bind_time_filter(query, start_time, end_time);
+        query = bind_key_filter(query, api_key_id);
         let rows = query.fetch_all(&self.pool).await?;
 
         use std::collections::HashMap;
@@ -400,6 +412,7 @@ impl UsageService {
         &self,
         start_time: Option<i64>,
         end_time: Option<i64>,
+        api_key_id: Option<i64>,
     ) -> Result<Vec<ModelBreakdown>> {
         let mut sql = String::from(
             "SELECT model,
@@ -413,8 +426,10 @@ impl UsageService {
              WHERE is_test = 0",
         );
         append_time_filter(&mut sql, "", start_time, end_time);
+        append_key_filter(&mut sql, "", api_key_id);
         let mut query = sqlx::query(&sql);
         query = bind_time_filter(query, start_time, end_time);
+        query = bind_key_filter(query, api_key_id);
         let rows = query.fetch_all(&self.pool).await?;
 
         use std::collections::HashMap;
@@ -467,6 +482,7 @@ impl UsageService {
         &self,
         start_time: Option<i64>,
         end_time: Option<i64>,
+        api_key_id: Option<i64>,
     ) -> Result<Vec<AccountBreakdown>> {
         let mut sql = String::from(
             "SELECT l.account_id AS id,
@@ -483,8 +499,10 @@ impl UsageService {
              WHERE l.is_test = 0",
         );
         append_time_filter(&mut sql, "l", start_time, end_time);
+        append_key_filter(&mut sql, "l", api_key_id);
         let mut query = sqlx::query(&sql);
         query = bind_time_filter(query, start_time, end_time);
+        query = bind_key_filter(query, api_key_id);
         let rows = query.fetch_all(&self.pool).await?;
 
         use std::collections::HashMap;
@@ -553,6 +571,7 @@ impl UsageService {
         start_time: Option<i64>,
         end_time: Option<i64>,
         granularity_ms: i64,
+        api_key_id: Option<i64>,
     ) -> Result<Vec<TimeseriesPoint>> {
         let gran = granularity_ms.max(60_000);
         let mut sql = String::from(
@@ -566,9 +585,13 @@ impl UsageService {
              WHERE is_test = 0",
         );
         append_time_filter(&mut sql, "", start_time, end_time);
+        append_key_filter(&mut sql, "", api_key_id);
         let mut query = sqlx::query(&sql);
+        // 顺序即位置：gran 的两个 ? 在 SELECT 里，时间的在其后，key 的最后。
+        // 调整这个顺序不会报错，只会让 gran 与 timestamp 错位、静默返回错分桶。
         query = query.bind(gran).bind(gran);
         query = bind_time_filter(query, start_time, end_time);
+        query = bind_key_filter(query, api_key_id);
         let rows = query.fetch_all(&self.pool).await?;
 
         use std::collections::HashMap;
@@ -634,6 +657,9 @@ impl UsageService {
         if options.is_stream.is_some() {
             sql.push_str(" AND l.is_stream = ?");
         }
+        if options.api_key_id.is_some() {
+            sql.push_str(" AND l.api_key_id = ?");
+        }
         sql.push_str(" ORDER BY l.timestamp DESC");
         if options.limit.is_some() {
             sql.push_str(" LIMIT ?");
@@ -660,6 +686,9 @@ impl UsageService {
         }
         if let Some(is_stream) = options.is_stream {
             query = query.bind(bool_to_i64(is_stream));
+        }
+        if let Some(api_key_id) = options.api_key_id {
+            query = query.bind(api_key_id);
         }
         if let Some(limit) = options.limit {
             query = query.bind(limit);
@@ -692,6 +721,9 @@ impl UsageService {
         if options.is_stream.is_some() {
             sql.push_str(" AND l.is_stream = ?");
         }
+        if options.api_key_id.is_some() {
+            sql.push_str(" AND l.api_key_id = ?");
+        }
 
         let mut query = sqlx::query(&sql);
         if let Some(start_time) = options.start_time {
@@ -711,6 +743,9 @@ impl UsageService {
         }
         if let Some(is_stream) = options.is_stream {
             query = query.bind(bool_to_i64(is_stream));
+        }
+        if let Some(api_key_id) = options.api_key_id {
+            query = query.bind(api_key_id);
         }
         Ok(query.fetch_one(&self.pool).await?.try_get("COUNT(*)")?)
     }
@@ -854,6 +889,30 @@ fn bind_time_filter<'q>(
     }
     if let Some(end_time) = end_time {
         query = query.bind(end_time);
+    }
+    query
+}
+
+/// 「按网关密钥筛选」的 SQL 片段。与 append_time_filter 成对使用，**必须在其后调用**
+/// —— 绑定按出现顺序取参，两个 helper 颠倒会让查询静默读错列（不报错，只是数据不对）。
+fn append_key_filter(sql: &mut String, table_alias: &str, api_key_id: Option<i64>) {
+    if api_key_id.is_some() {
+        let prefix = if table_alias.is_empty() {
+            "api_key_id".to_string()
+        } else {
+            format!("{table_alias}.api_key_id")
+        };
+        sql.push_str(&format!(" AND {prefix} = ?"));
+    }
+}
+
+/// 见 append_key_filter —— 绑定顺序必须与拼接顺序一致。
+fn bind_key_filter<'q>(
+    mut query: sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>,
+    api_key_id: Option<i64>,
+) -> sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>> {
+    if let Some(api_key_id) = api_key_id {
+        query = query.bind(api_key_id);
     }
     query
 }

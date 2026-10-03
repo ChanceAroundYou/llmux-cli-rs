@@ -38,6 +38,24 @@
 
 ### Added
 
+- **用量统计 / 请求日志 / 仪表盘活动流支持「按网关密钥筛选」**。此前三个页面都只能
+  按时间窗聚合，维度是模型 / 账号 / 厂商 —— 因为 `usage_logs` 表压根没记「这条请求
+  是用哪把密钥进来的」：鉴权中间件 `WHERE key = ?` 查出的 `AuthContext` 只有
+  `key_name` 不带 id，且 `AuthContext` 从此再没流向日志写入。所以第一步不是加 where
+  条件，而是先把 key 身份落到行上。
+
+  - 迁移 `0026` 给 `usage_logs` 加 `api_key_id`。**不加索引** —— 现有
+    `idx_usage_logs_is_test_timestamp` 已能按窗口收窄，`key_id` 只是在其结果上再过一层；
+    且本仓有「加索引前先 EXPLAIN」的硬规矩（0024 曾删掉 6 个从未被选中的索引）。
+  - `AuthContext` 加 `key_id`，经新 task-local `API_KEY_ID` 传到落库点。**流式路径
+    必须显式传参**：`tokio::spawn` 不继承 task-local，`client_ip` 当年正因此才要单独
+    传，`api_key_id` 同理，在 7 个含 `tokio::spawn` 的函数入口处捕获。
+  - 拨测 / 后台任务写的行仍是 NULL —— 那里本就没有密钥上下文（它们靠 `is_test` 区分）。
+
+  ⚠️ **历史数据靠 `client_ip` 反推**：生产库 2026-10-04 部署后一次性回填 77,161 行
+  （`192.168.1.11` → 星星包，其余 → 旧 key）。这是**推断**，不是记录 —— 该 IP 规则
+  由人提供，无法从库里验证。若将来某台机器换了密钥，历史归属不会自动纠正。
+
 - **定期回收 SQLite 文件里空掉的页**。`usage_logs` 的行永不删除（body 被置 NULL，
   行与统计永久保留 —— 这是设计决定），而 SQLite 释放的页只进 freelist 等复用，
   **文件不会自己缩**。2026-10 实测库涨到 600 MiB，其中 377 MiB 是空的。
@@ -133,6 +151,22 @@
   迁移与新库对不上。
 
 ### Fixed
+
+- **路由层的跳过不再盖掉上游真回过的错误**。所有 dispatcher 的 `last_error` 槽
+  被每个后续候选**无条件**覆盖，而「冷却中 / 账户不存在或已停用 / 协议不支持」
+  这类跳过原因的诊断价值远低于上游真的回过的错误 —— 覆盖之后调用方和
+  `usage_logs` 里就只剩那句没用的「account not found」。
+  2026-10-02 生产实测：聚合别名 `of` 连续 12 条请求失败，DB 记成
+  `Candidate 2 account 57 not found or inactive`，NAS 日志里真相是候选 0
+  回了上游 **400 `invalid request error`**（请求体 1.1 MB，被上游拒），
+  而账户 55 当时完全健康（同桶 10 条成功）—— 它只是在这类超大请求上失败。
+  现在跳过走 `helpers::note_skip_reason`（仅在空槽时写），上游/网络错误仍
+  无条件覆盖（状态码侧本就依赖这个覆盖顺序，见 `exhausted_status` 注释，
+  故 `exhausted_status` 逻辑与返回码均未改动）。
+  回归测试 `crates/llmux-server/tests/e2e_error_masking.rs` 钉住两半：上游
+  错误不被掩盖，且**纯跳过耗尽时跳过原因仍要报出来**（否则调用方只剩一句
+  "All aggregate candidates exhausted"，比原来更糟）。两个用例经三个变异验证
+  会红（M1 跳过改为无条件覆盖 / M2 跳过完全不记 / M3 把 9 个调用点退回直接赋值）。
 
 - **成功率统计不再全表扫 `usage_logs`**。`/api/health` 与 `/api/dashboard` 的
   `GROUP BY account_id` 此前**没有时间窗**，而这张表只涨不跌（10.7 万行 / 103 MiB）。

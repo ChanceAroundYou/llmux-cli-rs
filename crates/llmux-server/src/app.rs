@@ -22,6 +22,11 @@ pub const HOT_CACHE_TTL: Duration = Duration::from_secs(60);
 // ponytail: simple TTL caches for hot-path SQL — avoid 2 RTT per request (auth + alias)
 tokio::task_local! {
     pub static CLIENT_IP: String;
+    /// 当前请求的网关密钥 id，统计按密钥筛选靠它落到 usage_logs。
+    /// 与 CLIENT_IP 不同：它**不能**在 RequestLogMiddleware 里 scope ——
+    /// 那层跑在鉴权中间件之外，AuthContext 那时还不存在。由 v1_auth_middleware
+    /// 在校验通过后 scope。
+    pub static API_KEY_ID: Option<i64>;
 }
 
 #[derive(Debug, Clone)]

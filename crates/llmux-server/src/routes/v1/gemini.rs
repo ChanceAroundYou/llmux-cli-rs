@@ -454,6 +454,8 @@ async fn gemini_streaming_passthrough(
 
     let (tx, rx) = mpsc::channel::<Result<Bytes, axum::Error>>(64);
     let client_ip = super::helpers::current_client_ip();
+    // 同 client_ip：流式跑在 tokio::spawn 里，task-local 传不进来，必须在此捕获。
+    let api_key_id = super::helpers::current_api_key_id();
     tokio::spawn(async move {
         let mut received: Vec<u8> = Vec::with_capacity(4096);
         let mut sse = response.bytes_stream();
@@ -497,7 +499,7 @@ async fn gemini_streaming_passthrough(
             stream_failed,
             request_body,
             Some(resp_body),
-            ttft_ms, true, client_ip,
+            ttft_ms, true, client_ip, api_key_id,
         )
     });
 

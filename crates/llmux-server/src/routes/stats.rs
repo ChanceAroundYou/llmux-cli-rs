@@ -25,6 +25,11 @@ pub struct StatsQuery {
     pub start: Option<i64>,
     pub end: Option<i64>,
     pub granularity: Option<i64>,
+    /// 按网关密钥筛选。缺省 = 全部。
+    ///
+    /// 只能筛到本列有值的行：usage_logs.api_key_id 是 0026 才加的，
+    /// 更早的请求根本没记是哪把密钥，筛老时间窗必然是空。
+    pub key_id: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -38,6 +43,8 @@ pub struct LogsQuery {
     pub success: Option<String>,
     /// Accepts 1/0 or true/false (the UI sends 1/0; serde bool would 400).
     pub is_stream: Option<String>,
+    /// 按网关密钥筛选，见 StatsQuery::key_id。
+    pub key_id: Option<i64>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
 }
@@ -67,11 +74,11 @@ pub async fn get_stats(
 
     let svc = UsageService::new(state.pool.clone());
     let (summary, by_model, by_account, by_provider, timeseries) = tokio::join!(
-        svc.get_summary(Some(start), Some(end)),
-        svc.get_breakdown_by_model(Some(start), Some(end)),
-        svc.get_breakdown_by_account(Some(start), Some(end)),
-        svc.get_breakdown_by_provider(Some(start), Some(end)),
-        svc.get_timeseries(Some(start), Some(end), granularity),
+        svc.get_summary(Some(start), Some(end), params.key_id),
+        svc.get_breakdown_by_model(Some(start), Some(end), params.key_id),
+        svc.get_breakdown_by_account(Some(start), Some(end), params.key_id),
+        svc.get_breakdown_by_provider(Some(start), Some(end), params.key_id),
+        svc.get_timeseries(Some(start), Some(end), granularity, params.key_id),
     );
 
     let summary = match summary {
@@ -133,6 +140,7 @@ pub async fn get_stats_logs(
             provider: params.provider.clone(),
             success: success_flag,
             is_stream: stream_flag,
+            api_key_id: params.key_id,
             limit: None,
             offset: None,
         })
@@ -150,6 +158,7 @@ pub async fn get_stats_logs(
             provider: params.provider,
             success: success_flag,
             is_stream: stream_flag,
+            api_key_id: params.key_id,
             limit: Some(limit),
             offset: Some(offset),
         })

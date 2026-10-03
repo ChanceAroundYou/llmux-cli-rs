@@ -35,7 +35,8 @@
     "down": "Down",
     "alias": "Alias",
     "logs": "Logs",
-    "copy": "Copy"
+    "copy": "Copy",
+    "allKeys": "All keys"
   },
   "dashboard": {
     "overview": "System Overview",

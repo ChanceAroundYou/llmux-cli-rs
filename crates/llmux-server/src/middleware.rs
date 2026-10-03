@@ -9,11 +9,13 @@ use serde_json::json;
 use sqlx::Row;
 
 use crate::app::AppState;
+use crate::app::API_KEY_ID;
 
 /// Context injected into request extensions by the auth middleware so
 /// downstream handlers can check allowed_models.
 #[derive(Debug, Clone)]
 pub struct AuthContext {
+    pub key_id: i64,
     pub key_name: String,
     pub allowed_models: String,
 }
@@ -47,8 +49,9 @@ pub async fn v1_auth_middleware(
             };
             match ctx {
                 Ok(ctx) => {
-                    request.extensions_mut().insert(ctx);
-                    next.run(request).await
+                    request.extensions_mut().insert(ctx.clone());
+                    let key_id = ctx.key_id;
+                    API_KEY_ID.scope(Some(key_id), next.run(request)).await
                 }
                 Err(_) => send_error(
                     "Invalid API Key",
@@ -90,16 +93,18 @@ async fn validate_api_key(
     pool: &sqlx::SqlitePool,
     key: &str,
 ) -> anyhow::Result<AuthContext> {
-    let row = sqlx::query("SELECT name, allowed_models FROM api_keys WHERE key = ?")
+    let row = sqlx::query("SELECT id, name, allowed_models FROM api_keys WHERE key = ?")
         .bind(key)
         .fetch_optional(pool)
         .await?;
 
     match row {
         Some(row) => {
+            let key_id: i64 = row.try_get("id")?;
             let name: String = row.try_get("name")?;
             let allowed_models: String = row.try_get("allowed_models")?;
             Ok(AuthContext {
+                key_id,
                 key_name: name,
                 allowed_models,
             })

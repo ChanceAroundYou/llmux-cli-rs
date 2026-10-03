@@ -8,6 +8,7 @@ import { abbrModel, fmtSec, fmtSecNum } from '../utils/format';
 import { chartBarHeight, chartColorForLatency, chartColorForTtft, healthBadgeClass, totalTone, ttftTone } from '../utils/thresholds';
 import { cn } from '../lib/utils'
 import { StatusDot } from '../components/shared/StatusDot'
+import KeyFilter from '../components/shared/KeyFilter'
 import { PageHeader } from '../components/shared/PageHeader'
 import { EmptyState } from '../components/shared/EmptyState'
 import { StatCard } from '../components/shared/StatCard'
@@ -55,6 +56,8 @@ export default function Dashboard() {
   const [isLoading, setIsLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState('');
   const [onlyShowErrors, setOnlyShowErrors] = useState(false);
+  // null = 全部密钥。服务端筛选，所以活动流要按它重新拉，不能只做本地过滤。
+  const [keyId, setKeyId] = useState<number | null>(null);
 
   const loadAll = async () => {
     setIsLoading(true);
@@ -122,6 +125,19 @@ export default function Dashboard() {
   };
 
   useEffect(() => { const c = loadAll(); return () => { (c as any)?.then?.((f: any) => f?.()); }; }, []);
+
+  // 活动流单独按密钥重拉：/api/activity 的过滤是服务端做的，本地 filter 拿不到
+  // 被筛掉的那些行，所以必须重新请求。
+  useEffect(() => {
+    const ac = new AbortController();
+    const q = new URLSearchParams({ limit: '100' });
+    if (keyId !== null) q.set('key_id', String(keyId));
+    apiFetch(`/api/activity?${q.toString()}`, { signal: ac.signal })
+      .then(r => (r.ok ? r.json() : null))
+      .then(d => { if (d) setActivityLogs(Array.isArray(d.entries) ? d.entries : []); })
+      .catch(err => { if (err?.name !== 'AbortError') console.error('activity fetch failed', err); });
+    return () => ac.abort();
+  }, [keyId]);
 
   const aliasHealthList = useMemo(() => {
     // 普通别名：按 target_model 找最优的一条 model health
@@ -431,6 +447,7 @@ export default function Dashboard() {
                 <h2 className="text-lg font-bold text-foreground truncate">{t('dashboard.recentLogs')}</h2>
               </div>
               <div className="flex items-center gap-2 shrink-0">
+                <KeyFilter value={keyId} onChange={setKeyId} />
                 <button
                   type="button"
                   onClick={() => setOnlyShowErrors(!onlyShowErrors)}

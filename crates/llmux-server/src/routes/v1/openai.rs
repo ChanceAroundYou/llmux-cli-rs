@@ -707,6 +707,8 @@ async fn responses_to_chat_streaming(
     let account = account.clone();
     let (tx, rx) = mpsc::channel::<Result<Bytes, axum::Error>>(64);
     let client_ip = super::helpers::current_client_ip();
+    // 同 client_ip：流式跑在 tokio::spawn 里，task-local 传不进来，必须在此捕获。
+    let api_key_id = super::helpers::current_api_key_id();
     tokio::spawn(async move {
         let mut buffer: Vec<u8> = Vec::with_capacity(4096);
         let mut received: Vec<u8> = Vec::with_capacity(4096);
@@ -763,7 +765,7 @@ async fn responses_to_chat_streaming(
         let (cache_read, cache_create) = converter.usage_cache();
         let complete = converter.is_done() && !converter.is_failed();
         let latency_ms = start.elapsed().as_millis() as i64;
-        spawn_log_usage_ip(pool.clone(), account.clone(), model.clone(), account.provider_id.clone(), prompt_tokens, completion_tokens, cache_read, cache_create, latency_ms, complete, if complete { None } else if converter.is_failed() { Some("Upstream SSE reported a failure event".to_string()) } else { Some(format!("Responses upstream ended without terminal event after {chunks} chunks")) }, request_body, Some(String::from_utf8_lossy(&received).into_owned()), ttft_ms, true, client_ip)
+        spawn_log_usage_ip(pool.clone(), account.clone(), model.clone(), account.provider_id.clone(), prompt_tokens, completion_tokens, cache_read, cache_create, latency_ms, complete, if complete { None } else if converter.is_failed() { Some("Upstream SSE reported a failure event".to_string()) } else { Some(format!("Responses upstream ended without terminal event after {chunks} chunks")) }, request_body, Some(String::from_utf8_lossy(&received).into_owned()), ttft_ms, true, client_ip, api_key_id)
     });
     let body = Body::from_stream(ReceiverStream::new(rx));
     Response::builder().status(StatusCode::OK).header("content-type", "text/event-stream").header("cache-control", "no-cache").header("connection", "keep-alive").body(body).unwrap().into_response()
@@ -1526,6 +1528,8 @@ async fn openai_streaming_passthrough(
 
     let (tx, rx) = mpsc::channel::<Result<Bytes, axum::Error>>(64);
     let client_ip = super::helpers::current_client_ip();
+    // 同 client_ip：流式跑在 tokio::spawn 里，task-local 传不进来，必须在此捕获。
+    let api_key_id = super::helpers::current_api_key_id();
     tokio::spawn(async move {
         let mut buffer: Vec<u8> = Vec::with_capacity(4096);
         let mut received: Vec<u8> = Vec::with_capacity(4096);
@@ -1758,7 +1762,7 @@ async fn openai_streaming_passthrough(
             },
             request_body,
             Some(String::from_utf8_lossy(&received).into_owned()),
-            ttft_ms, true, client_ip,
+            ttft_ms, true, client_ip, api_key_id,
         )
     });
 
@@ -1950,6 +1954,8 @@ async fn anthropic_fallback_streaming(
 
     let (tx, rx) = mpsc::channel::<Result<Bytes, axum::Error>>(64);
     let client_ip = super::helpers::current_client_ip();
+    // 同 client_ip：流式跑在 tokio::spawn 里，task-local 传不进来，必须在此捕获。
+    let api_key_id = super::helpers::current_api_key_id();
     tokio::spawn(async move {
         let mut buffer: Vec<u8> = Vec::with_capacity(4096);
         let mut received: Vec<u8> = Vec::with_capacity(4096);
@@ -2023,7 +2029,7 @@ async fn anthropic_fallback_streaming(
                             None,
                             request_body,
                             Some(String::from_utf8_lossy(&received).into_owned()),
-                            ttft_ms, true, client_ip,
+                            ttft_ms, true, client_ip, api_key_id,
                         );
                         return;
                     }

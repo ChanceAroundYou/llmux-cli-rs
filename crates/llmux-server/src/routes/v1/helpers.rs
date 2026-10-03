@@ -678,6 +678,14 @@ pub fn current_client_ip() -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+/// Gateway key id of the current request (set by v1_auth_middleware's task-local).
+/// Same caveat as `current_client_ip` — streams run inside `tokio::spawn`, which
+/// does NOT inherit task-locals, so they must capture this at fn entry and pass
+/// it down alongside the client IP.
+pub fn current_api_key_id() -> Option<i64> {
+    crate::app::API_KEY_ID.try_with(|v| *v).ok().flatten()
+}
+
 // Fire-and-forget variant — does not block the response path.
 // Reads the request-scoped client IP from the task-local automatically.
 #[allow(clippy::too_many_arguments)]
@@ -702,6 +710,7 @@ pub fn spawn_log_usage(
         pool, account, model, provider_id, input_tokens, output_tokens,
         cache_read_input_tokens, cache_creation_input_tokens, latency_ms,
         success, error_message, request_body, response_body, ttft_ms, is_stream, current_client_ip(),
+        current_api_key_id(),
     );
 }
 
@@ -725,6 +734,7 @@ pub fn spawn_log_usage_ip(
     ttft_ms: Option<i64>,
     is_stream: bool,
     client_ip: Option<String>,
+    api_key_id: Option<i64>,
 ) {
     let account = account.clone();
     if !success {
@@ -758,12 +768,13 @@ pub fn spawn_log_usage_ip(
         if success {
             llmux_core::probe::clear_suspension(&pool, account.id, &model).await;
         }
-        let res = sqlx::query("INSERT INTO usage_logs (timestamp, account_id, provider_id, model, input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens, latency_ms, success, error_message, request_body, response_body, ttft_ms, is_stream, client_ip, is_test) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+        let res = sqlx::query("INSERT INTO usage_logs (timestamp, account_id, provider_id, model, input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens, latency_ms, success, error_message, request_body, response_body, ttft_ms, is_stream, client_ip, is_test, api_key_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
             .bind(timestamp).bind(account.id).bind(&provider_id).bind(&model)
             .bind(input_tokens).bind(output_tokens).bind(cache_read_input_tokens).bind(cache_creation_input_tokens)
             .bind(latency_ms).bind(if success {1} else {0}).bind(error_message.as_deref())
             .bind(request_body.as_deref()).bind(response_body.as_deref())
             .bind(ttft_ms).bind(if is_stream {1} else {0}).bind(client_ip.as_deref()).bind(0)
+            .bind(api_key_id)
             .execute(&pool).await;
         if let Err(e) = res { tracing::error!("📊 Failed to insert usage log: {e}"); }
         prune_old_bodies(&pool).await;
