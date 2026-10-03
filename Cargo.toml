@@ -49,6 +49,17 @@ url = "2"
 uuid = { version = "1", features = ["v4"] }
 zeroize = "1"
 
+[profile.dev]
+# 关掉调试信息。cargo 默认是 debug=2（全量），实测那 39% 的体积都是它 ——
+# 集成测试可执行文件单个 160-207M，其中最大的那个 139M 是 .debug_str +
+# .debug_info。14 个测试二进制 + 数百个 rlib 各带一份，加起来 1.4G。
+#
+# ⚠️ 代价：测试 panic 时只有函数名，没有「文件:行号」。需要调试时临时加：
+#   CARGO_PROFILE_DEV_DEBUG=2 cargo test
+# 那会让 cargo 全部重编（实测 3分24秒），所以别常开。
+# ⚠️ 改这个值等价于全部重编，一次性 3分24秒，之后不再付。
+debug = 0
+
 [profile.release]
 lto = "thin"
 strip = true
