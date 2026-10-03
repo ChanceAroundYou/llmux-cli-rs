@@ -196,6 +196,8 @@ pub async fn gemini(
             url,
             headers: req_headers,
             body: body.clone(),
+            // Gemini 原生协议用 thinkingConfig.thinkingBudget，没有 effort 枚举。
+            effort: Default::default(),
         };
 
         tracing::info!(
@@ -242,6 +244,10 @@ pub async fn gemini(
         let status = response.status();
         if !status.is_success() {
             let error_body = response.text().await.unwrap_or_default();
+            // 上游拒了这个档位 → 记下来，后续请求不再重复失败。
+            // 没有这一步，请求前解析只生效一次，整个机制等于空操作。
+            provider_request.effort.record_rejection(&error_body);
+
             last_error = Some(format!("Provider returned {status}: {error_body}"));
 
             if is_retryable_status(status.as_u16()) {
@@ -297,6 +303,7 @@ pub async fn gemini(
         }
 
         // Check content-type — Gemini returns JSON or SSE depending on ?alt=sse
+        provider_request.effort.record_success();
         let content_type = response
             .headers()
             .get("content-type")

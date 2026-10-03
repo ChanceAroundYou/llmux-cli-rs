@@ -210,7 +210,7 @@ pub async fn messages(
         } else if let Some(openai_base) = openai_base {
             // Anthropic → OpenAI protocol translation.
             match anthropic_to_openai_request(&body, &model_resolution.target_model) {
-                Ok(openai_body) => {
+                Ok(mut openai_body) => {
                     let mut req_headers = BTreeMap::new();
                     req_headers.insert(
                         "content-type".to_string(),
@@ -219,6 +219,12 @@ pub async fn messages(
                     req_headers.insert(
                         "authorization".to_string(),
                         format!("Bearer {}", account.api_key),
+                    );
+                    let effort = llmux_core::reasoning_effort::apply_reasoning_effort(
+                        &mut openai_body,
+                        &account.provider_id,
+                        &model_resolution.target_model,
+                        llmux_core::protocol::Protocol::Chat,
                     );
                     (
                         Ok(ProviderRequest {
@@ -229,6 +235,7 @@ pub async fn messages(
                             ),
                             headers: req_headers,
                             body: openai_body,
+                            effort,
                         }),
                         true,
                     )
@@ -312,6 +319,10 @@ pub async fn messages(
         let status = response.status();
         if !status.is_success() {
             let error_body = response.text().await.unwrap_or_default();
+            // 上游拒了这个档位 → 记下来，后续请求不再重复失败。
+            // 没有这一步，请求前解析只生效一次，整个机制等于空操作。
+            provider_request.effort.record_rejection(&error_body);
+
             last_error = Some(format!("Provider returned {status}: {error_body}"));
             last_status = Some(status.as_u16());
 
@@ -379,6 +390,7 @@ pub async fn messages(
         }
 
         // Success — streaming or non-streaming
+        provider_request.effort.record_success();
         if streaming {
             {
                 let mut router = state.dispatch_router.lock().unwrap();
@@ -735,11 +747,12 @@ async fn dispatch_aggregate_anthropic(
                 match openai_base {
                     Some(openai_base) => {
                         match anthropic_to_openai_request(&patched_body, &cand.model) {
-                            Ok(openai_body) => {
+                            Ok(mut openai_body) => {
                                 let mut req_headers = BTreeMap::new();
                                 req_headers.insert("content-type".to_string(), "application/json".to_string());
                                 req_headers.insert("authorization".to_string(), format!("Bearer {}", account.api_key));
-                                (Ok(ProviderRequest { method: "POST".to_string(), url: join_upstream_url(openai_base, "chat/completions"), headers: req_headers, body: openai_body }), true)
+                                let effort = llmux_core::reasoning_effort::apply_reasoning_effort(&mut openai_body, &account.provider_id, &cand.model, llmux_core::protocol::Protocol::Chat);
+                                (Ok(ProviderRequest { method: "POST".to_string(), url: join_upstream_url(openai_base, "chat/completions"), headers: req_headers, body: openai_body, effort }), true)
                             }
                             Err(e) => (Err(e), true),
                         }
@@ -758,11 +771,12 @@ async fn dispatch_aggregate_anthropic(
                     (build_anthropic_passthrough_request(&patched_body, &account, anthropic_base, &cand.model, anthropic_beta.as_deref()), false)
                 } else if let Some(openai_base) = openai_base {
                     match anthropic_to_openai_request(&patched_body, &cand.model) {
-                        Ok(openai_body) => {
+                        Ok(mut openai_body) => {
                             let mut req_headers = BTreeMap::new();
                             req_headers.insert("content-type".to_string(), "application/json".to_string());
                             req_headers.insert("authorization".to_string(), format!("Bearer {}", account.api_key));
-                            (Ok(ProviderRequest { method: "POST".to_string(), url: join_upstream_url(openai_base, "chat/completions"), headers: req_headers, body: openai_body }), true)
+                            let effort = llmux_core::reasoning_effort::apply_reasoning_effort(&mut openai_body, &account.provider_id, &cand.model, llmux_core::protocol::Protocol::Chat);
+                            (Ok(ProviderRequest { method: "POST".to_string(), url: join_upstream_url(openai_base, "chat/completions"), headers: req_headers, body: openai_body, effort }), true)
                         }
                         Err(e) => (Err(e), true),
                     }
@@ -785,6 +799,10 @@ async fn dispatch_aggregate_anthropic(
         let status = response.status();
         if !status.is_success() {
             let error_body = response.text().await.unwrap_or_default();
+            // 上游拒了这个档位 → 记下来，后续请求不再重复失败。
+            // 没有这一步，请求前解析只生效一次，整个机制等于空操作。
+            provider_request.effort.record_rejection(&error_body);
+
             last_error = Some(format!("Provider returned {status}: {error_body}"));
             last_status = Some(status.as_u16());
             if is_retryable_status(status.as_u16()) {
@@ -806,6 +824,7 @@ async fn dispatch_aggregate_anthropic(
 
         if streaming {
             state.aggregate_router.lock().unwrap().note_candidate_success(&alias, i, len);
+            provider_request.effort.record_success();
             hit = Some(i);
             hit_account = Some(account.clone());
             hit_stream = Some((response, cand.model.clone(), account.clone(), account.provider_id.clone(), is_conversion));
@@ -831,6 +850,7 @@ async fn dispatch_aggregate_anthropic(
         }
 
         let usage = extract_anthropic_usage_from_sse(&String::from_utf8_lossy(&body_bytes));
+        provider_request.effort.record_success();
         crate::routes::v1::helpers::spawn_log_usage(state.pool.clone(), account.clone(), cand.model.clone(), account.provider_id.clone(), usage.input_tokens, usage.output_tokens, usage.cache_read_input_tokens, usage.cache_creation_input_tokens, latency_ms, true, None, Some(body.to_string()), Some(data.to_string()), Some(latency_ms), false);
         state.aggregate_router.lock().unwrap().note_candidate_success(&alias, i, len);
         hit = Some(i);

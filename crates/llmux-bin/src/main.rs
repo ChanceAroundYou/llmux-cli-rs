@@ -176,6 +176,14 @@ async fn start(port_override: Option<u16>, use_tui: bool) -> anyhow::Result<()> 
     // usage_logs rows are kept forever by design, so SQLite's file never shrinks
     // on its own — without this it grew to 600 MiB of which 377 MiB was empty.
     llmux_server::db_vacuum::spawn_db_vacuum(pool.clone());
+    // reasoning_effort 能力行是**缓存**：没有它，进程每次重启都要把上游的脾气
+    // 重新学一遍 —— 昨天拒了 max 的 provider 今天还会再拒一次。读失败只是退回
+    // 「重新学」，不阻断启动。
+    let restored = llmux_core::reasoning_effort::restore_capabilities(&pool).await;
+    if restored > 0 {
+        tracing::info!("[reasoning-effort] 恢复 {restored} 条历史能力行");
+    }
+    llmux_core::reasoning_effort::spawn_capability_flush(pool.clone());
     let router = app(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], effective_port));

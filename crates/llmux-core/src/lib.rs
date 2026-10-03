@@ -10,6 +10,7 @@ pub mod export_import;
 pub mod models;
 pub mod probe;
 pub mod proxy;
+pub mod reasoning_effort;
 pub mod settings;
 pub mod protocol;
 pub mod upstream_api;

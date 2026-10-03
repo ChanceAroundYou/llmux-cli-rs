@@ -44,6 +44,8 @@ pub fn build_anthropic_passthrough_request(
         url: build_anthropic_target_url(provider_base_url),
         headers,
         body: Value::Object(patched),
+        // 目标是 Anthropic Messages，没有 reasoning_effort 枚举。
+        effort: Default::default(),
     })
 }
 

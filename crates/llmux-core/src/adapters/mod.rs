@@ -326,6 +326,14 @@ pub struct ProviderRequest {
     pub url: String,
     pub headers: BTreeMap<String, String>,
     pub body: Value,
+    /// 本次实际发出去的 `reasoning_effort`，回错时交给 `record_rejection` 记账。
+    ///
+    /// 挂在 request 上而不是让 `build_*` 单独返回，是因为所有构造函数的返回类型
+    /// 都是 `ProviderRequest` —— 单独返回的句柄会在函数边界被丢掉，回错处就无从
+    /// 知道「刚发出去的是哪一档」，只能重新推导（而观测层在请求与回错之间可能已经
+    /// 变了，推导结果不可信）。
+    #[serde(skip)]
+    pub effort: crate::reasoning_effort::EffortNote,
 }
 
 // ---------------------------------------------------------------------------
@@ -364,6 +372,7 @@ pub fn build_openai_passthrough(
         url: join_upstream_url(&base_url, endpoint),
         headers,
         body: chat_request_to_value(request),
+        effort: Default::default(),
     }
 }
 
@@ -383,6 +392,11 @@ pub fn build_passthrough(
 
 /// Same as `build_passthrough` but attaches `anthropic-beta` when the target
 /// is `Messages`.
+///
+/// `body` 在这里按上游能力表解析 `reasoning_effort`：客户端给的档位比 provider
+/// 实际接受的范围宽，发一个不支持的值会让**整轮请求失败**。返回的
+/// [`EffortNote`] 交给调用点在回错时记账 —— 两半缺一不可，只做前半段会让整个
+/// 机制变成空操作。
 pub fn build_passthrough_with_beta(
     account: &Account,
     protocol: crate::protocol::Protocol,
@@ -408,11 +422,24 @@ pub fn build_passthrough_with_beta(
     } else {
         headers.insert("authorization".into(), format!("Bearer {}", account.api_key));
     }
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let mut body = body.clone();
+    let effort = crate::reasoning_effort::apply_reasoning_effort(
+        &mut body,
+        &account.provider_id,
+        model,
+        proto,
+    );
+    // 记账句柄挂在 request 上：调用点已经在传 `&ProviderRequest`，不必改签名。
     ProviderRequest {
         method: "POST".into(),
         url,
         headers,
-        body: body.clone(),
+        body,
+        effort,
     }
 }
 
@@ -650,6 +677,7 @@ mod first_byte_timeout_tests {
             url: url.into(),
             headers: BTreeMap::new(),
             body,
+            effort: Default::default(),
         }
     }
 

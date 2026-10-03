@@ -265,6 +265,10 @@ pub(crate) async fn dispatch_with_conversion(
         let status = response.status();
         if !status.is_success() {
             let error_body = response.text().await.unwrap_or_default();
+            provider_request.effort.record_rejection(&error_body);
+            // 上游拒了这个档位 → 记下来，后续请求不再重复失败。
+            // 没有这一步，请求前解析只生效一次，整个机制等于空操作。
+
             // Runtime fallback: responses unsupported → account default protocol
             // (NOT hard-coded chat). Only relevant for Default/Auto mode.
             if target == Protocol::Responses
@@ -319,6 +323,9 @@ pub(crate) async fn dispatch_with_conversion(
         }
 
         // Success — back-convert the response according to (ingress, target).
+        // 发出去的那档被接受了 → 记下来。缺这一步未知 provider 永远学不会
+        // 「自己其实能用哪几档」，fail-closed 就变成永久失能而不是一轮降级。
+        provider_request.effort.record_success();
         match (back, streaming) {
             (Back::Passthrough, true) => {
                 if is_anthropic {
@@ -593,6 +600,10 @@ pub(crate) async fn dispatch_aggregate_with_conversion(
         let status = response.status();
         if !status.is_success() {
             let error_body = response.text().await.unwrap_or_default();
+            provider_request.effort.record_rejection(&error_body);
+            // 上游拒了这个档位 → 记下来，后续请求不再重复失败。
+            // 没有这一步，请求前解析只生效一次，整个机制等于空操作。
+
             // Runtime fallback: responses unsupported → candidate default protocol.
             if llmux_core::proxy::responses::is_responses_unsupported(&error_body) && mode == DownstreamMode::Default {
                 let fb = default_protocol_for(&account);
@@ -642,6 +653,7 @@ pub(crate) async fn dispatch_aggregate_with_conversion(
         };
         let latency_ms = start.elapsed().as_millis() as i64;
         spawn_log_usage(state.pool.clone(), account.clone(), cand.model.clone(), account.provider_id.clone(), pt, ct, cr, cc, latency_ms, true, None, Some(body.to_string()), Some(converted.to_string()), Some(latency_ms), false);
+        provider_request.effort.record_success();
         state.aggregate_router.lock().unwrap().note_candidate_success(&alias, i, len);
         hit_index = Some(i); hit_account = Some(account); hit_data = Some(converted); break;
     }
@@ -942,11 +954,19 @@ async fn openai_dispatch(
             );
         }
         let base_url = normalize_base_url(base_for_dispatch);
+        let mut forward_body = patched_body.clone();
+        let effort = llmux_core::reasoning_effort::apply_reasoning_effort(
+            &mut forward_body,
+            &account.provider_id,
+            &model_resolution.target_model,
+            proto,
+        );
         let provider_request = ProviderRequest {
             method: "POST".to_string(),
             url: format!("{base_url}/{endpoint}"),
             headers: req_headers,
-            body: patched_body.clone(),
+            body: forward_body,
+            effort,
         };
 
         tracing::info!(
@@ -995,6 +1015,10 @@ async fn openai_dispatch(
 
         if !status.is_success() {
             let error_body = response.text().await.unwrap_or_default();
+            provider_request.effort.record_rejection(&error_body);
+            // 上游拒了这个档位 → 记下来，后续请求不再重复失败。
+            // 没有这一步，请求前解析只生效一次，整个机制等于空操作。
+
             last_error = Some(format!("Provider returned {status}: {error_body}"));
             last_status = Some(status.as_u16());
 
@@ -1097,6 +1121,7 @@ async fn openai_dispatch(
                 let mut router = state.dispatch_router.lock().unwrap();
                 router.record_result(&dispatch_key, &dispatch_meta, Some(account.id), true);
             }
+            provider_request.effort.record_success();
             send_tui_request(&state.tui_tx, normalized_uri.path(), status.as_u16(), start, &model_resolution.target_model);
             return openai_streaming_passthrough(
                 response,
@@ -1133,6 +1158,7 @@ async fn openai_dispatch(
         let prompt_tokens = (raw_prompt - cache_read).max(0);
         let cache_create = 0;
         let latency_ms = start.elapsed().as_millis() as i64;
+        provider_request.effort.record_success();
         spawn_log_usage(
             state.pool.clone(),
             (*account).clone(),
@@ -1298,7 +1324,14 @@ async fn dispatch_aggregate_openai(
         } else {
             req_headers.insert("authorization".to_string(), format!("Bearer {}", account.api_key));
         }
-        let provider_request = ProviderRequest { method: "POST".to_string(), url: format!("{base_url}/{endpoint}"), headers: req_headers, body: patched_body.clone() };
+        let mut agg_body = patched_body.clone();
+        let effort = llmux_core::reasoning_effort::apply_reasoning_effort(
+            &mut agg_body,
+            &account.provider_id,
+            &cand.model,
+            proto,
+        );
+        let provider_request = ProviderRequest { method: "POST".to_string(), url: format!("{base_url}/{endpoint}"), headers: req_headers, body: agg_body, effort };
 
         tracing::info!("🔀 [agg:{} V={}] {} → {} → {}/{}", alias, active, account.alias, cand.model, base_url, endpoint);
         if let Some(tx) = &state.tui_tx {
@@ -1320,6 +1353,10 @@ async fn dispatch_aggregate_openai(
         let status = response.status();
         if !status.is_success() {
             let error_body = response.text().await.unwrap_or_default();
+            provider_request.effort.record_rejection(&error_body);
+            // 上游拒了这个档位 → 记下来，后续请求不再重复失败。
+            // 没有这一步，请求前解析只生效一次，整个机制等于空操作。
+
             last_error = Some(format!("Provider returned {status}: {error_body}"));
             last_status = Some(status.as_u16());
             if is_retryable_status(status.as_u16()) {
@@ -1353,6 +1390,7 @@ async fn dispatch_aggregate_openai(
         }
 
         if streaming {
+            provider_request.effort.record_success();
             state.aggregate_router.lock().unwrap().note_candidate_success(&alias, i, len);
             hit_index = Some(i);
             hit_account = Some(account.clone());
@@ -1364,6 +1402,7 @@ async fn dispatch_aggregate_openai(
         let data: Value = match serde_json::from_slice(&body_bytes) { Ok(v) => v, Err(e) => { last_error = Some(format!("Failed to parse response: {e}")); state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); failed_candidates += 1; continue; } };
         let (prompt_tokens, completion_tokens, cache_read, cache_create) = passthrough_usage(&data);
         let latency_ms = start.elapsed().as_millis() as i64;
+        provider_request.effort.record_success();
         spawn_log_usage(state.pool.clone(), account.clone(), cand.model.clone(), account.provider_id.clone(), prompt_tokens, completion_tokens, cache_read, cache_create, latency_ms, true, None, Some(body.to_string()), Some(data.to_string()), Some(latency_ms), false);
         state.aggregate_router.lock().unwrap().note_candidate_success(&alias, i, len);
         hit_index = Some(i);
@@ -1839,6 +1878,8 @@ async fn anthropic_fallback_response(
         url: build_anthropic_target_url(anthropic_base),
         headers,
         body: anthropic_body,
+        // 目标是 Anthropic Messages，没有 reasoning_effort 枚举。
+        effort: Default::default(),
     };
 
     let response = match execute_provider_request(&provider_request).await {
