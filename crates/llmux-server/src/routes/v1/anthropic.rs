@@ -177,7 +177,7 @@ pub async fn messages(
         // 配额/限流冷却中的账户跳过，见 openai.rs 183 行同处注释。
         if super::helpers::rate_limit_suspended(&state.pool, account.id, &model_resolution.target_model).await {
             tracing::debug!("⏸️  跳过 {} | 账户 {}：冷却中", model_resolution.target_model, account.alias);
-            last_error = Some(format!("Account {} rate limited, cooling down", account.alias));
+            super::helpers::note_skip_reason(&mut last_error, format!("Account {} rate limited, cooling down", account.alias));
             cooled_skips += 1;
             continue;
         }
@@ -699,15 +699,15 @@ async fn dispatch_aggregate_anthropic(
         // 重打只是再吃一次 429，还把整条链拖成 502。
         if crate::routes::v1::helpers::rate_limit_suspended(&state.pool, cand.account_id, &cand.model).await {
             tracing::debug!("⏸️  [agg:{}] 跳过 {} | 账户 {}：冷却中", alias, cand.model, cand.account_id);
-            last_error = Some(format!("Candidate {} ({}) rate limited, cooling down", i, cand.model));
+            crate::routes::v1::helpers::note_skip_reason(&mut last_error, format!("Candidate {} ({}) rate limited, cooling down", i, cand.model));
             cooled_skips += 1;
             state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len);
             continue;
         }
         let account = match get_account_by_id(&state.pool, cand.account_id, &state.master_key).await {
             Ok(Some(a)) => a,
-            Ok(None) => { state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); last_error = Some(format!("Candidate {} account {} not found or inactive", i, cand.account_id)); failed_candidates += 1; continue; }
-            Err(e) => { state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); last_error = Some(format!("Failed to load account {}: {e}", cand.account_id)); failed_candidates += 1; continue; }
+            Ok(None) => { state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); crate::routes::v1::helpers::note_skip_reason(&mut last_error, format!("Candidate {} account {} not found or inactive", i, cand.account_id)); failed_candidates += 1; continue; }
+            Err(e) => { state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); crate::routes::v1::helpers::note_skip_reason(&mut last_error, format!("Failed to load account {}: {e}", cand.account_id)); failed_candidates += 1; continue; }
         };
 
         // Patch body model

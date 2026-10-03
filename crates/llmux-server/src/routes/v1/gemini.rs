@@ -136,7 +136,7 @@ pub async fn gemini(
         // 配额/限流冷却中的账户跳过，见 openai.rs 183 行同处注释。
         if super::helpers::rate_limit_suspended(&state.pool, account.id, &model_resolution.target_model).await {
             tracing::debug!("⏸️  跳过 {} | 账户 {}：冷却中", model_resolution.target_model, account.alias);
-            last_error = Some(format!("Account {} rate limited, cooling down", account.alias));
+            super::helpers::note_skip_reason(&mut last_error, format!("Account {} rate limited, cooling down", account.alias));
             cooled_skips += 1;
             continue;
         }

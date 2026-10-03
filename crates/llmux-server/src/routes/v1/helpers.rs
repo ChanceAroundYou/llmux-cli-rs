@@ -112,6 +112,26 @@ pub fn exhausted_status(cooled: usize, failed: usize, last_status: Option<u16>) 
     }
 }
 
+/// 记一条**路由层**的跳过原因（冷却中 / 账户不可用 / 协议不支持），只在还没
+/// 记过任何原因时写入。
+///
+/// 这些原因都是「这个候选压根没被试过」，诊断价值远低于上游真的回过的错误。
+/// 无条件写会互相盖掉：候选 0 拿到上游 400（响应正文里有真正的诊断信息），
+/// 候选 1 恰好是已停用账户，于是 `last_error` 变成 "account not found"，
+/// 调用方和 `usage_logs` 里都只剩这条，**真正的原因消失了**。
+/// 2026-10-02 生产实测：12 条 `deepseek/deepseek-v4.1-flash` 记成
+/// "account 57 not found or inactive"，日志里真相是上游 400
+/// `invalid request error`（body 1.1 MB，被上游拒），账户 55 当时完全健康。
+///
+/// 上游错误那条路径**不用**这个函数 —— 它必须无条件覆盖（最后一次尝试的真实
+/// 结果比更早的更相关，见 `exhausted_status` 的注释：状态码那侧同样依赖
+/// "后一个候选会覆盖前一个"这个行为来避免顺序依赖）。
+pub fn note_skip_reason(slot: &mut Option<String>, reason: String) {
+    if slot.is_none() {
+        *slot = Some(reason);
+    }
+}
+
 /// 全部候选都因 429 耗尽（冷却跳过 or 上游回 429）→ 回 429 + Retry-After，让调用方退避而不是立刻重试
 pub fn rate_limited_response(message: &str, is_anthropic: bool) -> axum::response::Response {
     let retry_after = llmux_core::probe::SUSPEND_SECS.to_string();

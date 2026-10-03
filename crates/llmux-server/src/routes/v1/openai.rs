@@ -192,7 +192,7 @@ pub(crate) async fn dispatch_with_conversion(
         // 每日 100 次配额耗尽后，不跳的话每次请求都原样吃一个 429。
         if super::helpers::rate_limit_suspended(&state.pool, account.id, &model_name).await {
             tracing::debug!("⏸️  跳过 {} | 账户 {}：冷却中", model_name, account.alias);
-            last_error = Some(format!("Account {} rate limited, cooling down", account.alias));
+            super::helpers::note_skip_reason(&mut last_error, format!("Account {} rate limited, cooling down", account.alias));
             cooled_skips += 1;
             continue;
         }
@@ -202,7 +202,7 @@ pub(crate) async fn dispatch_with_conversion(
         // protocol this account doesn't serve — skip it instead of falling
         // through to build_passthrough's api.openai.com fallback URL.
         if !llmux_core::protocol::supports(account, target) {
-            last_error = Some(format!("Account {} does not support {:?} target", account.alias, target));
+            super::helpers::note_skip_reason(&mut last_error, format!("Account {} does not support {:?} target", account.alias, target));
             failed_candidates += 1;
             continue;
         }
@@ -559,15 +559,15 @@ pub(crate) async fn dispatch_aggregate_with_conversion(
         // 配额/限流冷却中的候选跳过，见 670 行同处注释。
         if crate::routes::v1::helpers::rate_limit_suspended(&state.pool, cand.account_id, &cand.model).await {
             tracing::debug!("⏸️  [agg:{}] 跳过 {} | 账户 {}：冷却中", alias, cand.model, cand.account_id);
-            last_error = Some(format!("Candidate {} ({}) rate limited, cooling down", i, cand.model));
+            crate::routes::v1::helpers::note_skip_reason(&mut last_error, format!("Candidate {} ({}) rate limited, cooling down", i, cand.model));
             cooled_skips += 1;
             state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len);
             continue;
         }
         let account = match get_account_by_id(&state.pool, cand.account_id, &state.master_key).await {
             Ok(Some(a)) => a,
-            Ok(None) => { state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); last_error = Some(format!("Candidate {} account {} not found", i, cand.account_id)); failed_candidates += 1; continue; }
-            Err(e) => { state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); last_error = Some(format!("Failed to load account {}: {e}", cand.account_id)); failed_candidates += 1; continue; }
+            Ok(None) => { state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); crate::routes::v1::helpers::note_skip_reason(&mut last_error, format!("Candidate {} account {} not found", i, cand.account_id)); failed_candidates += 1; continue; }
+            Err(e) => { state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); crate::routes::v1::helpers::note_skip_reason(&mut last_error, format!("Failed to load account {}: {e}", cand.account_id)); failed_candidates += 1; continue; }
         };
         // Per-candidate target computation (Task 6).
         let target = target_protocol(ingress, mode, &account);
@@ -575,7 +575,7 @@ pub(crate) async fn dispatch_aggregate_with_conversion(
             // This candidate's account can't serve the Responses target; skip it.
             // (Explicit responses aggregates resolve uniformly in practice.)
             state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len);
-            last_error = Some(format!("Candidate {} account {} cannot serve Responses target", i, cand.account_id));
+            crate::routes::v1::helpers::note_skip_reason(&mut last_error, format!("Candidate {} account {} cannot serve Responses target", i, cand.account_id));
             failed_candidates += 1;
             continue;
         }
@@ -1256,7 +1256,7 @@ async fn dispatch_aggregate_openai(
             Ok(Some(a)) => a,
             Ok(None) => {
                 state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len);
-                last_error = Some(format!("Candidate {} account {} not found or inactive", i, cand.account_id));
+                crate::routes::v1::helpers::note_skip_reason(&mut last_error, format!("Candidate {} account {} not found or inactive", i, cand.account_id));
                 failed_candidates += 1;
                 continue;
             }
