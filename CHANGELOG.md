@@ -75,6 +75,28 @@
   默认才是 7；CLAUDE.md 两处都写成 7。按 7 去做「日志占太多」的判断会得出错误结论。
   已更正，并注明日志走 NAS（6.4T 大盘）**不占路由器 overlay**。
 
+- **用量统计加「折算成本」估算**。复用 0001 就建好、却一直 0 行且无人读写的
+  `model_prices` 表：迁移 `0027` 补 `cache_read_price` / `cache_write_price` /
+  `source` / `source_model_id`。单价单位是 **美元 / token**（OpenRouter 原始单位，
+  不是每百万）。
+
+  - `source='openrouter'` 由 6h 刷新任务写入；`source='manual'` 是手工定价与免费
+    模型的 0 价行，**刷新永不覆盖**。这是「另建一张 price_cache 表」方案想解决的
+    唯一问题，用一列解决，不拆表。
+  - 刷新任务 `model_prices::spawn_price_refresh`：启动先拉一次，之后每 6h 一轮，
+    拉 OpenRouter 公开 `/api/v1/models`（无需 key）。匹配三层：精确 → 去厂商前缀
+    （`deepseek-v4.1-flash` ↔ `deepseek/deepseek-v4.1-flash`）→ 再剥 `-free` / 日期
+    后缀。失败只 warn，循环不死，与 `db_vacuum` 同规矩。
+  - 统计侧 `est_cost` 进 summary / 按模型 / 按账号 / 按厂商 / timeseries；并返回
+    `unpriced_models`，把「有流量却没价目」显式暴露，避免估算静默偏低。
+  - 迁移种入 7 个公开渠道查不到报价的模型（`omen-alpha`、`agnes-*`、
+    `deepseek-flash*`、`bonsai2-27b`、`qwen3.8-max`）为 `manual` + 0 价。本地 GGUF
+    无价目行，读取侧本来也记 0。
+  - UI：用量统计加成本卡片与列；新增 `/prices` 价目表页（列表 / 手填 / 立即刷新）。
+  - ⚠️ **估算口径**：订阅制 / 包月上游（OpenCode Zen、teamorouter）与本地模型的
+    token 记为 0 成本 —— 付的是包月 / 电费，不是按量。若某上游改成按量计费，需把
+    对应行改回 `openrouter`（允许刷新）或手填价。
+
 ### Performance
 
 - **非流式上游请求加首字节超时，挂死的上游从 340s 压到 30s**。原先 client 只设了

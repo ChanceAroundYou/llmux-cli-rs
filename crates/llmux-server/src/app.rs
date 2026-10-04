@@ -49,7 +49,7 @@ use tower_http::{
     trace::TraceLayer,
 };
 
-use crate::routes::{accounts, auth, dashboard, health, keys, models, settings, stats, system, usage, v1};
+use crate::routes::{accounts, auth, dashboard, health, keys, model_prices, models, settings, stats, system, usage, v1};
 
 static TIME_FMT: LazyLock<Vec<time::format_description::BorrowedFormatItem<'static>>> =
     LazyLock::new(|| time::format_description::parse_borrowed::<1>("[hour]:[minute]:[second]").unwrap());
@@ -364,6 +364,14 @@ fn core_router() -> AppRouter {
         .route("/api/activity/:id", get(usage::get_activity_detail))
         .route("/api/stats", get(stats::get_stats))
         .route("/api/stats/logs", get(stats::get_stats_logs))
+        .route(
+            "/api/model-prices",
+            get(model_prices::list_model_prices).put(model_prices::set_model_price),
+        )
+        .route(
+            "/api/model-prices/refresh",
+            post(model_prices::refresh_model_prices),
+        )
         .route("/api/health", get(health::get_health_status))
         .route("/api/system/tools", get(system::get_installed_tools))
         .route(

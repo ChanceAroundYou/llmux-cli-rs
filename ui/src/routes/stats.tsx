@@ -2,7 +2,7 @@ import React, { useEffect, useState, useMemo, useCallback } from 'react';
 import { apiFetch } from "@/lib/api";
 import { useTranslation } from 'react-i18next';
 import { BarChart3, RefreshCw, Search, Inbox } from 'lucide-react';
-import { fmtSec, fmtTokens } from '../utils/format';
+import { fmtSec, fmtTokens, fmtCost } from '../utils/format';
 import { PageHeader } from '../components/shared/PageHeader';
 import { StatCard } from '../components/shared/StatCard';
 import { EmptyState } from '../components/shared/EmptyState';
@@ -42,6 +42,8 @@ interface Summary {
   avg_tps: number;
   total_requests: number;
   success_requests: number;
+  est_cost: number;
+  unpriced_models: number;
 }
 interface ModelBreakdown {
   model: string | null;
@@ -56,6 +58,7 @@ interface ModelBreakdown {
   avgTtft: number;
   p95Ttft: number;
   avgTps: number;
+  estCost: number;
 }
 interface AccountBreakdown {
   id: number;
@@ -73,6 +76,7 @@ interface AccountBreakdown {
   avgTtft: number;
   p95Ttft: number;
   avgTps: number;
+  estCost: number;
 }
 
 const PRESET_MS: Record<Exclude<Preset, 'custom'>, number> = {
@@ -180,6 +184,7 @@ export default function StatsPage() {
         case 'avgLatency': return m.avgLatency;
         case 'avgTtft': return m.avgTtft;
         case 'avgTps': return m.avgTps;
+        case 'estCost': return m.estCost ?? 0;
         default: return 0;
       }
     };
@@ -206,6 +211,7 @@ export default function StatsPage() {
         case 'avgLatency': return a.avgLatency;
         case 'avgTtft': return a.avgTtft;
         case 'avgTps': return a.avgTps;
+        case 'estCost': return a.estCost ?? 0;
         default: return 0;
       }
     };
@@ -423,6 +429,7 @@ export default function StatsPage() {
         <StatCard label={t('usage.statsCards.avgLatency', { defaultValue: '平均耗时' })} value={fmtSec(avgNetLatency)} subtitle={`P95 ${fmtSec(p95NetLatency)}`} icon={BarChart3} />
         <StatCard label={t('usage.statsCards.avgTtft', { defaultValue: '平均 TTFT' })} value={fmtSec(summary?.avg_ttft ?? 0)} subtitle={`P95 ${fmtSec(summary?.p95_ttft ?? 0)}`} icon={BarChart3} />
         <StatCard label={t('usage.statsCards.avgTps', { defaultValue: '平均 Token/s' })} value={`${(summary?.avg_tps ?? 0).toFixed(1)} Token/s`} icon={BarChart3} />
+        <StatCard label={t('usage.statsCards.estCost', { defaultValue: '折算成本' })} value={`$${fmtCost(summary?.est_cost ?? 0)}`} subtitle={(summary?.unpriced_models ?? 0) > 0 ? t('usage.unpricedModels', { defaultValue: '{{count}} 个模型未定价，估算偏低', count: summary?.unpriced_models }) : t('usage.statsCards.estCostNote', { defaultValue: '按 OpenRouter 单价折算' })} icon={BarChart3} />
       </section>
 
       {/* Charts */}
@@ -487,11 +494,12 @@ export default function StatsPage() {
                 <th className="text-right px-3 py-2 cursor-pointer select-none" onClick={() => toggleModelSort('avgLatency')}>{t('usage.tables.headers.avgLatency', { defaultValue: '平均耗时' })}{sortIndicator(modelSort,'avgLatency')}</th>
                 <th className="text-right px-3 py-2 cursor-pointer select-none" onClick={() => toggleModelSort('avgTtft')}>{t('usage.tables.headers.avgTtft', { defaultValue: '平均 TTFT' })}{sortIndicator(modelSort,'avgTtft')}</th>
                 <th className="text-right px-3 py-2 cursor-pointer select-none" onClick={() => toggleModelSort('avgTps')}>{t('usage.tables.headers.avgTps', { defaultValue: 'Token/s' })}{sortIndicator(modelSort,'avgTps')}</th>
+                <th className="text-right px-3 py-2 cursor-pointer select-none" onClick={() => toggleModelSort('estCost')}>{t('usage.tables.headers.estCost', { defaultValue: '成本' })}{sortIndicator(modelSort,'estCost')}</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-border/50">
               {sortedModels.length === 0 ? (
-                <tr><td colSpan={10} className="py-8"><EmptyState icon={Inbox} title={t('usage.noData', { defaultValue: '暂无数据' })} /></td></tr>
+                <tr><td colSpan={11} className="py-8"><EmptyState icon={Inbox} title={t('usage.noData', { defaultValue: '暂无数据' })} /></td></tr>
               ) : sortedModels.map((m, i) => (
                 <tr key={i} className="hover:bg-muted/30">
                   <td className="px-4 py-2 font-mono truncate max-w-[260px]">{m.model ?? '—'}</td>
@@ -504,6 +512,7 @@ export default function StatsPage() {
                   <td className="text-right px-3 py-2">{fmtSec(Math.max(0, m.avgLatency - m.avgTtft))}</td>
                   <td className="text-right px-3 py-2">{fmtSec(m.avgTtft)}</td>
                   <td className="text-right px-3 py-2">{m.avgTps.toFixed(1)}</td>
+                  <td className="text-right px-3 py-2">${fmtCost(m.estCost)}</td>
                 </tr>
               ))}
             </tbody>
@@ -534,11 +543,12 @@ export default function StatsPage() {
                 <th className="text-right px-3 py-2 cursor-pointer select-none" onClick={() => toggleAccountSort('avgLatency')}>{t('usage.tables.headers.avgLatency', { defaultValue: '平均耗时' })}{sortIndicator(accountSort,'avgLatency')}</th>
                 <th className="text-right px-3 py-2 cursor-pointer select-none" onClick={() => toggleAccountSort('avgTtft')}>{t('usage.tables.headers.avgTtft', { defaultValue: '平均 TTFT' })}{sortIndicator(accountSort,'avgTtft')}</th>
                 <th className="text-right px-3 py-2 cursor-pointer select-none" onClick={() => toggleAccountSort('avgTps')}>{t('usage.tables.headers.avgTps', { defaultValue: 'Token/s' })}{sortIndicator(accountSort,'avgTps')}</th>
+                <th className="text-right px-3 py-2 cursor-pointer select-none" onClick={() => toggleAccountSort('estCost')}>{t('usage.tables.headers.estCost', { defaultValue: '成本' })}{sortIndicator(accountSort,'estCost')}</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-border/50">
               {sortedAccounts.length === 0 ? (
-                <tr><td colSpan={10} className="py-8"><EmptyState icon={Inbox} title={t('usage.noData', { defaultValue: '暂无数据' })} /></td></tr>
+                <tr><td colSpan={11} className="py-8"><EmptyState icon={Inbox} title={t('usage.noData', { defaultValue: '暂无数据' })} /></td></tr>
               ) : sortedAccounts.map(a => (
                 <tr key={a.id} className="hover:bg-muted/30">
                   <td className="px-4 py-2 font-medium">{a.name}</td>
@@ -551,6 +561,7 @@ export default function StatsPage() {
                   <td className="text-right px-3 py-2">{fmtSec(Math.max(0, a.avgLatency - a.avgTtft))}</td>
                   <td className="text-right px-3 py-2">{fmtSec(a.avgTtft)}</td>
                   <td className="text-right px-3 py-2">{a.avgTps.toFixed(1)}</td>
+                  <td className="text-right px-3 py-2">${fmtCost(a.estCost)}</td>
                 </tr>
               ))}
             </tbody>

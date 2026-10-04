@@ -176,6 +176,9 @@ async fn start(port_override: Option<u16>, use_tui: bool) -> anyhow::Result<()> 
     // usage_logs rows are kept forever by design, so SQLite's file never shrinks
     // on its own — without this it grew to 600 MiB of which 377 MiB was empty.
     llmux_server::db_vacuum::spawn_db_vacuum(pool.clone());
+    // 价目刷新（6h，启动先拉一次）：复用 model_prices 表，只覆盖 source='openrouter'
+    // 的行，手工/免费模型的 0 价行永不被冲掉。失败只 warn，不影响网关。
+    llmux_server::model_prices::spawn_price_refresh(pool.clone());
     // reasoning_effort 能力行是**缓存**：没有它，进程每次重启都要把上游的脾气
     // 重新学一遍 —— 昨天拒了 max 的 provider 今天还会再拒一次。读失败只是退回
     // 「重新学」，不阻断启动。

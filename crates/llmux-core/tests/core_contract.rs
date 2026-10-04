@@ -258,6 +258,124 @@ async fn usage_service_logs_usage_updates_limit_cache_and_queries_non_test_data(
     );
 }
 
+/// 费用估算：汇总要按 model_prices 的单价把四类 token 折算成美元。
+///
+/// 顺带回归一个 SQLite 动态类型的坑：全 0 的 `SUM()` 会以 INTEGER 返回，
+/// `try_get::<f64>` 会报 "not compatible with SQL type INTEGER" —— 所以
+/// 表达式里用 `0.0` 字面量、对外兜底也写成 `0.0`。
+#[tokio::test]
+async fn usage_cost_is_summed_from_model_prices() {
+    let pool = memory_db().await;
+    let usage = UsageService::new(pool.clone());
+
+    let account_id =
+        sqlx::query("INSERT INTO accounts (alias, provider_id, api_key) VALUES (?, ?, ?)")
+            .bind("Main")
+            .bind("openai")
+            .bind("encrypted")
+            .execute(&pool)
+            .await
+            .expect("insert account")
+            .last_insert_rowid();
+
+    sqlx::query(
+        "INSERT INTO usage_logs (timestamp, account_id, provider_id, model, input_tokens,
+            output_tokens, cache_read_input_tokens, cache_creation_input_tokens, latency_ms,
+            success, is_test)
+         VALUES (1000, ?, 'openai', 'gpt-4o', 10, 20, 3, 4, 50, 1, 0)",
+    )
+    .bind(account_id)
+    .execute(&pool)
+    .await
+    .expect("insert usage");
+
+    // 没有任何价目行：估算是 REAL 0.0，且「未定价模型」要显式报出来。
+    let summary = usage.get_summary(None, None, None).await.expect("summary");
+    assert_eq!(summary.est_cost, 0.0, "无价目行时应是 REAL 0.0");
+    assert_eq!(summary.unpriced_models, 1, "未定价模型必须可见");
+
+    // 灌入单价（美元 / token）后再算一次。
+    sqlx::query(
+        "INSERT INTO model_prices
+            (model_id, vendor, input_price, output_price, cache_read_price, cache_write_price, source)
+         VALUES ('gpt-4o', 'openai', 0.000001, 0.000002, 0.0000001, 0.0000002, 'openrouter')",
+    )
+    .execute(&pool)
+    .await
+    .expect("insert price");
+
+    let summary = usage.get_summary(None, None, None).await.expect("summary");
+    let expected = 10.0 * 1e-6 + 20.0 * 2e-6 + 3.0 * 1e-7 + 4.0 * 2e-7;
+    assert!(
+        (summary.est_cost - expected).abs() < 1e-15,
+        "est_cost={} expected={}",
+        summary.est_cost,
+        expected
+    );
+    assert_eq!(summary.unpriced_models, 0, "已定价模型不再计入未定价");
+
+    let by_model = usage
+        .get_breakdown_by_model(None, None, None)
+        .await
+        .expect("model breakdown");
+    let row = by_model
+        .iter()
+        .find(|r| r.model.as_deref() == Some("gpt-4o"))
+        .expect("gpt-4o row");
+    assert!((row.est_cost - expected).abs() < 1e-15);
+
+    let ts = usage
+        .get_timeseries(None, None, 60_000, None)
+        .await
+        .expect("timeseries");
+    assert!((ts.iter().map(|p| p.est_cost).sum::<f64>() - expected).abs() < 1e-15);
+}
+
+/// 0027 给 model_prices 加缓存价与来源列，并种入公开渠道查不到报价的免费模型。
+/// `source` 默认 `'openrouter'` 是刷新「只覆盖自动行」这条规矩的地基。
+#[tokio::test]
+async fn migration_0027_adds_price_columns_and_seeds_manual_free_models() {
+    let pool = memory_db().await;
+    let cols: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_table_info('model_prices')")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    for expected in [
+        "cache_read_price",
+        "cache_write_price",
+        "source",
+        "source_model_id",
+    ] {
+        assert!(
+            cols.contains(&expected.to_string()),
+            "0027 未生效：{expected} 缺失"
+        );
+    }
+
+    let default: String = sqlx::query_scalar(
+        "SELECT dflt_value FROM pragma_table_info('model_prices') WHERE name = 'source'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("source column exists");
+    assert_eq!(default, "'openrouter'");
+
+    let manual: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM model_prices WHERE source = 'manual'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(manual, 7, "应种入 7 个查不到报价的模型，全部记 0 且 manual");
+
+    let price: f64 =
+        sqlx::query_scalar("SELECT input_price FROM model_prices WHERE model_id = 'omen-alpha'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(price, 0.0);
+}
+
 #[tokio::test]
 async fn multi_protocol_result_survives_in_one_row() {
     // 回归：原 model_protocol_cache 的 PK 是 (account_id, model)、漏了 protocol，

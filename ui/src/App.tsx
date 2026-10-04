@@ -14,6 +14,7 @@ import {
   X,
   BarChart3,
   ScrollText,
+  DollarSign,
   LogOut,
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
@@ -29,6 +30,7 @@ const Models = lazy(() => import('./routes/models'));
 const KeysPage = lazy(() => import('./routes/keys'));
 const StatsPage = lazy(() => import('./routes/stats'));
 const LogsPage = lazy(() => import('./routes/logs'));
+const PricesPage = lazy(() => import('./routes/prices'));
 const SettingsPage = lazy(() => import('./routes/settings'));
 
 const RouteFallback = () => (
@@ -149,6 +151,7 @@ function Shell() {
           <NavItem to="/keys" icon={KeyIcon} labelKey="common.keys" />
           <NavItem to="/stats" icon={BarChart3} labelKey="common.usage" />
           <NavItem to="/logs" icon={ScrollText} labelKey="common.logs" />
+          <NavItem to="/prices" icon={DollarSign} labelKey="common.prices" />
 
           <div className="pt-6 text-xs font-bold text-muted-foreground/50 uppercase tracking-wider px-3 mb-2">{t('common.menuPref')}</div>
           <NavItem to="/settings" icon={Settings} labelKey="common.settings" />
@@ -214,6 +217,7 @@ function App() {
           <Route path="/keys" element={<Suspense fallback={<RouteFallback />}><KeysPage /></Suspense>} />
           <Route path="/stats" element={<Suspense fallback={<RouteFallback />}><StatsPage /></Suspense>} />
           <Route path="/logs" element={<Suspense fallback={<RouteFallback />}><LogsPage /></Suspense>} />
+          <Route path="/prices" element={<Suspense fallback={<RouteFallback />}><PricesPage /></Suspense>} />
           <Route path="/settings" element={<Suspense fallback={<RouteFallback />}><SettingsPage /></Suspense>} />
         </Route>
       </Route>

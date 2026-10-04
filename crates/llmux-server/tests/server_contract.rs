@@ -119,6 +119,39 @@ async fn api_read_routes_match_gateway_empty_placeholder_shapes() {
     }
 }
 
+/// 价目接口：0027 种入的 7 个「查不到报价」模型必须出现且是 manual；
+/// 手工定价的必填校验必须回网关错误形状（而不是 500）。
+#[tokio::test]
+async fn model_prices_routes_expose_seed_rows_and_validate_manual_pricing() {
+    let (status, body) = request_json(Method::GET, "/api/model-prices", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let prices = body["prices"].as_array().expect("prices array");
+    assert_eq!(prices.len(), 7, "应列出 7 个手工 0 价模型");
+    assert!(
+        prices.iter().all(|p| p["source"] == "manual"),
+        "种入的行必须都是 manual（刷新不可覆盖）"
+    );
+    assert!(body["unpriced"].is_array());
+
+    let (status, body) = request_json(Method::PUT, "/api/model-prices", Some(json!({}))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body, json!({ "error": "modelId is required" }));
+
+    let (status, body) =
+        request_json(Method::PUT, "/api/model-prices", Some(json!({ "modelId": "gpt-4o" }))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body, json!({ "error": "inputPrice and outputPrice are required" }));
+
+    let (status, body) = request_json(
+        Method::PUT,
+        "/api/model-prices",
+        Some(json!({ "modelId": "gpt-4o", "inputPrice": 0.000001, "outputPrice": 0.000002 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, json!({ "success": true }));
+}
+
 #[tokio::test]
 async fn api_write_routes_validate_required_fields_and_return_gateway_shapes() {
     let (status, body) = request_json(Method::POST, "/api/auth/web-session", Some(json!({}))).await;

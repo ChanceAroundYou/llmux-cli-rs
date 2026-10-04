@@ -3,6 +3,7 @@ pub mod app;
 pub mod db_vacuum;
 pub mod error;
 pub mod middleware;
+pub mod model_prices;
 pub mod routes;
 pub mod static_ui;
 

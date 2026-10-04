@@ -26,6 +26,16 @@ export const fmtTokens = (n: number | null | undefined): string => {
   return `${v}`;
 };
 
+// 折算成本（美元）。单价是「美元 / token」，量级很小 —— 太多小数会糊成一片，
+// 太少又会把真实花费抹成 0，所以按量级自适应精度。
+export const fmtCost = (n: number | null | undefined): string => {
+  const v = typeof n === 'number' && Number.isFinite(n) ? n : 0;
+  if (v === 0) return '0';
+  if (v < 0.0001) return v.toFixed(6);
+  if (v < 1) return v.toFixed(4);
+  return v.toFixed(2);
+};
+
 // 智能中间省略（>20 才触发）：按 '-' 词边界保留，尽量多保留头段信息，避免把单词切成 tor-free
 //  muse-spark-1.2-contributor-free → muse-spark-1.2…free (19) 优于 muse-spark…free (16) 更完整，且不切词
 export const abbrModel = (s: string): string => {

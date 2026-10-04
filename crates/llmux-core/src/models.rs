@@ -50,6 +50,14 @@ pub struct ModelPrice {
     pub vendor: Option<String>,
     pub input_price: Option<f64>,
     pub output_price: Option<f64>,
+    /// 缓存读价（美元 / token）。OpenRouter 的 `input_cache_read`，不是每百万。
+    pub cache_read_price: Option<f64>,
+    /// 缓存写价（美元 / token）。OpenRouter 的 `input_cache_write`，多数模型缺省。
+    pub cache_write_price: Option<f64>,
+    /// 'openrouter' = 自动刷新写入并可被覆盖；'manual' = 手填/免费 0 价，刷新不碰。
+    pub source: Option<String>,
+    /// 匹配到的 OpenRouter id（如 `deepseek/deepseek-v4.1-flash`），用于溯源。
+    pub source_model_id: Option<String>,
     pub updated_at: Option<String>,
 }
 

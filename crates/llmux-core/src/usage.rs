@@ -25,6 +25,10 @@ pub struct UsageSummary {
     pub avg_tps: f64,
     pub total_requests: i64,
     pub success_requests: i64,
+    /// 折算成本（美元）。按 token 数 × model_prices 单价求和，未定价模型计 0。
+    pub est_cost: f64,
+    /// 窗口内「有 token 却没价目」的模型数 —— 让估算偏低可见，而不是静默。
+    pub unpriced_models: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -64,6 +68,8 @@ pub struct ProviderBreakdown {
     pub avg_ttft: f64,
     pub p95_ttft: f64,
     pub avg_tps: f64,
+    /// 折算成本（美元），见 UsageSummary::est_cost。
+    pub est_cost: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -81,6 +87,8 @@ pub struct ModelBreakdown {
     pub avg_ttft: f64,
     pub p95_ttft: f64,
     pub avg_tps: f64,
+    /// 折算成本（美元），见 UsageSummary::est_cost。
+    pub est_cost: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -101,6 +109,8 @@ pub struct AccountBreakdown {
     pub avg_ttft: f64,
     pub p95_ttft: f64,
     pub avg_tps: f64,
+    /// 折算成本（美元），见 UsageSummary::est_cost。
+    pub est_cost: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -117,6 +127,8 @@ pub struct TimeseriesPoint {
     pub avg_ttft: f64,
     pub p95_ttft: f64,
     pub avg_tps: f64,
+    /// 折算成本（美元），见 UsageSummary::est_cost。
+    pub est_cost: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -210,15 +222,27 @@ impl UsageService {
     ) -> Result<UsageSummary> {
         let mut sql = String::from(
             "SELECT
-                IFNULL(SUM(input_tokens), 0) AS total_input,
-                IFNULL(SUM(output_tokens), 0) AS total_output,
-                IFNULL(SUM(cache_read_input_tokens), 0) AS total_cache_read,
-                IFNULL(SUM(cache_creation_input_tokens), 0) AS total_cache_create,
-                CAST(IFNULL(AVG(latency_ms), 0) AS REAL) AS avg_latency,
+                IFNULL(SUM(usage_logs.input_tokens), 0) AS total_input,
+                IFNULL(SUM(usage_logs.output_tokens), 0) AS total_output,
+                IFNULL(SUM(usage_logs.cache_read_input_tokens), 0) AS total_cache_read,
+                IFNULL(SUM(usage_logs.cache_creation_input_tokens), 0) AS total_cache_create,
+                CAST(IFNULL(AVG(usage_logs.latency_ms), 0) AS REAL) AS avg_latency,
                 COUNT(*) AS total_requests,
-                IFNULL(SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END), 0) AS success_requests
+                IFNULL(SUM(CASE WHEN usage_logs.success = 1 THEN 1 ELSE 0 END), 0) AS success_requests,
+                IFNULL(SUM(
+                    IFNULL(usage_logs.input_tokens, 0) * IFNULL(p.input_price, 0.0)
+                  + IFNULL(usage_logs.output_tokens, 0) * IFNULL(p.output_price, 0.0)
+                  + IFNULL(usage_logs.cache_read_input_tokens, 0) * IFNULL(p.cache_read_price, 0.0)
+                  + IFNULL(usage_logs.cache_creation_input_tokens, 0) * IFNULL(p.cache_write_price, 0.0)
+                ), 0.0) AS est_cost,
+                COUNT(DISTINCT CASE WHEN p.model_id IS NULL
+                      AND (IFNULL(usage_logs.input_tokens, 0) + IFNULL(usage_logs.output_tokens, 0)
+                           + IFNULL(usage_logs.cache_read_input_tokens, 0)
+                           + IFNULL(usage_logs.cache_creation_input_tokens, 0)) > 0
+                      THEN usage_logs.model END) AS unpriced_models
              FROM usage_logs
-             WHERE is_test = 0",
+             LEFT JOIN model_prices p ON p.model_id = usage_logs.model
+             WHERE usage_logs.is_test = 0",
         );
         append_time_filter(&mut sql, "", start_time, end_time);
         append_key_filter(&mut sql, "", api_key_id);
@@ -239,6 +263,8 @@ impl UsageService {
         let total_requests: i64 = row.try_get("total_requests")?;
         let success_requests: i64 = row.try_get("success_requests")?;
         let total_output: i64 = row.try_get("total_output")?;
+        let est_cost: f64 = row.try_get("est_cost")?;
+        let unpriced_models: i64 = row.try_get("unpriced_models")?;
 
         // Percentiles + tps require raw per-row values.
         let mut raw_sql = String::from(
@@ -297,6 +323,8 @@ impl UsageService {
             avg_tps,
             total_requests,
             success_requests,
+            est_cost,
+            unpriced_models,
         })
     }
 
@@ -350,8 +378,13 @@ impl UsageService {
                     IFNULL(cache_read_input_tokens, 0) AS cache_read,
                     IFNULL(cache_creation_input_tokens, 0) AS cache_create,
                     latency_ms, ttft_ms,
-                    CASE WHEN success = 1 THEN 1 ELSE 0 END AS success
+                    CASE WHEN success = 1 THEN 1 ELSE 0 END AS success,
+                    IFNULL(input_tokens, 0) * IFNULL(p.input_price, 0.0)
+                  + IFNULL(output_tokens, 0) * IFNULL(p.output_price, 0.0)
+                  + IFNULL(cache_read_input_tokens, 0) * IFNULL(p.cache_read_price, 0.0)
+                  + IFNULL(cache_creation_input_tokens, 0) * IFNULL(p.cache_write_price, 0.0) AS est_cost
              FROM usage_logs
+             LEFT JOIN model_prices p ON p.model_id = usage_logs.model
              WHERE is_test = 0",
         );
         append_time_filter(&mut sql, "", start_time, end_time);
@@ -370,6 +403,7 @@ impl UsageService {
             acc.output += row.try_get::<i64, _>("output_tokens")?;
             acc.cache_read += row.try_get::<i64, _>("cache_read")?;
             acc.cache_create += row.try_get::<i64, _>("cache_create")?;
+            acc.est_cost += row.try_get::<f64, _>("est_cost")?;
             acc.requests += 1;
             acc.success_count += row.try_get::<i64, _>("success")?;
             acc.latencies.push(row.try_get::<i64, _>("latency_ms")?);
@@ -397,6 +431,7 @@ impl UsageService {
                     avg_ttft,
                     p95_ttft,
                     avg_tps,
+                    est_cost: acc.est_cost,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -421,8 +456,13 @@ impl UsageService {
                     IFNULL(cache_read_input_tokens, 0) AS cache_read,
                     IFNULL(cache_creation_input_tokens, 0) AS cache_create,
                     latency_ms, ttft_ms,
-                    CASE WHEN success = 1 THEN 1 ELSE 0 END AS success
+                    CASE WHEN success = 1 THEN 1 ELSE 0 END AS success,
+                    IFNULL(input_tokens, 0) * IFNULL(p.input_price, 0.0)
+                  + IFNULL(output_tokens, 0) * IFNULL(p.output_price, 0.0)
+                  + IFNULL(cache_read_input_tokens, 0) * IFNULL(p.cache_read_price, 0.0)
+                  + IFNULL(cache_creation_input_tokens, 0) * IFNULL(p.cache_write_price, 0.0) AS est_cost
              FROM usage_logs
+             LEFT JOIN model_prices p ON p.model_id = usage_logs.model
              WHERE is_test = 0",
         );
         append_time_filter(&mut sql, "", start_time, end_time);
@@ -441,6 +481,7 @@ impl UsageService {
             acc.output += row.try_get::<i64, _>("output_tokens")?;
             acc.cache_read += row.try_get::<i64, _>("cache_read")?;
             acc.cache_create += row.try_get::<i64, _>("cache_create")?;
+            acc.est_cost += row.try_get::<f64, _>("est_cost")?;
             acc.requests += 1;
             acc.success_count += row.try_get::<i64, _>("success")?;
             acc.latencies.push(row.try_get::<i64, _>("latency_ms")?);
@@ -467,6 +508,7 @@ impl UsageService {
                     avg_ttft,
                     p95_ttft,
                     avg_tps,
+                    est_cost: acc.est_cost,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -493,9 +535,14 @@ impl UsageService {
                     IFNULL(l.cache_read_input_tokens, 0) AS cache_read,
                     IFNULL(l.cache_creation_input_tokens, 0) AS cache_create,
                     l.latency_ms, l.ttft_ms,
-                    CASE WHEN l.success = 1 THEN 1 ELSE 0 END AS success
+                    CASE WHEN l.success = 1 THEN 1 ELSE 0 END AS success,
+                    IFNULL(l.input_tokens, 0) * IFNULL(p.input_price, 0.0)
+                  + IFNULL(l.output_tokens, 0) * IFNULL(p.output_price, 0.0)
+                  + IFNULL(l.cache_read_input_tokens, 0) * IFNULL(p.cache_read_price, 0.0)
+                  + IFNULL(l.cache_creation_input_tokens, 0) * IFNULL(p.cache_write_price, 0.0) AS est_cost
              FROM usage_logs l
              JOIN accounts a ON l.account_id = a.id
+             LEFT JOIN model_prices p ON p.model_id = l.model
              WHERE l.is_test = 0",
         );
         append_time_filter(&mut sql, "l", start_time, end_time);
@@ -524,6 +571,7 @@ impl UsageService {
             entry.acc.output += row.try_get::<i64, _>("output_tokens")?;
             entry.acc.cache_read += row.try_get::<i64, _>("cache_read")?;
             entry.acc.cache_create += row.try_get::<i64, _>("cache_create")?;
+            entry.acc.est_cost += row.try_get::<f64, _>("est_cost")?;
             entry.acc.requests += 1;
             entry.acc.success_count += row.try_get::<i64, _>("success")?;
             entry.acc.latencies.push(row.try_get::<i64, _>("latency_ms")?);
@@ -553,6 +601,7 @@ impl UsageService {
                     avg_ttft,
                     p95_ttft,
                     avg_tps,
+                    est_cost: g.acc.est_cost,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -580,8 +629,13 @@ impl UsageService {
                     IFNULL(output_tokens, 0) AS output_tokens,
                     IFNULL(cache_read_input_tokens, 0) AS cache_read,
                     IFNULL(cache_creation_input_tokens, 0) AS cache_create,
-                    latency_ms, ttft_ms
+                    latency_ms, ttft_ms,
+                    IFNULL(input_tokens, 0) * IFNULL(p.input_price, 0.0)
+                  + IFNULL(output_tokens, 0) * IFNULL(p.output_price, 0.0)
+                  + IFNULL(cache_read_input_tokens, 0) * IFNULL(p.cache_read_price, 0.0)
+                  + IFNULL(cache_creation_input_tokens, 0) * IFNULL(p.cache_write_price, 0.0) AS est_cost
              FROM usage_logs
+             LEFT JOIN model_prices p ON p.model_id = usage_logs.model
              WHERE is_test = 0",
         );
         append_time_filter(&mut sql, "", start_time, end_time);
@@ -603,6 +657,7 @@ impl UsageService {
             acc.output += row.try_get::<i64, _>("output_tokens")?;
             acc.cache_read += row.try_get::<i64, _>("cache_read")?;
             acc.cache_create += row.try_get::<i64, _>("cache_create")?;
+            acc.est_cost += row.try_get::<f64, _>("est_cost")?;
             acc.requests += 1;
             acc.latencies.push(row.try_get::<i64, _>("latency_ms")?);
             if let Some(t) = row.try_get::<Option<i64>, _>("ttft_ms")? {
@@ -627,6 +682,7 @@ impl UsageService {
                     avg_ttft,
                     p95_ttft,
                     avg_tps,
+                    est_cost: acc.est_cost,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -799,6 +855,9 @@ struct GroupAcc {
     cache_create: i64,
     requests: i64,
     success_count: i64,
+    /// 逐行累加的折算成本（美元）。分组维度（厂商/账号/分桶）无法从合计 token
+    /// 反推成本 —— 不同模型单价不同，必须按行算完再累加。
+    est_cost: f64,
     latencies: Vec<i64>,
     ttfts: Vec<i64>,
 }
