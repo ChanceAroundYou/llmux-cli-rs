@@ -62,6 +62,27 @@ pub struct ModelPrice {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, PartialEq)]
+pub struct UpstreamPrice {
+    pub account_id: i64,
+    pub model_id: String,
+    pub vendor: Option<String>,
+    pub input_price: Option<f64>,
+    pub output_price: Option<f64>,
+    pub cache_read_price: Option<f64>,
+    pub cache_write_price: Option<f64>,
+    /// 长上下文分档阈值（token）。非空时 prompt(input+cache_read) 超过它用 long_* 价。
+    pub long_context_threshold: Option<i64>,
+    pub long_input_price: Option<f64>,
+    pub long_output_price: Option<f64>,
+    pub long_cache_read_price: Option<f64>,
+    pub long_cache_write_price: Option<f64>,
+    /// openrouter|zen|zen-go|deepseek|teamorouter|command|dashscope|manual|free。
+    pub source: Option<String>,
+    pub source_model_id: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, PartialEq)]
 pub struct ApiKey {
     pub id: Option<i64>,
     pub name: String,

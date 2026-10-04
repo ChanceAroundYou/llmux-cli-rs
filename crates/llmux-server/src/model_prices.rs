@@ -318,8 +318,12 @@ pub fn spawn_price_refresh(pool: SqlitePool) {
 
 async fn run_once(pool: &SqlitePool) {
     match refresh(pool).await {
-        Ok(report) => tracing::info!("💰 价目刷新：{}", report.summary()),
+        Ok(report) => tracing::info!("💰 价目刷新（OpenRouter 目录）：{}", report.summary()),
         Err(e) => tracing::warn!("💰 价目刷新失败（下一轮重试）: {e}"),
+    }
+    match crate::price_sources::refresh_all(pool).await {
+        Ok(report) => tracing::info!("💰 上游价目刷新（按账号）：{}", report.summary()),
+        Err(e) => tracing::warn!("💰 上游价目刷新失败（下一轮重试）: {e}"),
     }
 }
 

@@ -66,6 +66,7 @@ async fn init_db_creates_fresh_schema_and_seed_providers() {
             "providers",
             "reasoning_effort_capabilities",
             "settings",
+            "upstream_prices",
             "usage_logs",
         ]
     );
@@ -329,6 +330,170 @@ async fn usage_cost_is_summed_from_model_prices() {
         .await
         .expect("timeseries");
     assert!((ts.iter().map(|p| p.est_cost).sum::<f64>() - expected).abs() < 1e-15);
+}
+
+/// 计价改成「按上游账号 × 模型」后：账号专属价优先于全局兜底；账号没有专属行时
+/// 才退回全局目录（model_prices）。同一模型在两个账号上必须算出不同的钱。
+#[tokio::test]
+async fn usage_prefers_account_price_over_global_fallback() {
+    let pool = memory_db().await;
+    let usage = UsageService::new(pool.clone());
+
+    let a = sqlx::query("INSERT INTO accounts (alias, provider_id, api_key) VALUES (?, ?, ?)")
+        .bind("A")
+        .bind("custom")
+        .bind("k")
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+    let b = sqlx::query("INSERT INTO accounts (alias, provider_id, api_key) VALUES (?, ?, ?)")
+        .bind("B")
+        .bind("custom")
+        .bind("k")
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+
+    // 全局兜底目录（OpenRouter）：9e-6 / 9e-6。
+    sqlx::query(
+        "INSERT INTO model_prices (model_id, input_price, output_price, source)
+         VALUES ('m', 0.000009, 0.000009, 'openrouter')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    // 账号 A 的专属价（OpenCode Go）：1e-6 / 2e-6 —— 必须盖过全局。
+    sqlx::query(
+        "INSERT INTO upstream_prices (account_id, model_id, input_price, output_price, source)
+         VALUES (?, 'm', 0.000001, 0.000002, 'zen-go')",
+    )
+    .bind(a)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    for acct in [a, b] {
+        sqlx::query(
+            "INSERT INTO usage_logs (timestamp, account_id, provider_id, model, input_tokens,
+                output_tokens, cache_read_input_tokens, cache_creation_input_tokens, latency_ms,
+                success, is_test)
+             VALUES (1000, ?, 'custom', 'm', 10, 20, 0, 0, 5, 1, 0)",
+        )
+        .bind(acct)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    let rows = usage
+        .get_breakdown_by_account(None, None, None)
+        .await
+        .expect("account breakdown");
+    let cost = |id: i64| rows.iter().find(|r| r.id == id).unwrap().est_cost;
+    assert!(
+        (cost(a) - (10.0 * 1e-6 + 20.0 * 2e-6)).abs() < 1e-15,
+        "账号专属价应优先，实得 {}",
+        cost(a)
+    );
+    assert!(
+        (cost(b) - (10.0 * 9e-6 + 20.0 * 9e-6)).abs() < 1e-15,
+        "没有专属行时应退回全局目录，实得 {}",
+        cost(b)
+    );
+    assert_ne!(cost(a), cost(b), "同一模型在两个账号上必须算出不同的钱");
+}
+
+/// 长上下文分档：prompt = input + cache_read，超过 `long_context_threshold` 用 long_* 价。
+#[tokio::test]
+async fn usage_applies_long_context_tier() {
+    let pool = memory_db().await;
+    let usage = UsageService::new(pool.clone());
+    let a = sqlx::query("INSERT INTO accounts (alias, provider_id, api_key) VALUES (?, ?, ?)")
+        .bind("A")
+        .bind("custom")
+        .bind("k")
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+
+    sqlx::query(
+        "INSERT INTO upstream_prices
+            (account_id, model_id, input_price, output_price, cache_read_price,
+             cache_write_price, long_context_threshold, long_input_price, source)
+         VALUES (?, 't', 0.000001, 0.0, 0.0, 0.0, 100, 0.000005, 'zen')",
+    )
+    .bind(a)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // prompt = 200 > 100 → 走 long 价 5e-6。
+    sqlx::query(
+        "INSERT INTO usage_logs (timestamp, account_id, provider_id, model, input_tokens,
+            output_tokens, cache_read_input_tokens, cache_creation_input_tokens, latency_ms,
+            success, is_test)
+         VALUES (1000, ?, 'custom', 't', 200, 0, 0, 0, 5, 1, 0)",
+    )
+    .bind(a)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let s = usage.get_summary(None, None, None).await.expect("summary");
+    assert!(
+        (s.est_cost - 200.0 * 5e-6).abs() < 1e-15,
+        "长上下文应命中 long_input_price，est_cost={}",
+        s.est_cost
+    );
+}
+
+/// 0028：按「上游账号 × 模型」计价的表。列齐 + 主键是 (account_id, model_id)，
+/// 读取侧靠它 JOIN；长上下文分档列也必须在，否则分档价会被静默忽略。
+#[tokio::test]
+async fn migration_0028_creates_upstream_prices_keyed_by_account_and_model() {
+    let pool = memory_db().await;
+    let cols: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_table_info('upstream_prices')")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    for expected in [
+        "account_id",
+        "model_id",
+        "input_price",
+        "output_price",
+        "cache_read_price",
+        "cache_write_price",
+        "long_context_threshold",
+        "long_input_price",
+        "long_output_price",
+        "long_cache_read_price",
+        "long_cache_write_price",
+        "source",
+        "source_model_id",
+    ] {
+        assert!(
+            cols.contains(&expected.to_string()),
+            "0028 未生效：upstream_prices.{expected} 缺失"
+        );
+    }
+
+    // 主键必须是 (account_id, model_id)：同模型在不同账号上是两行。
+    sqlx::query(
+        "INSERT INTO upstream_prices (account_id, model_id, input_price, source)
+         VALUES (1, 'm', 1e-6, 'zen'), (2, 'm', 2e-6, 'zen-go')",
+    )
+    .execute(&pool)
+    .await
+    .expect("同一模型在不同账号上应能各存一行");
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM upstream_prices WHERE model_id = 'm'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 2);
 }
 
 /// 0027 给 model_prices 加缓存价与来源列，并种入公开渠道查不到报价的免费模型。

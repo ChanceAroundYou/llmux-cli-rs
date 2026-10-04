@@ -94,9 +94,28 @@
     `deepseek-flash*`、`bonsai2-27b`、`qwen3.8-max`）为 `manual` + 0 价。本地 GGUF
     无价目行，读取侧本来也记 0。
   - UI：用量统计加成本卡片与列；新增 `/prices` 价目表页（列表 / 手填 / 立即刷新）。
-  - ⚠️ **估算口径**：订阅制 / 包月上游（OpenCode Zen、teamorouter）与本地模型的
-    token 记为 0 成本 —— 付的是包月 / 电费，不是按量。若某上游改成按量计费，需把
-    对应行改回 `openrouter`（允许刷新）或手填价。
+  - ⚠️ **估算口径**：这一版把订阅制 / 聚合站一并记 0，偏保守；下面引入
+    `upstream_prices` 后，订阅制上游改用各自官方 token 价折算。
+
+- **成本估算改为「按上游账号 × 模型」的真实价目**。上一版只用 OpenRouter 一家的价、
+  且按模型名取价 —— 但同一个 `deepseek-v4.1-flash` 被 go2/go6/go7（OpenCode Go 订阅）、
+  command、DeepSeek 官方等多个上游服务，价各不相同：OpenRouter 的缓存读价 $0.03/M 是
+  OpenCode Go（$0.006/M）的 **5 倍**。按模型名取价把不同上游算成一个价，是实打实的错。
+
+  - 迁移 `0028` 新增 `upstream_prices(account_id, model_id, …)`：键是「上游账号 × 模型」，
+    带长上下文分档价（`long_context_threshold` + `long_*`）。旧 `model_prices` 降级为
+    全局兜底目录 —— 某账号没有专属行时才退回它，改造期间数字不跳变。
+  - 新增 `price_sources` 抓取框架（**不引新依赖**，手写 HTML 表格提取器）：
+    - **OpenRouter**（JSON）、**OpenCode Zen / Go**（文档页 HTML 表）、
+      **DeepSeek 官方**（竖排表，取峰价）、**TeamoRouter**（首页 live 折扣价，`class="tr"`）
+      四个来源自动抓取；账号 → 来源按 `base_url` 判定。
+    - DeepSeek 系按定下的口径**一律取峰价**：不判时段、不维护节假日表，宁可高估（最多 2×）。
+    - 抓不到的来源落 `manual`：Command Code（价格页 JS 渲染 + 订阅套餐）、阿里百炼
+      （价在登录控制台）、api123go / agnes（无公开价目页）；`local` / Copilot 记 `free` 0 价。
+    - 失败保留旧值（绝不半张表覆盖），`manual` 行永不被刷新覆盖。
+  - 读取侧 5 个聚合的成本表达式改为 `COALESCE(upstream_prices, model_prices, 0)`，并按
+    `input + cache_read` 是否超过阈值切长上下文档。
+  - UI `/prices` 增加「按上游账号」分组，展示实际计价的价目并可逐账号手填。
 
 ### Performance
 

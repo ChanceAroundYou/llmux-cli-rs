@@ -220,7 +220,7 @@ impl UsageService {
         end_time: Option<i64>,
         api_key_id: Option<i64>,
     ) -> Result<UsageSummary> {
-        let mut sql = String::from(
+        let mut sql = format!(
             "SELECT
                 IFNULL(SUM(usage_logs.input_tokens), 0) AS total_input,
                 IFNULL(SUM(usage_logs.output_tokens), 0) AS total_output,
@@ -230,19 +230,19 @@ impl UsageService {
                 COUNT(*) AS total_requests,
                 IFNULL(SUM(CASE WHEN usage_logs.success = 1 THEN 1 ELSE 0 END), 0) AS success_requests,
                 IFNULL(SUM(
-                    IFNULL(usage_logs.input_tokens, 0) * IFNULL(p.input_price, 0.0)
-                  + IFNULL(usage_logs.output_tokens, 0) * IFNULL(p.output_price, 0.0)
-                  + IFNULL(usage_logs.cache_read_input_tokens, 0) * IFNULL(p.cache_read_price, 0.0)
-                  + IFNULL(usage_logs.cache_creation_input_tokens, 0) * IFNULL(p.cache_write_price, 0.0)
+                    {}
                 ), 0.0) AS est_cost,
-                COUNT(DISTINCT CASE WHEN p.model_id IS NULL
+                COUNT(DISTINCT CASE WHEN up.model_id IS NULL AND mp.model_id IS NULL
                       AND (IFNULL(usage_logs.input_tokens, 0) + IFNULL(usage_logs.output_tokens, 0)
                            + IFNULL(usage_logs.cache_read_input_tokens, 0)
                            + IFNULL(usage_logs.cache_creation_input_tokens, 0)) > 0
                       THEN usage_logs.model END) AS unpriced_models
              FROM usage_logs
-             LEFT JOIN model_prices p ON p.model_id = usage_logs.model
+             LEFT JOIN upstream_prices up
+                    ON up.account_id = usage_logs.account_id AND up.model_id = usage_logs.model
+             LEFT JOIN model_prices mp ON mp.model_id = usage_logs.model
              WHERE usage_logs.is_test = 0",
+            price_expr("")
         );
         append_time_filter(&mut sql, "", start_time, end_time);
         append_key_filter(&mut sql, "", api_key_id);
@@ -371,7 +371,7 @@ impl UsageService {
         end_time: Option<i64>,
         api_key_id: Option<i64>,
     ) -> Result<Vec<ProviderBreakdown>> {
-        let mut sql = String::from(
+        let mut sql = format!(
             "SELECT provider_id AS id,
                     IFNULL(input_tokens, 0) AS input_tokens,
                     IFNULL(output_tokens, 0) AS output_tokens,
@@ -379,13 +379,13 @@ impl UsageService {
                     IFNULL(cache_creation_input_tokens, 0) AS cache_create,
                     latency_ms, ttft_ms,
                     CASE WHEN success = 1 THEN 1 ELSE 0 END AS success,
-                    IFNULL(input_tokens, 0) * IFNULL(p.input_price, 0.0)
-                  + IFNULL(output_tokens, 0) * IFNULL(p.output_price, 0.0)
-                  + IFNULL(cache_read_input_tokens, 0) * IFNULL(p.cache_read_price, 0.0)
-                  + IFNULL(cache_creation_input_tokens, 0) * IFNULL(p.cache_write_price, 0.0) AS est_cost
+                    {} AS est_cost
              FROM usage_logs
-             LEFT JOIN model_prices p ON p.model_id = usage_logs.model
+             LEFT JOIN upstream_prices up
+                    ON up.account_id = usage_logs.account_id AND up.model_id = usage_logs.model
+             LEFT JOIN model_prices mp ON mp.model_id = usage_logs.model
              WHERE is_test = 0",
+            price_expr("")
         );
         append_time_filter(&mut sql, "", start_time, end_time);
         append_key_filter(&mut sql, "", api_key_id);
@@ -449,7 +449,7 @@ impl UsageService {
         end_time: Option<i64>,
         api_key_id: Option<i64>,
     ) -> Result<Vec<ModelBreakdown>> {
-        let mut sql = String::from(
+        let mut sql = format!(
             "SELECT model,
                     IFNULL(input_tokens, 0) AS input_tokens,
                     IFNULL(output_tokens, 0) AS output_tokens,
@@ -457,13 +457,13 @@ impl UsageService {
                     IFNULL(cache_creation_input_tokens, 0) AS cache_create,
                     latency_ms, ttft_ms,
                     CASE WHEN success = 1 THEN 1 ELSE 0 END AS success,
-                    IFNULL(input_tokens, 0) * IFNULL(p.input_price, 0.0)
-                  + IFNULL(output_tokens, 0) * IFNULL(p.output_price, 0.0)
-                  + IFNULL(cache_read_input_tokens, 0) * IFNULL(p.cache_read_price, 0.0)
-                  + IFNULL(cache_creation_input_tokens, 0) * IFNULL(p.cache_write_price, 0.0) AS est_cost
+                    {} AS est_cost
              FROM usage_logs
-             LEFT JOIN model_prices p ON p.model_id = usage_logs.model
+             LEFT JOIN upstream_prices up
+                    ON up.account_id = usage_logs.account_id AND up.model_id = usage_logs.model
+             LEFT JOIN model_prices mp ON mp.model_id = usage_logs.model
              WHERE is_test = 0",
+            price_expr("")
         );
         append_time_filter(&mut sql, "", start_time, end_time);
         append_key_filter(&mut sql, "", api_key_id);
@@ -526,7 +526,7 @@ impl UsageService {
         end_time: Option<i64>,
         api_key_id: Option<i64>,
     ) -> Result<Vec<AccountBreakdown>> {
-        let mut sql = String::from(
+        let mut sql = format!(
             "SELECT l.account_id AS id,
                     a.alias AS name,
                     a.provider_id AS provider,
@@ -536,14 +536,14 @@ impl UsageService {
                     IFNULL(l.cache_creation_input_tokens, 0) AS cache_create,
                     l.latency_ms, l.ttft_ms,
                     CASE WHEN l.success = 1 THEN 1 ELSE 0 END AS success,
-                    IFNULL(l.input_tokens, 0) * IFNULL(p.input_price, 0.0)
-                  + IFNULL(l.output_tokens, 0) * IFNULL(p.output_price, 0.0)
-                  + IFNULL(l.cache_read_input_tokens, 0) * IFNULL(p.cache_read_price, 0.0)
-                  + IFNULL(l.cache_creation_input_tokens, 0) * IFNULL(p.cache_write_price, 0.0) AS est_cost
+                    {} AS est_cost
              FROM usage_logs l
              JOIN accounts a ON l.account_id = a.id
-             LEFT JOIN model_prices p ON p.model_id = l.model
+             LEFT JOIN upstream_prices up
+                    ON up.account_id = l.account_id AND up.model_id = l.model
+             LEFT JOIN model_prices mp ON mp.model_id = l.model
              WHERE l.is_test = 0",
+            price_expr("l.")
         );
         append_time_filter(&mut sql, "l", start_time, end_time);
         append_key_filter(&mut sql, "l", api_key_id);
@@ -623,20 +623,20 @@ impl UsageService {
         api_key_id: Option<i64>,
     ) -> Result<Vec<TimeseriesPoint>> {
         let gran = granularity_ms.max(60_000);
-        let mut sql = String::from(
+        let mut sql = format!(
             "SELECT CAST(timestamp / ? AS INTEGER) * ? AS bucket,
                     IFNULL(input_tokens, 0) AS input_tokens,
                     IFNULL(output_tokens, 0) AS output_tokens,
                     IFNULL(cache_read_input_tokens, 0) AS cache_read,
                     IFNULL(cache_creation_input_tokens, 0) AS cache_create,
                     latency_ms, ttft_ms,
-                    IFNULL(input_tokens, 0) * IFNULL(p.input_price, 0.0)
-                  + IFNULL(output_tokens, 0) * IFNULL(p.output_price, 0.0)
-                  + IFNULL(cache_read_input_tokens, 0) * IFNULL(p.cache_read_price, 0.0)
-                  + IFNULL(cache_creation_input_tokens, 0) * IFNULL(p.cache_write_price, 0.0) AS est_cost
+                    {} AS est_cost
              FROM usage_logs
-             LEFT JOIN model_prices p ON p.model_id = usage_logs.model
+             LEFT JOIN upstream_prices up
+                    ON up.account_id = usage_logs.account_id AND up.model_id = usage_logs.model
+             LEFT JOIN model_prices mp ON mp.model_id = usage_logs.model
              WHERE is_test = 0",
+            price_expr("")
         );
         append_time_filter(&mut sql, "", start_time, end_time);
         append_key_filter(&mut sql, "", api_key_id);
@@ -902,6 +902,41 @@ fn finalize_group(acc: &GroupAcc) -> (f64, f64, f64, f64, f64, f64, f64, f64) {
         p95_ttft,
         avg_tps,
         cache_hit_rate,
+    )
+}
+
+/// 每行折算成本（美元）的 SQL 片段（不含 `AS est_cost`）。
+///
+/// 单价优先级：`upstream_prices`（该**账号 × 模型**）→ `model_prices`（全局兜底，
+/// OpenRouter 目录）→ 0。长上下文分档：prompt = input + cache_read，超过 threshold
+/// 用 long_* 价；long_* 缺失时退回短档价，不把整行算成 0。DeepSeek 系的峰谷在写入侧
+/// 就已按「一律取峰价」拍平，读取侧不再看时间。
+///
+/// `log_alias` 是 usage_logs 的别名（`""` 或 `"l."`，带点）。调用方必须同时 JOIN：
+/// `LEFT JOIN upstream_prices up ON up.account_id = <a>account_id AND up.model_id = <a>model`
+/// 与 `LEFT JOIN model_prices mp ON mp.model_id = <a>model`。
+fn price_expr(log_alias: &str) -> String {
+    let tok = |c: &str| format!("IFNULL({log_alias}{c}, 0)");
+    let unit = |short: &str, long: &str| {
+        format!(
+            "CASE WHEN up.long_context_threshold IS NOT NULL \
+               AND ({inp} + {cr}) > up.long_context_threshold \
+              THEN IFNULL(up.{long}, COALESCE(up.{short}, mp.{short}, 0.0)) \
+              ELSE COALESCE(up.{short}, mp.{short}, 0.0) END",
+            inp = tok("input_tokens"),
+            cr = tok("cache_read_input_tokens"),
+        )
+    };
+    format!(
+        "{} * {} + {} * {} + {} * {} + {} * {}",
+        tok("input_tokens"),
+        unit("input_price", "long_input_price"),
+        tok("output_tokens"),
+        unit("output_price", "long_output_price"),
+        tok("cache_read_input_tokens"),
+        unit("cache_read_price", "long_cache_read_price"),
+        tok("cache_creation_input_tokens"),
+        unit("cache_write_price", "long_cache_write_price"),
     )
 }
 
