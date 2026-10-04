@@ -116,6 +116,9 @@
   - 读取侧 5 个聚合的成本表达式改为 `COALESCE(upstream_prices, model_prices, 0)`，并按
     `input + cache_read` 是否超过阈值切长上下文档。
   - UI `/prices` 增加「按上游账号」分组，展示实际计价的价目并可逐账号手填。
+  - **免费 / stealth 模型**（名字带 `-free` / `:free`，以及 `space-bunny-alpha`、
+    `omen-alpha`、`big-pickle`）在**任何**上游都显式落 `free` 0 价行 —— 不再依赖某个
+    来源的价目表恰好把它标成 0，也不会走全局兜底被误计费。
 
 ### Performance
 

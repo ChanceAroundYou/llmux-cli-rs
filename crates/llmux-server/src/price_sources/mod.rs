@@ -165,6 +165,26 @@ fn apply_alias_map(src: Source, local: &str) -> String {
         .unwrap_or_else(|| local.to_string())
 }
 
+/// 已知免费 / stealth 模型：名字带 `-free` / `:free`，或明确在名单里。
+///
+/// 这类模型在**任何**上游都不该产生成本 —— 不能依赖某个来源的价目表恰好把它标成
+/// 0，否则来源改版、或该账号走全局兜底时就会被误计费。`space-bunny-alpha`、
+/// `omen-alpha`、`big-pickle` 是各家文档里点名的 stealth 免费模型。
+pub fn is_known_free(model_id: &str) -> bool {
+    let m = model_id.to_lowercase();
+    if m.ends_with("-free") || m.ends_with(":free") || m.contains("-free-") {
+        return true;
+    }
+    matches!(
+        m.as_str(),
+        "stealth/space-bunny-alpha"
+            | "space-bunny-alpha"
+            | "space-bunny-free"
+            | "omen-alpha"
+            | "big-pickle"
+    )
+}
+
 /// 全量刷新：按账号判定来源 → 每来源抓一次 → 匹配本地模型名 → 写 `upstream_prices`。
 pub async fn refresh_all(pool: &SqlitePool) -> Result<RefreshReport> {
     let accounts: Vec<(i64, String, Option<String>)> =
@@ -193,9 +213,21 @@ pub async fn refresh_all(pool: &SqlitePool) -> Result<RefreshReport> {
             continue;
         }
 
+        // 已知免费 / stealth 模型：任何上游都不该产生成本，先落 free 0 价行 ——
+        // 不能指望某个来源的价目表恰好把它标成 0（space-bunny / omen 就是这种）。
+        let (free_locals, paid_locals): (Vec<String>, Vec<String>) =
+            locals.into_iter().partition(|m| is_known_free(m));
+        for m in &free_locals {
+            upsert_zero(pool, id, m, Source::Free.as_str()).await?;
+            report.free_rows += 1;
+        }
+        if paid_locals.is_empty() {
+            continue;
+        }
+
         match src {
             Source::Free => {
-                for m in locals {
+                for m in paid_locals {
                     upsert_zero(pool, id, &m, Source::Free.as_str()).await?;
                     report.free_rows += 1;
                 }
@@ -214,7 +246,7 @@ pub async fn refresh_all(pool: &SqlitePool) -> Result<RefreshReport> {
                 }
                 let prices = &cache[&src];
                 let candidates: Vec<String> = prices.iter().map(|p| p.model_id.clone()).collect();
-                for local in locals {
+                for local in paid_locals {
                     let want = apply_alias_map(src, &local);
                     let hit = match_model(&want, &candidates)
                         .and_then(|found| prices.iter().find(|p| p.model_id == found).map(|p| (found, p)));
@@ -364,6 +396,18 @@ mod tests {
         assert_eq!(source_for("https://api.agnes-ai.cn/v1", "agnes"), Source::Manual);
         assert_eq!(source_for("http://pc.xiaokubao.space:8080/v1", "local"), Source::Free);
         assert_eq!(source_for("http://192.168.1.6:25001/v1", "Copilot"), Source::Free);
+    }
+
+    #[test]
+    fn recognises_free_and_stealth_models() {
+        assert!(is_known_free("stealth/space-bunny-alpha"));
+        assert!(is_known_free("space-bunny-free"));
+        assert!(is_known_free("omen-alpha"));
+        assert!(is_known_free("big-pickle"));
+        assert!(is_known_free("deepseek-v4-flash-free"));
+        assert!(is_known_free("inclusionai/ling-3.0-flash-sante:free"));
+        assert!(!is_known_free("gpt-6-astra"));
+        assert!(!is_known_free("deepseek-v4.1-flash"));
     }
 
     /// 临时端到端烟测：对一份库副本跑全量刷新（`LLMUX_PRICE_DB=/tmp/.../llmux_db.db`）。
