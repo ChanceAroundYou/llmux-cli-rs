@@ -6,7 +6,7 @@ import { PageHeader } from '../components/shared/PageHeader';
 import { EmptyState } from '../components/shared/EmptyState';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
-import { fmtCost } from '../utils/format';
+import { fmtPricePerMillion } from '../utils/format';
 
 interface PriceRow {
   model_id: string;
@@ -30,7 +30,20 @@ interface Draft {
 
 const EMPTY_DRAFT: Draft = { vendor: '', input: '', output: '', cacheRead: '', cacheWrite: '' };
 
-const priceCell = (v: number | null): string => (v == null ? '—' : `$${fmtCost(v)}`);
+// 单价列显示的是「美元 / 百万 token」。
+const priceCell = (v: number | null): string =>
+  v == null ? '—' : `$${fmtPricePerMillion(v)}`;
+
+// 存储是美元 / token，输入框按美元 / 百万 token 显示 —— 否则 3e-7 会显示成
+// 一连串 0，看着像免费。toPrecision(12) 抹掉浮点乘法的尾数噪声。
+const toPerM = (v: number | null): string =>
+  v == null ? '' : String(Number((v * 1_000_000).toPrecision(12)));
+
+const toPerToken = (v: string): number | null => {
+  if (v.trim() === '') return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n / 1_000_000 : null;
+};
 
 /// 价目表管理：看自动拉到的价、手工改价、触发刷新。
 ///
@@ -90,22 +103,26 @@ export default function PricesPage() {
     setEditingId(row.model_id);
     setDraft({
       vendor: row.vendor ?? '',
-      input: String(row.input_price ?? 0),
-      output: String(row.output_price ?? 0),
-      cacheRead: row.cache_read_price == null ? '' : String(row.cache_read_price),
-      cacheWrite: row.cache_write_price == null ? '' : String(row.cache_write_price),
+      input: toPerM(row.input_price ?? 0),
+      output: toPerM(row.output_price ?? 0),
+      cacheRead: toPerM(row.cache_read_price),
+      cacheWrite: toPerM(row.cache_write_price),
     });
   };
 
   const save = async () => {
     if (!editingId) return;
-    const input = Number(draft.input);
-    const output = Number(draft.output);
-    if (!Number.isFinite(input) || !Number.isFinite(output)) {
+    const inputPerM = Number(draft.input);
+    const outputPerM = Number(draft.output);
+    if (
+      draft.input.trim() === '' ||
+      draft.output.trim() === '' ||
+      !Number.isFinite(inputPerM) ||
+      !Number.isFinite(outputPerM)
+    ) {
       setNotice(t('prices.invalidNumber', { defaultValue: '输入 / 输出价必须是数字' }));
       return;
     }
-    const optional = (v: string): number | null => (v.trim() === '' ? null : Number(v));
     setLoading(true);
     try {
       const res = await apiFetch('/api/model-prices', {
@@ -114,10 +131,10 @@ export default function PricesPage() {
         body: JSON.stringify({
           modelId: editingId,
           vendor: draft.vendor.trim() || null,
-          inputPrice: input,
-          outputPrice: output,
-          cacheReadPrice: optional(draft.cacheRead),
-          cacheWritePrice: optional(draft.cacheWrite),
+          inputPrice: inputPerM / 1_000_000,
+          outputPrice: outputPerM / 1_000_000,
+          cacheReadPrice: toPerToken(draft.cacheRead),
+          cacheWritePrice: toPerToken(draft.cacheWrite),
         }),
       });
       const data = await res.json();
@@ -140,7 +157,7 @@ export default function PricesPage() {
     <div className="space-y-6">
       <PageHeader
         title={t('common.prices', { defaultValue: '价目表' })}
-        subtitle={t('prices.subtitle', { defaultValue: '按 OpenRouter 公开价目折算成本；手工定价不会被 6 小时刷新覆盖' })}
+        subtitle={t('prices.subtitle', { defaultValue: '单价为「美元 / 百万 token」；手工定价不会被 6 小时刷新覆盖' })}
         icon={<DollarSign size={20} />}
         action={
           <Button size="sm" onClick={refresh} disabled={loading}>
@@ -175,10 +192,10 @@ export default function PricesPage() {
                 <th className="text-left px-4 py-2">{t('prices.headers.model', { defaultValue: '模型' })}</th>
                 <th className="text-left px-3 py-2">{t('prices.headers.vendor', { defaultValue: '厂商' })}</th>
                 <th className="text-left px-3 py-2">{t('prices.headers.source', { defaultValue: '来源' })}</th>
-                <th className="text-right px-3 py-2">{t('usage.input', { defaultValue: '输入' })}</th>
-                <th className="text-right px-3 py-2">{t('usage.output', { defaultValue: '输出' })}</th>
-                <th className="text-right px-3 py-2">{t('prices.headers.cacheRead', { defaultValue: '缓存读' })}</th>
-                <th className="text-right px-3 py-2">{t('prices.headers.cacheWrite', { defaultValue: '缓存写' })}</th>
+                <th className="text-right px-3 py-2">{t('prices.headers.inputPerM', { defaultValue: '输入 $/M' })}</th>
+                <th className="text-right px-3 py-2">{t('prices.headers.outputPerM', { defaultValue: '输出 $/M' })}</th>
+                <th className="text-right px-3 py-2">{t('prices.headers.cacheReadPerM', { defaultValue: '缓存读 $/M' })}</th>
+                <th className="text-right px-3 py-2">{t('prices.headers.cacheWritePerM', { defaultValue: '缓存写 $/M' })}</th>
                 <th className="text-right px-3 py-2">{t('prices.headers.updated', { defaultValue: '更新时间' })}</th>
                 <th className="text-right px-4 py-2">{t('prices.headers.action', { defaultValue: '操作' })}</th>
               </tr>

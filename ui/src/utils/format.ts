@@ -26,13 +26,25 @@ export const fmtTokens = (n: number | null | undefined): string => {
   return `${v}`;
 };
 
-// 折算成本（美元）。单价是「美元 / token」，量级很小 —— 太多小数会糊成一片，
-// 太少又会把真实花费抹成 0，所以按量级自适应精度。
+// 折算成本总额（美元）。总量一般 >= 0.01；极小值时用科学计数，绝不四舍五入成 $0。
 export const fmtCost = (n: number | null | undefined): string => {
   const v = typeof n === 'number' && Number.isFinite(n) ? n : 0;
   if (v === 0) return '0';
-  if (v < 0.0001) return v.toFixed(6);
-  if (v < 1) return v.toFixed(4);
+  const abs = Math.abs(v);
+  if (abs < 0.0001) return v.toExponential(2);
+  if (abs < 1) return v.toFixed(4);
+  return v.toFixed(2);
+};
+
+// 单价按「美元 / 百万 token」展示。OpenRouter 原始单位是美元 / token，
+// 直接显示会是一串 0（3e-7 → $0.000000），看着像免费 —— 而各家报价本来就是按
+// 百万 token 报的（$0.30/M）。存储仍是美元 / token，只在这里换算。
+export const fmtPricePerMillion = (perToken: number | null | undefined): string => {
+  if (typeof perToken !== 'number' || !Number.isFinite(perToken)) return '—';
+  const v = perToken * 1_000_000;
+  if (v === 0) return '0';
+  if (Math.abs(v) < 0.01) return v.toFixed(4);
+  if (Math.abs(v) < 1) return v.toFixed(3);
   return v.toFixed(2);
 };
 

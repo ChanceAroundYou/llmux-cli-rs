@@ -77,8 +77,9 @@
 
 - **用量统计加「折算成本」估算**。复用 0001 就建好、却一直 0 行且无人读写的
   `model_prices` 表：迁移 `0027` 补 `cache_read_price` / `cache_write_price` /
-  `source` / `source_model_id`。单价单位是 **美元 / token**（OpenRouter 原始单位，
-  不是每百万）。
+  `source` / `source_model_id`。单价**存储**用 **美元 / token**（OpenRouter 原始
+  单位），UI 单价按**美元 / 百万 token** 展示 —— 直接显示美元/token 会是一串 0
+  （`3e-7` → `$0.000000`），看着像免费。
 
   - `source='openrouter'` 由 6h 刷新任务写入；`source='manual'` 是手工定价与免费
     模型的 0 价行，**刷新永不覆盖**。这是「另建一张 price_cache 表」方案想解决的
