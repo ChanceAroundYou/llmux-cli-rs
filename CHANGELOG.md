@@ -7,27 +7,62 @@
 
 ### Fixed
 
-- **空响应判据改用直接事实，不再用 token 计数猜**。原先的 `empty_content` 是
-  `completion_tokens == 0 && chunks <= 4`（`c7b57e2` 引入）—— 用**代理指标**去猜
-  **直接事实**（这条流到底有没有产出内容），两个方向都会错：
+- **余额不足类错误此前从未触发过任何冷却**，根因是入口被状态码挡在门外。
+  `is_quota_exhausted` 早就把「余额 / insufficient / billing」算作配额类，但所有
+  调用点长这样：
 
-  - **假失败**：纯 tool_call 的回合本来就几乎不产 completion token，却被判成空
-    响应 —— 正是上一条修复涉及的那批行。
-  - **假成功**：空响应一旦超过 4 个分片（keep-alive、心跳）就漏判。`chunks <= 4`
-    是个没有依据的经验阈值。
+  ```rust
+  if is_retryable_status(status) {              // 400 不在里面
+      if status == 429 { note_rate_limit(...) }  // ← 只有 429 进得来
+  }
+  ```
 
-  现在直接看载荷：转换器早已分别记录 `text_block_started` /
-  `thinking_started` / `tool_indices`，这次把它们经 `produced_output()` 暴露出来；
-  透传路径的 `StreamAccounting` 增加 `saw_text` / `saw_tool_call`。判据变成
-  「这条流没有产出任何内容」，**`chunks` 不再参与任何判定**，只留在日志里。
-  顺带覆盖两类此前漏判的产出：**thinking-only 回合**与**非流式响应**
-  （`message.content` 而非 `delta.content`）。
+  而余额不足在实践中以 **400 / 402** 为主：14 天里 478 次 HTTP 400、108 次 402，
+  而 429 只有 112 次。实测 api123 / `gpt-5.6-luna` 的
+  `consecutive_quota_failures` 一直是 **0**、`traffic_suspended_until` 一直是 **0**
+  —— 配额路径从未被触发，重试间隔 p50 仅 **4s**。对照组 `gpt-5.6-terra`（真返回 429）
+  198 次失败但冷却正常：机制没坏，**是入口漏了**。
 
-  > 更正：本次审计中口头汇报过「两天里 1481 条空响应被记成 success=1」——
-  > **那个数字是我分析脚本的解析缺陷**（只认 OpenAI 的 `delta` 形状，漏了
-  > Anthropic 原生帧与非流式响应体），不是生产数据。格式感知地复核后实际只有
-  > **1** 条。判据确实该改（理由是机制上的，与那个数字无关），但影响远小于
-  > 我当时说的。
+  - 新增 `note_upstream_throttle`：**先看正文、再看状态码**，400/402/429 一视同仁。
+    7 个调用点（openai ×4、anthropic ×2、gemini ×1）统一改走它。
+  - 新增 `FailureKind::PaymentRequired` + `is_payment_required`：余额类挂起
+    **24h**（由 `suspend_secs_for` 分派），配额类仍是 30 分钟。余额不会在 30 分钟后
+    自己长回来，而短冷却会被一次次续期、期间真实流量照打。到期后由后台探活先探
+    一次，不通就再续；充值后第一次跑通即由既有 `clear_suspension` 自动恢复。
+  - ⚠️ 判定刻意要求「钱」的词 **与** 一个否定式说法同时出现（`余额不足` /
+    `insufficient` / `recharge`）。只用 `contains` 会把参数错误里的
+    `billing address is required` 误判成余额不足，**把一个能用的模型挂起 24 小时**
+    —— 代价远大于多打几次请求。该场景已用测试钉死，并经变异验证
+    （把 `billing` 改成无条件匹配 → 测试变红）。
+
+- **上游流不再全量缓冲**：新增 `helpers::StreamCapture`，保留**头部 + 尾部**，
+  中间丢弃。此前每条在途流都持有一份完整副本，而实测未截断的上游响应
+  p50=6KB、p90=87KB、**p99=615KB、max=1.2MB**（4998 条流）—— 容器 RSS 因此是
+  386MiB，而 CLAUDE.md 记的稳态是 18MiB（这不是泄漏：20 秒两次采样纹丝不动）。
+  头尾各留是有理由的：头给详情页与 `smart_truncate_body`，尾保住**结束符与最终
+  usage** —— 上一条修复（去重吞掉记账）之所以只能靠现网日志才查得出来，正是因为
+  DB 里的 body 被砍到只剩头，尾部证据全没了。超限时中段确实丢失，`RUST_LOG=trace`
+  也补不回来，但那本来就是异常大流。
+
+- **截断标记里的换行会让 JSON 变成非法**。`smart_truncate_body` 的标记原本是
+  `\n…[truncated N chars, kept head]…\n`，插进 JSON 字符串**之间**时那对 `\n`
+  就是裸控制字符 —— 实测库里 id=169551 就是这样
+  （`Invalid control character at: char 15964`；155 个 JSON 形态 body 里唯一一条，
+  因为它需要恰好切在换行邻接处）。切点本身合法（`scan_json_cut_points` 保证了），
+  坏的是标记。改为单行标记。
+
+- **`is_known_free` 不再用子串匹配**：删掉 `contains("-free-")`，只认后缀
+  （`-free` / `:free`）与显式名单。原先任何**中间**含 `-free-` 的付费模型名都会被
+  判成免费，`refresh_all` 随即给它写一行全 0 的 `upstream_prices` —— 静默少计费。
+  2026-10-05 核对库里 32 个真实模型名：后缀 + 名单命中 5 个、误判 0 个，
+  收紧不会让任何在用的免费模型漏判。
+
+- **价目抓取补上行数骤降兜底**：`html.rs` 的模块注释一直声称上层有「行数骤降即判
+  失败」，grep 全树其实**并不存在**。页面改版时手写解析器会安静地返回空/残缺，
+  `Ok` 里与「正常但模型少了」无法区分，于是价格**静默过期且无告警**。现在：抓到
+  0 条永远判失败；较上次成功抓到一半以下也判失败；状态只放在单次刷新的局部
+  `HashMap` 里，**不写库、不加列、不加迁移**。它不会写坏已有行（未匹配上的模型只是
+  skip，不会被写成 0），挡的是「拿残缺价目去刷新」与「静默过期」。
 
 - **转发策略不再吞掉记账：被丢弃的重复终止事件，其 `usage` 仍被记录**。这是
   `98e0621`（丢弃重复 `finish_reason: "tool_calls"`）引入的回归：那个循环改成

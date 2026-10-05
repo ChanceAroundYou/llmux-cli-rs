@@ -258,15 +258,7 @@ pub async fn gemini(
                     status.as_u16()
                 );
                 // 429 → 记冷却，见 anthropic.rs 同处注释。
-                if status.as_u16() == 429 {
-                    super::helpers::note_rate_limit(
-                        &state.pool,
-                        account.id,
-                        &model_resolution.target_model,
-                        &last_error.clone().unwrap_or_default(),
-                    )
-                    .await;
-                }
+                super::helpers::note_upstream_throttle(&state.pool, account.id, &model_resolution.target_model, &last_error.clone().unwrap_or_default(),).await;
                 if let Some(tx) = &state.tui_tx {
                     let _ = tx.send(TuiEvent::Retry {
                         account: account.alias.clone(),
@@ -457,7 +449,9 @@ async fn gemini_streaming_passthrough(
     // 同 client_ip：流式跑在 tokio::spawn 里，task-local 传不进来，必须在此捕获。
     let api_key_id = super::helpers::current_api_key_id();
     tokio::spawn(async move {
-        let mut received: Vec<u8> = Vec::with_capacity(4096);
+        // 有界头尾缓冲：见 helpers::StreamCapture（p99 上游流 615KB，全量缓冲
+        // 是 RSS 386MiB 的主因）。头部给详情页，尾部保住结束符与最终 usage。
+        let mut received = super::helpers::StreamCapture::new(131072);
         let mut sse = response.bytes_stream();
         let mut ttft_ms: Option<i64> = None;
         // 成功与否必须推导，不能写死 true —— 读错误 break 出去之后照样会走到
@@ -472,7 +466,7 @@ async fn gemini_streaming_passthrough(
                     break;
                 }
             };
-            received.extend_from_slice(&chunk);
+            received.push(&chunk);
             let sent = tx.send(Ok(chunk)).await.is_ok();
             if sent && ttft_ms.is_none() {
                 ttft_ms = Some(start.elapsed().as_millis() as i64);
@@ -484,7 +478,7 @@ async fn gemini_streaming_passthrough(
             stream_failed = Some("Upstream stream closed without sending any data".to_string());
         }
         let latency_ms = start.elapsed().as_millis() as i64;
-        let resp_body = String::from_utf8_lossy(&received).into_owned();
+        let resp_body = received.to_body_string().unwrap_or_default();
         super::helpers::spawn_log_usage_ip(
             pool.clone(),
             account.clone(),

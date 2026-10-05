@@ -580,6 +580,21 @@ pub const SUSPEND_AFTER_FAILURES: i64 = 2;
 /// 每次暂停的时长（30 分钟，逐次递增）。
 pub const SUSPEND_SECS: i64 = 30 * 60;
 
+/// 「余额不足 / 账单被拒」这类需要人工充值的失败，挂起多久。
+///
+/// 远长于 [`SUSPEND_SECS`]，因为余额不会在 30 分钟后自己长回来 —— 短冷却
+/// 会被一次次续期，而真实流量在续期间隙照打不误（实测重试间隔 p50 仅 4s）。
+/// 24h 覆盖「当天充值」这个常见节奏；到期后由后台探活先探一次，不通就再续。
+pub const PAYMENT_SUSPEND_SECS: i64 = 24 * 3600;
+
+/// 这个失败类型该挂起多久（秒）。
+pub fn suspend_secs_for(kind: FailureKind) -> i64 {
+    match kind {
+        FailureKind::PaymentRequired => PAYMENT_SUSPEND_SECS,
+        FailureKind::Probe | FailureKind::Quota => SUSPEND_SECS,
+    }
+}
+
 /// 这次失败该不该记在生产流量的账上。
 ///
 /// 探活失败**永远不算** —— 探的是「流量到来之前上游还认不认这个模型」，
@@ -595,6 +610,14 @@ pub enum FailureKind {
     Probe,
     /// 真实流量吃到配额类 429：探活和流量两侧都冷却。
     Quota,
+    /// 真实流量吃到「余额不足 / 账单被拒」：两侧都冷却，时长远长于配额类。
+    ///
+    /// 与 `Quota` 分开，因为**恢复方式**不同：配额类当天会自愈（错误正文里
+    /// 就写着 resets at），30 分钟够；余额类不会自己长回来 —— 实测 api123 的
+    /// `gpt-5.6-luna` 在 14 天里吃了 **478** 次 HTTP 400 的「钱包余额不足」，
+    /// 重试间隔 p50 只有 4s，30 分钟冷却被一次次续期而真实流量仍在打。
+    /// 到期后由后台探活先探一次，不通就再续，所以挂久一点无妨。
+    PaymentRequired,
 }
 
 /// 一条 (账户, 模型) 的暂停状态。
@@ -731,7 +754,7 @@ pub async fn note_failure(
     kind: FailureKind,
 ) -> bool {
     let now = now_ms();
-    let until = now + SUSPEND_SECS * 1000;
+    let until = now + suspend_secs_for(kind) * 1000;
     // 两侧分开报：配额 429 会同时动两侧（探活侧也该停探），只报一个布尔值
     // 会让调用方漏打一半日志。
     let (mut probe_changed, mut traffic_changed) = (false, false);
@@ -788,7 +811,7 @@ pub async fn note_failure(
             .flatten();
             probe_changed = after.is_some_and(|n| n >= SUSPEND_AFTER_FAILURES);
         }
-        FailureKind::Quota => {
+        FailureKind::Quota | FailureKind::PaymentRequired => {
             // 计数用 SQL 原子自增（`col = col + 1`），不在 Rust 里读出来加一。
             // 真实流量下同一 (账户,模型) 的并发 429 很常见：读-改-写会让两个
             // 请求都读到 n、都写 n+1，丢一次失败，配额冷却迟迟不开挡 —— 而这

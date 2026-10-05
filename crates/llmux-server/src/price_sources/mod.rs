@@ -172,7 +172,14 @@ fn apply_alias_map(src: Source, local: &str) -> String {
 /// `omen-alpha`、`big-pickle` 是各家文档里点名的 stealth 免费模型。
 pub fn is_known_free(model_id: &str) -> bool {
     let m = model_id.to_lowercase();
-    if m.ends_with("-free") || m.ends_with(":free") || m.contains("-free-") {
+    // 只认**后缀**。原先还有一条 `contains("-free-")` 的子串匹配，任何中间带
+    // `-free-` 的付费模型名都会被判成免费，再被 `refresh_all` 强制写一行
+    // 全 0 的 `upstream_prices` —— 那是静默的少计费。
+    //
+    // 后缀才是各家的真实约定：OpenRouter 用 `:free` 与 `-free`，stealth
+    // 免费模型另有文档点名的名单。2026-10-05 核对库里 32 个真实模型名，
+    // 后缀 + 名单命中 5 个、误判 0 个，收紧不会让任何在用的免费模型漏判。
+    if m.ends_with("-free") || m.ends_with(":free") {
         return true;
     }
     matches!(
@@ -198,6 +205,7 @@ pub async fn refresh_all(pool: &SqlitePool) -> Result<RefreshReport> {
         ..Default::default()
     };
     let mut cache: HashMap<Source, Vec<FetchedPrice>> = HashMap::new();
+    let mut last_row_count: HashMap<Source, usize> = HashMap::new();
 
     for (id, alias, base_url) in accounts {
         let src = source_for(base_url.as_deref().unwrap_or(""), &alias);
@@ -236,6 +244,22 @@ pub async fn refresh_all(pool: &SqlitePool) -> Result<RefreshReport> {
                 if !cache.contains_key(&src) {
                     match fetch_source(src).await {
                         Ok(v) => {
+                            // 抓到了，但「抓到 0 条」和「抓到 3 条」与「抓到 40 条」
+                            // 在 `Ok` 里长得一模一样。页面改版时手写解析器会安静地
+                            // 返回空或残缺，刷新循环认为成功，于是价格**静默过期**
+                            // 且没有任何告警 —— `html.rs` 的模块注释一直声称上层有
+                            // 「行数骤降即判失败」的兜底，grep 全树其实并不存在。
+                            //
+                            // 补上它。注意这**不会**写坏任何已有行：未匹配上的模型
+                            // 只是被 skip，不会被写成 0；这里挡的是「拿一份残缺的
+                            // 价目去刷新」以及「静默过期」。
+                            if let Some(reason) = row_count_regression(src, v.len(), &last_row_count) {
+                                report
+                                    .failures
+                                    .push(format!("{}: {reason}", src.as_str()));
+                                continue;
+                            }
+                            last_row_count.insert(src, v.len());
                             cache.insert(src, v);
                         }
                         Err(e) => {
@@ -265,6 +289,33 @@ pub async fn refresh_all(pool: &SqlitePool) -> Result<RefreshReport> {
     report.sources_fetched = cache.keys().map(|s| s.as_str().to_string()).collect();
     report.sources_fetched.sort();
     Ok(report)
+}
+
+/// 抓取结果相对上次是否**骤降**到不值得采信。
+///
+/// 只是一次刷新内的对比，所以状态放在 `refresh_all` 的局部 `HashMap` 里 ——
+/// 不写库、不加列、不加迁移。仅在「上次成功抓到过、这次掉到一半以下」时报警。
+///
+/// 阈值取一半而不是绝对条数：来源自己上下架模型是常态，跌一半才像是解析
+/// 失灵。`Some(0)` 永远判为失败 —— 空结果没有任何信息量。
+fn row_count_regression(
+    src: Source,
+    fetched: usize,
+    last_row_count: &HashMap<Source, usize>,
+) -> Option<String> {
+    if fetched == 0 {
+        return Some(format!(
+            "抓到 0 条价目（{}）——页面结构可能已改版，判为抓取失败",
+            src.as_str()
+        ));
+    }
+    let prev = *last_row_count.get(&src)?;
+    if fetched * 2 < prev {
+        return Some(format!(
+            "抓到 {fetched} 条，较上次 {prev} 条骤降，判为抓取失败",
+        ));
+    }
+    None
 }
 
 async fn fetch_source(src: Source) -> Result<Vec<FetchedPrice>> {
@@ -383,6 +434,61 @@ async fn upsert_zero(pool: &SqlitePool, account_id: i64, model_id: &str, source:
 
 #[cfg(test)]
 mod tests {
+    use super::{is_known_free, row_count_regression, Source};
+    use std::collections::HashMap;
+
+    /// 页面改版时解析器会安静地返回空/残缺，`Ok` 里看不出区别 —— 这条兜底
+    /// 就是 `html.rs` 模块注释一直声称存在、实际并不存在的那个。
+    #[test]
+    fn a_fetch_that_collapses_to_nothing_is_treated_as_failure() {
+        let mut last: HashMap<Source, usize> = HashMap::new();
+        // 首次就抓到 0 条：空结果没有任何信息量，永远判失败。
+        assert!(row_count_regression(Source::Zen, 0, &last).is_some());
+        last.insert(Source::Zen, 40);
+        // 抓到 3 条 vs 上次 40 条：骤降 → 判失败。
+        assert!(row_count_regression(Source::Zen, 3, &last).is_some());
+        // 正常波动：40 → 35 不算失败。
+        assert!(row_count_regression(Source::Zen, 35, &last).is_none());
+        // 恰好一半（40 → 20）通过；再少就该怀疑解析失灵了。
+        assert!(row_count_regression(Source::Zen, 20, &last).is_none());
+        assert!(row_count_regression(Source::Zen, 19, &last).is_some());
+        // 没有历史可比时不做判断（首轮刷新不该把自己拦下）。
+        let empty: HashMap<Source, usize> = HashMap::new();
+        assert!(row_count_regression(Source::DeepSeek, 5, &empty).is_none());
+    }
+
+    /// 免费判定只认后缀与名单 —— 不认子串。
+    ///
+    /// `contains("-free-")` 那一版会把任何中间带 `-free-` 的**付费**模型判成
+    /// 免费，`refresh_all` 随即给它写一行全 0 的 `upstream_prices`，静默少计费。
+    /// 这条测试钉死「中间含 -free- 的付费名不算免费」。
+    #[test]
+    fn only_suffixes_and_the_allowlist_count_as_free() {
+        for free in [
+            "deepseek-v4-flash-free",
+            "glm-5.3-flash-free",
+            "muse-spark-1.2-contributor-free",
+            "inclusionai/ling-3.0-flash-sante:free",
+            "poolside/laguna-s-2.1-free",
+            "stealth/space-bunny-alpha",
+            "omen-alpha",
+            "big-pickle",
+        ] {
+            assert!(is_known_free(free), "should be free: {free}");
+        }
+        for paid in [
+            // 中间含 `-free-`，但那是付费模型名的一部分
+            "vendor-x-free-tier-2",
+            "some-free-tier-model",
+            "acme-free-preview-v3",
+            // 明显付费
+            "gpt-6-astra",
+            "deepseek-v4.1-flash",
+            "qwen3.8-max",
+        ] {
+            assert!(!is_known_free(paid), "must NOT be free: {paid}");
+        }
+    }
     use super::*;
 
     #[test]

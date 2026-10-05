@@ -308,9 +308,7 @@ pub(crate) async fn dispatch_with_conversion(
             last_status = Some(status.as_u16());
             if is_retryable_status(status.as_u16()) {
                 // 429 → 记冷却，见 anthropic.rs 同处注释。
-                if status.as_u16() == 429 {
-                    super::helpers::note_rate_limit(&state.pool, account.id, &model_name, &error_body).await;
-                }
+                super::helpers::note_upstream_throttle(&state.pool, account.id, &model_name, &error_body).await;
                 if account.id == preferred_id { let mut r = state.dispatch_router.lock().unwrap(); r.record_result(&dispatch_key, &dispatch_meta, None, false); }
                 failed_candidates += 1;
                 continue;
@@ -613,9 +611,7 @@ pub(crate) async fn dispatch_aggregate_with_conversion(
             last_status = Some(status.as_u16());
             if is_retryable_status(status.as_u16()) {
                 // 429 → 记冷却，见 anthropic.rs 同处注释。
-                if status.as_u16() == 429 {
-                    super::helpers::note_rate_limit(&state.pool, account.id, &cand.model, &error_body).await;
-                }
+                super::helpers::note_upstream_throttle(&state.pool, account.id, &cand.model, &error_body).await;
                 state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); failed_candidates += 1; continue;
             }
             tracing::warn!("🔀 [agg:{}] Account {} (id={}) failed ({}) — trying next (non-retryable): {}", alias, account.alias, account.id, status.as_u16(), error_body.chars().take(200).collect::<String>());
@@ -711,7 +707,9 @@ async fn responses_to_chat_streaming(
     let api_key_id = super::helpers::current_api_key_id();
     tokio::spawn(async move {
         let mut buffer: Vec<u8> = Vec::with_capacity(4096);
-        let mut received: Vec<u8> = Vec::with_capacity(4096);
+        // 有界头尾缓冲：见 helpers::StreamCapture（p99 上游流 615KB，全量缓冲
+        // 是 RSS 386MiB 的主因）。头部给详情页，尾部保住结束符与最终 usage。
+        let mut received = super::helpers::StreamCapture::new(131072);
         let mut converter = llmux_core::proxy::responses::ResponsesToChatConverter::new(&model);
         let mut sse = response.bytes_stream();
         let mut chunks: u64 = 0;
@@ -721,7 +719,7 @@ async fn responses_to_chat_streaming(
                 Ok(c) => {
                     chunks += 1;
                     buffer.extend_from_slice(&c);
-                    received.extend_from_slice(&c);
+                    received.push(&c);
                     for event_text in parse_sse_chunks(&mut buffer, 0) {
                         for out in converter.feed(&event_text) {
                             let sent = tx.send(Ok(Bytes::from(out))).await.is_ok();
@@ -765,7 +763,7 @@ async fn responses_to_chat_streaming(
         let (cache_read, cache_create) = converter.usage_cache();
         let complete = converter.is_done() && !converter.is_failed();
         let latency_ms = start.elapsed().as_millis() as i64;
-        spawn_log_usage_ip(pool.clone(), account.clone(), model.clone(), account.provider_id.clone(), prompt_tokens, completion_tokens, cache_read, cache_create, latency_ms, complete, if complete { None } else if converter.is_failed() { Some("Upstream SSE reported a failure event".to_string()) } else { Some(format!("Responses upstream ended without terminal event after {chunks} chunks")) }, request_body, Some(String::from_utf8_lossy(&received).into_owned()), ttft_ms, true, client_ip, api_key_id)
+        spawn_log_usage_ip(pool.clone(), account.clone(), model.clone(), account.provider_id.clone(), prompt_tokens, completion_tokens, cache_read, cache_create, latency_ms, complete, if complete { None } else if converter.is_failed() { Some("Upstream SSE reported a failure event".to_string()) } else { Some(format!("Responses upstream ended without terminal event after {chunks} chunks")) }, request_body, received.to_body_string(), ttft_ms, true, client_ip, api_key_id)
     });
     let body = Body::from_stream(ReceiverStream::new(rx));
     Response::builder().status(StatusCode::OK).header("content-type", "text/event-stream").header("cache-control", "no-cache").header("connection", "keep-alive").body(body).unwrap().into_response()
@@ -1032,15 +1030,7 @@ async fn openai_dispatch(
                     status.as_u16()
                 );
                 // 429 → 记冷却，见 anthropic.rs 同处注释。
-                if status.as_u16() == 429 {
-                    super::helpers::note_rate_limit(
-                        &state.pool,
-                        account.id,
-                        &model_resolution.target_model,
-                        &last_error.clone().unwrap_or_default(),
-                    )
-                    .await;
-                }
+                super::helpers::note_upstream_throttle(&state.pool, account.id, &model_resolution.target_model, &last_error.clone().unwrap_or_default(),).await;
                 if let Some(tx) = &state.tui_tx {
                     let _ = tx.send(TuiEvent::Retry {
                         account: account.alias.clone(),
@@ -1364,9 +1354,7 @@ async fn dispatch_aggregate_openai(
             if is_retryable_status(status.as_u16()) {
                 tracing::warn!("🔀 [agg:{}] Account {} failed ({}) — trying next...", alias, account.alias, status.as_u16());
                 // 429 → 记冷却，见 anthropic.rs 同处注释。
-                if status.as_u16() == 429 {
-                    super::helpers::note_rate_limit(&state.pool, account.id, &cand.model, &error_body).await;
-                }
+                super::helpers::note_upstream_throttle(&state.pool, account.id, &cand.model, &error_body).await;
                 state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len);
                 if let Some(tx) = &state.tui_tx { let _ = tx.send(TuiEvent::Retry { account: account.alias.clone(), status: status.as_u16(), message: error_body.clone() }); }
                 failed_candidates += 1;
@@ -1664,7 +1652,9 @@ async fn openai_streaming_passthrough(
     let api_key_id = super::helpers::current_api_key_id();
     tokio::spawn(async move {
         let mut buffer: Vec<u8> = Vec::with_capacity(4096);
-        let mut received: Vec<u8> = Vec::with_capacity(4096);
+        // 有界头尾缓冲：见 helpers::StreamCapture（p99 上游流 615KB，全量缓冲
+        // 是 RSS 386MiB 的主因）。头部给详情页，尾部保住结束符与最终 usage。
+        let mut received = super::helpers::StreamCapture::new(131072);
         let mut sse = response.bytes_stream();
         let mut acc = StreamAccounting::default();
 
@@ -1675,7 +1665,7 @@ async fn openai_streaming_passthrough(
                 Ok(c) => {
                     acc.chunks += 1;
                     buffer.extend_from_slice(&c);
-                    received.extend_from_slice(&c);
+                    received.push(&c);
                     // Forward only whole events, so a redundant terminator can be
                     // withheld before the client ever sees it. Partial data stays
                     // buffered until its `\n\n` arrives — verified: upstreams
@@ -1796,7 +1786,7 @@ async fn openai_streaming_passthrough(
                 "[openai:{model}] full upstream body ({} bytes, account={}): {}",
                 received.len(),
                 account.alias,
-                String::from_utf8_lossy(&received)
+                &received.to_body_string().unwrap_or_default()
             );
         }
         if final_truncated {
@@ -1828,7 +1818,7 @@ async fn openai_streaming_passthrough(
                 None
             },
             request_body,
-            Some(String::from_utf8_lossy(&received).into_owned()),
+            received.to_body_string(),
             acc.ttft_ms, true, client_ip, api_key_id,
         )
     });
@@ -2196,7 +2186,9 @@ async fn anthropic_fallback_streaming(
     let api_key_id = super::helpers::current_api_key_id();
     tokio::spawn(async move {
         let mut buffer: Vec<u8> = Vec::with_capacity(4096);
-        let mut received: Vec<u8> = Vec::with_capacity(4096);
+        // 有界头尾缓冲：见 helpers::StreamCapture（p99 上游流 615KB，全量缓冲
+        // 是 RSS 386MiB 的主因）。头部给详情页，尾部保住结束符与最终 usage。
+        let mut received = super::helpers::StreamCapture::new(131072);
         let mut converter = AnthropicSseConverter::new(&model);
         let mut sse = response.bytes_stream();
         let mut usage: Option<Value> = None;
@@ -2211,7 +2203,7 @@ async fn anthropic_fallback_streaming(
                 }
             };
             buffer.extend_from_slice(&chunk);
-            received.extend_from_slice(&chunk);
+            received.push(&chunk);
             for event_text in parse_sse_chunks(&mut buffer, 0) {
                 let Some(payload) = sse_data_payload(&event_text) else {
                     continue;
@@ -2266,7 +2258,7 @@ async fn anthropic_fallback_streaming(
                             true,
                             None,
                             request_body,
-                            Some(String::from_utf8_lossy(&received).into_owned()),
+                            received.to_body_string(),
                             ttft_ms, true, client_ip, api_key_id,
                         );
                         return;

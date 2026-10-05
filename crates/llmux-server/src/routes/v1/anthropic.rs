@@ -336,15 +336,7 @@ pub async fn messages(
                 // 429 = 配额/限流。这条分支直接 continue 不落库，所以冷却
                 // 得在这儿记 —— 否则重打一次吃一次 429，配额耗尽的模型会被
                 // 反复打一整天。
-                if status.as_u16() == 429 {
-                    super::helpers::note_rate_limit(
-                        &state.pool,
-                        account.id,
-                        &model_resolution.target_model,
-                        &last_error.clone().unwrap_or_default(),
-                    )
-                    .await;
-                }
+                super::helpers::note_upstream_throttle(&state.pool, account.id, &model_resolution.target_model, &last_error.clone().unwrap_or_default(),).await;
                 if let Some(tx) = &state.tui_tx {
                     let _ = tx.send(TuiEvent::Retry {
                         account: account.alias.clone(),
@@ -808,9 +800,7 @@ async fn dispatch_aggregate_anthropic(
             if is_retryable_status(status.as_u16()) {
                 tracing::warn!("🔀 [agg:{}] Account {} failed ({}) — trying next...", alias, account.alias, status.as_u16());
                 // 429 → 记冷却，见同文件 297 行注释。
-                if status.as_u16() == 429 {
-                    super::helpers::note_rate_limit(&state.pool, account.id, &cand.model, &error_body).await;
-                }
+                super::helpers::note_upstream_throttle(&state.pool, account.id, &cand.model, &error_body).await;
                 state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len);
                 failed_candidates += 1;
                 continue;
@@ -926,7 +916,9 @@ pub(crate) async fn anthropic_streaming_passthrough(
     let api_key_id = super::helpers::current_api_key_id();
 
     tokio::spawn(async move {
-        let mut received: Vec<u8> = Vec::with_capacity(4096);
+        // 有界头尾缓冲：见 helpers::StreamCapture（p99 上游流 615KB，全量缓冲
+        // 是 RSS 386MiB 的主因）。头部给详情页，尾部保住结束符与最终 usage。
+        let mut received = crate::routes::v1::helpers::StreamCapture::new(131072);
         let mut sse = response.bytes_stream();
         let mut ttft_ms: Option<i64> = None;
         while let Some(chunk) = sse.next().await {
@@ -937,7 +929,7 @@ pub(crate) async fn anthropic_streaming_passthrough(
                     break;
                 }
             };
-            received.extend_from_slice(&chunk);
+            received.push(&chunk);
             let sent = tx.send(Ok(chunk)).await.is_ok();
             if sent && ttft_ms.is_none() {
                 ttft_ms = Some(start.elapsed().as_millis() as i64);
@@ -948,8 +940,9 @@ pub(crate) async fn anthropic_streaming_passthrough(
         }
 
         let latency_ms = start.elapsed().as_millis() as i64;
-        let resp_body = String::from_utf8_lossy(&received).into_owned();
-        // 完整流落文件日志（DB 里是截断视图）—— 同 anthropic_to_openai_streaming。
+        let resp_body = received.to_body_string().unwrap_or_default();
+        // 头尾视图落文件日志（DB 里另有 smart_truncate_body 的二次封顶）
+        // —— 同 anthropic_to_openai_streaming。
         if tracing::enabled!(tracing::Level::TRACE) {
             tracing::trace!(
                 "[stream:{model}] full upstream body ({} bytes, account={}): {}",
@@ -960,6 +953,11 @@ pub(crate) async fn anthropic_streaming_passthrough(
         }
         let usage = extract_anthropic_usage_from_sse(&resp_body);
         // message_stop is the terminal event: success only when it was seen.
+        //
+        // 头尾缓冲下这个判断依然成立：`message_stop` 是**最后**一个事件，落在
+        // 保留的尾部里。中间的 usage 事件同理（除非整条流短到没触发截断，
+        // 那时 head+tail 就是完整原文）。真被丢掉的只有中段正文，而那不含
+        // 决定成败的终止标记。
         let done = resp_body.contains("message_stop");
         spawn_log_usage_ip(
             pool.clone(),
@@ -1019,7 +1017,9 @@ pub(crate) async fn anthropic_to_openai_streaming(
 
     tokio::spawn(async move {
         let mut buffer: Vec<u8> = Vec::with_capacity(4096);
-        let mut received: Vec<u8> = Vec::with_capacity(4096);
+        // 有界头尾缓冲：见 helpers::StreamCapture（p99 上游流 615KB，全量缓冲
+        // 是 RSS 386MiB 的主因）。头部给详情页，尾部保住结束符与最终 usage。
+        let mut received = crate::routes::v1::helpers::StreamCapture::new(131072);
         let mut sse = response.bytes_stream();
         let mut done = false;
         let mut chunks_received: u64 = 0;
@@ -1040,7 +1040,7 @@ pub(crate) async fn anthropic_to_openai_streaming(
             };
             chunks_received += 1;
             buffer.extend_from_slice(&chunk);
-            received.extend_from_slice(&chunk);
+            received.push(&chunk);
 
             for event_text in parse_sse_chunks(&mut buffer, 0) {
                 let Some(payload) = sse_data_payload(&event_text) else {
@@ -1143,7 +1143,7 @@ pub(crate) async fn anthropic_to_openai_streaming(
                 "[stream:{model}] full upstream body ({} bytes, account={}): {}",
                 received.len(),
                 account.alias,
-                String::from_utf8_lossy(&received)
+                &received.to_body_string().unwrap_or_default()
             );
         }
         let (input_tokens, output_tokens, cache_read, cache_create) = converter.usage_tokens();
@@ -1182,7 +1182,7 @@ pub(crate) async fn anthropic_to_openai_streaming(
                 None
             },
             request_body,
-            Some(String::from_utf8_lossy(&received).into_owned()),
+            received.to_body_string(),
             ttft_ms, true, client_ip, api_key_id,
         )
     });
@@ -1241,14 +1241,16 @@ pub(crate) async fn responses_to_anthropic_streaming(
     let api_key_id = crate::routes::v1::helpers::current_api_key_id();
     tokio::spawn(async move {
         let mut buffer: Vec<u8> = Vec::with_capacity(4096);
-        let mut received: Vec<u8> = Vec::with_capacity(4096);
+        // 有界头尾缓冲：见 helpers::StreamCapture（p99 上游流 615KB，全量缓冲
+        // 是 RSS 386MiB 的主因）。头部给详情页，尾部保住结束符与最终 usage。
+        let mut received = crate::routes::v1::helpers::StreamCapture::new(131072);
         let mut conv = llmux_core::proxy::responses::ResponsesToAnthropicConverter::new(&model);
         let mut sse = response.bytes_stream();
         let mut ttft_ms: Option<i64> = None;
         while let Some(chunk) = sse.next().await {
             let c = match chunk { Ok(c) => c, Err(_) => break };
             buffer.extend_from_slice(&c);
-            received.extend_from_slice(&c);
+            received.push(&c);
             for ev in llmux_core::proxy::anthropic_openai::parse_sse_chunks(&mut buffer, 0) {
                 for out in conv.feed(&ev) {
                     let sent = tx.send(Ok(Bytes::from(out))).await.is_ok();
@@ -1284,11 +1286,11 @@ pub(crate) async fn responses_to_anthropic_streaming(
                 "[stream:{model}] full upstream body ({} bytes, account={}): {}",
                 received.len(),
                 account.alias,
-                String::from_utf8_lossy(&received)
+                &received.to_body_string().unwrap_or_default()
             );
         }
         let complete = conv.is_done() && !conv.is_failed();
-        crate::routes::v1::helpers::spawn_log_usage_ip(pool.clone(), account.clone(), model.clone(), provider_id.clone(), input_tokens, output_tokens, cache_read, cache_create, latency_ms, complete, if complete { None } else if conv.is_failed() { Some("Upstream SSE reported a failure event".to_string()) } else { Some("Responses upstream ended without terminal event".to_string()) }, request_body, Some(String::from_utf8_lossy(&received).into_owned()), ttft_ms, true, client_ip, api_key_id)
+        crate::routes::v1::helpers::spawn_log_usage_ip(pool.clone(), account.clone(), model.clone(), provider_id.clone(), input_tokens, output_tokens, cache_read, cache_create, latency_ms, complete, if complete { None } else if conv.is_failed() { Some("Upstream SSE reported a failure event".to_string()) } else { Some("Responses upstream ended without terminal event".to_string()) }, request_body, received.to_body_string(), ttft_ms, true, client_ip, api_key_id)
     });
     let body = Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx));
     Response::builder().status(StatusCode::OK).header("content-type", "text/event-stream").header("cache-control", "no-cache").header("connection", "keep-alive").body(body).unwrap().into_response()

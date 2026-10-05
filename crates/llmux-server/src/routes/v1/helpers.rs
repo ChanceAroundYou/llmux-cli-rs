@@ -90,6 +90,92 @@ pub async fn note_rate_limit(
     }
 }
 
+/// 「账户需要充值」—— 余额不足 / 账单被拒。
+///
+/// 与 [`is_quota_exhausted`] 分开，因为两者的**恢复方式**不同：
+///
+/// - 配额类（`resets at 00:00` / `usage limit`）当天会自愈 → 30 分钟冷却够；
+/// - 充值类（余额 0、账单被拒）**不会自己长回来**，30 分钟冷却会一直续期，
+///   而在这期间每个真实请求仍然打过去 —— 实测 api123/gpt-5.6-luna 在
+///   14 天里吃了 **478 次** HTTP 400 的「钱包余额不足」，重试间隔 p50 仅 4s。
+///
+/// 判定刻意要求**同时**出现「钱」的词和一个**否定式**的说法。只用 `contains`
+/// 会误伤正常参数错误里的 "billing"（例如 "billing address is required"），
+/// 把一个能用的模型长挂起 —— 那个代价远大于多打几次请求。
+pub fn is_payment_required(error_body: &str) -> bool {
+    let b = error_body.to_ascii_lowercase();
+    const NEEDS_TOPUP: [&str; 7] = [
+        "余额",
+        "欠费",
+        "insufficient balance",
+        "insufficient funds",
+        "top up",
+        "topup",
+        "recharge",
+    ];
+    const REFUSING: [&str; 6] = [
+        "insufficient",
+        "余额不足",
+        "欠费",
+        "recharge",
+        "top up",
+        "topup",
+    ];
+    NEEDS_TOPUP.iter().any(|m| b.contains(m)) && REFUSING.iter().any(|m| b.contains(m))
+}
+
+/// 余额不足这类「要人工介入」的失败：挂起时间远长于配额类。
+///
+/// 24h 而不是更长：充值通常当天完成，探活会在到期后先探一次，探不通就再续期，
+/// 所以宁可多挂一会儿，也不用人去改配置。
+pub const PAYMENT_SUSPEND_SECS: i64 = 24 * 3600;
+
+/// 上游回了「要充值」的错误 → 记一次失败并进入长挂起。
+///
+/// 与 [`note_rate_limit`] 的区别只有两点：用的是更长的挂起时长，以及
+/// **不看状态码**（余额不足在实践中以 400 / 402 为主，见函数文档）。
+/// 仍然由成功调用时的 `clear_suspension` 解除，所以充值后第一次跑通即自动恢复。
+pub async fn note_payment_required(
+    pool: &sqlx::SqlitePool,
+    account_id: i64,
+    model: &str,
+    error: &str,
+) {
+    let kind = llmux_core::probe::FailureKind::PaymentRequired;
+    if llmux_core::probe::note_failure(pool, account_id, model, Some(error), kind).await {
+        tracing::warn!(
+            "💳 {} | 账户 {} 余额不足，挂起 {} 小时（充值后跑通一次即自动恢复）",
+            model,
+            account_id,
+            PAYMENT_SUSPEND_SECS / 3600
+        );
+    }
+}
+
+/// 一次上游失败的归类。**先看正文再看状态码** —— 配额与余额类错误在实践中
+/// 以 400 / 402 为主（余额不足 478 次 vs 429 112 次，见函数文档），把它们
+/// 绑在 `429` 上会让整套冷却机制对它们完全失效。
+///
+/// 调用点原先长这样：
+/// ```ignore
+/// if is_retryable_status(status) {
+///     if status == 429 { note_rate_limit(...) }   // ← 400 永远进不来
+/// }
+/// ```
+/// 改为在这里统一分流，各调用点不再自己判断状态码。
+pub async fn note_upstream_throttle(
+    pool: &sqlx::SqlitePool,
+    account_id: i64,
+    model: &str,
+    error_body: &str,
+) {
+    if is_payment_required(error_body) {
+        note_payment_required(pool, account_id, model, error_body).await;
+    } else if is_quota_exhausted(error_body) {
+        note_rate_limit(pool, account_id, model, error_body).await;
+    }
+}
+
 /// 全部候选耗尽后该回给客户端的状态码。
 ///
 /// 只有**每一个**候选都因配额冷却被跳过时才回 429 —— 502 对调用方是"网关坏了"，
@@ -586,6 +672,99 @@ fn compress_messages(body: &mut Value, per_field_limit: usize) {
     }
 }
 
+/// 上游流的**有界**捕获缓冲：保留头部与尾部，中间丢弃。
+///
+/// 取代此前「整条流无条件全量缓冲」的 `Vec<u8>`。实测（2026-10-05，4998 条流）
+/// 未截断的上游响应 p50=6KB、p90=87KB、**p99=615KB、max=1.2MB**；每条在途
+/// 流各持一份完整副本，容器 RSS 因此是 386MiB，而 CLAUDE.md 记的稳态是 18MiB
+/// —— 差的正是这块（不是泄漏：20 秒两次采样纹丝不动）。
+///
+/// 为什么是头 + 尾而不是纯上限：
+/// - **头**给 `usage_logs` 详情页与 `smart_truncate_body`（它只要头部）；
+/// - **尾**给「结束符在哪」「最终 usage 是多少」「最后几个 chunk 长什么样」——
+///   上一条修复（去重吞掉记账）之所以要靠现网日志才查得出来，正是因为
+///   DB 里的 body 被砍到只剩头，尾部证据全没了。
+///
+/// 代价：中间的正文不再留全。超出 `max` 时中段真的没了，`RUST_LOG=trace`
+/// 也不再能补 —— 但那本来就是异常大流（p90 已是 87KB）。
+pub struct StreamCapture {
+    head: Vec<u8>,
+    tail: Vec<u8>,
+    max: usize,
+    /// 中段被丢弃的总字节数。0 = 至今未丢过任何字节。
+    dropped: usize,
+}
+
+impl StreamCapture {
+    pub fn new(max: usize) -> Self {
+        Self {
+            head: Vec::new(),
+            tail: Vec::new(),
+            max,
+            dropped: 0,
+        }
+    }
+
+    /// 上游一个字节都没送来时为真 —— 与 `Vec::is_empty` 同义。
+    pub fn is_empty(&self) -> bool {
+        self.head.is_empty() && self.tail.is_empty()
+    }
+
+    /// 当前是否仍完整无损（DB 里的 body 可视为原文）。
+    pub fn is_complete(&self) -> bool {
+        self.dropped == 0
+    }
+
+    pub fn dropped(&self) -> usize {
+        self.dropped
+    }
+
+    pub fn len(&self) -> usize {
+        self.head.len() + self.tail.len()
+    }
+
+    pub fn push(&mut self, chunk: &[u8]) {
+        const TAIL_FRACTION: usize = 3; // 尾部约占上限的 1/4
+        let head_cap = self.max * TAIL_FRACTION / 4;
+        let tail_cap = self.max - head_cap;
+        if self.head.len() < head_cap {
+            let take = (head_cap - self.head.len()).min(chunk.len());
+            self.head.extend_from_slice(&chunk[..take]);
+            if take < chunk.len() {
+                self.tail.extend_from_slice(&chunk[take..]);
+            }
+        } else {
+            self.tail.extend_from_slice(chunk);
+        }
+        if self.tail.len() > tail_cap {
+            let excess = self.tail.len() - tail_cap;
+            self.tail.drain(..excess);
+            self.dropped += excess;
+        }
+    }
+
+    /// 头部 + （若有丢弃）标记 + 尾部。空则返回 `None`。
+    pub fn to_body_string(&self) -> Option<String> {
+        if self.head.is_empty() && self.tail.is_empty() {
+            return None;
+        }
+        if self.dropped == 0 {
+            return Some(String::from_utf8_lossy(&self.head).into_owned());
+        }
+        let mut out = String::with_capacity(self.len() + 48);
+        out.push_str(&String::from_utf8_lossy(&self.head));
+        // 单行标记：head+tail 会原样进 `response_body`，而 body 可能是 JSON。
+        // 带换行的标记插进 JSON 就是裸控制字符 → 非法 JSON（见
+        // `smart_truncate_body` 里同一条注释与实测的 1 条违规）。
+        out.push_str(&format!(
+            "…[{} bytes omitted from the middle]…",
+            self.dropped
+        ));
+        out.push_str(&String::from_utf8_lossy(&self.tail));
+        Some(out)
+    }
+}
+
 fn smart_truncate_body(
     s: Option<String>,
     is_success: bool,
@@ -663,7 +842,15 @@ fn smart_truncate_body(
     // 看到「首条片段没有 id/name」，从而误判成「上游没发」——而它其实发了。
     // 头部才是 SSE 的证据所在（message_start、第一条 tool_call 的完整形态）。
     let count = trimmed.chars().count();
-    let marker = format!("\n…[truncated {} chars, kept head]…\n", count - cap);
+    // 标记里**不能有换行**。切点已经保证落在字符串外（`scan_json_cut_points`），
+    // 但把一个带 `\n` 的标记插进 JSON 字符串之间，产出的就是**非法 JSON**：
+    // 裸换行在 JSON 里是控制字符，只能出现在字符串**内部**且要转义。
+    // 2026-10-05 实测库里就有 1 条这样的 body（155 个 JSON 形态中唯一一条，
+    // 因为它需要恰好切在换行邻接处 —— 罕见但确实发生过）。
+    //
+    // SSE body 不是 JSON，本来带换行没问题；但同一个标记会被用在 JSON body 上，
+    // 所以标记本身必须干净。「截断处省略了多少」的信息用 `…` 前后包夹即可。
+    let marker = format!("…[truncated {} chars, kept head]…", count - cap);
     let budget = cap.saturating_sub(marker.chars().count());
     let head: String = trimmed.chars().take(budget).collect();
     Some(format!("{head}{marker}"))
@@ -1404,6 +1591,172 @@ mod tests {
         ] {
             assert!(!is_quota_exhausted(transient), "should NOT cool: {transient}");
         }
+    }
+
+    /// 余额不足要和配额类分开：前者要 24h 长挂起，后者 30 分钟。
+    ///
+    /// 用的是生产原文（TeamoRouter 经 api123 转售透传，2026-10-05 实测 478 次）。
+    #[test]
+    fn balance_errors_are_classified_as_payment_required() {
+        for payment in [
+            r#"{"error":{"message":"TeamoRouter 钱包余额不足，请前往 https://teamorouter.cn/dashboard?buy=1 充值后继续使用","type":"invalid_request_error"}}"#,
+            "钱包余额不足",
+            "insufficient balance",
+            "Insufficient funds on account",
+            "Please recharge your account to continue",
+            "账户已欠费，请充值",
+        ] {
+            assert!(is_payment_required(payment), "should need top-up: {payment}");
+        }
+    }
+
+    /// **这条最关键**：正常参数错误里也会出现 "billing"，把它判成余额不足
+    /// 会把一个能用的模型挂起 24 小时 —— 代价远大于多打几次请求。
+    #[test]
+    fn ordinary_bad_requests_are_never_payment_required() {
+        for not_payment in [
+            r#"{"error":{"message":"billing address is required for this account","type":"invalid_request_error"}}"#,
+            r#"{"error":{"message":"The input is longer than the model's context length","type":"invalid_request_error"}}"#,
+            r#"{"error":{"message":"max_tokens 不能超过 65536","type":"invalid_request_error"}}"#,
+            r#"{"error":{"message":"Vision is disabled for this server","code":"vision_disabled"}}"#,
+            "Provider returned 502 Bad Gateway",
+            "模型不存在 model not found",
+        ] {
+            assert!(
+                !is_payment_required(not_payment),
+                "must NOT suspend a working model: {not_payment}"
+            );
+        }
+    }
+
+    /// 429 的配额与 400 的余额都要能被识别 —— 分类只看正文，与状态码无关。
+    /// 这正是修复前的漏洞：`if status == 429` 把 400 的余额错误挡在门外。
+    #[test]
+    fn quota_detection_looks_at_the_body_not_the_status() {
+        // 配额类（原先只有 429 能进来）
+        assert!(is_quota_exhausted("Your quota resets at 2026-09-25T00:00:00.000Z"));
+        // 余额类（原先 400/402 进不来）
+        assert!(is_payment_required("钱包余额不足"));
+        assert!(!is_quota_exhausted("钱包余额不足") || is_payment_required("钱包余额不足"));
+    }
+
+    /// 两种失败的挂起时长必须不同，否则「长挂起」这个决策就没有落点。
+    #[test]
+    fn payment_required_suspends_far_longer_than_quota() {
+        use llmux_core::probe::{suspend_secs_for, FailureKind, PAYMENT_SUSPEND_SECS, SUSPEND_SECS};
+        assert_eq!(suspend_secs_for(FailureKind::Quota), SUSPEND_SECS);
+        assert_eq!(suspend_secs_for(FailureKind::Probe), SUSPEND_SECS);
+        assert_eq!(suspend_secs_for(FailureKind::PaymentRequired), PAYMENT_SUSPEND_SECS);
+        assert_eq!(PAYMENT_SUSPEND_SECS, 24 * 3600);
+        assert!(
+            PAYMENT_SUSPEND_SECS >= SUSPEND_SECS * 8,
+            "余额类至少要显著长于 30 分钟，否则会被反复续期"
+        );
+    }
+
+    // --- StreamCapture: 有界头尾缓冲 ---------------------------------------
+
+    /// 未超上限时必须逐字节等于原文 —— 绝大多数流（p50 6KB）不该有任何损失。
+    #[test]
+    fn capture_below_the_cap_is_byte_identical() {
+        let mut c = StreamCapture::new(1024);
+        for part in ["data: {\"a\":1}\n\n", "data: [DONE]\n\n"] {
+            c.push(part.as_bytes());
+        }
+        assert!(c.is_complete());
+        assert_eq!(c.to_body_string().unwrap(), "data: {\"a\":1}\n\ndata: [DONE]\n\n");
+    }
+
+    /// 超限时保住头与尾 —— 头给详情页，尾给「结束符 / 最终 usage」。
+    /// 上一条修复之所以只能靠现网日志定位，就是因为尾部证据被砍掉了。
+    #[test]
+    fn capture_keeps_head_and_tail_when_over_the_cap() {
+        let mut c = StreamCapture::new(100);
+        c.push(b"HEAD-MARKER");
+        c.push(&vec![b'x'; 500]); // middle that must be dropped
+        c.push(b"TAIL-MARKER");
+        let out = c.to_body_string().unwrap();
+        assert!(!c.is_complete());
+        assert!(out.starts_with("HEAD-MARKER"), "head kept: {out}");
+        assert!(out.ends_with("TAIL-MARKER"), "tail kept: {out}");
+        assert!(out.contains("omitted from the middle"));
+    }
+
+    /// 内存上界必须真的成立：无论推进多少字节，保留量都不超过上限 + 标记长度。
+    #[test]
+    fn capture_memory_is_bounded_no_matter_how_much_arrives() {
+        for max in [64usize, 256, 1024] {
+            let mut c = StreamCapture::new(max);
+            for _ in 0..500 {
+                c.push(&vec![b'z'; 100]);
+            }
+            assert!(
+                c.len() <= max,
+                "cap {max} exceeded: kept {}",
+                c.len()
+            );
+        }
+    }
+
+    /// 极小上限下单个 chunk 就溢出，头尾仍都要在（不能一边把另一头挤没）。
+    #[test]
+    fn capture_keeps_both_ends_under_a_tiny_cap() {
+        let mut c = StreamCapture::new(16);
+        c.push(b"AAAAAAAA");
+        c.push(b"BBBBBBBB");
+        c.push(b"CCCCCCCC");
+        let out = c.to_body_string().unwrap();
+        assert!(out.contains('A'), "head survives: {out}");
+        assert!(out.contains('C'), "tail survives: {out}");
+    }
+
+    /// 空流不能产出空串行 —— 上游一个字节都没给时详情页该显示「无」。
+    #[test]
+    fn capture_of_nothing_is_none() {
+        let c = StreamCapture::new(128);
+        assert!(c.to_body_string().is_none());
+    }
+
+    /// 回归：截断标记里的换行会把 JSON 打成非法。
+    ///
+    /// 生产实测（2026-10-05，id=169551）：一条 JSON 形态的 body 被截断后，
+    /// 标记里的 `\n` 落在字符串**外**，成了裸控制字符 ——
+    /// `Invalid control character at: char 15964`。切点本身是合法的
+    /// （`scan_json_cut_points` 保证了），坏的是标记。
+    ///
+    /// 只断言**标记不带裸换行**这一件事。「截断后一定可解析」由既有的
+    /// `over_cap_*_body_is_still_valid_json` / `cut_json_preserving_*` 覆盖，
+    /// 不在这里重复 —— 那条性质与本次改动无关。
+    #[test]
+    fn the_truncation_marker_is_a_single_line() {
+        for cap in [32_000usize, 64_000] {
+            let mut big = String::from("{\"choices\":[{\"message\":{\"content\":\"");
+            big.push_str(&"x".repeat(cap * 2));
+            big.push_str("\"}}]}");
+
+            let out = smart_truncate_body(Some(big), true, cap, cap).expect("truncated");
+            assert!(
+                !out.contains("\n…["),
+                "marker must not introduce a raw newline (cap={cap}): {out:.200}"
+            );
+        }
+    }
+
+    /// StreamCapture 的中段标记同理 —— 它的输出直接当 `response_body` 用，
+    /// 而 SSE body 本身不是 JSON，所以只断言标记单行 + 头尾都在。
+    #[test]
+    fn a_captured_body_is_single_line_with_both_ends() {
+        let mut c = StreamCapture::new(64);
+        c.push(br#"{"choices":[{"message":{"content":"#);
+        c.push(&vec![b'q'; 400]);
+        c.push(br#""}}]}"#);
+        let out = c.to_body_string().unwrap();
+        assert!(
+            !out.contains("\n…["),
+            "capture marker must be single-line: {out:.200}"
+        );
+        assert!(out.starts_with(r#"{"choices":[{"message":{"content":"#), "head kept: {out:.80}");
+        assert!(out.ends_with(r#""}}]}"#), "tail kept: {out:.80}");
     }
 }
 
