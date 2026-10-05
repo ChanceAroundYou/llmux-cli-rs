@@ -90,6 +90,11 @@ const CONTEXT_TABLE: &[(&str, u64)] = &[
     //   cached in account_model_cache (12/27 go1, 22/64 zen have context_length);
     //   missing ones fall back here. GOAT is authoritative for command/zen models.
     ("muse-spark", ONE_M),
+    // inclusionAI Ling 系全部 262K（GOAT 文档与 GET /models 一致）。
+    // **必须内置**：`os` 的主力是 `inclusionai/ling-3.1-flash:free`，客户端按别名
+    // 报的窗口决定何时压缩。缓存冷时（容器刚起、models_cache 还没预热）查不到它，
+    // 别名会干脆不报 context_length —— 客户端于是无从压缩，大请求直接打上去。
+    ("ling", 262_144),
     ("hy3", 262_144),
     ("glm-5.3", ONE_M),
     ("glm-5.2", ONE_M),
@@ -208,6 +213,10 @@ mod tests {
         assert_eq!(lookup_context_length("gemini-2.5-pro"), Some(1_048_576));
         assert_eq!(lookup_context_length("deepseek-v4-flash"), Some(1_000_000));
         assert_eq!(lookup_context_length("deepseek-chat"), Some(262_144));
+        // `os` 的免费主力：必须内置，否则缓存冷时别名报不出窗口（客户端无法压缩）。
+        // 带厂商前缀与 `:free` 后缀的真实 id 都要能落到 262K。
+        assert_eq!(lookup_context_length("inclusionai/ling-3.1-flash:free"), Some(262_144));
+        assert_eq!(lookup_context_length("inclusionai/ling-3.0-flash-sante:free"), Some(262_144));
         assert_eq!(lookup_context_length("grok-3"), Some(131_072));
         assert_eq!(lookup_context_length("mistral-small"), Some(131_072));
         assert_eq!(lookup_context_length("yi-lightning"), Some(16_384));
