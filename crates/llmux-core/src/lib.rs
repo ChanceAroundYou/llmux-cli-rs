@@ -7,6 +7,7 @@ pub mod crypto;
 pub mod db;
 pub mod dispatcher;
 pub mod export_import;
+pub mod max_tokens;
 pub mod models;
 pub mod probe;
 pub mod proxy;

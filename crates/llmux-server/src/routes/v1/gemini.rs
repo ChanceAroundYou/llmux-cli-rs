@@ -198,6 +198,9 @@ pub async fn gemini(
             body: body.clone(),
             // Gemini 原生协议用 thinkingConfig.thinkingBudget，没有 effort 枚举。
             effort: Default::default(),
+            // 本路径的 body 是 Gemini 原生形状（上限在 generationConfig.maxOutputTokens），
+            // 不含 max_tokens，所以这里无需收敛；OpenAI 兼容形状走 adapters 的构建器。
+            max_tokens: Default::default(),
         };
 
         tracing::info!(
@@ -247,6 +250,9 @@ pub async fn gemini(
             // 上游拒了这个档位 → 记下来，后续请求不再重复失败。
             // 没有这一步，请求前解析只生效一次，整个机制等于空操作。
             provider_request.effort.record_rejection(&error_body);
+            // 同一处回错顺便学 max_tokens 上限：客户端发 65536、上游只收
+            // 32768 时整轮 400，不学会就会一直白打（见 max_tokens 模块注释）。
+            provider_request.max_tokens.record_rejection(&error_body);
 
             last_error = Some(format!("Provider returned {status}: {error_body}"));
 

@@ -46,6 +46,8 @@ pub fn build_anthropic_passthrough_request(
         body: Value::Object(patched),
         // 目标是 Anthropic Messages，没有 reasoning_effort 枚举。
         effort: Default::default(),
+        // 同上：这条路径的 body 已定稿，max_tokens 收敛在 adapters 侧完成。
+        max_tokens: Default::default(),
     })
 }
 

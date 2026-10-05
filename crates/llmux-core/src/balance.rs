@@ -242,6 +242,7 @@ async fn get_json(
         body: Value::Null,
         // 余额查询不是推理请求，不带 reasoning_effort。
         effort: Default::default(),
+        max_tokens: Default::default(),
     };
     let resp = tokio::time::timeout(
         PROBE_TIMEOUT,
@@ -973,6 +974,7 @@ async fn bss_rpc_call(ak: &str, sk: &str, endpoint: &str, mut params: std::colle
         body: Value::Null,
         // 余额查询不是推理请求，不带 reasoning_effort。
         effort: Default::default(),
+        max_tokens: Default::default(),
     };
     let resp = tokio::time::timeout(PROBE_TIMEOUT, crate::adapters::execute_provider_request(&req)).await.map_err(|_| anyhow!("BSS timeout"))??;
     let status = resp.status();
@@ -1347,7 +1349,7 @@ async fn oc_workspace_html(ws_id: &str, cookie: &str) -> Option<String> {
     headers.insert("cookie".to_string(), cookie.to_string());
     headers.insert("user-agent".to_string(), "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36".to_string());
     headers.insert("accept".to_string(), "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8".to_string());
-    let req = crate::adapters::ProviderRequest { method: "GET".to_string(), url: format!("https://opencode.ai/workspace/{ws_id}"), headers, body: Value::Null, /* 余额查询不是推理请求，不带 reasoning_effort。 */ effort: Default::default() };
+    let req = crate::adapters::ProviderRequest { method: "GET".to_string(), url: format!("https://opencode.ai/workspace/{ws_id}"), headers, body: Value::Null, /* 余额查询不是推理请求，不带 reasoning_effort。 */ effort: Default::default(), max_tokens: Default::default() };
     let resp = tokio::time::timeout(PROBE_TIMEOUT, crate::adapters::execute_provider_request(&req)).await.ok()?.ok()?;
     if !resp.status().is_success() { return None; }
     resp.text().await.ok()
@@ -1370,6 +1372,7 @@ async fn fetch_opencode_go_api(api_key: &str) -> Result<Value> {    let key = ap
         body: Value::Null,
         // 余额查询不是推理请求，不带 reasoning_effort。
         effort: Default::default(),
+        max_tokens: Default::default(),
     };
     let resp = tokio::time::timeout(PROBE_TIMEOUT, crate::adapters::execute_provider_request(&req))
         .await
@@ -1419,6 +1422,7 @@ async fn oc_server_get(
         body: Value::Null,
         // 余额查询不是推理请求，不带 reasoning_effort。
         effort: Default::default(),
+        max_tokens: Default::default(),
     };
     let resp = tokio::time::timeout(
         PROBE_TIMEOUT,
@@ -1475,6 +1479,7 @@ async fn oc_go_page(ws_id: &str, cookie: &str) -> Option<String> {
         body: Value::Null,
         // 余额查询不是推理请求，不带 reasoning_effort。
         effort: Default::default(),
+        max_tokens: Default::default(),
     };
     let resp = tokio::time::timeout(
         PROBE_TIMEOUT,

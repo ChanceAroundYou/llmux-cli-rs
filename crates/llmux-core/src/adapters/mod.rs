@@ -334,6 +334,12 @@ pub struct ProviderRequest {
     /// 变了，推导结果不可信）。
     #[serde(skip)]
     pub effort: crate::reasoning_effort::EffortNote,
+    /// 本次实际发出去的 `max_tokens`，回错时交给 `record_rejection` 学习上限。
+    ///
+    /// 与 `effort` 同理挂在 request 上：所有构造函数的返回类型都是
+    /// `ProviderRequest`，单独返回的句柄会在函数边界被丢掉。
+    #[serde(skip)]
+    pub max_tokens: crate::max_tokens::MaxTokensNote,
 }
 
 // ---------------------------------------------------------------------------
@@ -373,6 +379,7 @@ pub fn build_openai_passthrough(
         headers,
         body: chat_request_to_value(request),
         effort: Default::default(),
+        max_tokens: Default::default(),
     }
 }
 
@@ -427,6 +434,10 @@ pub fn build_passthrough_with_beta(
         .and_then(Value::as_str)
         .unwrap_or_default();
     let mut body = body.clone();
+    // 按上游**实际接受的上限**收敛 max_tokens。客户端发 65536、而上游只收 32768
+    // 时，整轮请求会 400 —— 免费模型就是这样一次都没接住的（见 max_tokens 模块
+    // 注释）。顺序放在 effort 之前无所谓，两者互不影响。
+    let max_tokens = crate::max_tokens::clamp_max_tokens(&mut body, &account.provider_id, model);
     let effort = crate::reasoning_effort::apply_reasoning_effort(
         &mut body,
         &account.provider_id,
@@ -440,6 +451,7 @@ pub fn build_passthrough_with_beta(
         headers,
         body,
         effort,
+        max_tokens,
     }
 }
 
@@ -678,6 +690,7 @@ mod first_byte_timeout_tests {
             headers: BTreeMap::new(),
             body,
             effort: Default::default(),
+            max_tokens: Default::default(),
         }
     }
 

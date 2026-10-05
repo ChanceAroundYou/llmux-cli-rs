@@ -347,6 +347,7 @@ async fn native_probe(
                 }),
                 // 探活不是推理请求，不带 reasoning_effort。
                 effort: Default::default(),
+        max_tokens: Default::default(),
             },
         )
     } else {
@@ -375,6 +376,7 @@ async fn native_probe(
                 body: json!({"contents": [{"parts": [{"text": PROBE_PROMPT}]}]}),
                 // 探活不是推理请求，不带 reasoning_effort。
                 effort: Default::default(),
+        max_tokens: Default::default(),
             },
         )
     };

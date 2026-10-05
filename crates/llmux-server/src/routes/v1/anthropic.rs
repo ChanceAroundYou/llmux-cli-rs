@@ -226,6 +226,11 @@ pub async fn messages(
                         &model_resolution.target_model,
                         llmux_core::protocol::Protocol::Chat,
                     );
+                    let max_tokens = llmux_core::max_tokens::clamp_max_tokens(
+                        &mut openai_body,
+                        &account.provider_id,
+                        &model_resolution.target_model,
+                    );
                     (
                         Ok(ProviderRequest {
                             method: "POST".to_string(),
@@ -236,6 +241,7 @@ pub async fn messages(
                             headers: req_headers,
                             body: openai_body,
                             effort,
+                            max_tokens,
                         }),
                         true,
                     )
@@ -322,6 +328,9 @@ pub async fn messages(
             // 上游拒了这个档位 → 记下来，后续请求不再重复失败。
             // 没有这一步，请求前解析只生效一次，整个机制等于空操作。
             provider_request.effort.record_rejection(&error_body);
+            // 同一处回错顺便学 max_tokens 上限：客户端发 65536、上游只收
+            // 32768 时整轮 400，不学会就会一直白打（见 max_tokens 模块注释）。
+            provider_request.max_tokens.record_rejection(&error_body);
 
             last_error = Some(format!("Provider returned {status}: {error_body}"));
             last_status = Some(status.as_u16());
@@ -744,7 +753,8 @@ async fn dispatch_aggregate_anthropic(
                                 req_headers.insert("content-type".to_string(), "application/json".to_string());
                                 req_headers.insert("authorization".to_string(), format!("Bearer {}", account.api_key));
                                 let effort = llmux_core::reasoning_effort::apply_reasoning_effort(&mut openai_body, &account.provider_id, &cand.model, llmux_core::protocol::Protocol::Chat);
-                                (Ok(ProviderRequest { method: "POST".to_string(), url: join_upstream_url(openai_base, "chat/completions"), headers: req_headers, body: openai_body, effort }), true)
+                                let max_tokens = llmux_core::max_tokens::clamp_max_tokens(&mut openai_body, &account.provider_id, &cand.model);
+                                (Ok(ProviderRequest { method: "POST".to_string(), url: join_upstream_url(openai_base, "chat/completions"), headers: req_headers, body: openai_body, effort, max_tokens }), true)
                             }
                             Err(e) => (Err(e), true),
                         }
@@ -768,7 +778,8 @@ async fn dispatch_aggregate_anthropic(
                             req_headers.insert("content-type".to_string(), "application/json".to_string());
                             req_headers.insert("authorization".to_string(), format!("Bearer {}", account.api_key));
                             let effort = llmux_core::reasoning_effort::apply_reasoning_effort(&mut openai_body, &account.provider_id, &cand.model, llmux_core::protocol::Protocol::Chat);
-                            (Ok(ProviderRequest { method: "POST".to_string(), url: join_upstream_url(openai_base, "chat/completions"), headers: req_headers, body: openai_body, effort }), true)
+                            let max_tokens = llmux_core::max_tokens::clamp_max_tokens(&mut openai_body, &account.provider_id, &cand.model);
+                            (Ok(ProviderRequest { method: "POST".to_string(), url: join_upstream_url(openai_base, "chat/completions"), headers: req_headers, body: openai_body, effort, max_tokens }), true)
                         }
                         Err(e) => (Err(e), true),
                     }
@@ -794,6 +805,9 @@ async fn dispatch_aggregate_anthropic(
             // 上游拒了这个档位 → 记下来，后续请求不再重复失败。
             // 没有这一步，请求前解析只生效一次，整个机制等于空操作。
             provider_request.effort.record_rejection(&error_body);
+            // 同一处回错顺便学 max_tokens 上限：客户端发 65536、上游只收
+            // 32768 时整轮 400，不学会就会一直白打（见 max_tokens 模块注释）。
+            provider_request.max_tokens.record_rejection(&error_body);
 
             last_error = Some(format!("Provider returned {status}: {error_body}"));
             last_status = Some(status.as_u16());

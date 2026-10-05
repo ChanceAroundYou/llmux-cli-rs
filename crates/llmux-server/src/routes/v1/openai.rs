@@ -266,6 +266,9 @@ pub(crate) async fn dispatch_with_conversion(
         if !status.is_success() {
             let error_body = response.text().await.unwrap_or_default();
             provider_request.effort.record_rejection(&error_body);
+            // 同一处回错顺便学 max_tokens 上限：客户端发 65536、上游只收
+            // 32768 时整轮 400，不学会就会一直白打（见 max_tokens 模块注释）。
+            provider_request.max_tokens.record_rejection(&error_body);
             // 上游拒了这个档位 → 记下来，后续请求不再重复失败。
             // 没有这一步，请求前解析只生效一次，整个机制等于空操作。
 
@@ -599,6 +602,9 @@ pub(crate) async fn dispatch_aggregate_with_conversion(
         if !status.is_success() {
             let error_body = response.text().await.unwrap_or_default();
             provider_request.effort.record_rejection(&error_body);
+            // 同一处回错顺便学 max_tokens 上限：客户端发 65536、上游只收
+            // 32768 时整轮 400，不学会就会一直白打（见 max_tokens 模块注释）。
+            provider_request.max_tokens.record_rejection(&error_body);
             // 上游拒了这个档位 → 记下来，后续请求不再重复失败。
             // 没有这一步，请求前解析只生效一次，整个机制等于空操作。
 
@@ -961,12 +967,18 @@ async fn openai_dispatch(
             &model_resolution.target_model,
             proto,
         );
+        let max_tokens = llmux_core::max_tokens::clamp_max_tokens(
+            &mut forward_body,
+            &account.provider_id,
+            &model_resolution.target_model,
+        );
         let provider_request = ProviderRequest {
             method: "POST".to_string(),
             url: format!("{base_url}/{endpoint}"),
             headers: req_headers,
             body: forward_body,
             effort,
+            max_tokens,
         };
 
         tracing::info!(
@@ -1016,6 +1028,9 @@ async fn openai_dispatch(
         if !status.is_success() {
             let error_body = response.text().await.unwrap_or_default();
             provider_request.effort.record_rejection(&error_body);
+            // 同一处回错顺便学 max_tokens 上限：客户端发 65536、上游只收
+            // 32768 时整轮 400，不学会就会一直白打（见 max_tokens 模块注释）。
+            provider_request.max_tokens.record_rejection(&error_body);
             // 上游拒了这个档位 → 记下来，后续请求不再重复失败。
             // 没有这一步，请求前解析只生效一次，整个机制等于空操作。
 
@@ -1323,7 +1338,8 @@ async fn dispatch_aggregate_openai(
             &cand.model,
             proto,
         );
-        let provider_request = ProviderRequest { method: "POST".to_string(), url: format!("{base_url}/{endpoint}"), headers: req_headers, body: agg_body, effort };
+        let max_tokens = llmux_core::max_tokens::clamp_max_tokens(&mut agg_body, &account.provider_id, &cand.model);
+        let provider_request = ProviderRequest { method: "POST".to_string(), url: format!("{base_url}/{endpoint}"), headers: req_headers, body: agg_body, effort, max_tokens };
 
         tracing::info!("🔀 [agg:{} V={}] {} → {} → {}/{}", alias, active, account.alias, cand.model, base_url, endpoint);
         if let Some(tx) = &state.tui_tx {
@@ -1346,6 +1362,9 @@ async fn dispatch_aggregate_openai(
         if !status.is_success() {
             let error_body = response.text().await.unwrap_or_default();
             provider_request.effort.record_rejection(&error_body);
+            // 同一处回错顺便学 max_tokens 上限：客户端发 65536、上游只收
+            // 32768 时整轮 400，不学会就会一直白打（见 max_tokens 模块注释）。
+            provider_request.max_tokens.record_rejection(&error_body);
             // 上游拒了这个档位 → 记下来，后续请求不再重复失败。
             // 没有这一步，请求前解析只生效一次，整个机制等于空操作。
 
@@ -2168,7 +2187,7 @@ async fn anthropic_fallback_response(
     let anthropic_base =
         llmux_core::protocol::endpoint_for(account, llmux_core::protocol::Protocol::Messages)?;
 
-    let anthropic_body = match llmux_core::proxy::anthropic_openai::anthropic_to_openai_request(openai_body, model) {
+    let mut anthropic_body = match llmux_core::proxy::anthropic_openai::anthropic_to_openai_request(openai_body, model) {
         Ok(b) => b,
         Err(e) => {
             tracing::warn!("↩️ OpenAI→Anthropic conversion failed: {e}");
@@ -2181,6 +2200,12 @@ async fn anthropic_fallback_response(
     headers.insert("x-api-key".to_string(), account.api_key.clone());
     headers.insert("anthropic-version".to_string(), "2023-06-01".to_string());
 
+    // Anthropic Messages 的 body 里 `max_tokens` 是必填字段，同样要按上游上限收敛。
+    let max_tokens = llmux_core::max_tokens::clamp_max_tokens(
+        &mut anthropic_body,
+        &account.provider_id,
+        model,
+    );
     let provider_request = ProviderRequest {
         method: "POST".to_string(),
         url: build_anthropic_target_url(anthropic_base),
@@ -2188,6 +2213,7 @@ async fn anthropic_fallback_response(
         body: anthropic_body,
         // 目标是 Anthropic Messages，没有 reasoning_effort 枚举。
         effort: Default::default(),
+        max_tokens,
     };
 
     let response = match execute_provider_request(&provider_request).await {
