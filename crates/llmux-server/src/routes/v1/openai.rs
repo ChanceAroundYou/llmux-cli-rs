@@ -1549,6 +1549,25 @@ impl StreamAccounting {
     }
 }
 
+/// Reasoning/thinking fields seen in the wild. Kept as one list so a new
+/// upstream convention is a one-line addition rather than another missed case.
+///
+/// Getting this list wrong is not cosmetic: `produced_nothing()` decides
+/// success vs failure from it, so a missing name turns every reasoning-only
+/// turn from that upstream into a logged failure.
+const REASONING_FIELDS: [&str; 3] = ["reasoning", "reasoning_content", "reasoning_details"];
+
+/// Non-empty string, non-empty array, or any other present value (objects,
+/// numbers) — i.e. the field actually carries something.
+fn is_non_empty_value(v: &Value) -> bool {
+    match v {
+        Value::Null => false,
+        Value::String(s) => !s.trim().is_empty(),
+        Value::Array(a) => !a.is_empty(),
+        _ => true,
+    }
+}
+
 /// Fold one SSE event into the accounting state.
 ///
 /// Pure observation: it never decides forwarding and never declines an event,
@@ -1604,11 +1623,21 @@ fn observe_event(event_text: &str, acc: &mut StreamAccounting) {
                 {
                     acc.saw_tool_call = true;
                 }
-                // Reasoning-only turns still returned something.
-                if src.get("reasoning").is_some_and(|r| match r {
-                    Value::String(s) => !s.trim().is_empty(),
-                    _ => true,
-                }) {
+                // Reasoning-only turns still returned something — but the field
+                // name is **not** standardized, and checking only one of them is
+                // what made the first version of this check wrong in production:
+                // `agnes-3.0-flash` streams its whole turn as `reasoning_content`
+                // (338 frames in one measured stream) while this code looked for
+                // `reasoning` only, so a 4096-token reasoning turn was booked as
+                // an empty response. All three names are in live use:
+                //   `reasoning`         — DeepSeek/Console Go
+                //   `reasoning_content` — agnes / Qwen-style
+                //   `reasoning_details` — array form (hermes), see the note at
+                //                         `sanitize_chat_messages`
+                if REASONING_FIELDS
+                    .iter()
+                    .any(|f| src.get(f).is_some_and(is_non_empty_value))
+                {
                     acc.saw_text = true;
                 }
             }
@@ -2072,6 +2101,53 @@ mod tests {
         observe_and_should_forward("data: [DONE]\n\n", &mut acc);
         assert!(acc.saw_text);
         assert!(!acc.produced_nothing());
+    }
+
+    /// 生产实测（2026-10-05 16:10:16，agnes-3.0-flash）：整条回合只有
+    /// `reasoning_content`，`content` 与 `tool_calls` 都不出现 ——
+    /// `usage=(4926,4096)`、`finish_reason="length"`，即上游确实生成了 4096 个
+    /// token，却在第一版判据下被记成 `empty=true` 的**假失败**。
+    ///
+    /// 根因是只检查了 `reasoning` 一个字段名，而 agnes 用的是
+    /// `reasoning_content`（该流里出现 338 次，`reasoning` 0 次）。
+    #[test]
+    fn reasoning_content_only_stream_is_output_not_empty() {
+        let mut acc = StreamAccounting::default();
+        for _ in 0..3 {
+            observe_and_should_forward(&ev(r#"{"reasoning_content":"thinking…"}"#, "null"), &mut acc);
+        }
+        observe_and_should_forward(&ev("{}", r#""length""#), &mut acc);
+        observe_and_should_forward("data: [DONE]\n\n", &mut acc);
+
+        assert!(acc.saw_text, "reasoning_content IS output");
+        assert!(
+            !acc.produced_nothing(),
+            "a reasoning-only turn must not be booked as an empty response"
+        );
+    }
+
+    /// 三个字段名都要认：漏掉任何一个都会把该上游的推理回合变成假失败。
+    #[test]
+    fn every_known_reasoning_field_name_counts_as_output() {
+        let delta = |json: &str| format!("data: {{\"choices\":[{{\"index\":0,\"delta\":{json},\"finish_reason\":null}}]}}\n\n");
+        for field in [
+            r#"{"reasoning":"a"}"#,
+            r#"{"reasoning_content":"a"}"#,
+            r#"{"reasoning_details":[{"text":"a"}]}"#,
+        ] {
+            let mut acc = StreamAccounting::default();
+            observe_and_should_forward(&delta(field), &mut acc);
+            assert!(
+                !acc.produced_nothing(),
+                "must count as output: {field}"
+            );
+        }
+        // 空值不算产出（否则 `"reasoning":""` 会让真空响应漏判）。
+        for empty in [r#"{"reasoning":""}"#, r#"{"reasoning_content":"  "}"#, r#"{"reasoning_details":[]}"#] {
+            let mut acc = StreamAccounting::default();
+            observe_and_should_forward(&delta(empty), &mut acc);
+            assert!(acc.produced_nothing(), "empty value is not output: {empty}");
+        }
     }
 }
 

@@ -7,6 +7,21 @@
 
 ### Fixed
 
+- **推理字段名不止一个 —— 只认 `reasoning` 会把推理回合记成失败**（「空响应
+  判据」那条的后续修复，部署后 20 分钟内由生产日志发现）。那条把「流有没有产出
+  内容」改成直接看载荷，但对推理内容只检查了 `reasoning` 一个字段名。实测
+  agnes-3.0-flash 的整条回合只有 **`reasoning_content`**（该流出现 338 次，
+  `reasoning` 0 次），于是 `usage=(4926,4096)`、`finish_reason="length"` 的
+  一次正常 4096-token 生成被记成 `empty=true` 的假失败。
+
+  改为一张 `REASONING_FIELDS` 列表覆盖三个真实在用的名字：`reasoning`
+  （DeepSeek/Console Go）、`reasoning_content`（agnes/Qwen 系）、
+  `reasoning_details`（数组形态，hermes）。**列表是穷举出来的、不是猜的**：
+  对库里全部 174,944 个 delta/message 对象做字段统计，只存在 6 个键
+  （`content` / `role` / `reasoning` / `reasoning_details` / `tool_calls` /
+  `reasoning_content`），推理类就这三个。空值（`""`、`[]`、空白串）仍不算产出，
+  以免真的空响应漏判。两条测试经变异验证（只留 `reasoning` → 双双变红）。
+
 - **余额不足类错误此前从未触发过任何冷却**，根因是入口被状态码挡在门外。
   `is_quota_exhausted` 早就把「余额 / insufficient / billing」算作配额类，但所有
   调用点长这样：
