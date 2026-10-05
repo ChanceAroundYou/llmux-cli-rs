@@ -699,6 +699,9 @@ async fn dispatch_aggregate_anthropic(
     // 耗尽成因分类：全因配额冷却 vs 掺了别的原因（见 helpers::exhausted_status）
     let mut cooled_skips = 0usize;
     let mut failed_candidates = 0usize;
+    // 本次请求里有多少个候选是因**请求侧**原因被跳过的（见 is_request_side_rejection）。
+    // 这类跳过不能算「下游候选更好」的证据，否则几个大请求就能把别名切到付费兜底。
+    let mut request_side_skips = 0usize;
     let mut hit: Option<usize> = None;
 
     // Pre-build a flag for streaming hit response (need account/model for passthrough)
@@ -821,6 +824,7 @@ async fn dispatch_aggregate_anthropic(
                     alias,
                     account.alias
                 );
+                request_side_skips += 1;
                 failed_candidates += 1;
                 continue;
             }
@@ -877,7 +881,15 @@ async fn dispatch_aggregate_anthropic(
     }
 
     if let Some(idx) = hit {
-        let switched = state.aggregate_router.lock().unwrap().record_request_outcome(&alias, idx, len);
+        // 若本次落到下游只是因为请求侧原因（主候选装不下 / max_tokens 不合规），
+        // 那不是「下游更好」的证据 —— 记成功但不推进 3-confirm，否则几个大请求
+        // 就能把别名永久切到付费兜底，而主候选对其它请求完全健康。
+        let switched = if request_side_skips > 0 {
+            state.aggregate_router.lock().unwrap().note_candidate_success(&alias, idx, len);
+            false
+        } else {
+            state.aggregate_router.lock().unwrap().record_request_outcome(&alias, idx, len)
+        };
         if switched { tracing::info!("🔀 [agg:{}] V migrated -> {} (after 3-confirm)", alias, idx); }
         let cand_model = agg.candidates[idx].model.clone();
         if let Some((resp, model, account, provider_id, is_conv)) = hit_stream {
