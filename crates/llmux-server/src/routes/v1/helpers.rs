@@ -61,6 +61,36 @@ pub fn is_quota_exhausted(error_body: &str) -> bool {
     QUOTA_MARKERS.iter().any(|m| b.contains(m))
 }
 
+/// 「输入比这个模型的上下文窗口长」—— 这是**请求侧**的问题，不是候选不健康。
+///
+/// 必须与「上游坏了」区分开。记成候选失败会触发 `AggregateRouter` 的 3-confirm
+/// 迁移，把候选挤下线；而这个候选本来能服务其余所有请求。
+///
+/// 2026-10-05 生产实测：`os` 主力是 262K 的 `ling-3.1-flash:free`，13.1% 的请求
+/// 输入超过 262K（481K–485K），每个都先让它 400 → 连续 3 次 → 迁移到 deepseek。
+/// 更糟的是它**自锁**：迁移后别名开始报 1M，客户端于是不再压缩，大请求持续到来，
+/// 免费候选永远回不来。
+///
+/// 正确行为：跳过这个候选去试更大的，但**不给它记失败** —— 它没错，只是装不下。
+/// 全部候选都装不下时，把这个 400 原样回给客户端（那才是调用方需要知道的事）。
+///
+/// 判据只认明确措辞。宁可漏判（多记一次失败）也不能误判 —— 误判会把真正的故障
+/// 吞掉，让坏候选一直不被迁移走。
+pub fn is_context_overflow(error_body: &str) -> bool {
+    let b = error_body.to_ascii_lowercase();
+    const MARKERS: [&str; 8] = [
+        "longer than the model",  // 实测：commandcode 转售的正文
+        "context_length_exceeded", // OpenAI 官方 code
+        "maximum context length",  // OpenAI 官方 message
+        "prompt is too long",      // Anthropic 官方
+        "reduce the length of the messages",
+        "input is too long",
+        "exceeds the maximum number of tokens",
+        "too many tokens",
+    ];
+    MARKERS.iter().any(|m| b.contains(m))
+}
+
 /// 上游回了配额类 429 就记一次失败；连续两次进入 30 分钟冷却。
 ///
 /// 成功时 `spawn_log_usage_ip` 已有的 `clear_suspension` 会解除。
@@ -1642,8 +1672,7 @@ mod tests {
 
     /// 两种失败的挂起时长必须不同，否则「长挂起」这个决策就没有落点。
     #[test]
-    fn payment_required_suspends_far_longer_than_quota() {
-        use llmux_core::probe::{suspend_secs_for, FailureKind, PAYMENT_SUSPEND_SECS, SUSPEND_SECS};
+    fn payment_required_suspends_far_longer_than_quota() {        use llmux_core::probe::{suspend_secs_for, FailureKind, PAYMENT_SUSPEND_SECS, SUSPEND_SECS};
         assert_eq!(suspend_secs_for(FailureKind::Quota), SUSPEND_SECS);
         assert_eq!(suspend_secs_for(FailureKind::Probe), SUSPEND_SECS);
         assert_eq!(suspend_secs_for(FailureKind::PaymentRequired), PAYMENT_SUSPEND_SECS);
@@ -1757,6 +1786,51 @@ mod tests {
         );
         assert!(out.starts_with(r#"{"choices":[{"message":{"content":"#), "head kept: {out:.80}");
         assert!(out.ends_with(r#""}}]}"#), "tail kept: {out:.80}");
+    }
+
+    // --- is_context_overflow: 「装不下」≠「坏了」 -------------------------
+
+    /// 实测的生产正文（2026-10-05，ling-3.1 对 481K 输入的回答）。
+    ///
+    /// 差点被当成候选故障：3 次就会触发 3-confirm 迁移，把 262K 的免费主力
+    /// 挤下线，而它本来能服务其余 87% 的请求。
+    #[test]
+    fn recognises_the_measured_context_overflow() {
+        let real = r#"{"error":{"message":"{\"code\":\"500\",\"message\":\"{code=400, message=The input (481401 tokens) is longer than the model's context length (262144 tokens)., param: input\"}"}}"#;
+        assert!(is_context_overflow(real));
+    }
+
+    #[test]
+    fn recognises_the_official_vendor_wordings() {
+        for body in [
+            r#"{"error":{"code":"context_length_exceeded","message":"..."}}"#,
+            r#"{"error":{"message":"This model's maximum context length is 8192 tokens"}}"#,
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 250000 tokens > 200000 maximum"}}"#,
+            r#"{"error":{"message":"Please reduce the length of the messages."}}"#,
+            r#"{"error":{"message":"Input is too long for this model"}}"#,
+            "exceeds the maximum number of tokens",
+        ] {
+            assert!(is_context_overflow(body), "must recognise: {body}");
+        }
+    }
+
+    /// **宁可漏判，不可误判**：把真正的上游故障吞掉会让坏候选永远不被迁移走。
+    /// 所以只有明确措辞才算，泛泛提到 context/400 的一律不算。
+    #[test]
+    fn ordinary_failures_are_not_context_overflow() {
+        for body in [
+            "Provider returned 502 Bad Gateway",
+            "钱包余额不足",
+            r#"{"error":{"message":"billing address is required"}}"#,
+            r#"{"error":{"message":"The input is invalid JSON"}}"#,
+            r#"{"error":{"message":"invalid_request_error: unknown field 'foo'"}}"#,
+            "Upstream model provider is temporarily unavailable.",
+            "max_tokens (current value: 65536) must be between 0 and 32768",
+            // 只是提到了 context，但没有「装不下」的语义
+            r#"{"error":{"message":"context window is not configurable"}}"#,
+        ] {
+            assert!(!is_context_overflow(body), "must NOT match: {body}");
+        }
     }
 }
 

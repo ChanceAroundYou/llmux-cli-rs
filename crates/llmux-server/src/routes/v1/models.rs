@@ -74,18 +74,22 @@ async fn models_inner(state: AppState, headers: HeaderMap, prefix_ids: bool) -> 
             Err(_) => Vec::new(),
         };
     let mut alias_rows_with_agg = alias_rows;
-    // context_length 反映聚合别名当前激活候选的模型，而非恒为第一个候选
-    let active_map = state.aggregate_router.lock().unwrap().snapshot_actives();
+    // `context_length` 报**配置的主候选**（candidates[0]）的窗口，而不是运行时
+    // 临时迁移到的那个。
+    //
+    // 为什么不用 `active_map`（曾经如此）：激活下标是**健康度驱动的临时切换**。
+    // 大请求让主候选吃了 3 次「装不下」就迁移，别名随即改口报兜底模型的更大窗口
+    // —— 客户端据此以为还有余量、于是不压缩，大请求继续来，主候选永远回不来。
+    // 实测 2026-10-05：`os` 在 V=1 时报 1000000（deepseek），而它的主力
+    // `ling-3.1-flash:free` 只有 262144，自锁成环。
+    //
+    // 报配置的那一个才是稳定的：窗口是「这个别名被设计成多大」，不该随一次
+    // 临时故障转移而跳变。消费方（hermes 等按 OpenRouter 约定读该字段的客户端）
+    // 据此压缩，压到主候选装得下的尺寸，主候选就能持续服务。
     for (alias, candidates) in agg_rows {
         let target = llmux_core::aggregate::parse_candidates(&candidates)
             .ok()
-            .and_then(|v| {
-                if v.is_empty() {
-                    return None;
-                }
-                let active = active_map.get(&alias).copied().unwrap_or(0).min(v.len() - 1);
-                Some(v[active].model.clone())
-            })
+            .and_then(|v| v.first().map(|c| c.model.clone()))
             .unwrap_or_default();
         alias_rows_with_agg.push((alias, Some(target)));
     }
