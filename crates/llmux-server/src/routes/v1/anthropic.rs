@@ -950,8 +950,8 @@ pub(crate) async fn anthropic_streaming_passthrough(
         let latency_ms = start.elapsed().as_millis() as i64;
         let resp_body = String::from_utf8_lossy(&received).into_owned();
         // 完整流落文件日志（DB 里是截断视图）—— 同 anthropic_to_openai_streaming。
-        if tracing::enabled!(tracing::Level::DEBUG) {
-            tracing::debug!(
+        if tracing::enabled!(tracing::Level::TRACE) {
+            tracing::trace!(
                 "[stream:{model}] full upstream body ({} bytes, account={}): {}",
                 received.len(),
                 account.alias,
@@ -1136,9 +1136,10 @@ pub(crate) async fn anthropic_to_openai_streaming(
         // 把**完整**上游流落进文件日志。DB 里的 response_body 是截断视图
         // （成功仅 16KB，且历史上还砍过中段），排查 tool_call 缺 id/name 这类问题
         // 必须看得到 tool_call 的开场块——它常落在 DB 存不到的中段。
-        // 受 RUST_LOG 控制（默认 llmux=debug 开启）；不需要时设 llmux=info 即可关掉。
-        if tracing::enabled!(tracing::Level::DEBUG) {
-            tracing::debug!(
+        // 受 RUST_LOG 控制：TRACE 才打（2026-10-05 前挂在 DEBUG，一天能烧掉
+        // 130MB+），日常 `llmux=info` 关闭，排查时临时设 `llmux=trace`。
+        if tracing::enabled!(tracing::Level::TRACE) {
+            tracing::trace!(
                 "[stream:{model}] full upstream body ({} bytes, account={}): {}",
                 received.len(),
                 account.alias,
@@ -1270,8 +1271,8 @@ pub(crate) async fn responses_to_anthropic_streaming(
         let (cache_read, cache_create) = conv.usage_cache();
         let latency_ms = start.elapsed().as_millis() as i64;
         // 完整流落文件日志（DB 里是截断视图）—— 同 anthropic_to_openai_streaming。
-        if tracing::enabled!(tracing::Level::DEBUG) {
-            tracing::debug!(
+        if tracing::enabled!(tracing::Level::TRACE) {
+            tracing::trace!(
                 "[stream:{model}] full upstream body ({} bytes, account={}): {}",
                 received.len(),
                 account.alias,

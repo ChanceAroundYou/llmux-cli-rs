@@ -5,7 +5,40 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **转发策略不再吞掉记账：被丢弃的重复终止事件，其 `usage` 仍被记录**。这是
+  `98e0621`（丢弃重复 `finish_reason: "tool_calls"`）引入的回归：那个循环改成
+  「先判转发、`continue` 跳过记账」，而 `space-bunny-alpha` 恰恰把 `usage` 挂在
+  **第二个**（被丢弃的）终止事件上，于是每条这样的流都被记成 0/0 token 并顺带
+  判成 `truncated`。
+
+  2026-10-05 生产日志实测（无需改动代码即可观测，见下方那条 INFO）：387 条透传流
+  中 **150 条** `usage=(0,0)`，同期「丢弃重复终止事件」**149 次** —— 一一对应。
+
+  - 抽出 `StreamAccounting` + `observe_event`：观测是**纯函数**，只更新状态，
+    不参与控制流；`observe_and_should_forward` 是唯一调用点，先记账再判转发。
+    这样「新增一个转发过滤器顺手弄瞎记账」这个失效模式**结构上不可能再发生**。
+  - 顺带修好 EOF drain 与尾部残片两处的记账：原先 `last_usage` 会被一个
+    `if u.is_object()` 门卡住、尾部残片还漏了 `last_finish` 的 null 分支。
+  - 新增 3 条合约测试，用**生产实测形状**（双终止事件 + `usage` 挂在第二个）钉死
+    「被客户端看到的过滤，不等于被记账的过滤」。其中一条经变异验证：把记账挪回
+    转发判断之后即红。
+
+  ⚠️ 只有 `openai_streaming_passthrough` 一条路径受影响（anthropic 路径的 token
+  来自 `converter.usage_tokens()`，不过 SSE 解析，且没有去重门）。
+
 ### Changed
+
+- **全量 body 调试日志从 DEBUG 降到 TRACE；生产 `RUST_LOG` 改回 `info`**。
+  2026-10-05 实测当日日志 **132.6 MB 中 129.5 MB（97.6%）** 是 `data:` SSE 行，
+  全部来自 4 处 `full upstream body` dump（`openai.rs` 1 处、`anthropic.rs` 3 处）。
+  日志走 NAS CIFS，writer 无缓冲时**每行都是一次同步 SMB 往返**（约 2.5ms）。
+  排查仍需要完整流 —— 所以不是删掉，是挪到 `RUST_LOG=llmux=trace` 随时可开。
+
+  同时把 `openai.rs` 每条流结束的汇总行**从 DEBUG 提到 INFO**（**只此一行，不含
+  body**）：`usage=(…)` 就是记账丢失的早期告警信号 —— 一条流跑完了却记 0/0，
+  正是本次缺陷的形状。这样以后不必为了盯这个信号开全量 dump。
 
 - **后台聚合探活改为「被动优先」，活跃候选不再白发请求**。原先每 300s 一轮对每个
   聚合别名的 `0..=active` 候选逐个发真实生成请求（每候选最多三次：chat/messages/

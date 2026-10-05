@@ -1510,6 +1510,82 @@ fn should_forward_event(event_text: &str, saw_tool_call_finish: &mut bool) -> bo
     false
 }
 
+/// Per-stream accounting, fed by **every** event the upstream sends.
+///
+/// The invariant this type exists to enforce: **forwarding policy must never
+/// decide what gets measured.** An earlier version decided forwarding first and
+/// `continue`d past the bookkeeping below, so a withheld duplicate terminator
+/// also silently discarded the `usage` it carried. On
+/// `stealth/space-bunny-alpha` (account `command`) the duplicate terminator is
+/// the norm, so every such stream was booked as 0/0 tokens and then flagged
+/// `truncated` — 149 of 387 passthrough streams in a day, matching the count of
+/// dropped terminators one-for-one.
+#[derive(Default)]
+struct StreamAccounting {
+    /// Network chunks received. **Not** event count — the empty-content
+    /// heuristic in `c7b57e2` was calibrated against chunk arrival.
+    chunks: u64,
+    saw_done: bool,
+    last_finish: Option<String>,
+    last_usage: Option<Value>,
+    ttft_ms: Option<i64>,
+    /// Set once a `finish_reason: "tool_calls"` event has gone upstream, so a
+    /// second one on an empty delta is recognised as a redundant terminator.
+    saw_tool_call_finish: bool,
+    dropped_dup_finishes: u64,
+}
+
+/// Fold one SSE event into the accounting state.
+///
+/// Pure observation: it never decides forwarding and never declines an event,
+/// so no caller can lose a measurement by taking an early `continue`.
+fn observe_event(event_text: &str, acc: &mut StreamAccounting) {
+    let Some(payload) = sse_data_payload(event_text) else {
+        return;
+    };
+    if payload.trim() == "[DONE]" {
+        acc.saw_done = true;
+        return;
+    }
+    let Ok(parsed) = serde_json::from_str::<Value>(payload) else {
+        return;
+    };
+    if let Some(u) = parsed.get("usage") {
+        if u.is_object() {
+            acc.last_usage = Some(u.clone());
+        }
+    }
+    if let Some(choice) = parsed
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|a| a.first())
+    {
+        if let Some(fr) = choice.get("finish_reason") {
+            if fr.is_null() {
+                acc.last_finish = None;
+            } else if let Some(s) = fr.as_str() {
+                if !s.is_empty() {
+                    acc.last_finish = Some(s.to_string());
+                }
+            }
+        }
+    }
+}
+
+/// Account for one event, then decide whether it reaches the client.
+///
+/// Observation and the forwarding decision share a single call site on
+/// purpose: it makes "the `continue` swallowed the bookkeeping" unrepresentable
+/// rather than merely avoided. See `StreamAccounting`.
+fn observe_and_should_forward(event_text: &str, acc: &mut StreamAccounting) -> bool {
+    observe_event(event_text, acc);
+    let forward = should_forward_event(event_text, &mut acc.saw_tool_call_finish);
+    if !forward {
+        acc.dropped_dup_finishes += 1;
+    }
+    forward
+}
+
 /// Passthrough streaming for OpenAI-compatible responses.
 /// Bytes are forwarded as-is (SSE) but the stream is also parsed for
 /// observability: `finish_reason`, `usage`, and truncation (`[DONE]` / null
@@ -1534,22 +1610,14 @@ async fn openai_streaming_passthrough(
         let mut buffer: Vec<u8> = Vec::with_capacity(4096);
         let mut received: Vec<u8> = Vec::with_capacity(4096);
         let mut sse = response.bytes_stream();
-        let mut chunks: u64 = 0;
-        let mut saw_done = false;
-        let mut last_finish: Option<String> = None;
-        let mut last_usage: Option<Value> = None;
-        let mut ttft_ms: Option<i64> = None;
-        // Set once a `finish_reason: "tool_calls"` event has gone upstream, so a
-        // second one on an empty delta is recognised as a redundant terminator.
-        let mut saw_tool_call_finish = false;
-        let mut dropped_dup_finishes: u64 = 0;
+        let mut acc = StreamAccounting::default();
 
         tracing::debug!("[openai:{model}] upstream stream started (account={})", account.alias);
 
         while let Some(chunk) = sse.next().await {
             match chunk {
                 Ok(c) => {
-                    chunks += 1;
+                    acc.chunks += 1;
                     buffer.extend_from_slice(&c);
                     received.extend_from_slice(&c);
                     // Forward only whole events, so a redundant terminator can be
@@ -1558,42 +1626,18 @@ async fn openai_streaming_passthrough(
                     // delimit with a blank line, so this costs no latency.
                     let mut client_gone = false;
                     for event_text in parse_sse_chunks(&mut buffer, 0) {
-                        if !should_forward_event(&event_text, &mut saw_tool_call_finish) {
-                            dropped_dup_finishes += 1;
-                            continue;
-                        }
-                        if let Some(payload) = sse_data_payload(&event_text) {
-                            if payload.trim() == "[DONE]" {
-                                saw_done = true;
-                            } else if let Ok(parsed) = serde_json::from_str::<Value>(payload) {
-                                if let Some(u) = parsed.get("usage") {
-                                    if u.is_object() {
-                                        last_usage = Some(u.clone());
-                                    }
+                        // observe_and_should_forward already folded this event
+                        // into `acc` (including `saw_done` and `usage`) before
+                        // returning the forwarding decision.
+                        if observe_and_should_forward(&event_text, &mut acc) {
+                            if tx.send(Ok(Bytes::from(event_text.into_bytes()))).await.is_ok() {
+                                if acc.ttft_ms.is_none() {
+                                    acc.ttft_ms = Some(start.elapsed().as_millis() as i64);
                                 }
-                                if let Some(choice) = parsed
-                                    .get("choices")
-                                    .and_then(Value::as_array)
-                                    .and_then(|a| a.first())
-                                {
-                                    if let Some(fr) = choice.get("finish_reason") {
-                                        if fr.is_null() {
-                                            last_finish = None;
-                                        } else if let Some(s) = fr.as_str() {
-                                            if !s.is_empty() {
-                                                last_finish = Some(s.to_string());
-                                            }
-                                        }
-                                    }
-                                }
+                            } else {
+                                client_gone = true;
+                                break;
                             }
-                        }
-                        if !tx.send(Ok(Bytes::from(event_text.into_bytes()))).await.is_ok() {
-                            client_gone = true;
-                            break;
-                        }
-                        if ttft_ms.is_none() {
-                            ttft_ms = Some(start.elapsed().as_millis() as i64);
                         }
                     }
                     if client_gone {
@@ -1604,7 +1648,7 @@ async fn openai_streaming_passthrough(
                     tracing::warn!(
                         "[openai:{model}] upstream stream read error: {e} (account={}, chunks={})",
                         account.alias,
-                        chunks
+                        acc.chunks
                     );
                     break;
                 }
@@ -1621,34 +1665,7 @@ async fn openai_streaming_passthrough(
                 break;
             }
             for event_text in events {
-                let Some(payload) = sse_data_payload(&event_text) else {
-                    continue;
-                };
-                if payload.trim() == "[DONE]" {
-                    saw_done = true;
-                    continue;
-                }
-                let Ok(parsed) = serde_json::from_str::<Value>(payload) else {
-                    continue;
-                };
-                if let Some(u) = parsed.get("usage") {
-                    last_usage = Some(u.clone());
-                }
-                if let Some(choice) = parsed
-                    .get("choices")
-                    .and_then(Value::as_array)
-                    .and_then(|a| a.first())
-                {
-                    if let Some(fr) = choice.get("finish_reason") {
-                        if fr.is_null() {
-                            last_finish = None;
-                        } else if let Some(s) = fr.as_str() {
-                            if !s.is_empty() {
-                                last_finish = Some(s.to_string());
-                            }
-                        }
-                    }
-                }
+                observe_event(&event_text, &mut acc);
             }
         }
 
@@ -1656,67 +1673,53 @@ async fn openai_streaming_passthrough(
         // final event (commonly `data: [DONE]`) would never reach the client.
         if !buffer.is_empty() {
             let text = String::from_utf8_lossy(&buffer).to_string();
-            let keep = should_forward_event(&text, &mut saw_tool_call_finish);
-            if !keep {
-                dropped_dup_finishes += 1;
-            } else {
+            let keep = observe_and_should_forward(&text, &mut acc);
+            if keep {
                 let _ = tx.send(Ok(Bytes::from(buffer.clone()))).await.is_ok();
-            }
-            if let Some(payload) = sse_data_payload(&text) {
-                if payload.trim() == "[DONE]" {
-                    saw_done = true;
-                } else if let Ok(parsed) = serde_json::from_str::<Value>(payload) {
-                    if let Some(choice) = parsed
-                        .get("choices")
-                        .and_then(Value::as_array)
-                        .and_then(|a| a.first())
-                    {
-                        if let Some(fr) = choice.get("finish_reason").and_then(Value::as_str) {
-                            if !fr.is_empty() {
-                                last_finish = Some(fr.to_string());
-                            }
-                        }
-                    }
-                    if let Some(u) = parsed.get("usage") {
-                        last_usage = Some(u.clone());
-                    }
-                }
             }
         }
 
-        if dropped_dup_finishes > 0 {
+        if acc.dropped_dup_finishes > 0 {
             tracing::debug!(
-                "[openai:{model}] dropped {dropped_dup_finishes} redundant tool_calls terminator(s) (account={})",
+                "[openai:{model}] dropped {} redundant tool_calls terminator(s) (account={})",
+                acc.dropped_dup_finishes,
                 account.alias
             );
         }
 
-        let (raw_prompt, completion_tokens) = match &last_usage {
+        let (raw_prompt, completion_tokens) = match &acc.last_usage {
             Some(u) => (
                 u.get("prompt_tokens").and_then(Value::as_i64).unwrap_or(0),
                 u.get("completion_tokens").and_then(Value::as_i64).unwrap_or(0),
             ),
             None => (0, 0),
         };
-        let (cache_read, _) = last_usage
+        let (cache_read, _) = acc
+            .last_usage
             .as_ref()
             .map(cache_usage_from_openai)
             .unwrap_or((0, 0));
         let prompt_tokens = (raw_prompt - cache_read).max(0);
         let cache_create = 0;
         // ponytail: truncation = no [DONE]/finish_reason; empty stream with 0 tokens also truncated
-        let done = saw_done || last_finish.as_deref().is_some_and(|s| !s.is_empty());
+        let done = acc.saw_done || acc.last_finish.as_deref().is_some_and(|s| !s.is_empty());
         let truncated = !done;
-        let empty_content = !truncated && completion_tokens == 0 && chunks <= 4;
+        let empty_content = !truncated && completion_tokens == 0 && acc.chunks <= 4;
         let final_truncated = truncated || empty_content;
         let overflow = llmux_core::context::lookup_context_length(&model)
             .is_some_and(|limit| (prompt_tokens as u64) > limit);
         let latency_ms = start.elapsed().as_millis() as i64;
 
-        tracing::debug!(
-            "[openai:{model}] stream complete: done={done} saw_done={saw_done} finish={:?} chunks={chunks} buffer_remaining={} truncated={final_truncated} overflow={overflow} usage=({prompt_tokens},{completion_tokens})",
-            last_finish,
-            buffer.len()
+        // One INFO line per stream, deliberately body-free. The `usage=(…)`
+        // pair is the early-warning signal for accounting loss: a stream that
+        // completed but booked 0/0 is the shape the duplicate-terminator bug
+        // produced. Keeping it at INFO makes that visible without re-enabling
+        // the full-body dumps, which cost ~130MB/day.
+        tracing::info!(
+            "[openai:{model}] stream complete: done={done} saw_done={} finish={:?} chunks={} truncated={final_truncated} overflow={overflow} usage=({prompt_tokens},{completion_tokens})",
+            acc.saw_done,
+            acc.last_finish,
+            acc.chunks
         );
         // This path forwards upstream bytes to the client **verbatim** — it
         // parses only for usage accounting, and never repairs a tool_call. So
@@ -1725,8 +1728,11 @@ async fn openai_streaming_passthrough(
         // worth reading when a client reports "tool_calls without a complete id
         // and function name". Without this, the whole route is invisible: the
         // other three streaming paths log their full body, this one did not.
-        if tracing::enabled!(tracing::Level::DEBUG) {
-            tracing::debug!(
+        // TRACE, not DEBUG: a full body is tens-to-hundreds of KB and at DEBUG
+        // it dominated the log (129.5 of 132.6 MB on 2026-10-05). Investigation
+        // needs it; the steady state does not.
+        if tracing::enabled!(tracing::Level::TRACE) {
+            tracing::trace!(
                 "[openai:{model}] full upstream body ({} bytes, account={}): {}",
                 received.len(),
                 account.alias,
@@ -1737,8 +1743,8 @@ async fn openai_streaming_passthrough(
             tracing::warn!(
                 "[openai:{model}] stream truncated: account={} finish_reason=null chunks={} saw_done={} empty={empty_content} overflow={overflow}",
                 account.alias,
-                chunks,
-                saw_done
+                acc.chunks,
+                acc.saw_done
             );
         }
 
@@ -1755,14 +1761,15 @@ async fn openai_streaming_passthrough(
             !final_truncated,
             if final_truncated {
                 Some(format!(
-                    "truncated: finish_reason=null chunks={chunks} saw_done={saw_done} empty={empty_content} overflow={overflow}"
+                    "truncated: finish_reason=null chunks={} saw_done={} empty={empty_content} overflow={overflow}",
+                    acc.chunks, acc.saw_done
                 ))
             } else {
                 None
             },
             request_body,
             Some(String::from_utf8_lossy(&received).into_owned()),
-            ttft_ms, true, client_ip, api_key_id,
+            acc.ttft_ms, true, client_ip, api_key_id,
         )
     });
 
@@ -1779,7 +1786,7 @@ async fn openai_streaming_passthrough(
 
 #[cfg(test)]
 mod tests {
-    use super::should_forward_event;
+    use super::{observe_and_should_forward, should_forward_event, StreamAccounting};
 
     fn ev(delta: &str, finish: &str) -> String {
         format!("data: {{\"choices\":[{{\"index\":0,\"delta\":{delta},\"finish_reason\":{finish}}}]}}\n\n")
@@ -1844,6 +1851,100 @@ mod tests {
         let mut seen = false;
         assert!(should_forward_event(&ev("{}", r#""tool_calls""#), &mut seen));
         assert!(seen);
+    }
+
+    /// The exact stream measured in production (2026-10-05, account `command`):
+    /// a tool call, then TWO `tool_calls` terminators, with `usage` riding the
+    /// **second** one — the event the filter withholds from the client.
+    ///
+    /// Regression test for the accounting loss: the old loop called
+    /// `should_forward_event` first and `continue`d, so the withheld event's
+    /// `usage` was never read. The stream was then booked as 0/0 and flagged
+    /// `truncated`, 149 of 387 passthrough streams in a day. Withholding an
+    /// event from the client must never withhold it from accounting.
+    #[test]
+    fn usage_on_a_withheld_duplicate_terminator_is_still_accounted() {
+        let opener = ev(
+            r#"{"tool_calls":[{"index":0,"id":"c5abfdc7","type":"function","function":{"name":"Bash","arguments":""}}]}"#,
+            "null",
+        );
+        let first_finish = ev("{}", r#""tool_calls""#);
+        let dup_finish_with_usage = "data: {\"choices\":[{\"index\":0,\"delta\":{},\
+            \"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":189602,\
+            \"completion_tokens\":75,\"prompt_tokens_details\":{\"cached_tokens\":188867}}}\n\n"
+            .to_string();
+
+        let mut acc = StreamAccounting::default();
+        assert!(observe_and_should_forward(&opener, &mut acc));
+        assert!(
+            observe_and_should_forward(&first_finish, &mut acc),
+            "first terminator reaches the client"
+        );
+        assert!(
+            !observe_and_should_forward(&dup_finish_with_usage, &mut acc),
+            "the duplicate terminator is withheld from the client"
+        );
+
+        // ...but its usage is not withheld from accounting.
+        let usage = acc.last_usage.expect("usage must be recorded");
+        assert_eq!(usage.get("prompt_tokens").and_then(|v| v.as_i64()), Some(189602));
+        assert_eq!(usage.get("completion_tokens").and_then(|v| v.as_i64()), Some(75));
+        assert_eq!(acc.dropped_dup_finishes, 1);
+        assert!(
+            !acc.saw_done,
+            "the duplicate terminator carries no [DONE] marker"
+        );
+    }
+
+    /// `usage` must survive regardless of which terminator carries it — the
+    /// first one, the withheld second one, or a late tail event.
+    #[test]
+    fn usage_is_accounted_on_any_event_position() {
+        let usage_event = |pt: i64| {
+            format!("data: {{\"choices\":[{{\"index\":0,\"delta\":{{}}}}],\
+                \"usage\":{{\"prompt_tokens\":{pt},\"completion_tokens\":5}}}}\n\n")
+        };
+        for (label, events) in [
+            (
+                "on the first terminator",
+                vec![ev("{}", r#""tool_calls""#), usage_event(10)],
+            ),
+            (
+                "on the withheld duplicate",
+                vec![
+                    ev("{}", r#""tool_calls""#),
+                    ev("{}", r#""tool_calls""#),
+                    usage_event(20),
+                ],
+            ),
+            (
+                "after [DONE]",
+                vec![ev("{}", r#""tool_calls""#), usage_event(30), "data: [DONE]\n\n".to_string()],
+            ),
+        ] {
+            let mut acc = StreamAccounting::default();
+            for e in events {
+                observe_and_should_forward(&e, &mut acc);
+            }
+            assert!(
+                acc.last_usage.is_some(),
+                "usage must be accounted {label}"
+            );
+        }
+    }
+
+    /// `[DONE]` is bookkeeping, not a forwarding artefact: it must be seen even
+    /// when the event carrying it is withheld, so `done` (and therefore the
+    /// truncation verdict) cannot be flipped by a forwarding decision.
+    #[test]
+    fn done_marker_is_accounted_even_when_withheld() {
+        let mut acc = StreamAccounting::default();
+        for e in [ev("{}", r#""tool_calls""#), ev("{}", r#""tool_calls""#)] {
+            observe_and_should_forward(&e, &mut acc);
+        }
+        assert!(!acc.saw_done, "no [DONE] seen yet");
+        observe_and_should_forward("data: [DONE]\n\n", &mut acc);
+        assert!(acc.saw_done, "[DONE] is always observed");
     }
 }
 
