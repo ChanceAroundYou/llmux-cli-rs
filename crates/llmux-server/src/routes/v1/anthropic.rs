@@ -814,10 +814,10 @@ async fn dispatch_aggregate_anthropic(
             // 「装不下」不等于「坏了」：跳过这个候选去试更大的，但**不记失败**。
             // 记失败会触发 3-confirm 迁移，把本来能服务其余请求的候选挤下线，
             // 而且会自锁（迁移后别名报更大的窗口，客户端不再压缩）。见
-            // helpers::is_context_overflow 的数实测说明。
-            if super::helpers::is_context_overflow(&error_body) {
+            // helpers::is_request_side_rejection 的实测说明。
+            if super::helpers::is_request_side_rejection(&error_body) {
                 tracing::warn!(
-                    "🔀 [agg:{}] {} 装不下该请求（上下文超限）— 试下一个，不记失败",
+                    "🔀 [agg:{}] {} 的拒绝属于请求侧（上下文/ max_tokens 不合规）— 试下一个，不记失败",
                     alias,
                     account.alias
                 );

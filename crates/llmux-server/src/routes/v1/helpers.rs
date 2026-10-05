@@ -91,6 +91,23 @@ pub fn is_context_overflow(error_body: &str) -> bool {
     MARKERS.iter().any(|m| b.contains(m))
 }
 
+/// 这次拒绝是**请求侧**的问题（我们的请求参数不合适），不是候选不健康。
+///
+/// 两类，都已在生产实测到：
+///
+/// 1. **输入比候选的窗口长** —— 换个更大的候选就能服务（见 [`is_context_overflow`]）。
+/// 2. **`max_tokens` 超候选上限** —— 拒绝正文里就写着上限，`max_tokens` 模块
+///    已经把它学下来了，**下一次请求会自动收敛到合规值**，所以这次 400 是
+///    一次性的、且候选完全健康。
+///
+/// 两者都**不该**记候选失败。2026-10-05 实测：容器重启后内存里的上限学习被清空，
+/// 第一次请求又吃一个学习 400，紧接着两次真 429 —— 三次凑满 3-confirm，把本来
+/// 健康的免费主力 `ling-3.1-flash:free` 迁移下线，之后 6 次请求全走付费。
+pub fn is_request_side_rejection(error_body: &str) -> bool {
+    is_context_overflow(error_body)
+        || llmux_core::max_tokens::parse_ceiling(error_body).is_some()
+}
+
 /// 上游回了配额类 429 就记一次失败；连续两次进入 30 分钟冷却。
 ///
 /// 成功时 `spawn_log_usage_ip` 已有的 `clear_suspension` 会解除。
@@ -1812,6 +1829,21 @@ mod tests {
         ] {
             assert!(is_context_overflow(body), "must recognise: {body}");
         }
+    }
+
+    /// `max_tokens` 学习 400 同属请求侧：上限已被学下、下次会自动收敛，
+    /// 候选完全健康。实测它 + 两次真 429 就凑满 3-confirm 把免费主力迁走了。
+    #[test]
+    fn max_tokens_rejection_is_also_request_side() {
+        let ling = "max_tokens (current value: 65536) must be between 0 and 32768";
+        assert!(is_request_side_rejection(ling));
+        // 真故障仍然要记
+        assert!(!is_request_side_rejection("Provider returned 502 Bad Gateway"));
+        assert!(!is_request_side_rejection("钱包余额不足"));
+        // 上下文超限也仍算
+        assert!(is_request_side_rejection(
+            "The input (481401 tokens) is longer than the model's context length (262144 tokens)"
+        ));
     }
 
     /// **宁可漏判，不可误判**：把真正的上游故障吞掉会让坏候选永远不被迁移走。
