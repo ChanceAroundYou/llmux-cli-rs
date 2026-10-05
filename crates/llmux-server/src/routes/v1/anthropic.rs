@@ -1147,8 +1147,16 @@ pub(crate) async fn anthropic_to_openai_streaming(
             );
         }
         let (input_tokens, output_tokens, cache_read, cache_create) = converter.usage_tokens();
-        // ponytail: no [DONE] => truncated; 0 output with few chunks (empty model response) also truncated; overflow when prompt > built-in window
-        let empty_content = done && output_tokens == 0 && chunks_received <= 4;
+        // Truncation = the stream never finished. Empty response = it finished
+        // but emitted no text, no thinking and no tool call.
+        //
+        // Both are read off the payload, not inferred from token counts: a
+        // tool-call-only or thinking-only turn legitimately reports zero
+        // completion tokens, and an empty upstream response spans more than
+        // four chunks once keep-alives are counted. The old
+        // `output_tokens == 0 && chunks_received <= 4` proxy was wrong in both
+        // directions — same fix and same rationale as `openai.rs`.
+        let empty_content = done && !converter.produced_output();
         let raw_truncated = !done;
         let truncated = raw_truncated || empty_content;
         let overflow = llmux_core::context::lookup_context_length(&model)

@@ -991,6 +991,21 @@ impl OpenAISseConverter {
         let input = (raw_prompt - cache_read).max(0);
         (input, output, cache_read, cache_create)
     }
+
+    /// Did this stream carry **any** output — assistant text, thinking, or a
+    /// tool call?
+    ///
+    /// A direct observation of what was emitted, for the empty-response check
+    /// in the callers. Token counts are not a substitute: a tool-call-only or
+    /// thinking-only turn legitimately reports few or zero completion tokens,
+    /// and a stream that emitted nothing at all may still bill tokens.
+    ///
+    /// `text_block_started` / `thinking_started` are only set when a real
+    /// block is opened, and `tool_indices` only when a tool block is opened —
+    /// all three are driven by the payload, not by any arrival heuristic.
+    pub fn produced_output(&self) -> bool {
+        self.text_block_started || self.thinking_started || !self.tool_indices.is_empty()
+    }
 }
 
 /// Build a single Anthropic SSE frame: `event: <type>\ndata: <json>\n\n`.
@@ -1082,8 +1097,7 @@ mod tests {
 
     /// id and name are not equally recoverable: name cannot be invented, id can.
     #[test]
-    fn resolve_synthesizes_a_missing_id_but_keeps_the_name() {
-        match resolve_pending(&pending("", "Bash", "{\"a\":1}")) {
+    fn resolve_synthesizes_a_missing_id_but_keeps_the_name() {        match resolve_pending(&pending("", "Bash", "{\"a\":1}")) {
             Resolution::Open { id, name, args, synthesized_id } => {
                 assert!(synthesized_id, "id was missing, so it must be flagged synthesized");
                 assert!(!id.is_empty(), "a synthesized id must still be a real id");
@@ -1216,5 +1230,59 @@ mod tests {
         let starts = text.iter().filter(|s| s.contains("content_block_start")).count();
         let stops = text.iter().filter(|s| s.contains("content_block_stop")).count();
         assert_eq!(starts, stops, "every started block must be closed: {text:?}");
+    }
+
+    // --- produced_output: the direct empty-response signal ------------------
+    //
+    // Replaces the `output_tokens == 0 && chunks <= 4` proxy that the streaming
+    // routes used. That proxy was wrong in both directions (see the callers):
+    // a tool-call-only turn reports ~0 completion tokens but DID produce
+    // output, while a genuinely empty response can span more than four chunks.
+
+    /// A stream carrying only a tool call produced output, even though it bills
+    /// essentially no completion tokens.
+    #[test]
+    fn a_tool_call_only_stream_counts_as_produced_output() {
+        let mut conv = OpenAISseConverter::new("m");
+        conv.feed(&json!({
+            "choices": [{
+                "index": 0,
+                "delta": {"tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "Bash", "arguments": "{}"}
+                }]},
+                "finish_reason": "tool_calls"
+            }]
+        }));
+        assert!(conv.produced_output(), "a delivered tool call IS output");
+    }
+
+    /// A thinking-only turn also counts: the model did produce content, it just
+    /// did not go into `content`.
+    #[test]
+    fn a_thinking_only_stream_counts_as_produced_output() {
+        let mut conv = OpenAISseConverter::new("m");
+        conv.feed(&json!({
+            "choices": [{"index": 0, "delta": {"reasoning_content": "thinking…"}, "finish_reason": null}]
+        }));
+        assert!(conv.produced_output(), "reasoning content IS output");
+    }
+
+    /// The case `c7b57e2` existed to catch: a stream that finishes without ever
+    /// emitting text, thinking or a tool call — no matter how many keep-alive
+    /// frames preceded it.
+    #[test]
+    fn a_stream_that_only_ever_sent_role_and_keepalives_produced_nothing() {
+        let mut conv = OpenAISseConverter::new("m");
+        conv.feed(&json!({
+            "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}]
+        }));
+        conv.feed(&json!({
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1200, "completion_tokens": 0}
+        }));
+        assert!(!conv.produced_output(), "no text, no thinking, no tool call");
     }
 }

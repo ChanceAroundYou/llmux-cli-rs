@@ -7,6 +7,28 @@
 
 ### Fixed
 
+- **空响应判据改用直接事实，不再用 token 计数猜**。原先的 `empty_content` 是
+  `completion_tokens == 0 && chunks <= 4`（`c7b57e2` 引入）—— 用**代理指标**去猜
+  **直接事实**（这条流到底有没有产出内容），两个方向都会错：
+
+  - **假失败**：纯 tool_call 的回合本来就几乎不产 completion token，却被判成空
+    响应 —— 正是上一条修复涉及的那批行。
+  - **假成功**：空响应一旦超过 4 个分片（keep-alive、心跳）就漏判。`chunks <= 4`
+    是个没有依据的经验阈值。
+
+  现在直接看载荷：转换器早已分别记录 `text_block_started` /
+  `thinking_started` / `tool_indices`，这次把它们经 `produced_output()` 暴露出来；
+  透传路径的 `StreamAccounting` 增加 `saw_text` / `saw_tool_call`。判据变成
+  「这条流没有产出任何内容」，**`chunks` 不再参与任何判定**，只留在日志里。
+  顺带覆盖两类此前漏判的产出：**thinking-only 回合**与**非流式响应**
+  （`message.content` 而非 `delta.content`）。
+
+  > 更正：本次审计中口头汇报过「两天里 1481 条空响应被记成 success=1」——
+  > **那个数字是我分析脚本的解析缺陷**（只认 OpenAI 的 `delta` 形状，漏了
+  > Anthropic 原生帧与非流式响应体），不是生产数据。格式感知地复核后实际只有
+  > **1** 条。判据确实该改（理由是机制上的，与那个数字无关），但影响远小于
+  > 我当时说的。
+
 - **转发策略不再吞掉记账：被丢弃的重复终止事件，其 `usage` 仍被记录**。这是
   `98e0621`（丢弃重复 `finish_reason: "tool_calls"`）引入的回归：那个循环改成
   「先判转发、`continue` 跳过记账」，而 `space-bunny-alpha` 恰恰把 `usage` 挂在

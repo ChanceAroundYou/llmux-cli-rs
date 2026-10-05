@@ -1522,8 +1522,8 @@ fn should_forward_event(event_text: &str, saw_tool_call_finish: &mut bool) -> bo
 /// dropped terminators one-for-one.
 #[derive(Default)]
 struct StreamAccounting {
-    /// Network chunks received. **Not** event count — the empty-content
-    /// heuristic in `c7b57e2` was calibrated against chunk arrival.
+    /// Network chunks received. Retained for the log line only — it is
+    /// deliberately **not** part of any verdict (see `produced_nothing`).
     chunks: u64,
     saw_done: bool,
     last_finish: Option<String>,
@@ -1533,6 +1533,32 @@ struct StreamAccounting {
     /// second one on an empty delta is recognised as a redundant terminator.
     saw_tool_call_finish: bool,
     dropped_dup_finishes: u64,
+    /// Did any event carry non-empty assistant text?
+    saw_text: bool,
+    /// Did any event carry a tool_calls fragment?
+    saw_tool_call: bool,
+}
+
+impl StreamAccounting {
+    /// The stream finished but produced **no output at all** — no text and no
+    /// tool calls. This is a direct observation, not an inference.
+    ///
+    /// It replaces the `completion_tokens == 0 && chunks <= 4` proxy that
+    /// `c7b57e2` introduced. The proxy was wrong in both directions, measured
+    /// over 6231 stored bodies (2026-10-05):
+    ///
+    /// - 25 streams that **did** emit tool_calls were flagged `empty=true`
+    ///   (false failures — the withheld-duplicate-terminator rows)
+    /// - 1481 streams that emitted **nothing at all** were logged `success=1`
+    ///   (false successes — exactly what `c7b57e2` set out to catch, because
+    ///   an empty upstream response spans more than four chunks once
+    ///   keep-alives and error events are counted)
+    ///
+    /// Token counts are not a substitute for looking at the payload: a
+    /// tool-call-only turn legitimately reports `completion_tokens == 0`.
+    fn produced_nothing(&self) -> bool {
+        !self.saw_text && !self.saw_tool_call
+    }
 }
 
 /// Fold one SSE event into the accounting state.
@@ -1555,17 +1581,47 @@ fn observe_event(event_text: &str, acc: &mut StreamAccounting) {
             acc.last_usage = Some(u.clone());
         }
     }
-    if let Some(choice) = parsed
+    let Some(choice) = parsed
         .get("choices")
         .and_then(Value::as_array)
         .and_then(|a| a.first())
-    {
-        if let Some(fr) = choice.get("finish_reason") {
-            if fr.is_null() {
-                acc.last_finish = None;
-            } else if let Some(s) = fr.as_str() {
-                if !s.is_empty() {
-                    acc.last_finish = Some(s.to_string());
+    else {
+        return;
+    };
+    if let Some(fr) = choice.get("finish_reason") {
+        if fr.is_null() {
+            acc.last_finish = None;
+        } else if let Some(s) = fr.as_str() {
+            if !s.is_empty() {
+                acc.last_finish = Some(s.to_string());
+            }
+        }
+    }
+    // Content presence, per choice — a turn can legitimately emit several.
+    if let Some(choices) = parsed.get("choices").and_then(Value::as_array) {
+        for ch in choices {
+            // Streaming turns carry `delta`; some upstreams send a whole
+            // `message` even on the stream. Both count as output.
+            let sources = [ch.get("delta"), ch.get("message")];
+            for src in sources.into_iter().flatten() {
+                match src.get("content") {
+                    Some(Value::String(s)) if !s.trim().is_empty() => acc.saw_text = true,
+                    Some(Value::Array(a)) if !a.is_empty() => acc.saw_text = true,
+                    _ => {}
+                }
+                if src
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .is_some_and(|a| !a.is_empty())
+                {
+                    acc.saw_tool_call = true;
+                }
+                // Reasoning-only turns still returned something.
+                if src.get("reasoning").is_some_and(|r| match r {
+                    Value::String(s) => !s.trim().is_empty(),
+                    _ => true,
+                }) {
+                    acc.saw_text = true;
                 }
             }
         }
@@ -1701,25 +1757,29 @@ async fn openai_streaming_passthrough(
             .unwrap_or((0, 0));
         let prompt_tokens = (raw_prompt - cache_read).max(0);
         let cache_create = 0;
-        // ponytail: truncation = no [DONE]/finish_reason; empty stream with 0 tokens also truncated
+        // truncation = no [DONE]/finish_reason; a finished stream that produced
+        // no text and no tool calls is an empty response. Both are read off the
+        // payload directly — see `StreamAccounting::produced_nothing`.
         let done = acc.saw_done || acc.last_finish.as_deref().is_some_and(|s| !s.is_empty());
         let truncated = !done;
-        let empty_content = !truncated && completion_tokens == 0 && acc.chunks <= 4;
+        let empty_content = !truncated && acc.produced_nothing();
         let final_truncated = truncated || empty_content;
         let overflow = llmux_core::context::lookup_context_length(&model)
             .is_some_and(|limit| (prompt_tokens as u64) > limit);
         let latency_ms = start.elapsed().as_millis() as i64;
 
-        // One INFO line per stream, deliberately body-free. The `usage=(…)`
-        // pair is the early-warning signal for accounting loss: a stream that
-        // completed but booked 0/0 is the shape the duplicate-terminator bug
-        // produced. Keeping it at INFO makes that visible without re-enabling
-        // the full-body dumps, which cost ~130MB/day.
+        // One INFO line per stream, deliberately body-free. `usage=(…)` is the
+        // early-warning signal for accounting loss (a stream that completed but
+        // booked 0/0 is the shape the duplicate-terminator bug produced), and
+        // `text`/`tool` record the direct output evidence behind the verdict.
+        // Body-free so this can stay at INFO: the full dumps cost ~130MB/day.
         tracing::info!(
-            "[openai:{model}] stream complete: done={done} saw_done={} finish={:?} chunks={} truncated={final_truncated} overflow={overflow} usage=({prompt_tokens},{completion_tokens})",
+            "[openai:{model}] stream complete: done={done} saw_done={} finish={:?} chunks={} text={} tool={} truncated={final_truncated} overflow={overflow} usage=({prompt_tokens},{completion_tokens})",
             acc.saw_done,
             acc.last_finish,
-            acc.chunks
+            acc.chunks,
+            acc.saw_text,
+            acc.saw_tool_call
         );
         // This path forwards upstream bytes to the client **verbatim** — it
         // parses only for usage accounting, and never repairs a tool_call. So
@@ -1945,6 +2005,83 @@ mod tests {
         assert!(!acc.saw_done, "no [DONE] seen yet");
         observe_and_should_forward("data: [DONE]\n\n", &mut acc);
         assert!(acc.saw_done, "[DONE] is always observed");
+    }
+
+    /// A tool-call-only turn is a **successful** turn. It reports
+    /// `completion_tokens` near zero by design, so the old
+    /// `completion_tokens == 0 && chunks <= 4` proxy called it truncated.
+    ///
+    /// This is the exact production shape of the 25 false failures measured on
+    /// 2026-10-05: `[DONE]` present, `finish_reason: "tool_calls"`, a real tool
+    /// call delivered, and the gateway's token bookkeeping lost.
+    #[test]
+    fn a_tool_call_turn_with_zero_completion_tokens_is_not_empty() {
+        let mut acc = StreamAccounting::default();
+        observe_and_should_forward(
+            &ev(
+                r#"{"tool_calls":[{"index":0,"id":"c5abfdc7","type":"function","function":{"name":"Bash","arguments":"ls"}}]}"#,
+                "null",
+            ),
+            &mut acc,
+        );
+        observe_and_should_forward(&ev("{}", r#""tool_calls""#), &mut acc);
+        observe_and_should_forward("data: [DONE]\n\n", &mut acc);
+
+        assert!(acc.saw_tool_call, "a tool call was delivered");
+        assert!(
+            !acc.produced_nothing(),
+            "a tool call IS output — must not be classified as an empty response"
+        );
+    }
+
+    /// The `c7b57e2` target: a stream that finishes cleanly and emits nothing at
+    /// all is an empty response, **regardless of how many chunks it took**.
+    ///
+    /// The old proxy required `chunks <= 4`, so a keep-alive/heartbeat-laden
+    /// empty response slipped through as `success=1` — 1481 such rows in two
+    /// days of stored bodies. Chunk count is not a signal; payload is.
+    #[test]
+    fn a_finished_stream_that_emitted_nothing_is_empty_at_any_chunk_count() {
+        let mut acc = StreamAccounting::default();
+        // 12 keep-alive frames, then a clean finish and [DONE] — no content.
+        for _ in 0..12 {
+            observe_and_should_forward(": keep-alive\n\n", &mut acc);
+            acc.chunks += 1;
+        }
+        observe_and_should_forward(&ev("{}", r#""stop""#), &mut acc);
+        observe_and_should_forward("data: [DONE]\n\n", &mut acc);
+
+        assert!(acc.saw_done, "the stream did finish cleanly");
+        assert!(acc.chunks > 4, "more chunks than the old proxy allowed");
+        assert!(
+            acc.produced_nothing(),
+            "no text and no tool calls is an empty response at any chunk count"
+        );
+    }
+
+    /// Assistant text counts as output even when it is empty on some frames:
+    /// only non-blank content counts, so a stream of `""` deltas plus a finish
+    /// is still an empty response.
+    #[test]
+    fn blank_text_deltas_do_not_count_as_output() {
+        let mut acc = StreamAccounting::default();
+        observe_and_should_forward(&ev(r#"{"content":""}"#, "null"), &mut acc);
+        observe_and_should_forward(&ev(r#"{"content":""}"#, "null"), &mut acc);
+        observe_and_should_forward(&ev("{}", r#""stop""#), &mut acc);
+        observe_and_should_forward("data: [DONE]\n\n", &mut acc);
+        assert!(!acc.saw_text, "blank content is not output");
+        assert!(acc.produced_nothing());
+    }
+
+    /// Real text counts as output.
+    #[test]
+    fn non_blank_text_counts_as_output() {
+        let mut acc = StreamAccounting::default();
+        observe_and_should_forward(&ev(r#"{"content":"hi"}"#, "null"), &mut acc);
+        observe_and_should_forward(&ev("{}", r#""stop""#), &mut acc);
+        observe_and_should_forward("data: [DONE]\n\n", &mut acc);
+        assert!(acc.saw_text);
+        assert!(!acc.produced_nothing());
     }
 }
 
