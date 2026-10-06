@@ -144,8 +144,9 @@ async fn execute_provider_request_with(
 ///
 /// Call this from **every** outbound inference path — the shared funnel
 /// (`execute_provider_request`) *and* the model 拨测 probes in
-/// `routes/models/testing.rs`, which post their own requests. Balance GETs
-/// send their own browser UA and are not inference, so they are untouched.
+/// `llmux-core/src/probe.rs` (`send_probe` / `native_probe`), which post their
+/// own requests. Balance GETs send their own browser UA and are not inference,
+/// so they are untouched.
 pub fn apply_upstream_identity_headers(
     method: &str,
     url: &str,
@@ -599,8 +600,8 @@ mod console_go_header_tests {
 
     #[test]
     fn identity_headers_injected_for_console_go_posts_only() {
-        // 拨测 (routes/models/testing.rs) builds its own headers; the helper must
-        // fill in both Console Go requirements there too.
+        // 拨测 (probe.rs 的 send_probe / native_probe) 自己拼 headers；helper 必须
+        // 在那里也补齐 Console Go 的两项要求。
         let mut h = map(&[
             ("authorization", "Bearer sk-aaa"),
             ("content-type", "application/json"),
