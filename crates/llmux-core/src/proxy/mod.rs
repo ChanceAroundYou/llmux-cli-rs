@@ -48,6 +48,7 @@ pub fn build_anthropic_passthrough_request(
         effort: Default::default(),
         // 同上：这条路径的 body 已定稿，max_tokens 收敛在 adapters 侧完成。
         max_tokens: Default::default(),
+        first_byte_timeout_secs: None,
     })
 }
 
@@ -81,11 +82,60 @@ pub fn extract_anthropic_usage_from_json(data: &Value) -> AnthropicUsage {
 /// 还原只对上面这一个白名单字段生效，**不做「任何能解析成 JSON 的字符串都还原」**
 /// —— `content` 本就是 string，且完全合法地可能是 `"[1, 2, 3]"` 这种字面量正文，
 /// 无差别还原会静默篡改用户内容。
+/// Normalize the message list so every `system` message sits at the front,
+/// merged into a single leading message.
+///
+/// Some OpenAI-compatible upstreams (notably Qwen/DashScope) require exactly
+/// one `system` message and require it to be first — an inline one is rejected
+/// with `invalid_prompt` / "System message must be at the beginning".
+///
+/// Only system messages move; the relative order of every other message is
+/// untouched, so an assistant `tool_calls` message stays adjacent to the `tool`
+/// results that reference it.
+pub(crate) fn normalize_system_messages(messages: Vec<Value>) -> Vec<Value> {
+    let mut system_contents: Vec<Value> = Vec::new();
+    let mut rest: Vec<Value> = Vec::with_capacity(messages.len());
+    for msg in messages {
+        if msg.get("role").and_then(Value::as_str) == Some("system") {
+            system_contents.push(msg.get("content").cloned().unwrap_or(Value::Null));
+        } else {
+            rest.push(msg);
+        }
+    }
+    if system_contents.is_empty() {
+        return rest;
+    }
+    let mut out = Vec::with_capacity(rest.len() + 1);
+    out.push(json!({ "role": "system", "content": merge_system_content(system_contents) }));
+    out.extend(rest);
+    out
+}
+
+/// Fold N system contents into one. A lone content passes through unchanged
+/// (string stays a string, so the common single-system case is byte-identical
+/// to before). Multiple contents become one array of text parts, concatenated
+/// in order.
+fn merge_system_content(contents: Vec<Value>) -> Value {
+    if contents.len() == 1 {
+        return contents.into_iter().next().unwrap();
+    }
+    let mut parts: Vec<Value> = Vec::new();
+    for c in contents {
+        match c {
+            Value::String(s) => parts.push(json!({ "type": "text", "text": s })),
+            Value::Array(a) => parts.extend(a),
+            Value::Null => {}
+            other => parts.push(json!({ "type": "text", "text": other.to_string() })),
+        }
+    }
+    Value::Array(parts)
+}
+
 pub fn sanitize_chat_messages(body: &mut Value) {
     let Some(msgs) = body.get_mut("messages").and_then(Value::as_array_mut) else {
         return;
     };
-    for m in msgs {
+    for m in &mut *msgs {
         let Some(obj) = m.as_object_mut() else { continue };
         if obj.get("tool_calls").and_then(Value::as_array).is_some_and(Vec::is_empty) {
             obj.remove("tool_calls");
@@ -106,6 +156,10 @@ pub fn sanitize_chat_messages(body: &mut Value) {
             }
         }
     }
+    // Some upstreams (Qwen/DashScope) require exactly one system message at the
+    // front; an inline one is rejected with `invalid_prompt`. Reorder + merge.
+    let normalized = normalize_system_messages(msgs.clone());
+    *msgs = normalized;
 }
 
 pub fn extract_anthropic_usage_from_sse(stream_text: &str) -> AnthropicUsage {
@@ -260,5 +314,73 @@ mod tests {
         });
         sanitize_chat_messages(&mut body);
         assert!(body["messages"][0].get("reasoning_details").is_none(), "不得新增字段");
+    }
+
+    #[test]
+    fn sanitize_moves_inline_system_to_front() {
+        // hermes 等 OpenAI 客户端偶尔把 system 放在 user 之后，ninfer/Qwen 会
+        // 报 `invalid_prompt`。修复：把 system 提到开头。
+        let mut body = json!({
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": "You are a bot."}
+            ]
+        });
+        sanitize_chat_messages(&mut body);
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert_eq!(body["messages"][1]["role"], "user");
+    }
+
+    #[test]
+    fn sanitize_merges_multiple_system_into_one_leading() {
+        let mut body = json!({
+            "messages": [
+                {"role": "system", "content": "A"},
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": "B"}
+            ]
+        });
+        sanitize_chat_messages(&mut body);
+        assert_eq!(body["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(body["messages"][0]["role"], "system");
+        // 两个 system 合并成数组
+        assert_eq!(
+            body["messages"][0]["content"],
+            json!([{"type": "text", "text": "A"}, {"type": "text", "text": "B"}])
+        );
+        assert_eq!(body["messages"][1]["role"], "user");
+    }
+
+    #[test]
+    fn sanitize_single_leading_system_is_byte_identical() {
+        let mut body = json!({
+            "messages": [
+                {"role": "system", "content": "You are a bot."},
+                {"role": "user", "content": "hi"}
+            ]
+        });
+        let before = body["messages"].clone();
+        sanitize_chat_messages(&mut body);
+        assert_eq!(body["messages"], before);
+    }
+
+    #[test]
+    fn sanitize_preserves_non_system_order() {
+        let mut body = json!({
+            "messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "1"},
+                {"role": "assistant", "content": "2"},
+                {"role": "user", "content": "3"},
+                {"role": "assistant", "tool_calls": [{"id": "x"}]},
+                {"role": "tool", "tool_call_id": "x", "content": "4"}
+            ]
+        });
+        sanitize_chat_messages(&mut body);
+        let roles: Vec<_> = body["messages"].as_array().unwrap().iter()
+            .filter_map(|m| m.get("role").and_then(Value::as_str)).collect();
+        assert_eq!(roles, vec!["system", "user", "assistant", "user", "assistant", "tool"]);
+        // tool 消息仍紧邻其 tool_calls
+        assert_eq!(body["messages"][5]["tool_call_id"], "x");
     }
 }

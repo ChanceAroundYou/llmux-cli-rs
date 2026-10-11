@@ -12,7 +12,7 @@ use crate::app::AppState;
 
 pub async fn list_aggregate_aliases(Extension(state): Extension<AppState>) -> Response {
     let rows = match sqlx::query_as::<_, AggregateAliasRow>(
-        "SELECT id, alias, candidates, interval_secs, upstream_api, created_at, updated_at FROM aggregate_aliases ORDER BY id",
+        "SELECT id, alias, candidates, interval_secs, upstream_api, first_byte_timeout_secs, created_at, updated_at FROM aggregate_aliases ORDER BY id",
     )
     .fetch_all(&state.pool)
     .await
@@ -44,6 +44,7 @@ pub async fn list_aggregate_aliases(Extension(state): Extension<AppState>) -> Re
             "candidates": candidates,
             "interval_secs": row.interval_secs.unwrap_or(300),
             "upstream_api": row.upstream_api.clone().unwrap_or_else(|| "chat".to_string()),
+            "first_byte_timeout_secs": row.first_byte_timeout_secs,
             "active": active,
             "last_status": last_status,
             "pending_target": pending_target,
@@ -121,6 +122,28 @@ pub async fn set_aggregate_alias(
         .and_then(Value::as_i64)
         .unwrap_or(300)
         .clamp(60, 3600);
+
+    let first_byte_timeout_secs = match body.get("first_byte_timeout_secs") {
+        None | Some(Value::Null) => None,
+        Some(v) => {
+            let n = match v.as_i64() {
+                Some(n) => n,
+                None => {
+                    return crate::error::simple_error(
+                        "first_byte_timeout_secs must be an integer from 1 to 600, or null",
+                        StatusCode::BAD_REQUEST,
+                    )
+                }
+            };
+            if !(1..=600).contains(&n) {
+                return crate::error::simple_error(
+                    "first_byte_timeout_secs must be an integer from 1 to 600, or null",
+                    StatusCode::BAD_REQUEST,
+                );
+            }
+            Some(n)
+        }
+    };
 
     // Validate account_ids exist and are active (dedup: same account may appear with different models)
     {
@@ -212,12 +235,13 @@ pub async fn set_aggregate_alias(
     }
 
     match sqlx::query(
-        "INSERT INTO aggregate_aliases (alias, candidates, interval_secs, upstream_api, updated_at) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP) ON CONFLICT(alias) DO UPDATE SET candidates=excluded.candidates, interval_secs=excluded.interval_secs, upstream_api=excluded.upstream_api, updated_at=CURRENT_TIMESTAMP",
+        "INSERT INTO aggregate_aliases (alias, candidates, interval_secs, upstream_api, first_byte_timeout_secs, updated_at) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP) ON CONFLICT(alias) DO UPDATE SET candidates=excluded.candidates, interval_secs=excluded.interval_secs, upstream_api=excluded.upstream_api, first_byte_timeout_secs=excluded.first_byte_timeout_secs, updated_at=CURRENT_TIMESTAMP",
     )
     .bind(&alias)
     .bind(&candidates_json)
     .bind(interval_secs)
     .bind(&upstream_api)
+    .bind(first_byte_timeout_secs)
     .execute(&state.pool)
     .await
     {
@@ -265,7 +289,7 @@ pub async fn delete_aggregate_alias(
     Path(id): Path<String>,
 ) -> Response {
     let row = match sqlx::query_as::<_, AggregateAliasRow>(
-        "SELECT id, alias, candidates, interval_secs, upstream_api, created_at, updated_at FROM aggregate_aliases WHERE id = ?",
+        "SELECT id, alias, candidates, interval_secs, upstream_api, first_byte_timeout_secs, created_at, updated_at FROM aggregate_aliases WHERE id = ?",
     )
     .bind(&id)
     .fetch_optional(&state.pool)
@@ -337,7 +361,7 @@ pub async fn set_aggregate_active(
     Json(body): Json<Value>,
 ) -> Response {
     let row = match sqlx::query_as::<_, AggregateAliasRow>(
-        "SELECT id, alias, candidates, interval_secs, upstream_api, created_at, updated_at FROM aggregate_aliases WHERE id = ?",
+        "SELECT id, alias, candidates, interval_secs, upstream_api, first_byte_timeout_secs, created_at, updated_at FROM aggregate_aliases WHERE id = ?",
     )
     .bind(&id)
     .fetch_optional(&state.pool)

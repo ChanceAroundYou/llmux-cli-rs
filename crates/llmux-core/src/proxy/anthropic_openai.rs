@@ -21,6 +21,17 @@ pub fn anthropic_to_openai_request(
     anthropic_body: &Value,
     resolved_model: &str,
 ) -> anyhow::Result<Value> {
+    anthropic_to_openai_request_with(anthropic_body, resolved_model, true)
+}
+
+/// Same as [`anthropic_to_openai_request`], but lets the caller suppress the
+/// per-text-block `prompt_cache_breakpoint` marker. Upstreams that reject the
+/// field are recorded in a blacklist and routed here with `false`.
+pub fn anthropic_to_openai_request_with(
+    anthropic_body: &Value,
+    resolved_model: &str,
+    add_cache_breakpoint: bool,
+) -> anyhow::Result<Value> {
     let body_obj = anthropic_body
         .as_object()
         .ok_or_else(|| anyhow::anyhow!("Anthropic request body must be an object"))?;
@@ -36,13 +47,16 @@ pub fn anthropic_to_openai_request(
 
     if let Some(arr) = body_obj.get("messages").and_then(Value::as_array) {
         for msg in arr {
-            transform_anthropic_message(msg, &mut messages);
+            transform_anthropic_message(msg, &mut messages, add_cache_breakpoint);
         }
     }
 
     let mut out = Map::new();
     out.insert("model".to_string(), json!(resolved_model));
-    out.insert("messages".to_string(), Value::Array(messages));
+    out.insert(
+        "messages".to_string(),
+        Value::Array(crate::proxy::normalize_system_messages(messages)),
+    );
 
     for key in ["max_tokens", "temperature", "top_p"] {
         if let Some(v) = body_obj.get(key) {
@@ -110,7 +124,7 @@ pub fn anthropic_to_openai_request(
 /// become standalone `role: "tool"` messages; the rest (text/image/tool_use/
 /// thinking) collapse into a single message carrying content parts, tool_calls,
 /// and message-level reasoning fields.
-fn transform_anthropic_message(msg: &Value, messages: &mut Vec<Value>) {
+fn transform_anthropic_message(msg: &Value, messages: &mut Vec<Value>, add_cache_breakpoint: bool) {
     let role = msg
         .get("role")
         .and_then(Value::as_str)
@@ -143,7 +157,15 @@ fn transform_anthropic_message(msg: &Value, messages: &mut Vec<Value>) {
                     "text" => {
                         // Keep `cache_control` on the part (OpenAI gateways ignore
                         // unknown fields; those that understand it will honor it).
-                        parts.push(block.clone());
+                        // Also mark the part as an explicit shared-prefix boundary for
+                        // ninfer's KV-cache reuse. ninfer keeps the last four markers
+                        // per request and drops the rest, so tagging every text block
+                        // is safe there; gateways that don't know the field ignore it.
+                        let mut part = block.clone();
+                        if add_cache_breakpoint {
+                            part["prompt_cache_breakpoint"] = json!({ "mode": "explicit" });
+                        }
+                        parts.push(part);
                     }
                     "image" => {
                         if let Some(url) = image_block_to_url(block) {
@@ -202,10 +224,12 @@ fn transform_anthropic_message(msg: &Value, messages: &mut Vec<Value>) {
                 out_msg.insert("role".to_string(), json!(role));
                 if has_parts {
                     // A single plain text block flattens to a string, but a text
-                    // block carrying `cache_control` stays an array to preserve it.
+                    // block carrying `cache_control` or `prompt_cache_breakpoint`
+                    // stays an array to preserve them.
                     let flattenable = parts.len() == 1
                         && parts[0].get("type").and_then(Value::as_str) == Some("text")
-                        && parts[0].get("cache_control").is_none();
+                        && parts[0].get("cache_control").is_none()
+                        && parts[0].get("prompt_cache_breakpoint").is_none();
                     if flattenable {
                         out_msg.insert(
                             "content".to_string(),
@@ -1284,5 +1308,43 @@ mod tests {
             "usage": {"prompt_tokens": 1200, "completion_tokens": 0}
         }));
         assert!(!conv.produced_output(), "no text, no thinking, no tool call");
+    }
+
+    /// Every text block gets an explicit shared-prefix marker for ninfer's
+    /// KV-cache reuse. ninfer keeps the last four per request and drops the
+    /// rest, so tagging all of them is safe; other gateways ignore the field.
+    #[test]
+    fn text_blocks_carry_a_prompt_cache_breakpoint() {
+        let msg = json!({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "one"},
+                {"type": "text", "text": "two"}
+            ]
+        });
+        let mut out = Vec::new();
+        transform_anthropic_message(&msg, &mut out, true);
+        let parts = out[0]["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 2);
+        for p in parts {
+            assert_eq!(p["prompt_cache_breakpoint"], json!({"mode": "explicit"}));
+        }
+    }
+
+    /// A lone text block would normally flatten to a string, but it must stay
+    /// an array so the marker (which lives on the part) survives.
+    #[test]
+    fn a_lone_text_block_stays_an_array_to_keep_its_marker() {
+        let msg = json!({
+            "role": "user",
+            "content": [{"type": "text", "text": "hi"}]
+        });
+        let mut out = Vec::new();
+        transform_anthropic_message(&msg, &mut out, true);
+        assert!(out[0]["content"].is_array(), "带 marker 的 text 不得扁平化成字符串");
+        assert_eq!(
+            out[0]["content"][0]["prompt_cache_breakpoint"],
+            json!({"mode": "explicit"})
+        );
     }
 }

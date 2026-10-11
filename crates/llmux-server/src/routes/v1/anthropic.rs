@@ -20,8 +20,8 @@ use llmux_core::adapters::{self, execute_provider_request, join_upstream_url, Pr
 use llmux_core::aggregate::get_account_by_id;
 use llmux_core::dispatcher::{self, get_accounts_by_ids, get_active_accounts, is_retryable_status};
 use llmux_core::proxy::anthropic_openai::{
-    anthropic_to_openai_request, cache_usage_from_openai, openai_to_anthropic_response,
-    parse_sse_chunks, sse_data_payload, OpenAISseConverter,
+    anthropic_to_openai_request, anthropic_to_openai_request_with, cache_usage_from_openai,
+    openai_to_anthropic_response, parse_sse_chunks, sse_data_payload, OpenAISseConverter,
 };
 use llmux_core::proxy::{build_anthropic_passthrough_request, extract_anthropic_usage_from_sse};
 
@@ -209,7 +209,8 @@ pub async fn messages(
             )
         } else if let Some(openai_base) = openai_base {
             // Anthropic → OpenAI protocol translation.
-            match anthropic_to_openai_request(&body, &model_resolution.target_model) {
+            let add_bp = state.cache_breakpoint_ok(&account.provider_id);
+            match anthropic_to_openai_request_with(&body, &model_resolution.target_model, add_bp) {
                 Ok(mut openai_body) => {
                     let mut req_headers = BTreeMap::new();
                     req_headers.insert(
@@ -242,6 +243,7 @@ pub async fn messages(
                             body: openai_body,
                             effort,
                             max_tokens,
+                            first_byte_timeout_secs: None,
                         }),
                         true,
                     )
@@ -261,7 +263,7 @@ pub async fn messages(
             )
         };
 
-        let provider_request = match provider_request {
+        let mut provider_request = match provider_request {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!("📡 Failed to build provider request: {e}");
@@ -282,6 +284,7 @@ pub async fn messages(
                 continue;
             }
         };
+        provider_request.first_byte_timeout_secs = model_resolution.first_byte_timeout_secs;
 
         tracing::info!(
             "⚡ {} → {} → {} {}",
@@ -331,6 +334,11 @@ pub async fn messages(
             // 同一处回错顺便学 max_tokens 上限：客户端发 65536、上游只收
             // 32768 时整轮 400，不学会就会一直白打（见 max_tokens 模块注释）。
             provider_request.max_tokens.record_rejection(&error_body);
+            // 上游拒了 prompt_cache_breakpoint → 记下来，后续不再发。
+            if error_body.contains("prompt_cache_breakpoint") || error_body.contains("cache_breakpoint") {
+                state.note_cache_breakpoint_unsupported(&account.provider_id);
+                tracing::info!("🚫 {} rejected prompt_cache_breakpoint — will not send again", account.alias);
+            }
 
             last_error = Some(format!("Provider returned {status}: {error_body}"));
             last_status = Some(status.as_u16());
@@ -750,14 +758,15 @@ async fn dispatch_aggregate_anthropic(
             llmux_core::protocol::DownstreamMode::Chat => {
                 match openai_base {
                     Some(openai_base) => {
-                        match anthropic_to_openai_request(&patched_body, &cand.model) {
+                        let add_bp = state.cache_breakpoint_ok(&account.provider_id);
+                        match anthropic_to_openai_request_with(&patched_body, &cand.model, add_bp) {
                             Ok(mut openai_body) => {
                                 let mut req_headers = BTreeMap::new();
                                 req_headers.insert("content-type".to_string(), "application/json".to_string());
                                 req_headers.insert("authorization".to_string(), format!("Bearer {}", account.api_key));
                                 let effort = llmux_core::reasoning_effort::apply_reasoning_effort(&mut openai_body, &account.provider_id, &cand.model, llmux_core::protocol::Protocol::Chat);
                                 let max_tokens = llmux_core::max_tokens::clamp_max_tokens(&mut openai_body, &account.provider_id, &cand.model);
-                                (Ok(ProviderRequest { method: "POST".to_string(), url: join_upstream_url(openai_base, "chat/completions"), headers: req_headers, body: openai_body, effort, max_tokens }), true)
+                                (Ok(ProviderRequest { method: "POST".to_string(), url: join_upstream_url(openai_base, "chat/completions"), headers: req_headers, body: openai_body, effort, max_tokens, first_byte_timeout_secs: None }), true)
                             }
                             Err(e) => (Err(e), true),
                         }
@@ -775,14 +784,15 @@ async fn dispatch_aggregate_anthropic(
                 if let Some(anthropic_base) = anthropic_base {
                     (build_anthropic_passthrough_request(&patched_body, &account, anthropic_base, &cand.model, anthropic_beta.as_deref()), false)
                 } else if let Some(openai_base) = openai_base {
-                    match anthropic_to_openai_request(&patched_body, &cand.model) {
+                    let add_bp = state.cache_breakpoint_ok(&account.provider_id);
+                    match anthropic_to_openai_request_with(&patched_body, &cand.model, add_bp) {
                         Ok(mut openai_body) => {
                             let mut req_headers = BTreeMap::new();
                             req_headers.insert("content-type".to_string(), "application/json".to_string());
                             req_headers.insert("authorization".to_string(), format!("Bearer {}", account.api_key));
                             let effort = llmux_core::reasoning_effort::apply_reasoning_effort(&mut openai_body, &account.provider_id, &cand.model, llmux_core::protocol::Protocol::Chat);
                             let max_tokens = llmux_core::max_tokens::clamp_max_tokens(&mut openai_body, &account.provider_id, &cand.model);
-                            (Ok(ProviderRequest { method: "POST".to_string(), url: join_upstream_url(openai_base, "chat/completions"), headers: req_headers, body: openai_body, effort, max_tokens }), true)
+                            (Ok(ProviderRequest { method: "POST".to_string(), url: join_upstream_url(openai_base, "chat/completions"), headers: req_headers, body: openai_body, effort, max_tokens, first_byte_timeout_secs: None }), true)
                         }
                         Err(e) => (Err(e), true),
                     }
@@ -792,7 +802,8 @@ async fn dispatch_aggregate_anthropic(
             }
         };
 
-        let provider_request = match provider_request { Ok(r) => r, Err(e) => { tracing::error!("📡 [agg:{}] build request failed: {e}", alias); last_error = Some(format!("Failed to build provider request: {e}")); state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); failed_candidates += 1; continue; } };
+        let mut provider_request = match provider_request { Ok(r) => r, Err(e) => { tracing::error!("📡 [agg:{}] build request failed: {e}", alias); last_error = Some(format!("Failed to build provider request: {e}")); state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); failed_candidates += 1; continue; } };
+        provider_request.first_byte_timeout_secs = agg.first_byte_timeout_secs;
 
         tracing::info!("🔀 [agg:{} V={}] {} → {} → {} {}", alias, active, account.alias, cand.model, provider_request.url, if is_conversion { "[anthropic→openai]" } else { "" });
         if let Some(tx) = &state.tui_tx { let _ = tx.send(TuiEvent::Dispatch { timestamp: time::OffsetDateTime::now_utc().format(&DISPATCH_TIME_FMT).unwrap_or_default(), account: account.alias.clone(), model: cand.model.clone(), url: provider_request.url.clone(), tag: Some(format!("agg:{alias}")) }); }
@@ -811,6 +822,11 @@ async fn dispatch_aggregate_anthropic(
             // 同一处回错顺便学 max_tokens 上限：客户端发 65536、上游只收
             // 32768 时整轮 400，不学会就会一直白打（见 max_tokens 模块注释）。
             provider_request.max_tokens.record_rejection(&error_body);
+            // 上游拒了 prompt_cache_breakpoint → 记下来，后续不再发。
+            if error_body.contains("prompt_cache_breakpoint") || error_body.contains("cache_breakpoint") {
+                state.note_cache_breakpoint_unsupported(&account.provider_id);
+                tracing::info!("🚫 {} rejected prompt_cache_breakpoint — will not send again", account.alias);
+            }
 
             last_error = Some(format!("Provider returned {status}: {error_body}"));
             last_status = Some(status.as_u16());

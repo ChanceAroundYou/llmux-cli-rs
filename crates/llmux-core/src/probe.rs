@@ -348,6 +348,7 @@ async fn native_probe(
                 // 探活不是推理请求，不带 reasoning_effort。
                 effort: Default::default(),
         max_tokens: Default::default(),
+        first_byte_timeout_secs: None,
             },
         )
     } else {
@@ -377,6 +378,7 @@ async fn native_probe(
                 // 探活不是推理请求，不带 reasoning_effort。
                 effort: Default::default(),
         max_tokens: Default::default(),
+        first_byte_timeout_secs: None,
             },
         )
     };

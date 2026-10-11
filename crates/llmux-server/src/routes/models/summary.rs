@@ -48,7 +48,7 @@ pub async fn get_models_summary(Extension(state): Extension<AppState>) -> Respon
 
 async fn fetch_aliases(state: &AppState) -> anyhow::Result<Value> {
     let rows = sqlx::query_as::<_, llmux_core::models::ModelAlias>(
-        "SELECT id, alias, target_model, provider_id, account_ids, preferred_account_id, upstream_api FROM model_aliases ORDER BY id",
+        "SELECT id, alias, target_model, provider_id, account_ids, preferred_account_id, upstream_api, first_byte_timeout_secs FROM model_aliases ORDER BY id",
     )
     .fetch_all(&state.pool)
     .await?;

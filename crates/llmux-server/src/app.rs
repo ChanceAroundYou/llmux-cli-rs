@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
@@ -101,6 +101,9 @@ pub struct AppState {
     pub model_cache: Arc<Mutex<HashMap<String, CachedModel>>>,
     pub aggregate_cache: Arc<Mutex<HashMap<String, CachedAggregate>>>,
     pub sessions: Arc<Mutex<HashMap<String, Instant>>>,
+    /// Providers whose upstream rejected the `prompt_cache_breakpoint` marker.
+    /// Requests routed to them are converted without it.
+    pub cache_breakpoint_unsupported: Arc<Mutex<HashSet<String>>>,
 }
 
 pub type AppRouter = Router;
@@ -500,6 +503,7 @@ pub async fn test_state() -> AppState {
         model_cache: Arc::new(Mutex::new(HashMap::new())),
         aggregate_cache: Arc::new(Mutex::new(HashMap::new())),
         sessions: Arc::new(Mutex::new(HashMap::new())),
+        cache_breakpoint_unsupported: Arc::new(Mutex::new(HashSet::new())),
     }
 }
 
@@ -560,6 +564,25 @@ impl AppState {
     }
     pub fn clear_auth_cache(&self) {
         self.auth_cache.lock().unwrap().clear();
+    }
+
+    /// Whether the `prompt_cache_breakpoint` marker may still be sent to this
+    /// provider. Once an upstream rejects it, we stop tagging parts for it.
+    pub fn cache_breakpoint_ok(&self, provider_id: &str) -> bool {
+        !self
+            .cache_breakpoint_unsupported
+            .lock()
+            .unwrap()
+            .contains(provider_id)
+    }
+
+    /// Record that this provider rejected the `prompt_cache_breakpoint` marker;
+    /// future requests routed to it are converted without it.
+    pub fn note_cache_breakpoint_unsupported(&self, provider_id: &str) {
+        self.cache_breakpoint_unsupported
+            .lock()
+            .unwrap()
+            .insert(provider_id.to_string());
     }
 }
 

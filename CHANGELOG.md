@@ -224,6 +224,23 @@
 
 ### Added
 
+- **按别名配置首字节超时（`first_byte_timeout_secs`）**。2026-10-10 实测 ninfer
+  `qwen3.8-27b` 的 421KB 冷前缀非流式请求需要 **109–139s** 才能出首字节，远超默认
+  30s 超时。后果不是「慢」而是**死循环**：经 llmux → 30s 砍断 → prefill 未完成 →
+  前缀缓存永不写入 → 客户端重试 → 仍冷 → 再次 30s 超时 → 无限重试。直连 ninfer
+  无超时，109s 跑完并写入缓存，之后 6s 返回。
+
+  - 迁移 `0029` 给 `model_aliases` 加 `first_byte_timeout_secs INTEGER`（NULL = 默认 30s）。
+  - 别名解析（`dispatcher.rs`）读取该字段并传入 `ModelResolution`。
+  - OpenAI / Anthropic / Gemini 三条路径在构建 `ProviderRequest` 时读取该字段。
+  - `ProviderRequest.first_byte_timeout_secs` 覆盖默认值；NULL 回退 30s。
+  - API `/api/models/aliases` 接受并校验该字段（1–600 整数或 null）。
+  - UI 别名编辑表单新增「首字节超时（秒）」输入框，别名列表显示超时角标。
+  - 导出 / 导入包含该字段。
+
+  ⚠️ **只影响非流式请求**。流式请求（`stream: true`）不受首字节超时约束，ninfer
+  边 prefill 边出 token，421KB 冷前缀流式 ttft 仅 2.1s。
+
 - **用量统计 / 请求日志 / 仪表盘活动流支持「按网关密钥筛选」**。此前三个页面都只能
   按时间窗聚合，维度是模型 / 账号 / 厂商 —— 因为 `usage_logs` 表压根没记「这条请求
   是用哪把密钥进来的」：鉴权中间件 `WHERE key = ?` 查出的 `AuthContext` 只有

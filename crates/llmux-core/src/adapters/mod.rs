@@ -74,7 +74,7 @@ fn bound_first_byte_timeout(body: &Value) -> bool {
 pub async fn execute_provider_request(
     request: &ProviderRequest,
 ) -> anyhow::Result<reqwest::Response> {
-    execute_provider_request_with(request, Duration::from_secs(FIRST_BYTE_TIMEOUT_SECS)).await
+    execute_provider_request_with(request, Duration::from_secs(request.first_byte_timeout_secs.unwrap_or(FIRST_BYTE_TIMEOUT_SECS))).await
 }
 
 /// 真正的实现。`first_byte_timeout` 只在 `#[cfg(test)]` 下被调小，生产永远走上面的
@@ -341,6 +341,9 @@ pub struct ProviderRequest {
     /// `ProviderRequest`，单独返回的句柄会在函数边界被丢掉。
     #[serde(skip)]
     pub max_tokens: crate::max_tokens::MaxTokensNote,
+    /// Optional alias-specific first-byte timeout; streaming bodies remain unbounded.
+    #[serde(skip)]
+    pub first_byte_timeout_secs: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -381,6 +384,7 @@ pub fn build_openai_passthrough(
         body: chat_request_to_value(request),
         effort: Default::default(),
         max_tokens: Default::default(),
+        first_byte_timeout_secs: None,
     }
 }
 
@@ -453,6 +457,7 @@ pub fn build_passthrough_with_beta(
         body,
         effort,
         max_tokens,
+        first_byte_timeout_secs: None,
     }
 }
 
@@ -692,6 +697,7 @@ mod first_byte_timeout_tests {
             body,
             effort: Default::default(),
             max_tokens: Default::default(),
+            first_byte_timeout_secs: None,
         }
     }
 

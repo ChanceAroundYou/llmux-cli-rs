@@ -758,6 +758,7 @@ fn model_structs_preserve_legacy_field_names() {
         account_ids: None,
         preferred_account_id: None,
         upstream_api: None,
+        first_byte_timeout_secs: None,
     };
     let key = ApiKey {
         id: Some(1),

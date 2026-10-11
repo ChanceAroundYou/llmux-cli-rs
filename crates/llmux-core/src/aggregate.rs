@@ -20,6 +20,7 @@ pub struct AggregateAliasRow {
     pub candidates: String,
     pub interval_secs: Option<i64>,
     pub upstream_api: Option<String>,
+    pub first_byte_timeout_secs: Option<i64>,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
 }
@@ -50,6 +51,7 @@ pub struct AggregateResolution {
     pub candidates: Vec<AggregateCandidate>,
     pub active: usize,
     pub upstream_api: crate::upstream_api::UpstreamApi,
+    pub first_byte_timeout_secs: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -294,7 +296,7 @@ async fn find_aggregate_row(
     alias: &str,
 ) -> anyhow::Result<Option<AggregateAliasRow>> {
     Ok(sqlx::query_as::<_, AggregateAliasRow>(
-        "SELECT id, alias, candidates, interval_secs, upstream_api, created_at, updated_at FROM aggregate_aliases WHERE alias = ?",
+        "SELECT id, alias, candidates, interval_secs, upstream_api, first_byte_timeout_secs, created_at, updated_at FROM aggregate_aliases WHERE alias = ?",
     )
     .bind(alias)
     .fetch_optional(pool)
@@ -339,6 +341,7 @@ pub async fn resolve_aggregate(
         candidates,
         active,
         upstream_api,
+        first_byte_timeout_secs: row.first_byte_timeout_secs.and_then(|v| u64::try_from(v).ok()),
     }))
 }
 

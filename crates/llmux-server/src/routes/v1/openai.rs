@@ -24,7 +24,7 @@ use llmux_core::protocol::{target_protocol, default_protocol_for, DownstreamMode
 use llmux_core::proxy::openai_anthropic::{
     anthropic_to_openai_response, is_unsupported_api_for_model, AnthropicSseConverter,
 };
-use llmux_core::proxy::anthropic_openai::{cache_usage_from_openai, openai_to_anthropic_response, anthropic_to_openai_request};
+use llmux_core::proxy::anthropic_openai::{cache_usage_from_openai, openai_to_anthropic_response, anthropic_to_openai_request, anthropic_to_openai_request_with};
 use llmux_core::proxy::responses::{
     anthropic_to_responses, anthropic_resp_to_responses_resp, chat_resp_to_responses_resp,
     chat_to_responses, responses_to_anthropic, responses_to_chat, responses_req_to_anthropic_req,
@@ -218,15 +218,18 @@ pub(crate) async fn dispatch_with_conversion(
             ResponsesFromChat,
             ResponsesFromMessages,
         }
-        let (forward_body, back) = match (ingress, target) {
-            (Protocol::Chat, Protocol::Responses) => (Ok(chat_to_responses(&patched, &model_name)), Back::ChatFromResponses),
-            (Protocol::Chat, Protocol::Messages) => (anthropic_to_openai_request(&patched, &model_name).map_err(|e| e.to_string()), Back::ChatFromMessages),
-            (Protocol::Messages, Protocol::Responses) => (Ok(anthropic_to_responses(&patched, &model_name)), Back::MessagesFromResponses),
-            (Protocol::Messages, Protocol::Chat) => (anthropic_to_openai_request(&patched, &model_name).map_err(|e| e.to_string()), Back::MessagesFromChat),
-            (Protocol::Responses, Protocol::Chat) => (Ok(responses_req_to_chat_req(&patched)), Back::ResponsesFromChat),
-            (Protocol::Responses, Protocol::Messages) => (Ok(responses_req_to_anthropic_req(&patched, &model_name)), Back::ResponsesFromMessages),
-            (a, b) if a == b => (Ok(patched.clone()), Back::Passthrough),
-            _ => unreachable!(),
+        let (forward_body, back) = {
+            let add_bp = state.cache_breakpoint_ok(&account.provider_id);
+            match (ingress, target) {
+                (Protocol::Chat, Protocol::Responses) => (Ok(chat_to_responses(&patched, &model_name)), Back::ChatFromResponses),
+                (Protocol::Chat, Protocol::Messages) => (anthropic_to_openai_request_with(&patched, &model_name, add_bp).map_err(|e| e.to_string()), Back::ChatFromMessages),
+                (Protocol::Messages, Protocol::Responses) => (Ok(anthropic_to_responses(&patched, &model_name)), Back::MessagesFromResponses),
+                (Protocol::Messages, Protocol::Chat) => (anthropic_to_openai_request_with(&patched, &model_name, add_bp).map_err(|e| e.to_string()), Back::MessagesFromChat),
+                (Protocol::Responses, Protocol::Chat) => (Ok(responses_req_to_chat_req(&patched)), Back::ResponsesFromChat),
+                (Protocol::Responses, Protocol::Messages) => (Ok(responses_req_to_anthropic_req(&patched, &model_name)), Back::ResponsesFromMessages),
+                (a, b) if a == b => (Ok(patched.clone()), Back::Passthrough),
+                _ => unreachable!(),
+            }
         };
         let forward_body = match forward_body {
             Ok(b) => b,
@@ -239,7 +242,8 @@ pub(crate) async fn dispatch_with_conversion(
 
         // Build the provider request for the target protocol, preserving the
         // existing base_url / anthropic_base_url transport (read-only).
-        let provider_request = build_target_request(account, target, &forward_body, &anthropic_beta);
+        let mut provider_request = build_target_request(account, target, &forward_body, &anthropic_beta);
+        provider_request.first_byte_timeout_secs = res.first_byte_timeout_secs;
         let log_url = provider_request.url.clone();
         tracing::info!("⚡ {} → {} → {} [ingress={:?} target={:?}]", account.alias, model_name, log_url, ingress, target);
         if let Some(tx) = &state.tui_tx {
@@ -269,6 +273,11 @@ pub(crate) async fn dispatch_with_conversion(
             // 同一处回错顺便学 max_tokens 上限：客户端发 65536、上游只收
             // 32768 时整轮 400，不学会就会一直白打（见 max_tokens 模块注释）。
             provider_request.max_tokens.record_rejection(&error_body);
+            // 上游拒了 prompt_cache_breakpoint → 记下来，后续不再发。
+            if error_body.contains("prompt_cache_breakpoint") || error_body.contains("cache_breakpoint") {
+                state.note_cache_breakpoint_unsupported(&account.provider_id);
+                tracing::info!("🚫 {} rejected prompt_cache_breakpoint — will not send again", account.alias);
+            }
             // 上游拒了这个档位 → 记下来，后续请求不再重复失败。
             // 没有这一步，请求前解析只生效一次，整个机制等于空操作。
 
@@ -284,20 +293,23 @@ pub(crate) async fn dispatch_with_conversion(
                     // Reverse-convert the original ingress body to the fallback protocol and
                     // re-enter the main v1 dispatcher (ingress-aware, headers preserved via
                     // dispatch_with_conversion's own auth handling — pass original headers).
-                    let fallback_body = match (ingress, fallback) {
-                        (Protocol::Chat, Protocol::Chat) => patched.clone(),
-                        (Protocol::Chat, Protocol::Messages) => match anthropic_to_openai_request(&patched, &model_name) {
-                            Ok(b) => b, Err(_) => patched.clone(),
-                        },
-                        (Protocol::Messages, Protocol::Messages) => patched.clone(),
-                        (Protocol::Messages, Protocol::Chat) => match llmux_core::proxy::anthropic_openai::anthropic_to_openai_request(&patched, &model_name) {
-                            Ok(b) => b, Err(_) => patched.clone(),
-                        },
-                        (Protocol::Messages, Protocol::Responses) => match llmux_core::proxy::responses::anthropic_to_responses(&patched, &model_name) { b => b },
-                        (Protocol::Chat, Protocol::Responses) => match llmux_core::proxy::responses::chat_to_responses(&patched, &model_name) { b => b },
-                        (Protocol::Responses, Protocol::Chat) => llmux_core::proxy::responses::responses_req_to_chat_req(&patched),
-                        (Protocol::Responses, Protocol::Messages) => llmux_core::proxy::responses::responses_req_to_anthropic_req(&patched, &model_name),
-                        _ => patched.clone(),
+                    let fallback_body = {
+                        let add_bp = state.cache_breakpoint_ok(&account.provider_id);
+                        match (ingress, fallback) {
+                            (Protocol::Chat, Protocol::Chat) => patched.clone(),
+                            (Protocol::Chat, Protocol::Messages) => match anthropic_to_openai_request_with(&patched, &model_name, add_bp) {
+                                Ok(b) => b, Err(_) => patched.clone(),
+                            },
+                            (Protocol::Messages, Protocol::Messages) => patched.clone(),
+                            (Protocol::Messages, Protocol::Chat) => match llmux_core::proxy::anthropic_openai::anthropic_to_openai_request_with(&patched, &model_name, add_bp) {
+                                Ok(b) => b, Err(_) => patched.clone(),
+                            },
+                            (Protocol::Messages, Protocol::Responses) => match llmux_core::proxy::responses::anthropic_to_responses(&patched, &model_name) { b => b },
+                            (Protocol::Chat, Protocol::Responses) => match llmux_core::proxy::responses::chat_to_responses(&patched, &model_name) { b => b },
+                            (Protocol::Responses, Protocol::Chat) => llmux_core::proxy::responses::responses_req_to_chat_req(&patched),
+                            (Protocol::Responses, Protocol::Messages) => llmux_core::proxy::responses::responses_req_to_anthropic_req(&patched, &model_name),
+                            _ => patched.clone(),
+                        }
                     };
                     let endpoint = match fallback {
                         Protocol::Chat => "chat/completions",
@@ -595,7 +607,8 @@ pub(crate) async fn dispatch_aggregate_with_conversion(
             Protocol::Messages => anthropic_to_responses(&body, &cand.model),
             _ => unreachable!(),
         };
-        let provider_request = build_target_request(&account, Protocol::Responses, &translated, &None);
+        let mut provider_request = build_target_request(&account, Protocol::Responses, &translated, &None);
+        provider_request.first_byte_timeout_secs = agg.first_byte_timeout_secs;
         tracing::info!("🔀 [agg:{} V={}] {} → {} → {} [{:?}→responses]", alias, active, account.alias, cand.model, provider_request.url, ingress);
         let response = match execute_provider_request(&provider_request).await {
             Ok(r) => r,
@@ -1004,6 +1017,7 @@ async fn openai_dispatch(
             body: forward_body,
             effort,
             max_tokens,
+            first_byte_timeout_secs: model_resolution.first_byte_timeout_secs,
         };
 
         tracing::info!(
@@ -1106,7 +1120,7 @@ async fn openai_dispatch(
                     account,
                     &model_resolution.target_model,
                     streaming,
-                    state.pool.clone(),
+                    &state,
                     start,
                 )
                 .await
@@ -1367,7 +1381,7 @@ async fn dispatch_aggregate_openai(
             proto,
         );
         let max_tokens = llmux_core::max_tokens::clamp_max_tokens(&mut agg_body, &account.provider_id, &cand.model);
-        let provider_request = ProviderRequest { method: "POST".to_string(), url: format!("{base_url}/{endpoint}"), headers: req_headers, body: agg_body, effort, max_tokens };
+        let provider_request = ProviderRequest { method: "POST".to_string(), url: format!("{base_url}/{endpoint}"), headers: req_headers, body: agg_body, effort, max_tokens, first_byte_timeout_secs: agg.first_byte_timeout_secs };
 
         tracing::info!("🔀 [agg:{} V={}] {} → {} → {}/{}", alias, active, account.alias, cand.model, base_url, endpoint);
         if let Some(tx) = &state.tui_tx {
@@ -1423,7 +1437,7 @@ async fn dispatch_aggregate_openai(
             }
             if endpoint == "chat/completions" && is_unsupported_api_for_model(&error_body) && llmux_core::protocol::endpoint_for(&account, llmux_core::protocol::Protocol::Messages).is_some() {
                 tracing::info!("↩️ [agg:{}] {} rejected /chat/completions — retrying via /v1/messages", alias, account.alias);
-                if let Some(resp) = anthropic_fallback_response(&patched_body, &account, &cand.model, streaming, state.pool.clone(), start).await {
+                if let Some(resp) = anthropic_fallback_response(&patched_body, &account, &cand.model, streaming, &state, start).await {
                     state.aggregate_router.lock().unwrap().record_request_outcome(&alias, i, len);
                     send_tui_request(&state.tui_tx, normalized_uri.path(), 200, start, &cand.model);
                     return resp;
@@ -1583,6 +1597,7 @@ struct StreamAccounting {
     last_finish: Option<String>,
     last_usage: Option<Value>,
     ttft_ms: Option<i64>,
+    generated_content: bool,
     /// Set once a `finish_reason: "tool_calls"` event has gone upstream, so a
     /// second one on an empty delta is recognised as a redundant terminator.
     saw_tool_call_finish: bool,
@@ -1653,6 +1668,9 @@ fn observe_event(event_text: &str, acc: &mut StreamAccounting) {
         if u.is_object() {
             acc.last_usage = Some(u.clone());
         }
+    }
+    if llmux_core::streaming::event_has_generated_content(&parsed) {
+        acc.generated_content = true;
     }
     let Some(choice) = parsed
         .get("choices")
@@ -1772,7 +1790,7 @@ async fn openai_streaming_passthrough(
                         // returning the forwarding decision.
                         if observe_and_should_forward(&event_text, &mut acc) {
                             if tx.send(Ok(Bytes::from(event_text.into_bytes()))).await.is_ok() {
-                                if acc.ttft_ms.is_none() {
+                                if acc.ttft_ms.is_none() && acc.generated_content {
                                     acc.ttft_ms = Some(start.elapsed().as_millis() as i64);
                                 }
                             } else {
@@ -2227,14 +2245,15 @@ async fn anthropic_fallback_response(
     account: &adapters::Account,
     model: &str,
     streaming: bool,
-    pool: sqlx::SqlitePool,
+    state: &AppState,
     start: Instant,
 ) -> Option<Response> {
     // Resolved Messages endpoint (messages_endpoint → anthropic_base_url).
     let anthropic_base =
         llmux_core::protocol::endpoint_for(account, llmux_core::protocol::Protocol::Messages)?;
 
-    let mut anthropic_body = match llmux_core::proxy::anthropic_openai::anthropic_to_openai_request(openai_body, model) {
+    let add_bp = state.cache_breakpoint_ok(&account.provider_id);
+    let mut anthropic_body = match llmux_core::proxy::anthropic_openai::anthropic_to_openai_request_with(openai_body, model, add_bp) {
         Ok(b) => b,
         Err(e) => {
             tracing::warn!("↩️ OpenAI→Anthropic conversion failed: {e}");
@@ -2261,6 +2280,7 @@ async fn anthropic_fallback_response(
         // 目标是 Anthropic Messages，没有 reasoning_effort 枚举。
         effort: Default::default(),
         max_tokens,
+        first_byte_timeout_secs: None,
     };
 
     let response = match execute_provider_request(&provider_request).await {
@@ -2280,7 +2300,7 @@ async fn anthropic_fallback_response(
     }
 
     if streaming {
-        Some(anthropic_fallback_streaming(response, model, account, pool, start, Some(openai_body.to_string())).await)
+        Some(anthropic_fallback_streaming(response, model, account, state.pool.clone(), start, Some(openai_body.to_string())).await)
     } else {
         let bytes = match response.bytes().await {
             Ok(b) => b,
@@ -2299,7 +2319,7 @@ async fn anthropic_fallback_response(
         let openai_resp = anthropic_to_openai_response(&data, model);
         let usage = &data["usage"];
         spawn_log_usage(
-            pool.clone(),
+            state.pool.clone(),
             (*account).clone(),
             model.to_string(),
             account.provider_id.clone(),

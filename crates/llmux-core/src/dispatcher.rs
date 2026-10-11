@@ -15,6 +15,7 @@ pub struct ModelResolution {
     pub preferred_account_id: Option<i64>,
     pub alias_name: Option<String>,
     pub upstream_api: crate::upstream_api::UpstreamApi,
+    pub first_byte_timeout_secs: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -289,6 +290,7 @@ pub fn resolve_model_by_prefix(model_name: &str) -> ModelResolution {
         preferred_account_id: None,
         alias_name: None,
         upstream_api: Default::default(),
+        first_byte_timeout_secs: None,
     }
 }
 
@@ -305,7 +307,7 @@ pub fn strip_client_prefix(name: &str) -> Option<&str> {
     (!rest.is_empty()).then_some(rest)
 }
 
-const ALIAS_LOOKUP_SQL: &str = "SELECT id, alias, target_model, provider_id, account_ids, preferred_account_id, upstream_api FROM model_aliases WHERE alias = ?";
+const ALIAS_LOOKUP_SQL: &str = "SELECT id, alias, target_model, provider_id, account_ids, preferred_account_id, upstream_api, first_byte_timeout_secs FROM model_aliases WHERE alias = ?";
 
 /// 先按原名精确匹配别名表，查不到且名字带 discovery 前缀时再去掉前缀查一次。
 /// 精确匹配优先，所以真有个叫 `claude-xxx` 的别名时不会被前缀还原抢走。
@@ -352,6 +354,7 @@ pub async fn resolve_model(pool: &SqlitePool, model_name: &str) -> anyhow::Resul
                 preferred_account_id: alias.preferred_account_id,
                 alias_name,
                 upstream_api,
+                first_byte_timeout_secs: alias.first_byte_timeout_secs.and_then(|v| u64::try_from(v).ok()),
             });
         }
 
@@ -363,6 +366,7 @@ pub async fn resolve_model(pool: &SqlitePool, model_name: &str) -> anyhow::Resul
                 preferred_account_id: alias.preferred_account_id,
                 alias_name,
                 upstream_api,
+                first_byte_timeout_secs: alias.first_byte_timeout_secs.and_then(|v| u64::try_from(v).ok()),
             });
         }
 

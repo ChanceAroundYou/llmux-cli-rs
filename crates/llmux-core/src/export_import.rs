@@ -25,6 +25,8 @@ pub struct ExportAlias {
     pub account_ids: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preferred_account_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_byte_timeout_secs: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -74,18 +76,19 @@ pub async fn export_config(pool: &SqlitePool, encryption_secret: &str) -> Result
         });
     }
 
-    let aliases = sqlx::query_as::<_, (String, String, Option<String>, Option<String>, Option<i64>)>(
-        "SELECT alias, target_model, provider_id, account_ids, preferred_account_id, upstream_api FROM model_aliases ORDER BY id",
+    let aliases = sqlx::query_as::<_, (String, String, Option<String>, Option<String>, Option<i64>, Option<i64>)>(
+        "SELECT alias, target_model, provider_id, account_ids, preferred_account_id, first_byte_timeout_secs FROM model_aliases ORDER BY id",
     )
     .fetch_all(pool)
     .await?
     .into_iter()
-    .map(|(alias, target_model, provider_id, account_ids, preferred_account_id)| ExportAlias {
+        .map(|(alias, target_model, provider_id, account_ids, preferred_account_id, first_byte_timeout_secs)| ExportAlias {
         alias,
         target_model,
         provider_id,
         account_ids,
         preferred_account_id,
+        first_byte_timeout_secs,
     })
     .collect();
 
@@ -147,14 +150,15 @@ pub async fn import_config(
 
     for alias in &config.aliases {
         sqlx::query(
-            "INSERT OR REPLACE INTO model_aliases (alias, target_model, provider_id, account_ids, preferred_account_id)
-             VALUES (?, ?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO model_aliases (alias, target_model, provider_id, account_ids, preferred_account_id, first_byte_timeout_secs)
+             VALUES (?, ?, ?, ?, ?, ?)",
         )
         .bind(&alias.alias)
         .bind(&alias.target_model)
         .bind(&alias.provider_id)
         .bind(&alias.account_ids)
         .bind(&alias.preferred_account_id)
+        .bind(&alias.first_byte_timeout_secs)
         .execute(&mut *tx)
         .await?;
     }

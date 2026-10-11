@@ -168,6 +168,7 @@ async fn start(port_override: Option<u16>, use_tui: bool) -> anyhow::Result<()> 
         model_cache,
         aggregate_cache,
         sessions,
+        cache_breakpoint_unsupported: Arc::new(Mutex::new(std::collections::HashSet::new())),
         tui_tx,
     };
     // Spawn aggregate background probe (5 min, V-anchored, 3-confirm)

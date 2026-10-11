@@ -12,7 +12,7 @@ use crate::app::AppState;
 
 pub async fn get_model_aliases(Extension(state): Extension<AppState>) -> Response {
     match sqlx::query_as::<_, ModelAlias>(
-        "SELECT id, alias, target_model, provider_id, account_ids, preferred_account_id, upstream_api FROM model_aliases ORDER BY id",
+        "SELECT id, alias, target_model, provider_id, account_ids, preferred_account_id, upstream_api, first_byte_timeout_secs FROM model_aliases ORDER BY id",
     )
     .fetch_all(&state.pool)
     .await
@@ -82,13 +82,20 @@ pub async fn set_model_alias(
         .get("preferred_account_id")
         .and_then(|v| v.as_i64());
     let upstream_api = llmux_core::protocol::DownstreamMode::from_str(body.get("upstream_api").and_then(Value::as_str).unwrap_or("default")).as_str().to_string();
+    let first_byte_timeout_secs = match body.get("first_byte_timeout_secs") {
+        None | Some(Value::Null) => None,
+        Some(value) => match value.as_i64() {
+            Some(seconds) if (1..=600).contains(&seconds) => Some(seconds),
+            _ => return crate::error::simple_error("first_byte_timeout_secs must be an integer from 1 to 600, or null", StatusCode::BAD_REQUEST),
+        },
+    };
 
     // Forced protocols no longer reject unsupported bound accounts (2026-08):
     // the UI warns and the runtime skips unsupported accounts (supports guard in
     // dispatch_with_conversion).
 
     match sqlx::query(
-        "INSERT OR REPLACE INTO model_aliases (alias, target_model, provider_id, account_ids, preferred_account_id, upstream_api) VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT OR REPLACE INTO model_aliases (alias, target_model, provider_id, account_ids, preferred_account_id, upstream_api, first_byte_timeout_secs) VALUES (?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&alias)
     .bind(&target_model)
@@ -96,6 +103,7 @@ pub async fn set_model_alias(
     .bind(&account_ids)
     .bind(preferred_account_id)
     .bind(&upstream_api)
+    .bind(first_byte_timeout_secs)
     .execute(&state.pool)
     .await
     {
@@ -132,7 +140,7 @@ pub async fn delete_model_alias(
     Path(id): Path<String>,
 ) -> Response {
     let alias_row = match sqlx::query_as::<_, ModelAlias>(
-        "SELECT id, alias, target_model, provider_id, account_ids, preferred_account_id, upstream_api FROM model_aliases WHERE id = ?",
+        "SELECT id, alias, target_model, provider_id, account_ids, preferred_account_id, upstream_api, first_byte_timeout_secs FROM model_aliases WHERE id = ?",
     )
     .bind(&id)
     .fetch_optional(&state.pool)

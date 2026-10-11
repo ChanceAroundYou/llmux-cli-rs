@@ -416,7 +416,10 @@
     },
     "downstreamHintValidate": "Every candidate is validated when switching modes.",
     "accountUnsupportedMode": "Account does not support the \"{{mode}}\" routing mode. Pick another account or switch modes.",
-    "downstreamUnsupportedBadge": "unsupported: {{mode}}"
+    "downstreamUnsupportedBadge": "unsupported: {{mode}}",
+    "firstByteTimeout": "First-byte timeout (seconds)",
+    "firstByteTimeoutHint": "Optional; blank uses the 30-second default. Maximum 600 seconds.",
+    "firstByteTimeoutPlaceholder": "Default (30 seconds)"
   },
   "auth": {
     "webLogin": "Web Session Login",

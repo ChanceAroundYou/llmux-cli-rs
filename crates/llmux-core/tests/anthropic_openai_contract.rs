@@ -39,7 +39,9 @@ fn request_converts_system_and_text_message() {
 }
 
 #[test]
-fn request_flattens_single_text_block_to_string() {
+fn request_keeps_single_text_block_as_array_for_its_marker() {
+    // A lone text block stays an array: the shared-prefix marker lives on the
+    // part, so flattening to a bare string would drop it.
     let req = anthropic_to_openai_request(
         &json!({
             "model": "m",
@@ -49,7 +51,10 @@ fn request_flattens_single_text_block_to_string() {
     )
     .unwrap();
 
-    assert_eq!(req["messages"][0]["content"], "hi");
+    assert_eq!(
+        req["messages"][0]["content"],
+        json!([{"type": "text", "text": "hi", "prompt_cache_breakpoint": {"mode": "explicit"}}])
+    );
 }
 
 #[test]
@@ -122,7 +127,7 @@ fn request_converts_tool_use_and_tool_result() {
 
     let assistant = &req["messages"][0];
     assert_eq!(assistant["role"], "assistant");
-    assert_eq!(assistant["content"], "let me check");
+    assert_eq!(assistant["content"][0]["text"], "let me check");
     assert_eq!(assistant["tool_calls"][0]["id"], "toolu_1");
     assert_eq!(assistant["tool_calls"][0]["type"], "function");
     assert_eq!(assistant["tool_calls"][0]["function"]["name"], "get_weather");
@@ -136,6 +141,95 @@ fn request_converts_tool_use_and_tool_result() {
     assert_eq!(tool_msg["tool_call_id"], "toolu_1");
     assert_eq!(tool_msg["content"], "sunny");
     assert_eq!(tool_msg["is_error"], false);
+}
+
+#[test]
+fn request_moves_inline_system_message_to_the_front() {
+    // Some OpenAI-style clients put a system turn inline (here after a user
+    // turn). Qwen/DashScope reject a system message that is not first.
+    let req = anthropic_to_openai_request(
+        &json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": "Be terse."},
+                {"role": "user", "content": "again"}
+            ]
+        }),
+        "t",
+    )
+    .unwrap();
+
+    assert_eq!(req["messages"][0]["role"], "system");
+    assert_eq!(req["messages"][0]["content"], "Be terse.");
+    assert_eq!(req["messages"][1]["content"], "hi");
+    assert_eq!(req["messages"][2]["content"], "again");
+    // Exactly one system message, and nothing after the first slot.
+    let systems = req["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["role"] == "system")
+        .count();
+    assert_eq!(systems, 1);
+}
+
+#[test]
+fn request_merges_top_level_and_inline_system_into_one_leading_message() {
+    let req = anthropic_to_openai_request(
+        &json!({
+            "model": "m",
+            "system": "Top level.",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": "Inline."}
+            ]
+        }),
+        "t",
+    )
+    .unwrap();
+
+    let msgs = req["messages"].as_array().unwrap();
+    // Single merged system message, then the user turn — no separate system.
+    assert_eq!(msgs.len(), 2);
+    assert_eq!(msgs[0]["role"], "system");
+    assert_eq!(msgs[0]["content"][0]["text"], "Top level.");
+    assert_eq!(msgs[0]["content"][1]["text"], "Inline.");
+    assert_eq!(msgs[1]["role"], "user");
+    assert_eq!(msgs[1]["content"], "hi");
+}
+
+#[test]
+fn request_preserves_non_system_order_and_tool_pairing() {
+    let req = anthropic_to_openai_request(
+        &json!({
+            "model": "m",
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": "sunny"}
+                ]},
+                {"role": "system", "content": "late system"},
+                {"role": "user", "content": "next"}
+            ]
+        }),
+        "t",
+    )
+    .unwrap();
+
+    let msgs = req["messages"].as_array().unwrap();
+    assert_eq!(msgs[0]["role"], "system");
+    assert_eq!(msgs[0]["content"], "late system");
+    // Non-system order is untouched: the assistant tool_calls stays adjacent to
+    // the tool result that references it, then the trailing user turn.
+    assert_eq!(msgs[1]["role"], "assistant");
+    assert_eq!(msgs[1]["tool_calls"][0]["id"], "toolu_1");
+    assert_eq!(msgs[2]["role"], "tool");
+    assert_eq!(msgs[2]["tool_call_id"], "toolu_1");
+    assert_eq!(msgs[3]["role"], "user");
+    assert_eq!(msgs[3]["content"], "next");
 }
 
 #[test]
@@ -156,7 +250,7 @@ fn request_maps_thinking_block_to_reasoning_fields() {
     .unwrap();
 
     let msg = &req["messages"][0];
-    assert_eq!(msg["content"], "answer");
+    assert_eq!(msg["content"][0]["text"], "answer");
     assert_eq!(msg["reasoning_content"], "hmm");
     assert_eq!(msg["reasoning_signature"], "sig1");
 }

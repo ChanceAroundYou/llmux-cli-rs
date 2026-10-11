@@ -104,7 +104,7 @@ export default function Models() {
   // 目标下拉可能上百项 —— 输入筛选缩小选项，不重造组件
   const [targetFilter, setTargetFilter] = useState('');
   const [targetOpen, setTargetOpen] = useState(false);
-  const [aliasForm, setAliasForm] = useState({ alias: '', target: '', provider: '', selectedAccountIds: [] as number[], preferredAccountId: null as number | null, downstreamMode: 'chat' as string });
+  const [aliasForm, setAliasForm] = useState({ alias: '', target: '', provider: '', selectedAccountIds: [] as number[], preferredAccountId: null as number | null, downstreamMode: 'chat' as string, firstByteTimeoutSecs: null as number | null });
   // 提交时若强制模式选中了不支持的账户，提示并高亮
   const [aliasModeNotice, setAliasModeNotice] = useState<string | null>(null);
   // 测速/健康按账户隔离：key = accountId:modelId（避免同名模型互串）
@@ -143,7 +143,7 @@ export default function Models() {
   const [editingAliasId, setEditingAliasId] = useState<number | null>(null);
   const [isAggregateModalOpen, setIsAggregateModalOpen] = useState(false);
   const [editingAggregateId, setEditingAggregateId] = useState<number | null>(null);
-  const [aggregateForm, setAggregateForm] = useState<{ alias: string; downstreamMode: string; candidates: { account_id: number | ''; model: string }[] }>({ alias: '', downstreamMode: 'chat', candidates: [{ account_id: '', model: '' }] });
+  const [aggregateForm, setAggregateForm] = useState<{ alias: string; downstreamMode: string; candidates: { account_id: number | ''; model: string }[]; firstByteTimeoutSecs: number | '' }>({ alias: '', downstreamMode: 'chat', candidates: [{ account_id: '', model: '' }], firstByteTimeoutSecs: '' });
 
   const handleTest = async (modelId: string, providerId: string, accountId?: number) => {
     let resolvedAccountId = accountId ?? null;
@@ -407,12 +407,13 @@ export default function Models() {
         aliasForm.selectedAccountIds.length > 0 ? aliasForm.selectedAccountIds : undefined,
         aliasForm.preferredAccountId ?? undefined,
         undefined,
-        aliasForm.downstreamMode || 'default'
+        aliasForm.downstreamMode || 'default',
+        aliasForm.firstByteTimeoutSecs
       );
       showBgVerifyHint();
       setIsModalOpen(false);
       setEditingAliasId(null);
-      setAliasForm({ alias: '', target: '', provider: '', selectedAccountIds: [], preferredAccountId: null, downstreamMode: 'default' });
+      setAliasForm({ alias: '', target: '', provider: '', selectedAccountIds: [], preferredAccountId: null, downstreamMode: 'default', firstByteTimeoutSecs: null });
     } catch (err: any) {
       if (err?.status === 409 && err?.conflict === 'aggregate') {
         setOverwriteConfirm({ kind: 'aggregate', alias: aliasForm.alias, pending: { target: aliasForm.target, provider: aliasForm.provider, selectedAccountIds: aliasForm.selectedAccountIds, preferredAccountId: aliasForm.preferredAccountId, downstreamMode: aliasForm.downstreamMode } });
@@ -431,16 +432,16 @@ export default function Models() {
     setIsModalOpen(false);
     setEditingAliasId(null);
     setAliasModeNotice(null);
-    setAliasForm({ alias: '', target: '', provider: '', selectedAccountIds: [], preferredAccountId: null, downstreamMode: 'default' });
+    setAliasForm({ alias: '', target: '', provider: '', selectedAccountIds: [], preferredAccountId: null, downstreamMode: 'default', firstByteTimeoutSecs: null });
   };
 
   const openAggregateModal = (agg?: any) => {
     if (agg) {
       setEditingAggregateId(agg.id);
-      setAggregateForm({ alias: agg.alias, downstreamMode: normalizeMode((agg as any).upstream_api), candidates: agg.candidates.map((c: any) => ({ account_id: c.account_id, model: c.model })) });
+      setAggregateForm({ alias: agg.alias, downstreamMode: normalizeMode((agg as any).upstream_api), candidates: agg.candidates.map((c: any) => ({ account_id: c.account_id, model: c.model })), firstByteTimeoutSecs: (agg as any).first_byte_timeout_secs ?? '' });
     } else {
       setEditingAggregateId(null);
-      setAggregateForm({ alias: '', downstreamMode: 'default', candidates: [{ account_id: '', model: '' }] });
+      setAggregateForm({ alias: '', downstreamMode: 'default', candidates: [{ account_id: '', model: '' }], firstByteTimeoutSecs: '' });
     }
     setIsAggregateModalOpen(true);
   };
@@ -448,7 +449,7 @@ export default function Models() {
   const closeAggregateModal = () => {
     setIsAggregateModalOpen(false);
     setEditingAggregateId(null);
-    setAggregateForm({ alias: '', downstreamMode: 'default', candidates: [{ account_id: '', model: '' }] });
+    setAggregateForm({ alias: '', downstreamMode: 'default', candidates: [{ account_id: '', model: '' }], firstByteTimeoutSecs: '' });
   };
 
   const handleSaveAggregate = async (e: React.FormEvent) => {
@@ -465,7 +466,8 @@ export default function Models() {
       }
     }
     try {
-      await saveAggregateAlias(aggregateForm.alias.trim(), candidates, undefined, undefined, aggregateForm.downstreamMode || 'default');
+      const timeout = aggregateForm.firstByteTimeoutSecs === '' ? null : Number(aggregateForm.firstByteTimeoutSecs);
+      await saveAggregateAlias(aggregateForm.alias.trim(), candidates, undefined, undefined, aggregateForm.downstreamMode || 'default', timeout);
       showBgVerifyHint();
       closeAggregateModal();
     } catch (err: any) {
@@ -529,7 +531,7 @@ export default function Models() {
             <Button
               variant="outline"
               size="sm"
-              onClick={() => { setEditingAliasId(null); setAliasForm({ alias: '', target: '', provider: '', selectedAccountIds: [], preferredAccountId: null, downstreamMode: 'default' }); setIsModalOpen(true); }}
+              onClick={() => { setEditingAliasId(null); setAliasForm({ alias: '', target: '', provider: '', selectedAccountIds: [], preferredAccountId: null, downstreamMode: 'default', firstByteTimeoutSecs: null }); setIsModalOpen(true); }}
             >
               <Plus size={16} />
               {t('models.createAlias')}
@@ -557,8 +559,9 @@ export default function Models() {
                         target: a.target_model,
                         provider: a.provider_id || '',
                         selectedAccountIds: selectedIds,
-                        preferredAccountId: a.preferred_account_id,
+                        preferredAccountId: a.preferred_account_id ?? null,
                         downstreamMode: normalizeMode((a as any).upstream_api),
+                        firstByteTimeoutSecs: a.firstByteTimeoutSecs ?? null,
                       });
                       setEditingAliasId(a.id);
                       setIsModalOpen(true);
@@ -575,6 +578,11 @@ export default function Models() {
                         <ArrowRight size={10} className="text-muted-foreground opacity-30 shrink-0" />
                         <div className="flex items-center gap-2 min-w-0">
                           <div className="text-xs font-bold truncate text-muted-foreground">{a.target_model}</div>
+                          {a.firstByteTimeoutSecs != null && (
+                            <span className="text-[10px] font-bold text-muted-foreground/40 shrink-0" title="首字节超时">
+                              {a.firstByteTimeoutSecs}s
+                            </span>
+                          )}
                           {result && (
                             <div className="flex items-center gap-1.5 shrink-0">
                               <div className={cn(
@@ -881,7 +889,7 @@ export default function Models() {
                       setEditingAliasId(null);
                       const matchingOwners = [...new Set(safeModels.filter(x => x.id === model.id).map(x => x.owned_by))];
                       const matchingIds = safeAccounts.filter(a => matchingOwners.includes(a.alias) && a.is_active === 1).map(a => a.id);
-                      setAliasForm({ alias: '', target: model.id, provider: model.owned_by, selectedAccountIds: matchingIds, preferredAccountId: null, downstreamMode: 'default' });
+                      setAliasForm({ alias: '', target: model.id, provider: model.owned_by, selectedAccountIds: matchingIds, preferredAccountId: null, downstreamMode: 'default', firstByteTimeoutSecs: null });
                       setIsModalOpen(true);
                    }}
                    className="flex items-center gap-1 text-primary hover:opacity-80 transition-opacity"
@@ -1094,6 +1102,15 @@ export default function Models() {
             );
           })()}
           <div className="space-y-1.5 border-t border-border pt-3">
+            <label className="text-xs font-bold text-muted-foreground uppercase">{t('models.firstByteTimeout')}</label>
+            <p className="text-xs text-muted-foreground">{t('models.firstByteTimeoutHint')}</p>
+            <Input
+              type="number" min={1} max={600} value={aliasForm.firstByteTimeoutSecs ?? ''}
+              onChange={e => setAliasForm({...aliasForm, firstByteTimeoutSecs: e.target.value ? Number(e.target.value) : null})}
+              placeholder={t('models.firstByteTimeoutPlaceholder')}
+            />
+          </div>
+          <div className="space-y-1.5 border-t border-border pt-3">
             <label className="text-xs font-bold text-muted-foreground uppercase">{t('models.downstreamMode')}</label>
             <p className="text-xs text-muted-foreground">{t(downstreamHintKey(aliasForm.downstreamMode))}</p>
             <select
@@ -1226,6 +1243,19 @@ export default function Models() {
               ))}
             </select>
           </div>
+          <div className="space-y-1.5 border-t border-border pt-3">
+            <label className="text-xs font-bold text-muted-foreground uppercase">{t('models.firstByteTimeout')}</label>
+            <p className="text-xs text-muted-foreground">{t('models.firstByteTimeoutHint')}</p>
+            <Input
+              type="number"
+              min={1}
+              max={600}
+              value={aggregateForm.firstByteTimeoutSecs}
+              onChange={e => setAggregateForm({...aggregateForm, firstByteTimeoutSecs: e.target.value === '' ? '' : Number(e.target.value)})}
+              placeholder={t('models.firstByteTimeoutPlaceholder')}
+              className="w-full h-10 px-3 py-2 rounded-md border border-input bg-background text-sm"
+            />
+          </div>
           <div className="pt-4 flex gap-3">
             <Button type="button" variant="outline" onClick={closeAggregateModal} className="flex-1">{t('common.cancel')}</Button>
             <Button type="submit" className="flex-1"><Save size={16} /> {t('common.save')}</Button>
@@ -1246,7 +1276,7 @@ export default function Models() {
             await addAlias(overwriteConfirm.alias, pd.target, pd.provider || undefined, pd.selectedAccountIds?.length ? pd.selectedAccountIds : undefined, pd.preferredAccountId ?? undefined, true, pd.downstreamMode || 'chat');
             setIsModalOpen(false);
             setEditingAliasId(null);
-            setAliasForm({ alias: '', target: '', provider: '', selectedAccountIds: [], preferredAccountId: null, downstreamMode: 'default' });
+            setAliasForm({ alias: '', target: '', provider: '', selectedAccountIds: [], preferredAccountId: null, downstreamMode: 'default', firstByteTimeoutSecs: null });
           }
           setOverwriteConfirm(null);
         }}

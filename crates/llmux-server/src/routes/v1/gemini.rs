@@ -201,6 +201,7 @@ pub async fn gemini(
             // 本路径的 body 是 Gemini 原生形状（上限在 generationConfig.maxOutputTokens），
             // 不含 max_tokens，所以这里无需收敛；OpenAI 兼容形状走 adapters 的构建器。
             max_tokens: Default::default(),
+            first_byte_timeout_secs: None,
         };
 
         tracing::info!(

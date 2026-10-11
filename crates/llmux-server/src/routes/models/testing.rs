@@ -733,6 +733,7 @@ pub async fn start_test_queue(
                     preferred_account_id: None,
                     alias_name: None,
                     upstream_api: Default::default(),
+                    first_byte_timeout_secs: None,
                 }
             });
 

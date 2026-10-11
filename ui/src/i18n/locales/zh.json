@@ -418,7 +418,10 @@
     },
     "downstreamHintValidate": "切换后将即时校验每个候选账户。",
     "accountUnsupportedMode": "该账户不支持「{{mode}}」路由模式，请更换账户或切换模式。",
-    "downstreamUnsupportedBadge": "不支持 {{mode}}"
+    "downstreamUnsupportedBadge": "不支持 {{mode}}",
+    "firstByteTimeout": "首字节超时（秒）",
+    "firstByteTimeoutHint": "可选；留空使用 30 秒默认值，最大 600 秒。",
+    "firstByteTimeoutPlaceholder": "默认（30 秒）"
   },
   "keys": {
     "title": "API 密钥管理",
