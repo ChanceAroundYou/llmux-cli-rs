@@ -38,7 +38,7 @@ function parseAllowedModels(raw: string): string[] {
 export default function KeysPage() {
   const { t } = useTranslation();
   const { keys, isLoading, fetchKeys, createKey, deleteKey, updateKey } = useKeysStore();
-  const { availableModels, aliases, fetchModels, fetchAliases } = useModelsStore();
+  const { availableModels, aliases, aggregateAliases, fetchModels, fetchAliases, fetchAggregateAliases } = useModelsStore();
   
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [editingKey, setEditingKey] = useState<ApiKey | null>(null);
@@ -57,6 +57,7 @@ export default function KeysPage() {
     fetchKeys();
     fetchModels();
     fetchAliases();
+    fetchAggregateAliases();
   }, []);
 
   useEffect(() => {
@@ -93,8 +94,11 @@ export default function KeysPage() {
     setVisibleKeys(prev => ({ ...prev, [id]: !prev[id] }));
   };
 
-  // 限制：只能选择已创建别名的模型
-  const sortedModels = aliases.map(a => ({ id: a.alias, provider: a.provider_id }));
+  // 限制：只能选择已创建别名的模型（普通别名 + 聚合别名）
+  const sortedModels = [
+    ...aliases.map(a => ({ id: a.alias, provider: a.provider_id, isAggregate: false })),
+    ...aggregateAliases.map(a => ({ id: a.alias, provider: '', isAggregate: true })),
+  ];
 
   // 提交条件：有别名才能创建 key；指定模型时必须至少勾选一个
   const canSubmit = sortedModels.length > 0 && (
@@ -323,7 +327,9 @@ export default function KeysPage() {
                       />
                       <div className="flex flex-1 items-center justify-between min-w-0">
                         <span className="text-xs font-medium truncate">{item.id}</span>
-                        <span className="shrink-0 text-xs font-semibold bg-primary/10 text-primary px-2 py-0.5 rounded uppercase tracking-tight shadow-sm border border-primary/5">{t('common.alias')}</span>
+                        <span className="shrink-0 text-xs font-semibold bg-primary/10 text-primary px-2 py-0.5 rounded uppercase tracking-tight shadow-sm border border-primary/5">
+                          {item.isAggregate ? t('models.aggregate', '聚合') : t('common.alias')}
+                        </span>
                       </div>
                     </label>
                   ))
