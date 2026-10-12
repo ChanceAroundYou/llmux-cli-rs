@@ -552,6 +552,60 @@ fn passthrough_usage(data: &Value) -> (i64, i64, i64, i64) {
     (fresh, completion_tokens, read, 0)
 }
 
+/// Summarize the translated Responses body without logging request contents.
+fn responses_body_shape(body: &Value) -> String {
+    let Some(obj) = body.as_object() else {
+        return "fields=<non-object>".to_string();
+    };
+    let mut fields: Vec<&str> = obj.keys().map(String::as_str).collect();
+    fields.sort_unstable();
+    let flag = |name: &str| if obj.contains_key(name) { "y" } else { "n" };
+    let text_bytes = |value: Option<&Value>| -> usize {
+        match value {
+            Some(Value::String(text)) => text.len(),
+            Some(Value::Array(parts)) => parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .map(str::len)
+                .sum(),
+            _ => 0,
+        }
+    };
+
+    let mut input_types: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut input_text_bytes = 0usize;
+    let mut input_items = 0usize;
+    if let Some(items) = body.get("input").and_then(Value::as_array) {
+        input_items = items.len();
+        for item in items {
+            let kind = item
+                .get("type")
+                .and_then(Value::as_str)
+                .or_else(|| item.get("role").and_then(Value::as_str))
+                .unwrap_or("-");
+            *input_types.entry(kind).or_insert(0) += 1;
+            for key in ["text", "content"] {
+                input_text_bytes += text_bytes(item.get(key));
+            }
+        }
+    }
+
+    format!(
+        "fields=[{}] max_output_tokens={} stream={} stop={} instructions={} reasoning={} stream_options={} tools={} input_items={} input_text_bytes={} input_types={}",
+        fields.join(","),
+        body.get("max_output_tokens").and_then(Value::as_i64).map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()),
+        body.get("stream").and_then(Value::as_bool).map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()),
+        flag("stop"),
+        flag("instructions"),
+        flag("reasoning"),
+        flag("stream_options"),
+        body.get("tools").and_then(Value::as_array).map_or(0, Vec::len),
+        input_items,
+        input_text_bytes,
+        input_types.iter().map(|(kind, count)| format!("{kind}={count}")).collect::<Vec<_>>().join(","),
+    )
+}
+
 /// Unified aggregate dispatch with per-candidate target computation (Task 6).
 /// Handles ingress Chat or Messages routed to the Responses upstream (computing
 /// the target protocol per candidate), back-translating responses→chat or
@@ -617,7 +671,7 @@ pub(crate) async fn dispatch_aggregate_with_conversion(
         };
         let mut provider_request = build_target_request(&account, Protocol::Responses, &translated, &None);
         provider_request.first_byte_timeout_secs = agg.first_byte_timeout_secs;
-        tracing::info!("🔀 [agg:{} V={}] {} → {} → {} [{:?}→responses]", alias, active, account.alias, cand.model, provider_request.url, ingress);
+        tracing::info!("🔀 [agg:{} V={}] {} → {} → {} [{:?}→responses] outbound_shape={}", alias, active, account.alias, cand.model, provider_request.url, ingress, responses_body_shape(&translated));
         let response = match execute_provider_request(&provider_request).await {
             Ok(r) => r,
             Err(e) => { state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); last_error = Some(format!("Provider request failed: {e}")); failed_candidates += 1; continue; }

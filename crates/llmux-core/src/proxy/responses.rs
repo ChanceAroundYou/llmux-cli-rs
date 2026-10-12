@@ -312,9 +312,9 @@ pub fn anthropic_to_responses(anth_body: &Value, resolved_model: &str) -> Value 
     if let Some(v) = anth_body.get("max_tokens") {
         out.insert("max_output_tokens".to_string(), clamp_max_output_tokens(v));
     }
-    if let Some(v) = anth_body.get("stop_sequences") {
-        out.insert("stop".to_string(), v.clone());
-    }
+    // Anthropic Messages accepts `stop_sequences`, but the Responses API does
+    // not accept the Chat Completions `stop` parameter. Forwarding it causes
+    // otherwise valid requests to fail with a generic invalid-parameters 400.
     // stream_options is a chat/completions parameter; the Responses API rejects it
     // outright ("Unknown parameter: 'stream_options.include_usage'") and always
     // reports usage on its response.completed event, so there is nothing to ask for.
@@ -1255,6 +1255,19 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}]
         });
         assert_eq!(anthropic_to_responses(&anth, "muse")["max_output_tokens"], json!(4096));
+    }
+
+    #[test]
+    fn anthropic_stop_sequences_are_not_sent_as_responses_stop() {
+        let body = json!({
+            "max_tokens": 128,
+            "stop_sequences": ["\n\nHuman:"],
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+
+        let translated = anthropic_to_responses(&body, "muse");
+        assert!(translated.get("stop").is_none());
+        assert!(translated.get("stop_sequences").is_none());
     }
 
     #[test]
