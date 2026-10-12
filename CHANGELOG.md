@@ -7,6 +7,18 @@
 
 ### Fixed
 
+- **Anthropic 请求顶层 `system` 里的 `x-anthropic-billing-header` 块不再转发上游**。
+  Anthropic SDK 会往 `system` 数组开头塞一个文本块
+  `x-anthropic-billing-header: cc_version=2.1.283.f99; cc_entrypoint=sdk-go;`，
+  取值编码客户端构建号，**随 CLI 版本变化**。它落在 prompt 第 0 个 token，值一变，
+  支持 KV 前缀缓存的上游整段对话都命中不了 —— 每一轮都从零 prefill（实测 22 万
+  token 的会话因此 TTFT 37s）。该块对模型没有任何信息量，现在
+  `anthropic_to_openai_request` 里整块丢弃，其余 system 块原样保留；字符串形式的
+  `system` 不受影响。
+
+  验证：删除后经本机 NInfer 发两轮同前缀请求，第二轮
+  `cache_read_input_tokens=77`，前缀复用正常。
+
 - **请求侧原因导致的降级不再累积成「迁移」**。这是上一条只治了一半的地方。
 
   上一条把请求侧拒绝从「候选失败」里摘了出去，但迁移**根本不是失败计数驱动的** ——

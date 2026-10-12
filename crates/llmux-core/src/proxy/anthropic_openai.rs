@@ -33,6 +33,33 @@ pub(crate) fn effort_from_thinking_budget(thinking: &Value) -> Option<&'static s
     }
 }
 
+/// Drop the `x-anthropic-billing-header` text block from the top-level
+/// `system` array.
+///
+/// The Anthropic SDK prepends it, and its value encodes the client build
+/// (`cc_version=2.1.283.f99`), so it changes between CLI releases. It sits at
+/// token 0, which makes it a cache-buster for the *whole* conversation: a
+/// different value there means the upstream's KV prefix cache misses, and
+/// every turn re-prefills from scratch. The block carries nothing the model
+/// needs, so removing it is safe — the remaining system blocks are untouched.
+fn strip_billing_header(system: &Value) -> Value {
+    const MARKER: &str = "x-anthropic-billing-header:";
+    let Value::Array(blocks) = system else {
+        return system.clone();
+    };
+    Value::Array(
+        blocks
+            .iter()
+            .filter(|b| {
+                !b.get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|t| t.trim_start().starts_with(MARKER))
+            })
+            .cloned()
+            .collect(),
+    )
+}
+
 /// Convert an Anthropic `/v1/messages` request body to an OpenAI
 /// `/chat/completions` request body. `resolved_model` is the dispatcher-resolved
 /// target model (alias expansion already applied upstream).
@@ -60,7 +87,7 @@ pub fn anthropic_to_openai_request_with(
     // Anthropic top-level `system` (string or block array) → first system message.
     if let Some(system) = body_obj.get("system") {
         if system.is_string() || system.is_array() {
-            messages.push(json!({ "role": "system", "content": system }));
+            messages.push(json!({ "role": "system", "content": strip_billing_header(system) }));
         }
     }
 
@@ -1367,5 +1394,46 @@ mod tests {
             out[0]["content"][0]["prompt_cache_breakpoint"],
             json!({"mode": "explicit"})
         );
+    }
+    /// The SDK's billing header sits at token 0 and re-encodes the client build,
+    /// so leaving it in breaks KV prefix reuse for the whole conversation.
+    #[test]
+    fn billing_header_block_is_dropped_from_the_system_array() {
+        let sys = json!([
+            {"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.283.f99; cc_entrypoint=sdk-go;"},
+            {"type": "text", "text": "You are Claude Code."},
+            {"type": "text", "text": "main system prompt"}
+        ]);
+        let out = strip_billing_header(&sys);
+        let blocks = out.as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["text"], json!("You are Claude Code."));
+        assert_eq!(blocks[1]["text"], json!("main system prompt"));
+    }
+
+    /// A plain string `system` has no blocks to inspect and must pass through
+    /// byte-identical.
+    #[test]
+    fn a_string_system_passes_through_untouched() {
+        let out = strip_billing_header(&json!("just a system prompt"));
+        assert_eq!(out, json!("just a system prompt"));
+    }
+
+    /// End to end: the converted request's leading system message carries no
+    /// billing header, and the client's own system text survives.
+    #[test]
+    fn converted_request_has_no_billing_header() {
+        let body = json!({
+            "system": [
+                {"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.283.7a6;"},
+                {"type": "text", "text": "keep me"}
+            ],
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let out = anthropic_to_openai_request(&body, "qwen3.8-27b").unwrap();
+        let content = &out["messages"][0]["content"];
+        let text = content.to_string();
+        assert!(!text.contains("billing-header"), "billing header survived: {text}");
+        assert!(text.contains("keep me"));
     }
 }
