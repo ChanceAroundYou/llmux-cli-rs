@@ -747,6 +747,21 @@ fn parse_event_type(event_text: &str) -> &str {
     ""
 }
 
+/// Resolve an SSE event's type. Prefer the `event:` line; when the upstream omits
+/// it and carries the type only inside the JSON payload, fall back to the body's
+/// `type` field. The Codex/ChatGPT Responses backend (`chatgpt.com/backend-api/codex`)
+/// streams `data:` lines with no `event:` line — without this fallback every
+/// branch below is skipped and the reply degrades to an empty message
+/// (2026-10-12: `op`/gpt-6-luna streamed no `content_block_delta`).
+fn resolve_event_type<'a>(event_text: &'a str, data: &'a Value) -> &'a str {
+    let from_line = parse_event_type(event_text);
+    if from_line.is_empty() {
+        data.get("type").and_then(Value::as_str).unwrap_or("")
+    } else {
+        from_line
+    }
+}
+
 fn sse_data(event_text: &str) -> Option<&str> {
     for line in event_text.lines() {
         let t = line.trim();
@@ -929,10 +944,10 @@ impl ResponsesToChatConverter {
 
     pub fn feed(&mut self, event_text: &str) -> Vec<String> {
         let mut out = Vec::new();
-        let etype = parse_event_type(event_text);
         let Some(data_str) = sse_data(event_text) else { return out };
         if data_str == "[DONE]" { self.terminal = true; return out; }
         let Ok(data) = serde_json::from_str::<Value>(data_str) else { return out };
+        let etype = resolve_event_type(event_text, &data);
         if let Some(usage) = data.get("usage").or_else(|| data.get("response").and_then(|r| r.get("usage"))) {
             if usage.is_object() { self.last_usage = Some(usage.clone()); }
         }
@@ -1094,10 +1109,10 @@ impl ResponsesToAnthropicConverter {
 
     pub fn feed(&mut self, event_text: &str) -> Vec<String> {
         let mut out = Vec::new();
-        let etype = parse_event_type(event_text);
         let Some(data_str) = sse_data(event_text) else { return out };
         if data_str == "[DONE]" { self.terminal = true; return out; }
         let Ok(data) = serde_json::from_str::<Value>(data_str) else { return out };
+        let etype = resolve_event_type(event_text, &data);
         if let Some(usage) = data.get("usage").or_else(|| data.get("response").and_then(|r| r.get("usage"))) {
             if usage.is_object() { self.last_usage = Some(usage.clone()); }
         }
@@ -1411,6 +1426,31 @@ mod tests {
         assert!(output.contains("event: content_block_start"));
         assert!(output.contains("event: content_block_stop"));
         assert!(output.contains("event: message_stop"));
+    }
+
+    // 上游可能不发 `event:` 行，类型只在 JSON 体的 `type` 字段里（Codex/ChatGPT 的
+    // Responses 后端就是这样）。此时正文/收尾都必须照常，否则整条流退化成空消息
+    // —— 2026-10-12 实测的 op(gpt-6-luna) 事故：客户端只收到空 assistant 消息。
+    #[test]
+    fn data_only_frame_without_event_line_still_emits_text() {
+        let delta = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n";
+
+        let mut anth = ResponsesToAnthropicConverter::new("muse");
+        let output = anth.feed(delta).into_iter().chain(anth.finish()).collect::<String>();
+        assert!(output.contains("event: content_block_delta"), "got {output}");
+        assert!(output.contains("hello"), "got {output}");
+
+        let mut chat = ResponsesToChatConverter::new("muse");
+        let out = chat.feed(delta).concat();
+        assert!(out.contains("hello"), "got {out}");
+    }
+
+    #[test]
+    fn data_only_completed_frame_terminates_stream() {
+        let mut anth = ResponsesToAnthropicConverter::new("muse");
+        let _ = anth.feed("data: {\"type\":\"response.completed\",\"response\":{\"output\":[]}}\n\n");
+        assert!(anth.is_done(), "无 event: 行的 response.completed 也要终止流");
+        assert!(!anth.is_failed());
     }
 
     #[test]

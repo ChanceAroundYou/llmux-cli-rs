@@ -57,7 +57,7 @@ async fn fetch_aliases(state: &AppState) -> anyhow::Result<Value> {
 
 async fn fetch_aggregate_aliases(state: &AppState) -> anyhow::Result<Value> {
     let rows = sqlx::query_as::<_, llmux_core::aggregate::AggregateAliasRow>(
-        "SELECT id, alias, candidates, interval_secs, upstream_api, created_at, updated_at FROM aggregate_aliases ORDER BY id",
+        "SELECT id, alias, candidates, interval_secs, upstream_api, first_byte_timeout_secs, created_at, updated_at FROM aggregate_aliases ORDER BY id",
     )
     .fetch_all(&state.pool)
     .await?;
