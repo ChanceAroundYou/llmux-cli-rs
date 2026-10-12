@@ -73,8 +73,26 @@ async fn models_inner(state: AppState, headers: HeaderMap, prefix_ids: bool) -> 
             Ok(rows) => rows,
             Err(_) => Vec::new(),
         };
-    let mut alias_rows_with_agg = alias_rows;
-    // `context_length` 报**配置的主候选**（candidates[0]）的窗口，而不是运行时
+    // 手动禁用的 (account_id, model) 对集合。每个别名绑定哪台账户是已知的
+    // （account_ids JSON / provider_id 别名），禁掉了就别再广告出去 —— 客户端
+    // 会把它列进模型选择器，选中必然 404，不如一开始就不露面。
+    let disabled: std::collections::HashSet<(i64, String)> = {
+        let rows: Vec<(i64, String)> =
+            sqlx::query_as("SELECT account_id, model FROM disabled_models")
+                .fetch_all(&state.pool)
+                .await
+                .unwrap_or_default();
+        rows.into_iter().collect()
+    };
+    let account_alias_ids: Vec<(i64, String)> = sqlx::query_as("SELECT id, alias FROM accounts")
+        .fetch_all(&state.pool)
+        .await
+        .unwrap_or_default();
+    let alias_account_ids: std::collections::HashMap<String, i64> = account_alias_ids
+        .iter()
+        .map(|(id, a)| (a.clone(), *id))
+        .collect();
+    let mut alias_rows_with_agg = alias_rows;    // `context_length` 报**配置的主候选**（candidates[0]）的窗口，而不是运行时
     // 临时迁移到的那个。
     //
     // 为什么不用 `active_map`（曾经如此）：激活下标是**健康度驱动的临时切换**。
@@ -94,6 +112,22 @@ async fn models_inner(state: AppState, headers: HeaderMap, prefix_ids: bool) -> 
         alias_rows_with_agg.push((alias, Some(target)));
     }
 
+    // 原生别名（上面只取了 alias + target_model）再补一份 account_ids JSON
+    let alias_account_ids_map: std::collections::HashMap<String, Vec<i64>> =
+        sqlx::query_as::<_, (String, Option<String>)>("SELECT alias, account_ids FROM model_aliases")
+            .fetch_all(&state.pool)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(a, ids)| {
+                let parsed: Vec<i64> = ids
+                    .as_deref()
+                    .and_then(|s| serde_json::from_str(s).ok())
+                    .unwrap_or_default();
+                (a, parsed)
+            })
+            .collect();
+
     // Serve a single envelope that satisfies both the Anthropic and the OpenAI
     // model-list contracts. Request headers are not a reliable discriminator:
     // Claude Desktop's gateway mode sends `Authorization: Bearer` and may omit
@@ -108,6 +142,20 @@ async fn models_inner(state: AppState, headers: HeaderMap, prefix_ids: bool) -> 
         .as_secs();
     let data: Vec<Value> = alias_rows_with_agg
         .iter()
+        .filter(|(alias, target)| {
+            let ids = alias_account_ids_map.get(alias.as_str());
+            let target = target.as_deref().unwrap_or("");
+            if target.is_empty() {
+                return true;
+            }
+            let Some(ids) = ids else { return true };
+            if ids.is_empty() {
+                // provider_id 别名对准的账户只有一个
+                let Some(a) = alias_account_ids.get(alias.as_str()) else { return true };
+                return !disabled.contains(&(*a, target.to_string()));
+            }
+            !ids.iter().any(|id| disabled.contains(&(*id, target.to_string())))
+        })
         .map(|(alias, target)| {
             let id = if prefix_ids {
                 advertised_id(alias)

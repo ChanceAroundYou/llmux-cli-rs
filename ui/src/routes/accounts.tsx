@@ -38,7 +38,7 @@ const PROTOCOLS = ['chat', 'responses', 'messages'] as const;
 type Protocol = typeof PROTOCOLS[number];
 
 // 需要网页登录凭据（Cookie/Token）而非 API Key 的余额查询类型。
-const COOKIE_KINDS = ['copilot', 'commandcode', 'opencode', 'opencode-go', 'opencode-zen', 'deepseek', 'bailian'];
+const COOKIE_KINDS = ['copilot', 'commandcode', 'opencode', 'opencode-go', 'opencode-zen', 'deepseek', 'chatgpt', 'openai', 'bailian'];
 
 // 各类型的凭据获取教程（小叹号展开）——精确到 Cookie 名。
 const BALANCE_AUTH_HELP: Record<string, string[]> = {
@@ -93,6 +93,18 @@ const BALANCE_AUTH_HELP: Record<string, string[]> = {
     '1. 阿里云 RAM 控制台 → 用户 finance-staff → 认证管理 → 创建 AccessKey（记下 LTAI… / Secret），并授予 AliyunBSSReadOnlyAccess（只读账单）；',
     '2. 在下方“余额认证”填入 LTAI…:Secret（冒号分隔，加密存储，仅用于余额查询，不影响转发）；',
     '3. 余额查询选“阿里百炼”：折叠态常显可用余额 ¥；填了 LTAI…:Secret 才可展开查看“本月已用”，否则不可展开。',
+  ],
+  chatgpt: [
+    'ChatGPT 订阅用量走 chatgpt.com 的 wham/usage 接口，显示 Plus/Pro 的 5 小时与每周配额窗口。',
+    '方式一（推荐）· Codex OAuth access_token：终端执行 cat ~/.codex/auth.json，复制 tokens.access_token（形如 eyJhbGciOi… 的三段 JWT）；',
+    '方式二 · 网页登录 Cookie：浏览器登录 chatgpt.com → F12 → Application → Storage → Cookies → https://chatgpt.com，整串复制（或只复制 __Secure-next-auth.session-token 的 Value）；',
+    '可带 Bearer 前缀，系统会自动剥离；凭据只用于余额查询，不影响转发。',
+  ],
+  openai: [
+    'OpenAI API 用量走组织账单接口，显示近 30 天消费（按天分桶）与 Tokens。',
+    '1. 需要**组织管理员 Key**（sk-admin-…，platform.openai.com → 设置 → 组织 → API Keys，账号需有 Admin 权限）；',
+    '2. 普通 Key（sk-proj-…）没有组织成本权限，会自动回落到旧版额度接口 credit_grants，只显示可用/已用总额；',
+    '3. 两种接口都不可用时提示 401/403 —— 换管理员 Key 即可，不是网络问题。',
   ],
 };
 
@@ -852,6 +864,8 @@ export default function Accounts() {
                 <option value="api123">API123</option>
                 <option value="teamorouter">TeamoRouter</option>
                 <option value="bailian">阿里百炼</option>
+                <option value="chatgpt">ChatGPT 订阅</option>
+                <option value="openai">OpenAI API</option>
                 <option value="none">{t('accounts.balanceDisabled', '禁用查询')}</option>
               </select>
               <p className="text-xs text-muted-foreground">{t('accounts.balanceProviderHint', '决定余额查询走哪个上游接口；自动检测按名称/地址推断')}</p>
@@ -1013,6 +1027,8 @@ export default function Accounts() {
                 <option value="api123">API123</option>
                 <option value="teamorouter">TeamoRouter</option>
                 <option value="bailian">阿里百炼</option>
+                <option value="chatgpt">ChatGPT 订阅</option>
+                <option value="openai">OpenAI API</option>
                 <option value="none">{t('accounts.balanceDisabled', '禁用查询')}</option>
               </select>
               <p className="text-xs text-muted-foreground">{t('accounts.balanceProviderHint', '决定余额查询走哪个上游接口；自动检测按名称/地址推断')}</p>

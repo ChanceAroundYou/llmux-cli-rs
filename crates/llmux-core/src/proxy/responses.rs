@@ -195,11 +195,9 @@ pub fn chat_to_responses(chat_body: &Value, resolved_model: &str) -> Value {
     {
         out.insert("max_output_tokens".to_string(), clamp_max_output_tokens(v));
     }
-    if let Some(v) = chat_body.get("stream_options") {
-        out.insert("stream_options".to_string(), v.clone());
-    } else if chat_body.get("stream").and_then(Value::as_bool) == Some(true) {
-        out.insert("stream_options".to_string(), json!({"include_usage": true}));
-    }
+    // stream_options is a chat/completions parameter; the Responses API rejects it
+    // outright ("Unknown parameter: 'stream_options.include_usage'") and always
+    // reports usage on its response.completed event, so there is nothing to ask for.
     Value::Object(out)
 }
 
@@ -294,11 +292,20 @@ pub fn anthropic_to_responses(anth_body: &Value, resolved_model: &str) -> Value 
         out.insert("tool_choice".to_string(), to_responses_tool_choice(tool_choice));
     }
     if let Some(thinking) = anth_body.get("thinking") {
-        // thinking.budget_tokens → reasoning effort
-        out.insert("reasoning".to_string(), thinking.clone());
-        if anth_body.get("max_tokens").is_none() {
-            if let Some(b) = thinking.get("budget_tokens").and_then(Value::as_i64) {
-                out.insert("max_output_tokens".to_string(), json!(b));
+        // thinking.budget_tokens → reasoning.effort.
+        // 只搬 effort：Responses API 不认 budget_tokens（实测
+        // `Unknown parameter: 'reasoning.budget_tokens'` → 400），而它认
+        // 的 effort 已经 packed 在下面循环的 key 白名单里。
+        let disabled = thinking.get("type").and_then(Value::as_str) == Some("disabled");
+        if !disabled {
+            if let Some(effort) = super::anthropic_openai::effort_from_thinking_budget(thinking) {
+                out.insert("reasoning".to_string(), json!({ "effort": effort }));
+            }
+            // Anthropic 的 max_tokens 不含 thinking 预算，只给 budget 时补上输出上限。
+            if anth_body.get("max_tokens").is_none() {
+                if let Some(b) = thinking.get("budget_tokens").and_then(Value::as_i64) {
+                    out.insert("max_output_tokens".to_string(), json!(b));
+                }
             }
         }
     }
@@ -308,9 +315,9 @@ pub fn anthropic_to_responses(anth_body: &Value, resolved_model: &str) -> Value 
     if let Some(v) = anth_body.get("stop_sequences") {
         out.insert("stop".to_string(), v.clone());
     }
-    if anth_body.get("stream").and_then(Value::as_bool) == Some(true) {
-        out.insert("stream_options".to_string(), json!({"include_usage": true}));
-    }
+    // stream_options is a chat/completions parameter; the Responses API rejects it
+    // outright ("Unknown parameter: 'stream_options.include_usage'") and always
+    // reports usage on its response.completed event, so there is nothing to ask for.
     Value::Object(out)
 }
 

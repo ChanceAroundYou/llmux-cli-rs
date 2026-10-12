@@ -30,6 +30,8 @@ pub enum BalanceKind {
     Api123,
     Teamorouter,
     Bailian,
+    ChatGPT,
+    OpenAI,
 }
 
 impl BalanceKind {
@@ -45,6 +47,8 @@ impl BalanceKind {
             Self::Api123 => "api123",
             Self::Teamorouter => "teamorouter",
             Self::Bailian => "bailian",
+            Self::ChatGPT => "chatgpt",
+            Self::OpenAI => "openai",
         }
     }
 }
@@ -68,6 +72,8 @@ pub fn detect_kind(provider_id: &str, endpoints: &[&str], balance_provider: &str
             "api123" => Some(BalanceKind::Api123),
             "teamorouter" => Some(BalanceKind::Teamorouter),
             "bailian" | "dashscope" | "aliyun" | "aliyun-bailian" => Some(BalanceKind::Bailian),
+            "chatgpt" | "chatgpt-plus" | "codex" => Some(BalanceKind::ChatGPT),
+            "openai" | "openai-api" => Some(BalanceKind::OpenAI),
             _ => None, // "none"/unknown → disabled
         };
     }
@@ -80,6 +86,8 @@ pub fn detect_kind(provider_id: &str, endpoints: &[&str], balance_provider: &str
         "commandcode" | "command-code" => Some(BalanceKind::CommandCode),
         "opencode" => Some(BalanceKind::OpenCode),
         "opencode-go" | "opencode_go" | "go" => Some(BalanceKind::OpenCodeGo),
+        "chatgpt" | "chatgpt-plus" | "codex" => Some(BalanceKind::ChatGPT),
+        "openai" => Some(BalanceKind::OpenAI),
         // Host sniffing: the UI creates accounts with provider_id='custom',
         // so the endpoint host is the real signal.
         _ => endpoints.iter().find_map(|ep| {
@@ -111,6 +119,11 @@ pub fn detect_kind(provider_id: &str, endpoints: &[&str], balance_provider: &str
                 {
                     Some(BalanceKind::Bailian)
                 }
+                // ChatGPT 订阅用量（wham/usage）与 OpenAI 管理 API（organization/costs）
+                // 分居两个主机，按 host 分派。detect 的 explicit 分支「none 也算显式」
+                // 语义不变：只有 balance_provider 为空时才会走到这里。
+                h if h.contains("chatgpt.com") => Some(BalanceKind::ChatGPT),
+                h if h.contains("api.openai.com") => Some(BalanceKind::OpenAI),
                 _ => None,
             }
         }),
@@ -191,6 +204,8 @@ pub async fn fetch_balance(kind: BalanceKind, credential: &str, endpoints: &[Str
         BalanceKind::Api123 => fetch_api123(credential, endpoints).await,
         BalanceKind::Teamorouter => fetch_teamorouter(credential, endpoints).await,
         BalanceKind::Bailian => fetch_bailian(credential, endpoints).await,
+        BalanceKind::ChatGPT => fetch_chatgpt(credential, endpoints).await,
+        BalanceKind::OpenAI => fetch_openai(credential, endpoints).await,
     }
     .unwrap_or_else(|e| err_result(kind.as_str(), &e.to_string()))
 }
@@ -225,6 +240,68 @@ pub fn normalize_credential_for_kind(kind: BalanceKind, raw: &str) -> String {
         }
         BalanceKind::OpenCode | BalanceKind::OpenCodeGo | BalanceKind::OpenCodeZen => format!("auth={t}"),
         _ => t.to_string(),
+    }
+}
+
+/// Codex OAuth access_token（`~/.codex/auth.json` 的 `tokens.access_token`）是
+/// Header.Payload.Signature 三段 JWT；ChatGPT 网页登录拿到的 next-auth session
+/// token 是单段 opaque。两者都要能当 Bearer 用，但 JWT 段才能顺便解出
+/// `ChatGPT-Account-Id`（payload 里的 `https://api.openai.com/auth` →
+/// `chatgpt_account_id`），Cookie 兜底路径没有这个头。
+fn looks_like_jwt(s: &str) -> bool {
+    let t = s.trim().trim_start_matches("Bearer ").trim_start_matches("bearer ").trim();
+    let mut parts = t.split('.');
+    let (Some(a), Some(b), Some(_c), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    !a.is_empty() && !b.is_empty()
+}
+
+/// 从 Codex JWT 的 payload 解出 `chatgpt_account_id`。解析失败一律返回 None ——
+/// 这个头只是锦上添花（wham/usage 不带它也能用），不值得为它 fail 整次探测。
+fn jwt_chatgpt_account_id(token: &str) -> Option<String> {
+    use base64::Engine as _;
+    let t = token.trim().trim_start_matches("Bearer ").trim_start_matches("bearer ").trim();
+    let payload = t.split('.').nth(1)?;
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload.trim_end_matches('='))
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload))
+        .ok()?;
+    let v: Value = serde_json::from_slice(&decoded).ok()?;
+    let auth_obj = v.get("https://api.openai.com/auth")?;
+    auth_obj
+        .get("chatgpt_account_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn looks_like_jwt_detection() {
+        use super::looks_like_jwt;
+        assert!(looks_like_jwt("eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ4In0.sig"));
+        assert!(looks_like_jwt("Bearer eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ4In0.sig"));
+        assert!(!looks_like_jwt("sess_abc123"));
+        assert!(!looks_like_jwt("__Secure-next-auth.session-token=abc"));
+        assert!(!looks_like_jwt(""));
+        assert!(!looks_like_jwt("only.two"));
+    }
+
+    #[test]
+    fn jwt_account_id_extraction() {
+        use super::jwt_chatgpt_account_id;
+        use base64::Engine as _;
+        // 构造一个含 https://api.openai.com/auth.chatgpt_account_id 的 payload
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(r#"{"https://api.openai.com/auth":{"chatgpt_account_id":"acc_xyz"}}"#);
+        let token = format!("header.{payload}.sig");
+        assert_eq!(jwt_chatgpt_account_id(&token).as_deref(), Some("acc_xyz"));
+        assert_eq!(jwt_chatgpt_account_id("Bearer eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ4In0.sig"), None);
+        assert_eq!(jwt_chatgpt_account_id("not.a.jwt"), None);
     }
 }
 
@@ -2114,4 +2191,437 @@ fn format_abs_ms(ms: u64) -> String {
         return format!("{:02}月{:02}日 {:02}:{:02}", odt.month() as u8, odt.day(), odt.hour(), odt.minute());
     }
     ms.to_string()
+}
+
+// ─── ChatGPT 订阅用量（ChatGPT Plus / Codex 配额）────────────────────────────
+// GET https://chatgpt.com/backend-api/wham/usage
+// 凭据两路：Codex OAuth JWT（`~/.codex/auth.json` 的 tokens.access_token）走
+// Bearer + `ChatGPT-Account-Id`；网页登录 Cookie 整串走 Cookie 头。
+// 响应语义与 llmux 的 `percent` 相反：`used_percent` 是**已用**比例。
+
+async fn fetch_chatgpt(credential: &str, endpoints: &[String]) -> Result<Value> {
+    let raw = credential.trim();
+    if raw.is_empty() {
+        return Err(anyhow!("未配置凭据：ChatGPT 需要 Codex OAuth access_token 或网页登录 Cookie"));
+    }
+    // 自定义 base（自建网关）优先，否则官方域名。
+    let base = endpoints
+        .iter()
+        .find_map(|ep| {
+            let u = url::Url::parse(ep).ok()?;
+            let host = u.host_str()?;
+            if host.contains("chatgpt.com") || host.contains("openai.com") {
+                Some(format!("{}://{}", u.scheme(), host))
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| "https://chatgpt.com".into());
+    let url = format!("{}/backend-api/wham/usage", base.trim_end_matches('/'));
+
+    let cred = raw
+        .strip_prefix("Bearer ")
+        .or_else(|| raw.strip_prefix("bearer "))
+        .unwrap_or(raw)
+        .trim()
+        .to_string();
+    let mut headers: Vec<(String, String)> = vec![
+        ("accept".to_string(), "application/json".to_string()),
+        ("accept-language".to_string(), "en-US,en;q=0.9".to_string()),
+        ("user-agent".to_string(), "CodexBar".to_string()),
+    ];
+    if looks_like_jwt(&cred) {
+        // OAuth JWT：当 Bearer 用，并尽量带上 ChatGPT-Account-Id
+        headers.push(("authorization".to_string(), format!("Bearer {cred}")));
+        if let Some(account_id) = jwt_chatgpt_account_id(&cred) {
+            headers.push(("chatgpt-account-id".to_string(), account_id));
+        }
+    } else {
+        // 网页登录 Cookie 整串：同一条既当 Cookie 又当 Bearer ——
+        // 有的部署校验 Bearer、有的只认 Cookie，两边都带上最省事。
+        headers.push(("cookie".to_string(), cred.clone()));
+        headers.push(("authorization".to_string(), format!("Bearer {cred}")));
+    }
+
+    let (status, v) = get_json(
+        &url,
+        &headers.iter().map(|(k, v)| (k.as_str(), v.clone())).collect::<Vec<_>>(),
+    )
+    .await?;
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return Err(anyhow!(
+            "ChatGPT 拒绝了该凭据（HTTP {}）：token 过期或 Cookie 已失效，请重新复制",
+            status.as_u16()
+        ));
+    }
+    if !status.is_success() {
+        return Err(anyhow!("HTTP {}: {}", status.as_u16(), truncate_for_err(&v.to_string())));
+    }
+    Ok(chatgpt_result(&v))
+}
+
+/// Pure: build the ChatGPT subscription-usage result from the `wham/usage`
+/// payload. Exposed for contract tests.
+///
+/// `windows[].percent` 存**剩余**比例 —— llmux 的约定与上游 `used_percent` 相反，
+/// 这里做 `100 - used_percent` 换算；`resets_at` 是**秒**，乘 1000 转毫秒。
+pub fn chatgpt_result(v: &Value) -> Value {
+    let plan = v
+        .get("plan_type")
+        .and_then(Value::as_str)
+        .unwrap_or("ChatGPT")
+        .to_string();
+    let primary = v.get("rate_limit").and_then(|r| r.get("primary_window"));
+    let secondary = v.get("rate_limit").and_then(|r| r.get("secondary_window"));
+    let credits = v.get("credits");
+    let additional = v.get("additional_rate_limits").and_then(Value::as_array);
+
+    struct Win {
+        label: &'static str,
+        used: f64,
+        reset_ms: Option<u64>,
+    }
+    let mut wins: Vec<Win> = Vec::new();
+    let mut push_window = |label: &'static str, w: Option<&Value>| {
+        let Some(w) = w else { return };
+        let Some(used) = w.get("used_percent").and_then(Value::as_f64) else { return };
+        // reset_at 是秒；limit_window_seconds 只用来在缺失时兜底推算。
+        let reset_ms = w
+            .get("reset_at")
+            .and_then(Value::as_i64)
+            .filter(|s| *s > 0)
+            .map(|s| (s as u64) * 1000);
+        wins.push(Win { label, used: used.clamp(0.0, 100.0), reset_ms });
+    };
+    // primary = 5 小时窗口，secondary = 每周窗口（Codex 的默认两段）。
+    push_window("5 小时", primary);
+    push_window("每周", secondary);
+    for extra in additional.into_iter().flatten() {
+        let name = extra
+            .get("limit_name")
+            .and_then(Value::as_str)
+            .or_else(|| extra.get("metered_feature").and_then(Value::as_str))
+            .unwrap_or("额外限额");
+        let w = extra.get("rate_limit").and_then(|r| r.get("primary_window"));
+        // additional_rate_limits 的 label 来自上游，借用堆上的字符串——这里只能
+        // 放进 Vec 后再转 JSON，所以用 owned label。
+        if let Some(w) = w {
+            if let Some(used) = w.get("used_percent").and_then(Value::as_f64) {
+                let reset_ms = w
+                    .get("reset_at")
+                    .and_then(Value::as_i64)
+                    .filter(|s| *s > 0)
+                    .map(|s| (s as u64) * 1000);
+                wins.push(Win { label: Box::leak(name.to_string().into_boxed_str()), used: used.clamp(0.0, 100.0), reset_ms });
+            }
+        }
+    }
+
+    // rows：额度余额（credits）+ 各窗口的重置时间
+    let mut rows: Vec<Value> = Vec::new();
+    if let Some(c) = credits {
+        let unlimited = c.get("unlimited").and_then(Value::as_bool).unwrap_or(false);
+        let has = c.get("has_credits").and_then(Value::as_bool).unwrap_or(false);
+        match (unlimited, c.get("balance").and_then(Value::as_f64)) {
+            (true, _) => rows.push(json!({"label": "额度", "value": "无限"})),
+            (false, Some(bal)) if has => rows.push(json!({"label": "额度余额", "value": format!("${:.2}", bal)})),
+            _ => {}
+        }
+    }
+
+    let windows_json: Vec<Value> = wins
+        .iter()
+        .map(|w| {
+            let remaining = 100.0 - w.used;
+            let mut obj = json!({
+                "label": w.label,
+                "percent": remaining,
+                "exceeded": remaining <= 0.5,
+            });
+            if let Some(ms) = w.reset_ms {
+                obj["resets_at"] = json!(ms);
+            }
+            obj
+        })
+        .collect();
+
+    // summary：主窗口剩余百分比 + 计划名
+    let summary = match primary.and_then(|p| p.get("used_percent")).and_then(Value::as_f64) {
+        Some(used) => format!("{} 5h 余 {}%", plan, (100.0 - used.clamp(0.0, 100.0)).round()),
+        None => plan.clone(),
+    };
+    let detail = match secondary.and_then(|p| p.get("used_percent")).and_then(Value::as_f64) {
+        Some(used) => format!("每周窗口余 {}%", (100.0 - used.clamp(0.0, 100.0)).round()),
+        None => "订阅配额".to_string(),
+    };
+
+    ok_result("chatgpt", summary, detail, json!(windows_json), json!(rows))
+}
+
+// ─── OpenAI API 用量（组织成本 / 旧版额度）───────────────────────────────────
+// 管理员 Key（sk-admin-…）走 /v1/organization/costs + /v1/organization/usage/completions；
+// 普通 Key 回落到 /v1/dashboard/billing/credit_grants。
+
+async fn fetch_openai(credential: &str, endpoints: &[String]) -> Result<Value> {
+    let key = credential.trim();
+    if key.is_empty() {
+        return Err(anyhow!("未配置凭据：OpenAI 需要组织管理员 API Key（sk-admin-…）或普通 API Key"));
+    }
+    let bearer = key
+        .strip_prefix("Bearer ")
+        .or_else(|| key.strip_prefix("bearer "))
+        .unwrap_or(key)
+        .trim()
+        .to_string();
+    // 自建/代理网关优先，否则官方。
+    let base = endpoints
+        .iter()
+        .find_map(|ep| {
+            let u = url::Url::parse(ep).ok()?;
+            let host = u.host_str()?;
+            if host.contains("openai.com") || host.contains("chatgpt.com") {
+                Some(u.origin().ascii_serialization())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| "https://api.openai.com".into());
+
+    // 近 30 天，按天分桶（bucket_width=1d）。limit=31 是上游单页上限。
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+    let start_ms = now_ms - 30 * 24 * 3600 * 1000;
+    let start = start_ms / 1000;
+    let end = now_ms / 1000;
+
+    let costs_url = format!(
+        "{}/v1/organization/costs?start_time={}&end_time={}&bucket_width=1d&limit=31&group_by=line_item",
+        base.trim_end_matches('/'),
+        start,
+        end
+    );
+    let usage_url = format!(
+        "{}/v1/organization/usage/completions?start_time={}&end_time={}&bucket_width=1d&limit=31&group_by=model",
+        base.trim_end_matches('/'),
+        start,
+        end
+    );
+
+    // 先试管理员接口（organization/costs）。401/403 落到旧版余额。
+    let costs = get_json(
+        &costs_url,
+        &[
+            ("authorization", format!("Bearer {bearer}")),
+            ("accept", "application/json".into()),
+        ],
+    )
+    .await;
+    match costs {
+        Ok((status, v)) if status.is_success() => {
+            let usage = get_json(
+                &usage_url,
+                &[
+                    ("authorization", format!("Bearer {bearer}")),
+                    ("accept", "application/json".into()),
+                ],
+            )
+            .await;
+            let usage_json = usage.ok().map(|(_, v)| v);
+            Ok(openai_result(&v, usage_json.as_ref(), start_ms as u64, now_ms as u64))
+        }
+        Ok((status, _v)) if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN => {
+            // 管理员接口不可用 → 旧版额度（普通 Key 也能查）
+            match fetch_openai_credit_grants(&base, &bearer).await {
+                Ok(v) => Ok(openai_result(&v, None, start_ms as u64, now_ms as u64)),
+                Err(_) => Err(anyhow!(
+                    "OpenAI 拒绝了该 Key（HTTP {}）：组织成本接口需要管理员 Key（sk-admin-…），\
+                     普通 Key 只能查旧版额度，两个接口都不可用",
+                    status.as_u16()
+                )),
+            }
+        }
+        Ok((status, v)) => Err(anyhow!("HTTP {}: {}", status.as_u16(), truncate_for_err(&v.to_string()))),
+        Err(e) => Err(e),
+    }
+}
+
+/// 旧版额度：`/v1/dashboard/billing/credit_grants`（total_granted/total_used/total_available/grants）
+async fn fetch_openai_credit_grants(base: &str, bearer: &str) -> Result<Value> {
+    let url = format!("{}/v1/dashboard/billing/credit_grants", base.trim_end_matches('/'));
+    let (status, v) = get_json(
+        &url,
+        &[
+            ("authorization", format!("Bearer {bearer}")),
+            ("accept", "application/json".into()),
+        ],
+    )
+    .await?;
+    if !status.is_success() {
+        return Err(anyhow!("credit_grants HTTP {}", status.as_u16()));
+    }
+    Ok(v)
+}
+
+/// Pure: build the OpenAI API-usage result. Exposed for contract tests.
+///
+/// `costs` 是 `/v1/organization/costs` 的 data[]（每天一笔 `results[]`，
+/// 每项 `amount.value` + `line_item`）；`usage` 是 `/v1/organization/usage/completions`
+/// 的 data[]（同分桶，`results[]` 带 token 数）。任一为 None 就是走了旧版额度
+/// 分支：payload 里直接是 `total_granted/total_used/total_available`。
+///
+/// 展示口径用「近 30 天累计」而不是「本月」—— 与 llmux 既有的本日/本月/累计
+/// 行文一致，且 bucket 边界由上游给，不必自己算月初。
+pub fn openai_result(costs: &Value, usage: Option<&Value>, start_ms: u64, end_ms: u64) -> Value {
+    // 旧版额度分支：payload 直接是 credit_grants 本体
+    let is_credit_grants = costs.get("total_granted").is_some()
+        || costs.get("total_used").is_some()
+        || costs.get("total_available").is_some();
+    if is_credit_grants {
+        let granted = costs.get("total_granted").and_then(Value::as_f64).unwrap_or(0.0);
+        let used = costs.get("total_used").and_then(Value::as_f64).unwrap_or(0.0);
+        let available = costs.get("total_available").and_then(Value::as_f64).unwrap_or(0.0);
+        let percent_remaining = if granted > 0.0 {
+            ((available / granted) * 100.0).clamp(0.0, 100.0)
+        } else if available > 0.0 {
+            100.0
+        } else {
+            0.0
+        };
+        // grants[].expires_at 是 unix 秒；取最近一个未来到期日作重置点
+        let resets_at = costs
+            .get("grants")
+            .and_then(|g| g.get("data"))
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|g| g.get("expires_at").and_then(Value::as_i64))
+                    .filter(|s| *s > 0 && (*s as u64) * 1000 > end_ms)
+                    .map(|s| (s as u64) * 1000)
+                    .min()
+            })
+            .flatten();
+        let windows = match resets_at {
+            Some(ms) => json!([{
+                "label": "API 额度",
+                "percent": percent_remaining,
+                "exceeded": percent_remaining <= 0.5,
+                "resets_at": ms,
+            }]),
+            None => json!([{
+                "label": "API 额度",
+                "percent": percent_remaining,
+                "exceeded": percent_remaining <= 0.5,
+            }]),
+        };
+        return ok_result(
+            "openai",
+            format!("${:.2}", available),
+            format!("已用 ${:.2} / 共 ${:.2}", used, granted),
+            windows,
+            json!([
+                {"label": "可用额度", "value": format!("{:.2} USD", available)},
+                {"label": "累计消费", "value": format!("{:.2} USD", used)},
+                {"label": "总授予", "value": format!("{:.2} USD", granted)},
+            ]),
+        );
+    }
+
+    // ─── 管理员分支：按天聚合 costs + usage ───
+    fn day_totals(buckets: &Value) -> Vec<(u64, u64, f64)> {
+        // 返回 (start_ms, end_ms, total)
+        let mut out: Vec<(u64, u64, f64)> = Vec::new();
+        let Some(arr) = buckets.get("data").and_then(Value::as_array) else { return out };
+        for b in arr {
+            let start_s = b.get("start_time").and_then(Value::as_i64).unwrap_or(0);
+            let end_s = b.get("end_time").and_then(Value::as_i64).unwrap_or(0);
+            if start_s <= 0 {
+                continue;
+            }
+            let total: f64 = b
+                .get("results")
+                .and_then(Value::as_array)
+                .map(|rs| {
+                    rs.iter()
+                        .map(|r| {
+                            r.get("amount")
+                                .and_then(|a| a.get("value"))
+                                .and_then(Value::as_f64)
+                                .unwrap_or(0.0)
+                        })
+                        .sum()
+                })
+                .unwrap_or(0.0);
+            out.push((start_s as u64 * 1000, end_s as u64 * 1000, total));
+        }
+        out.sort_by_key(|d| d.0);
+        out
+    }
+
+    let cost_days = day_totals(costs);
+    let today_total = cost_days
+        .last()
+        .map(|(s, e, t)| {
+            let _ = s;
+            if *e >= end_ms {
+                (*t).max(0.0)
+            } else {
+                0.0
+            }
+        })
+        .unwrap_or(0.0);
+    // 窗口内累计（前端按 30 天拉的区间，start_ms 起）
+    // 负零要 clamp：`format!("${:.2}", -0.0)` 会打出「$-0.00」（浮点 -0.0 无法避免，
+    // 上游金额是整数所以默认就是 0，但防御性 clamp 一行搞定）。
+    let window_total: f64 = cost_days
+        .iter()
+        .filter(|(s, _, _)| *s >= start_ms)
+        .map(|(_, _, t)| *t)
+        .sum::<f64>()
+        .max(0.0);
+
+    // token / 请求数来自 usage/completions（可选）
+    let mut tokens: i64 = 0;
+    let mut requests: i64 = 0;
+    if let Some(u) = usage {
+        if let Some(arr) = u.get("data").and_then(Value::as_array) {
+            for b in arr {
+                let Some(results) = b.get("results").and_then(Value::as_array) else { continue };
+                for r in results {
+                    let input = r.get("input_tokens").and_then(Value::as_i64).unwrap_or(0);
+                    let cached = r.get("input_cached_tokens").and_then(Value::as_i64).unwrap_or(0);
+                    let output = r.get("output_tokens").and_then(Value::as_i64).unwrap_or(0);
+                    let audio_in = r.get("input_audio_tokens").and_then(Value::as_i64).unwrap_or(0);
+                    let audio_out = r.get("output_audio_tokens").and_then(Value::as_i64).unwrap_or(0);
+                    tokens += input + cached + output + audio_in + audio_out;
+                    requests += r.get("num_model_requests").and_then(Value::as_i64).unwrap_or(0);
+                }
+            }
+        }
+    }
+
+    let mut rows = vec![
+        json!({"label": "今日消费", "value": format!("${:.2}", today_total)}),
+        json!({"label": "近30天累计", "value": format!("${:.2}", window_total)}),
+    ];
+    if tokens > 0 {
+        rows.push(json!({"label": "近30天 Tokens", "value": tokens.to_string()}));
+        rows.push(json!({"label": "近30天请求数", "value": requests.to_string()}));
+    }
+
+    // 管理员接口没有「剩余比例」语义：给一个占位 window（percent=100），
+    // UI 只把它当进度条画。真正信息量在 rows。
+    let windows = json!([{
+        "label": "近30天",
+        "percent": if window_total > 0.0 { 100.0 } else { 0.0 },
+    }]);
+
+    ok_result(
+        "openai",
+        format!("30天 ${:.2}", window_total),
+        format!("今日 ${:.2}", today_total),
+        windows,
+        json!(rows),
+    )
 }

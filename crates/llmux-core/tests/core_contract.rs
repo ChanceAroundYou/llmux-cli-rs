@@ -1,6 +1,8 @@
 use llmux_core::config::AppConfig;
 use llmux_core::crypto::{decrypt_api_key, encrypt_api_key, get_or_create_master_key};
-use llmux_core::db::{connect_sqlite, init_db, INIT_SQL, MIGRATION_0021};
+use llmux_core::db::{
+    connect_sqlite, init_db, MIGRATION_0030, INIT_SQL, MIGRATION_0021,
+};
 use llmux_core::export_import::{export_config, import_config, ConfigExport};
 use llmux_core::models::{Account, ApiKey, ModelAlias, Provider, UsageLogParams};
 use llmux_core::settings::SettingsService;
@@ -59,6 +61,7 @@ async fn init_db_creates_fresh_schema_and_seed_providers() {
             "admin_credentials",
             "aggregate_aliases",
             "api_keys",
+            "disabled_models",
             "model_aliases",
             "model_prices",
             "model_probe_suspensions",
@@ -1209,4 +1212,46 @@ async fn migration_0024_makes_the_dashboard_query_a_covering_ordered_scan() {
         plan.contains("idx_usage_logs_is_test_timestamp"),
         "首页查询没走新加的索引：{plan}"
     );
+}
+
+/// 0030 要在**没有迁移记录表**的前提下幂等：init_db 每次启动都重跑全部迁移，
+/// 靠吞掉「already exists」假装幂等。所以 0030 必须能在一个已经建过
+/// disabled_models 的库上再跑一遍而不报错 —— 否则每次启动都 warn 一片。
+#[tokio::test]
+async fn migration_0030_is_idempotent_on_restart() {
+    let pool = memory_db().await;
+    // 第一次：建表 + 插一行
+    for stmt in MIGRATION_0030.split(';') {
+        let stmt = stmt.trim();
+        if !stmt.is_empty() {
+            sqlx::query(stmt).execute(&pool).await.expect("0030 first run");
+        }
+    }
+    sqlx::query("INSERT INTO disabled_models (account_id, model) VALUES (1, 'gpt-4o')")
+        .execute(&pool)
+        .await
+        .expect("insert disabled");
+
+    // 第二次：模拟重启，再跑一遍 0030 —— 必须静默成功（CREATE TABLE IF NOT EXISTS）
+    for stmt in MIGRATION_0030.split(';') {
+        let stmt = stmt.trim();
+        if !stmt.is_empty() {
+            sqlx::query(stmt).execute(&pool).await.expect("0030 second run");
+        }
+    }
+
+    // 行还在，主键 (account_id, model) 生效
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM disabled_models WHERE account_id = 1 AND model = 'gpt-4o'")
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(n, 1);
+    // 重复插入被主键挡住（INSERT OR REPLACE 语义由调用方保证，这里只验主键存在）
+    let cols: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM pragma_table_info('disabled_models') ORDER BY name",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("columns");
+    assert_eq!(cols, vec!["account_id", "model"]);
 }

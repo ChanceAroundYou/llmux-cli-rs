@@ -9,6 +9,7 @@ export interface AvailableModel {
   owned_by: string;
   error?: string;
   context_length?: number;
+  disabled?: boolean;
 }
 
 export interface ModelAlias {
@@ -76,6 +77,7 @@ interface ModelsState {
   saveAggregateAlias: (alias: string, candidates: AggregateCandidate[], intervalSecs?: number, confirm?: boolean, upstreamApi?: string, firstByteTimeoutSecs?: number | null) => Promise<void>;
   deleteAggregateAlias: (id: number) => Promise<void>;
   setAggregateActive: (id: number, active: number) => Promise<void>;
+  setModelDisabled: (accountId: number, model: string, disabled: boolean) => Promise<void>;
   testModel: (modelId: string, providerId?: string, accountId?: number) => Promise<{ success: boolean; error?: string; latency?: number; status?: number; via?: string | null; supported?: string[]; mismatchedConfig?: string | null }>;
   startTestQueue: (models: { model: string, providerId: string, accountId?: number }[], scope?: string) => Promise<{ success: boolean; error?: string }>;
   fetchTestQueueStatus: () => Promise<{ isRunning: boolean; current: number; total: number; progress: number; scope?: string }>;
@@ -307,6 +309,19 @@ export const useModelsStore = create<ModelsState>((set, get) => ({
       const res = await apiFetch(`/api/aggregate-aliases/${id}/active`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ active }) });
       if (!res.ok) { const data = await res.json(); throw new Error(data.error || 'Failed to set active'); }
       await get().fetchAggregateAliases();
+    } catch (err: any) { set({ error: err.message }); throw err; }
+  },
+
+  setModelDisabled: async (accountId, model, disabled) => {
+    try {
+      const res = await apiFetch('/api/models/disabled', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ account_id: accountId, model, disabled }),
+      });
+      if (!res.ok) { const data = await res.json(); throw new Error(data.error || 'Failed to update model state'); }
+      // 强制刷新保证 persisted data / SSE / 内存态一致
+      await get().fetchModels(true);
     } catch (err: any) { set({ error: err.message }); throw err; }
   },
 

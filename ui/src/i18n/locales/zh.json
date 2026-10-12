@@ -388,7 +388,8 @@
       "noAliases": "暂无关联别名",
       "refresh": "刷新模型库",
       "copyAlias": "复制别名",
-      "copyName": "复制模型名称"
+      "copyName": "复制模型名称",
+      "disable": "禁用此模型（该账户不再探测/曝光，别名不受影响）"
     },
     "testBtn": "拨测",
     "probeSuspended": "已暂停自动拨测（连续失败 {{n}} 次）· {{t}} 后重试",
@@ -421,7 +422,9 @@
     "downstreamUnsupportedBadge": "不支持 {{mode}}",
     "firstByteTimeout": "首字节超时（秒）",
     "firstByteTimeoutHint": "可选；留空使用 30 秒默认值，最大 600 秒。",
-    "firstByteTimeoutPlaceholder": "默认（30 秒）"
+    "firstByteTimeoutPlaceholder": "默认（30 秒）",
+    "disableBtn": "禁用",
+    "enableBtn": "解除禁用"
   },
   "keys": {
     "title": "API 密钥管理",

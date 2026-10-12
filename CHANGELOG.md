@@ -181,6 +181,46 @@
   ⚠️ 只有 `openai_streaming_passthrough` 一条路径受影响（anthropic 路径的 token
   来自 `converter.usage_tokens()`，不过 SSE 解析，且没有去重门）。
 
+### Added
+
+- **ChatGPT 订阅用量显示**（ChatGPT Plus / Pro / Team）。账户的「余额查询接口」
+  新增「ChatGPT 订阅」选项，凭据填 Codex OAuth `access_token`（`~/.codex/auth.json`
+  的 `tokens.access_token`，三段 JWT）或网页登录 Cookie。数据源走
+  `GET chatgpt.com/backend-api/wham/usage`，折叠态显示 5 小时窗口剩余百分比，
+  展开显示 5 小时 / 每周两个窗口的重置时间与额度余额。`additional_rate_limits`
+  里的模型专属限额（如 gpt-5.3-codex-spark）也按窗口列出。
+
+  实现是既有 balance 流水线的**第 2 阶段扩展**：`detect_kind` 加两分支（显式
+  `chatgpt`/`chatgpt-plus`/`codex`、host `chatgpt.com`），`fetch_balance` 加一个
+  arm，其余（写 `limits_cache`、UI 渲染、凭据选择）一行没改。
+
+  两个字段语义要留意：上游 `used_percent` 是**已用**比例，转成 llmux 的
+  「剩余」约定（`percent = 100 - used_percent`）；`reset_at` 是**秒**，乘 1000
+  转毫秒。JWT payload 里的 `chatgpt_account_id` 会顺手解出来当
+  `ChatGPT-Account-Id` 头（解析失败不阻断探测）。
+
+- **OpenAI API 用量显示**。账户的「余额查询接口」新增「OpenAI API」选项。
+  有组织管理员 Key（`sk-admin-…`）时走 `/v1/organization/costs`（按天分桶，
+  `group_by=line_item`）+ `/v1/organization/usage/completions`，展示今日消费 /
+  近 30 天累计 / Tokens / 请求数。普通 Key 会自动回落到旧版
+  `/v1/dashboard/billing/credit_grants`，只显示可用/已用/总授予与最近到期日。
+  两个接口都不可用时返回 401/403 并提示换管理员 Key，**不**渲染空卡片。
+
+  「近 30 天」而不是「本月」：与 llmux 既有的本日/本月/累计口径一致，且桶边界
+  由上游给，不必自己算月初。
+
+- **模型管理页支持手动禁用账户下的模型**。卡片底部新增「禁用」小按钮，
+  点掉后该模型从这台账户的可用列表里消失（不被拨测、不出现在快速关联的目标
+  下拉、`/v1/models` 不再广告目标模型被禁用的别名），但**不删别名** ——
+  用户可能故意禁上游模型而保留别名，改绑还是删由用户决定。
+
+  存储是迁移 0030 的 `disabled_models(account_id, model)` 表，与
+  `model_protocol_cache` 同粒度同主键，只记录事实、不参与路由。过滤发生在
+  **写入**持久快照时（`account_model_cache`）而不是各消费方各自筛 ——
+  否则今天禁掉、明天重启，快照又把它吐回来了。`/v1/models` 另有一道过滤：
+  别名绑定的每个账户都把 target_model 禁掉时才不广告，客户端不会列出一个
+  选中必然 404 的模型。
+
 ### Changed
 
 - **全量 body 调试日志从 DEBUG 降到 TRACE；生产 `RUST_LOG` 改回 `info`**。

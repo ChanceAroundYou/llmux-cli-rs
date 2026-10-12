@@ -343,6 +343,7 @@ fn core_router() -> AppRouter {
             "/api/models/aliases/:id",
             delete(models::delete_model_alias),
         )
+        .route("/api/models/disabled", post(models::set_model_disabled))
         .route(
             "/api/aggregate-aliases",
             get(models::list_aggregate_aliases).post(models::set_aggregate_alias),

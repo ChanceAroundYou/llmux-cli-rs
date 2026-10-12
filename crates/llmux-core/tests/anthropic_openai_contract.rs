@@ -6,6 +6,9 @@ use llmux_core::proxy::anthropic_openai::{
     map_tools_to_openai, openai_to_anthropic_response, parse_sse_chunks, sse_data_payload,
     OpenAISseConverter,
 };
+use llmux_core::proxy::responses::{
+    anthropic_to_responses, chat_to_responses, ResponsesToChatConverter,
+};
 use serde_json::json;
 
 // ---------------------------------------------------------------------------
@@ -311,63 +314,37 @@ fn request_thinking_budget_backstops_max_tokens() {
     .unwrap();
 
     assert_eq!(req["max_tokens"], 4096);
-    assert_eq!(req["thinking"]["type"], "enabled");
+    // `thinking` 是 Anthropic 专有参数，OpenAI chat/completions 直接 400
+    // （实测 `Unknown parameter: 'thinking'`）。必须换成 `reasoning_effort`。
+    assert!(req.get("thinking").is_none(), "thinking must not be forwarded: {req}");
+    assert_eq!(req["reasoning_effort"], "medium");
 }
 
 #[test]
-fn request_normalizes_adaptive_thinking_type() {
-    // DeepSeek-style clients send `thinking.type: "adaptive"`. Some gateways
-    // (Sensenova) pass it through but their backend (Tencent Cloud) only
-    // accepts ["enabled","disabled","auto"] → 400. Must normalize to "enabled".
-    let req = anthropic_to_openai_request(
-        &json!({
-            "model": "m",
-            "max_tokens": 100,
-            "messages": [{"role": "user", "content": "hi"}],
-            "thinking": {"type": "adaptive", "budget_tokens": 200}
-        }),
-        "t",
-    )
-    .unwrap();
-
-    assert_eq!(req["thinking"]["type"], "enabled");
-    assert_eq!(req["thinking"]["budget_tokens"], 200);
-    assert_eq!(req["max_tokens"], 100); // max_tokens already present, unchanged
+fn request_thinking_maps_budget_to_effort() {
+    // 预算 → 档位：低预算给低档，高预算给高档。
+    let cases = [
+        (512, "low"),
+        (4096, "medium"),
+        (32000, "high"),
+    ];    for (budget, want) in cases {
+        let req = anthropic_to_openai_request(
+            &json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "hi"}],
+                "thinking": {"type": "enabled", "budget_tokens": budget}
+            }),
+            "t",
+        )
+        .unwrap();
+        assert_eq!(req["reasoning_effort"], want, "budget {budget} -> {want}");
+    }
 }
 
 #[test]
-fn request_adaptive_thinking_backstops_max_tokens() {
-    let req = anthropic_to_openai_request(
-        &json!({
-            "model": "m",
-            "messages": [{"role": "user", "content": "hi"}],
-            "thinking": {"type": "adaptive", "budget_tokens": 512}
-        }),
-        "t",
-    )
-    .unwrap();
-
-    assert_eq!(req["max_tokens"], 512);
-    assert_eq!(req["thinking"]["type"], "enabled");
-}
-
-#[test]
-fn request_thinking_enabled_unchanged() {
-    let req = anthropic_to_openai_request(
-        &json!({
-            "model": "m",
-            "messages": [{"role": "user", "content": "hi"}],
-            "thinking": {"type": "enabled", "budget_tokens": 4096}
-        }),
-        "t",
-    )
-    .unwrap();
-
-    assert_eq!(req["thinking"]["type"], "enabled");
-}
-
-#[test]
-fn request_thinking_disabled_unchanged() {
+fn request_thinking_disabled_sends_no_effort() {
+    // `disabled` 不该变成 `reasoning_effort: "none"` —— 多数 OpenAI 系上游
+    // 连 `none` 一起拒（见 reasoning_effort 模块注释）。
     let req = anthropic_to_openai_request(
         &json!({
             "model": "m",
@@ -378,7 +355,8 @@ fn request_thinking_disabled_unchanged() {
     )
     .unwrap();
 
-    assert_eq!(req["thinking"]["type"], "disabled");
+    assert!(req.get("thinking").is_none());
+    assert!(req.get("reasoning_effort").is_none());
 }
 
 #[test]
@@ -951,4 +929,103 @@ fn nonstream_keeps_valid_tool_calls_and_valid_siblings() {
     let text = out.to_string();
     assert!(text.contains("call_ok") && text.contains("Bash"), "valid call must survive: {text}");
     assert!(!text.contains("Nameless"), "nameless call must be dropped: {text}");
+}
+
+// ---------------------------------------------------------------------------
+// Responses conversion: stream_options must not leak into a /responses body
+// ---------------------------------------------------------------------------
+
+#[test]
+fn responses_request_omits_stream_options() {
+    // The Responses API has no stream_options parameter — OpenAI rejects the request
+    // wholesale ("Unknown parameter: 'stream_options.include_usage'", 400), which
+    // takes down every streaming call routed to a /responses upstream.
+    let req = anthropic_to_responses(
+        &json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        }),
+        "gpt-6-luna",
+    );
+
+    assert_eq!(req["stream"], true);
+    assert!(req.get("stream_options").is_none(),
+        " Responses body must not carry stream_options: {req}");
+
+    let req = chat_to_responses(
+        &json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true,
+            "stream_options": {"include_usage": true}
+        }),
+        "gpt-6-luna",
+    );
+
+    assert_eq!(req["stream"], true);
+    assert!(req.get("stream_options").is_none(),
+        "a chat-side stream_options must not be forwarded: {req}");
+}
+
+#[test]
+fn responses_reasoning_maps_budget_to_effort() {
+    // Responses API only accepts `reasoning.effort`; sending the Anthropic
+    // `thinking` object verbatim 400s on `reasoning.budget_tokens`.
+    let req = anthropic_to_responses(
+        &json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "enabled", "budget_tokens": 4096}
+        }),
+        "gpt-6-luna",
+    );
+
+    assert!(req.get("thinking").is_none(), "Anthropic `thinking` must not be forwarded: {req}");
+    assert_eq!(req["reasoning"]["effort"], "medium");
+    // 客户端没给 max_tokens 时，thinking 的预算就是输出上限（Anthropic 的
+    // max_tokens **不含** thinking 预算）。
+    assert_eq!(req["max_output_tokens"], 4096);
+}
+
+#[test]
+fn responses_reasoning_disabled_sends_nothing() {
+    // 不能发 `reasoning.effort: "none"` —— Responses 模型大多没有这一档。
+    let req = anthropic_to_responses(
+        &json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "disabled"}
+        }),
+        "gpt-6-luna",
+    );
+
+    assert!(req.get("reasoning").is_none());
+    assert!(req.get("max_output_tokens").is_none());
+}
+
+#[test]
+fn responses_reasoning_does_not_override_client_max_tokens() {
+    let req = anthropic_to_responses(
+        &json!({
+            "model": "m",
+            "max_tokens": 128,
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "enabled", "budget_tokens": 32000}
+        }),
+        "gpt-6-luna",
+    );
+
+    assert_eq!(req["max_output_tokens"], 128);
+    assert_eq!(req["reasoning"]["effort"], "high");
+}
+
+#[test]
+fn responses_stream_usage_survives_without_stream_options() {
+    // Usage accounting must not come to depend on the removed parameter: the
+    // converter harvests it from the response.completed event.
+    let mut c = ResponsesToChatConverter::new("gpt-6-luna");
+    c.feed("event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n\n");
+
+    assert_eq!(c.usage_tokens(), (10, 5));
 }

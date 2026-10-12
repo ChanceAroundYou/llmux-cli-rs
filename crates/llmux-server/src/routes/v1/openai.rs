@@ -273,6 +273,13 @@ pub(crate) async fn dispatch_with_conversion(
             // 同一处回错顺便学 max_tokens 上限：客户端发 65536、上游只收
             // 32768 时整轮 400，不学会就会一直白打（见 max_tokens 模块注释）。
             provider_request.max_tokens.record_rejection(&error_body);
+            // 另一种 400：参数名本身不被接受（`Unsupported parameter: 'max_tokens'
+            // ... Use 'max_completion_tokens' instead.`，gpt-6/o 系列）。这不是
+            // 数值问题，clamp 救不了 —— 得改名重发。
+            if llmux_core::max_tokens::is_param_name_rejection(&error_body) {
+                llmux_core::max_tokens::note_completion_rename(&account.provider_id, &model_name);
+                tracing::info!("🚫 {} / {} requires max_completion_tokens — will rename on next request", account.alias, model_name);
+            }
             // 上游拒了 prompt_cache_breakpoint → 记下来，后续不再发。
             if error_body.contains("prompt_cache_breakpoint") || error_body.contains("cache_breakpoint") {
                 state.note_cache_breakpoint_unsupported(&account.provider_id);
@@ -489,6 +496,7 @@ pub(crate) async fn dispatch_with_conversion(
 /// `chat/responses/messages_endpoint` columns (with legacy `base_url` fallback
 /// via `protocol::endpoint_for`) are honored. Anthropic headers are set when
 /// the target is `Messages`.
+
 fn build_target_request(
     account: &adapters::Account,
     target: Protocol,

@@ -386,7 +386,8 @@
       "noAliases": "No aliases defined",
       "refresh": "Refresh Models",
       "copyAlias": "Copy Alias",
-      "copyName": "Copy Model Name"
+      "copyName": "Copy Model Name",
+      "disable": "Disable this model (the account no longer probes/exposes it; aliases are unaffected)"
     },
     "testBtn": "Test",
     "probeSuspended": "Auto-probing paused ({{n}} consecutive failures) · retry in {{t}}",
@@ -419,7 +420,9 @@
     "downstreamUnsupportedBadge": "unsupported: {{mode}}",
     "firstByteTimeout": "First-byte timeout (seconds)",
     "firstByteTimeoutHint": "Optional; blank uses the 30-second default. Maximum 600 seconds.",
-    "firstByteTimeoutPlaceholder": "Default (30 seconds)"
+    "firstByteTimeoutPlaceholder": "Default (30 seconds)",
+    "disableBtn": "Disable",
+    "enableBtn": "Enable"
   },
   "auth": {
     "webLogin": "Web Session Login",

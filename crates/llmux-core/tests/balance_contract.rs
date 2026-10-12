@@ -4,9 +4,10 @@
 //! worth locking down; the HTTP layer is exercised in production.
 
 use llmux_core::balance::{
-    balance_credential, balance_uses_api_key, commandcode_result, detect_kind, oc_parse_billing_balance,
-    oc_parse_billing_balance_loose, oc_parse_subscription, oc_parse_subscription_goat,
-    oc_scan_balance_any_text, teamorouter_result, BalanceKind,
+    balance_credential, balance_uses_api_key, chatgpt_result, commandcode_result, detect_kind,
+    oc_parse_billing_balance, oc_parse_billing_balance_loose, oc_parse_subscription,
+    oc_parse_subscription_goat, oc_scan_balance_any_text, openai_result, teamorouter_result,
+    BalanceKind,
 };
 
 #[test]
@@ -382,4 +383,238 @@ fn teamorouter_bad_payload_reports_error_not_empty_card() {
     let v = teamorouter_result(&serde_json::json!({"code": 0}));
     assert_eq!(v["ok"], false);
     assert!(v["error"].as_str().unwrap().contains("data"), "{v}");
+}
+
+// ─── ChatGPT 订阅用量 ────────────────────────────────────────────────────────
+
+#[test]
+fn chatgpt_detected_explicitly_and_by_host() {
+    assert!(matches!(
+        detect_kind("custom", &[], "chatgpt"),
+        Some(BalanceKind::ChatGPT)
+    ));
+    // 显式 aliases：chatgpt-plus / codex
+    assert!(matches!(
+        detect_kind("custom", &[], "chatgpt-plus"),
+        Some(BalanceKind::ChatGPT)
+    ));
+    assert!(matches!(
+        detect_kind("custom", &[], "codex"),
+        Some(BalanceKind::ChatGPT)
+    ));
+    // 自动检测：UI 建号时 provider_id='custom'，host 是唯一信号
+    assert!(matches!(
+        detect_kind("custom", &["https://chatgpt.com/backend-api"], ""),
+        Some(BalanceKind::ChatGPT)
+    ));
+    assert_eq!(BalanceKind::ChatGPT.as_str(), "chatgpt");
+    // 「none」仍必须显式禁用，不被 host 嗅探抢走
+    assert!(detect_kind("custom", &["https://chatgpt.com"], "none").is_none());
+}
+
+#[test]
+fn chatgpt_usage_real_payload() {
+    // 2026-10-11 ChatGPT Plus 实测形态（wham/usage）
+    let v = chatgpt_result(&serde_json::json!({
+        "account_id": "acc_123",
+        "plan_type": "plus",
+        "rate_limit": {
+            "primary_window": { "used_percent": 12, "reset_at": 1_760_000_000i64, "limit_window_seconds": 18000 },
+            "secondary_window": { "used_percent": 41, "reset_at": 1_760_300_000i64, "limit_window_seconds": 604800 }
+        },
+        "credits": { "has_credits": true, "unlimited": false, "balance": 8.75 }
+    }));
+    assert_eq!(v["ok"], true, "{v}");
+    assert_eq!(v["provider"], "chatgpt");
+    let windows = v["windows"].as_array().unwrap();
+    assert_eq!(windows.len(), 2, "{v}");
+    // llmux 的 percent 是「剩余」：100 - used_percent
+    assert_eq!(windows[0]["label"], "5 小时");
+    assert_eq!(windows[0]["percent"], 88.0);
+    assert_eq!(windows[0]["exceeded"], false);
+    // reset_at 是秒 → 毫秒
+    assert_eq!(windows[0]["resets_at"], 1_760_000_000_000i64);
+    assert_eq!(windows[1]["label"], "每周");
+    assert_eq!(windows[1]["percent"], 59.0);
+    // summary/detail 也报剩余比例
+    assert!(v["summary"].as_str().unwrap().contains("plus"), "{v}");
+    assert!(v["summary"].as_str().unwrap().contains("88"), "{v}");
+    assert!(v["detail"].as_str().unwrap().contains("59"), "{v}");
+    // 额度余额进 rows
+    assert_eq!(v["rows"][0]["label"], "额度余额");
+    assert_eq!(v["rows"][0]["value"], "$8.75");
+}
+
+#[test]
+fn chatgpt_unlimited_credits_and_additional_limits() {
+    // unlimited 额度 → 「无限」；additional_rate_limits 的模型专属窗口也要出现
+    let v = chatgpt_result(&serde_json::json!({
+        "plan_type": "pro",
+        "rate_limit": { "primary_window": { "used_percent": 100, "reset_at": 1_760_000_000i64, "limit_window_seconds": 18000 } },
+        "credits": { "has_credits": true, "unlimited": true },
+        "additional_rate_limits": [
+            { "limit_name": "gpt-5.3-codex-spark", "rate_limit": { "primary_window": { "used_percent": 5, "reset_at": 1_760_100_000i64, "limit_window_seconds": 604800 } } }
+        ]
+    }));
+    assert_eq!(v["ok"], true, "{v}");
+    let windows = v["windows"].as_array().unwrap();
+    assert_eq!(windows.len(), 2, "{v}");
+    assert_eq!(windows[0]["percent"], 0.0, "{v}");
+    // 用满 = exceeded
+    assert_eq!(windows[0]["exceeded"], true);
+    assert_eq!(windows[1]["label"], "gpt-5.3-codex-spark");
+    assert_eq!(windows[1]["percent"], 95.0);
+    assert_eq!(v["rows"][0]["value"], "无限");
+}
+
+#[test]
+fn chatgpt_free_plan_without_windows_still_ok() {
+    // free / guest 计划没有 rate_limit → 卡片不能是空壳，summary 退化成计划名
+    let v = chatgpt_result(&serde_json::json!({ "plan_type": "free" }));
+    assert_eq!(v["ok"], true, "{v}");
+    assert_eq!(v["summary"], "free");
+    assert_eq!(v["windows"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn chatgpt_bad_payload_reports_error_not_empty_card() {
+    // 没有 plan_type、没有 rate_limit、没有 credits → 至少不能崩，且 ok:true 仅是
+    // 「空但合法」的卡片（与 free 计划同口径）；真正的坏 payload（非对象）由
+    // fetch 层的 JSON parse 拦住，不会走到这里。
+    let v = chatgpt_result(&serde_json::json!({}));
+    assert_eq!(v["ok"], true, "{v}");
+    assert_eq!(v["summary"], "ChatGPT");
+}
+
+// ─── OpenAI API 用量 ─────────────────────────────────────────────────────────
+
+#[test]
+fn openai_detected_explicitly_and_by_host() {
+    assert!(matches!(
+        detect_kind("custom", &[], "openai"),
+        Some(BalanceKind::OpenAI)
+    ));
+    assert!(matches!(
+        detect_kind("custom", &[], "openai-api"),
+        Some(BalanceKind::OpenAI)
+    ));
+    assert!(matches!(
+        detect_kind("custom", &["https://api.openai.com/v1"], ""),
+        Some(BalanceKind::OpenAI)
+    ));
+    assert_eq!(BalanceKind::OpenAI.as_str(), "openai");
+    // 「none」显式禁用优先级高于 host 嗅探
+    assert!(detect_kind("custom", &["https://api.openai.com"], "none").is_none());
+}
+
+#[test]
+fn openai_admin_costs_payload() {
+    // /v1/organization/costs 的 data[] 分桶形态
+    let costs = serde_json::json!({
+        "data": [
+            { "start_time": 1_759_000_000i64, "end_time": 1_759_086_400i64,
+              "results": [ { "amount": { "value": 3.25, "currency": "usd" }, "line_item": "gpt-4o" } ] },
+            { "start_time": 1_759_086_400i64, "end_time": 1_759_172_800i64,
+              "results": [
+                { "amount": { "value": 1.5 }, "line_item": "gpt-4o" },
+                { "amount": { "value": 0.25 }, "line_item": "gpt-3.5-turbo" }
+              ] }
+        ]
+    });
+    let usage = serde_json::json!({
+        "data": [
+            { "start_time": 1_759_086_400i64, "end_time": 1_759_172_800i64,
+              "results": [ { "input_tokens": 1000, "output_tokens": 500, "num_model_requests": 7, "model": "gpt-4o" } ] }
+        ]
+    });
+    // 窗口 [start_ms, end_ms)：故意把窗口起点设在第一个桶之前、终点落在第二个桶内，
+    // 于是第一个桶算「昨天/历史」、第二个桶算「今天」—— day 判据是 end >= end_ms。
+    let v = openai_result(&costs, Some(&usage), 1_758_000_000_000u64, 1_759_172_800_000u64);
+    assert_eq!(v["ok"], true, "{v}");
+    assert_eq!(v["provider"], "openai");
+    let rows = v["rows"].as_array().unwrap();
+    // 今日 = 最后那个覆盖 end_ms 的桶（1.75）
+    assert_eq!(rows[0]["label"], "今日消费");
+    assert_eq!(rows[0]["value"], "$1.75");
+    // 累计 = start_ms 之后的两个桶合计（3.25 + 1.5 + 0.25）
+    assert_eq!(rows[1]["label"], "近30天累计");
+    assert_eq!(rows[1]["value"], "$5.00");
+    // token/请求来自 usage/completions
+    assert_eq!(rows[2]["label"], "近30天 Tokens");
+    assert_eq!(rows[2]["value"], "1500");
+    assert_eq!(rows[3]["label"], "近30天请求数");
+    assert_eq!(rows[3]["value"], "7");
+}
+
+#[test]
+fn openai_credit_grants_fallback() {
+    // 普通 Key 只走得了 /v1/dashboard/billing/credit_grants
+    let grants = serde_json::json!({
+        "total_granted": 120.0,
+        "total_used": 12.5,
+        "total_available": 107.5,
+        "grants": { "data": [ { "grant_amount": 120.0, "used_amount": 12.5, "expires_at": 1_770_000_000i64 } ] }
+    });
+    let v = openai_result(&grants, None, 0, 1_760_000_000_000u64);
+    assert_eq!(v["ok"], true, "{v}");
+    assert_eq!(v["summary"], "$107.50");
+    assert!(v["detail"].as_str().unwrap().contains("12.50"), "{v}");
+    let windows = v["windows"].as_array().unwrap();
+    assert_eq!(windows[0]["label"], "API 额度");
+    // available / granted ≈ 89.58%
+    assert!((windows[0]["percent"].as_f64().unwrap() - 89.5833).abs() < 0.01, "{v}");
+    // expires_at 秒 → 毫秒，且必须是未来的
+    assert_eq!(windows[0]["resets_at"], 1_770_000_000_000i64);
+}
+
+#[test]
+fn openai_credit_grants_rough_payload_still_parses() {
+    // 上游实际返回大量浮点噪声 + 整数金额，不能崩
+    let grants = serde_json::json!({
+        "total_granted": 5.893680000000001,
+        "total_used": 0.000000000000000,
+        "total_available": 5.893680000000001
+    });
+    let v = openai_result(&grants, None, 0, 0);
+    assert_eq!(v["ok"], true, "{v}");
+    assert_eq!(v["summary"], "$5.89");
+}
+
+#[test]
+fn openai_costs_without_usage_json_still_ok() {
+    // usage/completions 不可用时（只 costs 成功）不该丢金额信息
+    let costs = serde_json::json!({
+        "data": [
+            { "start_time": 1_759_086_400i64, "end_time": 1_759_172_800i64,
+              "results": [ { "amount": { "value": 2.0 } } ] }
+        ]
+    });
+    let v = openai_result(&costs, None, 0, 1_759_172_800_000u64);
+    assert_eq!(v["ok"], true, "{v}");
+    assert_eq!(v["rows"][0]["value"], "$2.00");
+    // 没有 usage → 不追加 token/请求行
+    assert_eq!(v["rows"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn openai_empty_costs_never_fakes_a_number() {
+    // 空 data[] 不得退化成「有数字的空卡片」——rows 仍给 0，但结构合法
+    let costs = serde_json::json!({ "data": [] });
+    let v = openai_result(&costs, None, 0, 1_760_000_000_000u64);
+    assert_eq!(v["ok"], true, "{v}");
+    assert_eq!(v["rows"][0]["value"], "$0.00");
+    assert_eq!(v["rows"][1]["value"], "$0.00");
+}
+
+#[test]
+fn openai_amount_missing_defaults_zero() {
+    // results[] 里个别项没有 amount.value（新计费项）→ 按 0 计，不 panic
+    let costs = serde_json::json!({
+        "data": [
+            { "start_time": 1_759_086_400i64, "end_time": 1_759_172_800i64,
+              "results": [ { "line_item": "image-gen" }, { "amount": { "value": 1.0 } } ] }
+        ]
+    });
+    let v = openai_result(&costs, None, 0, 1_759_172_800_000u64);
+    assert_eq!(v["rows"][0]["value"], "$1.00");
 }

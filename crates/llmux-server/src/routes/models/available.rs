@@ -10,6 +10,35 @@ use llmux_core::dispatcher::{get_active_accounts, resolve_provider_type};
 
 use crate::app::{AppState, ModelsCache};
 
+/// 该账户被手动禁用的模型集合（只读事实，表不可用时返回空集）。
+pub async fn disabled_model_set(pool: &sqlx::SqlitePool, account_id: i64) -> std::collections::HashSet<String> {
+    match sqlx::query_scalar::<_, String>("SELECT model FROM disabled_models WHERE account_id = ?")
+        .bind(account_id)
+        .fetch_all(pool)
+        .await
+    {
+        Ok(rows) => rows.into_iter().collect(),
+        Err(_) => std::collections::HashSet::new(),
+    }
+}
+
+/// 给模型数组里的每个对象打上 `disabled` 标记（true/false）。
+///
+/// 禁用的模型**不剔除**，而是留在列表里让前端变灰显示 —— 用户需要看到它们才能解除禁用。
+/// 过滤只发生在真正消费的地方：探测（`do_fetch_models`）、`/v1/models` 广告、别名表单下拉。
+pub async fn mark_disabled(models: &mut [Value], account_id: i64, pool: &sqlx::SqlitePool) {
+    let disabled = disabled_model_set(pool, account_id).await;
+    if disabled.is_empty() {
+        return;
+    }
+    for m in models.iter_mut() {
+        if let Some(obj) = m.as_object_mut() {
+            let id = obj.get("id").and_then(Value::as_str).unwrap_or("");
+            obj.insert("disabled".to_string(), json!(disabled.contains(id)));
+        }
+    }
+}
+
 /// Normalize a model object to a unified format.
 ///
 /// Ensures every model has: `id`, `name`, `object`, `created`.
@@ -213,6 +242,7 @@ async fn load_persistent_snapshot(pool: &sqlx::SqlitePool) -> Option<(Vec<Value>
         max_ts = max_ts.max(updated_at);
         let mut models: Vec<Value> = serde_json::from_str(&j).unwrap_or_default();
         for m in &mut models { normalize_model(m); }
+        mark_disabled(&mut models, account_id, pool).await;
         for m in &models { let id = m.get("id").and_then(Value::as_str).unwrap_or(""); let key = format!("{}:{}", alias, id); if seen.insert(key) { all.push(m.clone()); } }
         per_account.push(json!({"account_id": account_id, "alias": alias, "updated_at": updated_at, "error": err, "count": models.len()}));
     }
@@ -237,6 +267,9 @@ async fn persist_snapshot(pool: &sqlx::SqlitePool, all_models: &[Value]) {
         let row = sqlx::query("SELECT id FROM accounts WHERE alias = ? LIMIT 1").bind(&alias).fetch_optional(pool).await.ok().flatten();
         let account_id: Option<i64> = row.and_then(|r| r.try_get::<i64,_>("id").ok());
         let Some(aid) = account_id else { continue; };
+        // 禁用的模型也写进缓存（前端要显示灰卡），但打上 disabled 标记
+        let mut models = models.clone();
+        mark_disabled(&mut models, aid, pool).await;
         let j = serde_json::to_string(&models).unwrap_or_else(|_| "[]".into());
         let _ = sqlx::query("INSERT OR REPLACE INTO account_model_cache (account_id, alias, models_json, error, updated_at) VALUES (?, ?, ?, NULL, ?)")
             .bind(aid).bind(&alias).bind(&j).bind(now).execute(pool).await;
@@ -264,7 +297,11 @@ async fn do_fetch_models(state: &AppState) -> Vec<Value> {
             let account = account.clone();
             async move {
                 let provider_type = resolve_provider_type(None, &account.provider_id);
-                let (models, fetch_error) = fetch_provider_models(&account, &provider_type).await;
+                let (mut models, fetch_error) = fetch_provider_models(&account, &provider_type).await;
+                if !models.is_empty() {
+                    // 保留禁用模型进缓存（前端灰卡显示），但打标；探测层不再过滤
+                    mark_disabled(&mut models, account.id as i64, &state.pool).await;
+                }
                 (account.alias, models, fetch_error)
             }
         })

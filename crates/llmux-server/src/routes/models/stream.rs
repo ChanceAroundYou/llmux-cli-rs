@@ -109,6 +109,8 @@ pub async fn stream_available_models(
                     for m in &mut models {
                         if let Value::Object(obj) = m { obj.insert("owned_by".to_string(), json!(account.alias)); }
                     }
+                    // 禁用的模型留在列表里（前端灰卡显示），但打上 disabled 标记
+                    super::available::mark_disabled(&mut models, account.id as i64, &state_c.pool).await;
                     payload_models = models.clone();
                     let j = serde_json::to_string(&payload_models).unwrap_or_else(|_| "[]".into());
                     let _ = sqlx::query("INSERT OR REPLACE INTO account_model_cache (account_id, alias, models_json, error, updated_at) VALUES (?, ?, ?, ?, ?)")

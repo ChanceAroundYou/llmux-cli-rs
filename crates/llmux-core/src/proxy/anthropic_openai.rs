@@ -14,6 +14,25 @@ use std::collections::{HashMap, HashSet};
 // Request conversion: Anthropic Messages → OpenAI Chat Completions
 // ---------------------------------------------------------------------------
 
+/// Anthropic `thinking.budget_tokens` → OpenAI `reasoning_effort` tier.
+///
+/// There is no exact conversion: one is a token count, the other a named tier.
+/// Breakpoints are chosen around what clients actually send — Claude Code's
+/// default is 4096 (→ medium), and "give it real room" requests land in the
+/// tens of thousands (→ high). Deliberately coarse, because the route layer's
+/// `apply_reasoning_effort` steps the result down to whatever the upstream
+/// accepts: landing one tier high costs a redial, not a failure.
+/// Absent/zero budget means "on, no stated size" → the portable middle.
+pub(crate) fn effort_from_thinking_budget(thinking: &Value) -> Option<&'static str> {
+    match thinking.get("budget_tokens").and_then(Value::as_i64) {
+        Some(n) if n <= 0 => Some("low"),
+        Some(n) if n < 4_000 => Some("low"),
+        Some(n) if n < 24_000 => Some("medium"),
+        Some(_) => Some("high"),
+        None => Some("medium"),
+    }
+}
+
 /// Convert an Anthropic `/v1/messages` request body to an OpenAI
 /// `/chat/completions` request body. `resolved_model` is the dispatcher-resolved
 /// target model (alias expansion already applied upstream).
@@ -79,33 +98,35 @@ pub fn anthropic_to_openai_request_with(
         out.insert("tool_choice".to_string(), map_tool_choice_to_openai(v));
     }
 
-    // Extended thinking: pass through the `thinking` block, and when enabled
-    // without a max_tokens, backstop with the budget (Anthropic's max_tokens
-    // excludes the thinking budget).
+    // Extended thinking. `thinking` is an Anthropic-only request parameter:
+    // OpenAI and every OpenAI-compatible upstream reject it outright
+    // (`Unknown parameter: 'thinking'` → 400). Translate the intent instead —
+    // Anthropic expresses it as `thinking.budget_tokens`, OpenAI as a
+    // `reasoning_effort` tier. Keep the budget→max_tokens backstop: Anthropic's
+    // max_tokens excludes the thinking budget, so a client that sends only
+    // `budget_tokens` still gets a usable output ceiling.
     if let Some(thinking) = body_obj.get("thinking") {
-        let mut thinking = thinking.clone();
-        // Normalize `thinking.type`: Anthropic sends "enabled"/"disabled";
-        // DeepSeek-style clients send "adaptive"; some gateway backends
-        // (Tencent Cloud) only accept ["enabled","disabled","auto"]. "adaptive"
-        // passes some gateways' front-end validation (e.g. Sensenova's
-        // ["enabled","disabled","adaptive"]) but is then rejected by the
-        // backend with `'type' must be in ["enabled", "disabled", "auto"]`.
-        // Map any non-standard type to "enabled" so thinking keeps working
-        // across all OpenAI-compatible upstreams.
-        if let Some(t) = thinking.get_mut("type") {
-            if !matches!(t.as_str(), Some("enabled" | "disabled")) {
-                *t = json!("enabled");
-            }
-        }
-        let enabled = thinking.get("type").and_then(Value::as_str) == Some("enabled");
+        let enabled = match thinking.get("type").and_then(Value::as_str) {
+            // Anthropic sends "enabled"/"disabled"; clients that speak OpenAI's
+            // vocabulary send "adaptive"/"auto" (or a bare budget) meaning "on".
+            Some("disabled") => false,
+            _ => true,
+        };
         if enabled {
             if !out.contains_key("max_tokens") {
                 if let Some(budget) = thinking.get("budget_tokens").and_then(Value::as_i64) {
                     out.insert("max_tokens".to_string(), json!(budget));
                 }
             }
+            // Only when the client did not already pick a tier — an explicit
+            // `reasoning_effort` is theirs to choose, and `apply_reasoning_effort`
+            // (route layer) reconciles it with what the upstream accepts.
+            if !out.contains_key("reasoning_effort") {
+                if let Some(effort) = effort_from_thinking_budget(thinking) {
+                    out.insert("reasoning_effort".to_string(), json!(effort));
+                }
+            }
         }
-        out.insert("thinking".to_string(), thinking);
     }
 
     // Ask for real usage in the stream tail (DeepSeek/OpenAI-compatible gateways

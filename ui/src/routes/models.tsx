@@ -16,7 +16,9 @@ import {
   Layers,
   ChevronUp,
   ChevronDown,
-  PauseCircle
+  PauseCircle,
+  Ban,
+  RotateCcw
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { Dialog, ConfirmDialog } from '../components/Modal';
@@ -95,7 +97,7 @@ function ScopeTestButton({
 
 export default function Models() {
   const { t, i18n } = useTranslation();
-  const { availableModels, aliases, aggregateAliases, accounts, isLoading, streaming, healthCache, queueCache, fetchModels, streamModels, fetchAliases, fetchAggregateAliases, fetchAccounts, fetchSummary, addAlias, deleteAlias, saveAggregateAlias, deleteAggregateAlias, setAggregateActive, testModel } = useModelsStore();
+  const { availableModels, aliases, aggregateAliases, accounts, isLoading, streaming, healthCache, queueCache, fetchModels, streamModels, fetchAliases, fetchAggregateAliases, fetchAccounts, fetchSummary, addAlias, deleteAlias, saveAggregateAlias, deleteAggregateAlias, setAggregateActive, setModelDisabled, testModel } = useModelsStore();
   const safeModels = availableModels || [];
   const safeAccounts = accounts || [];
   const [search, setSearch] = useState('');
@@ -302,7 +304,7 @@ export default function Models() {
                           (m.owned_by ?? '').toLowerCase().includes(search.toLowerCase());
       const matchProvider = m.owned_by === activeProvider;
       return matchSearch && matchProvider;
-    });
+    }).sort((a, b) => (a.disabled ? 1 : 0) - (b.disabled ? 1 : 0));
   }, [safeModels, search, activeProvider]);
 
   const handleTestAll = (scope: TestScope) => {
@@ -363,12 +365,13 @@ export default function Models() {
   };
 
   // 模型卡片入口：无筛选 → 当前账户全部模型；有筛选 → 筛选后可见的模型。
+  // 禁用模型不参与批量拨测（但仍在卡片上灰显，可解除禁用）。
   const hasFilter = search.trim() !== '';
   const executeTestModels = async () => {
     const source = hasFilter
       ? filteredModels
       : safeModels.filter(m => m.owned_by === activeProvider);
-    const items = source.map(m => {
+    const items = source.filter(m => !m.disabled).map(m => {
       const aid = modelAccountId(m.owned_by, m.id);
       return { model: m.id, providerId: m.owned_by, ...(aid != null ? { accountId: aid } : {}) };
     }).filter(m => m.model);
@@ -749,6 +752,7 @@ export default function Models() {
           <div key={`${model.owned_by}:${model.id}`} className={cn("p-4 rounded-xl border bg-card hover:border-primary/40 transition-all group flex flex-col justify-between min-h-[160px]",
             isPlaceholder ? "border-dashed border-warning/30 bg-warning/5" : "border-border",
             suspended && "opacity-60 grayscale-[0.5] border-muted-foreground/20",
+            model.disabled && "opacity-50 grayscale border-muted-foreground/20",
           )}>
             <div className="space-y-1">
               <div className="flex items-center justify-between">
@@ -871,7 +875,7 @@ export default function Models() {
             <div className="pt-3 mt-3 border-t border-border/40 flex items-center justify-between text-xs font-bold text-muted-foreground uppercase tracking-tighter">
                {isPlaceholder ? (
                  <p className="text-xs text-warning font-normal normal-case truncate" title={(model as any).error}>{(model as any).error || t('models.apiUnavailable')}</p>
-               ) : (
+               ) : !model.disabled && (
                  <button
                    onClick={() => handleTest(model.id, model.owned_by, cardAccountId ?? undefined)}
                    // 刻意**不**因 suspended 而禁用：暂停只拦自动拨测，用户明确要
@@ -883,7 +887,30 @@ export default function Models() {
                    {cardResult?.loading ? t('models.testing') : t('models.testBtn')}
                  </button>
                )}
-               {!isPlaceholder && (
+               {!isPlaceholder && cardAccountId != null && (
+                 model.disabled ? (
+                   <button
+                     onClick={() => setModelDisabled(cardAccountId, model.id, false)}
+                     disabled={queueBusy}
+                     className="flex items-center gap-1 text-muted-foreground hover:text-success transition-colors disabled:opacity-50"
+                     title={t('models.actions.enable', '解除禁用（恢复探测与曝光）')}
+                   >
+                     <RotateCcw size={12} />
+                     {t('models.enableBtn', '解除禁用')}
+                   </button>
+                 ) : (
+                   <button
+                     onClick={() => setModelDisabled(cardAccountId, model.id, true)}
+                     disabled={queueBusy}
+                     className="flex items-center gap-1 text-muted-foreground hover:text-destructive transition-colors disabled:opacity-50"
+                     title={t('models.actions.disable', '禁用此模型（该账户不再探测/曝光，别名不受影响）')}
+                   >
+                     <Ban size={12} />
+                     {t('models.disableBtn', '禁用')}
+                   </button>
+                 )
+               )}
+               {!isPlaceholder && !model.disabled && (
                  <button
                    onClick={() => {
                       setEditingAliasId(null);
@@ -951,6 +978,7 @@ export default function Models() {
                       .filter(a => a.alias !== aliasForm.alias)
                       .filter(a => !q || a.alias.toLowerCase().includes(q));
                     const modelItems = safeModels
+                      .filter(m => !m.disabled)
                       .filter(m => !q || (m.owned_by + ' ' + m.id).toLowerCase().includes(q));
                     const pickAlias = (name: string) => {
                       // 重定向别名：provider 留空、不绑账户，请求沿别名链解析

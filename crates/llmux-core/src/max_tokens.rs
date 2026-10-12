@@ -20,7 +20,7 @@
 //! **认不出就什么都不做**（宁可漏记，不可误记）：把上限记小了会静默截断正常回复，
 //! 那个代价远大于多打一次 400。所以解析只认几种明确的措辞，且数值要落在合理区间。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 
 use serde_json::Value;
@@ -191,6 +191,71 @@ impl MaxTokensNote {
     }
 }
 
+/// 上游只认 `max_completion_tokens`、不认 `max_tokens` 的 (provider, model)。
+///
+/// 和 ceiling 分开记：ceiling 管「数值太大」，这个管「参数名不对」——
+/// 两种拒绝长得不一样，混在一起会让 rename 把上限也一起改错。
+/// gpt-6 / o 系列属此类（实测 `Unsupported parameter: 'max_tokens' is not
+/// supported with this model. Use 'max_completion_tokens' instead.`）。
+fn renames() -> &'static Mutex<HashSet<(String, String)>> {
+    static R: OnceLock<Mutex<HashSet<(String, String)>>> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// 这个 (provider, model) 是否已经因为参数名被拒过。
+pub fn needs_completion_rename(provider: &str, model: &str) -> bool {
+    renames()
+        .lock()
+        .map(|m| m.contains(&key(provider, model)))
+        .unwrap_or(false)
+}
+
+/// 记下「这个 (provider, model) 只认 `max_completion_tokens`」。
+pub fn note_completion_rename(provider: &str, model: &str) {
+    if let Ok(mut m) = renames().lock() {
+        m.insert(key(provider, model));
+    }
+    tracing::info!(
+        "[max-tokens] {} / {} requires max_completion_tokens",
+        provider,
+        model
+    );
+}
+
+/// 从上游错误正文里认出「参数名不被接受」这一类拒绝。
+///
+/// 判据刻意严：必须同时出现 `max_tokens` 和 `max_completion_tokens`，或出现
+/// 指向性明确的 "unsupported parameter"。只出现 `max_tokens` 的不算 ——
+/// 那更可能是数值超限，归 `parse_ceiling` 管。
+pub fn is_param_name_rejection(error_body: &str) -> bool {
+    let lower = error_body.to_lowercase();
+    if !lower.contains("max_tokens") {
+        return false;
+    }
+    lower.contains("max_completion_tokens")
+        || lower.contains("unsupported parameter")
+        || lower.contains("unknown parameter")
+}
+
+/// 测试之间清空 rename 记录（与 `reset_ceilings` 同义）。
+#[cfg(test)]
+pub fn reset_renames() {
+    if let Ok(mut m) = renames().lock() {
+        m.clear();
+    }
+}
+
+/// 上游只认 `max_completion_tokens` 时改名（gpt-6 / o 系列拒 `max_tokens`）。
+/// 只有真被拒过才改；显式设了 `max_completion_tokens` 的不覆盖。
+fn rename_to_completion_tokens(obj: &mut serde_json::Map<String, Value>, provider: &str, model: &str) {
+    if !needs_completion_rename(provider, model) {
+        return;
+    }
+    if let Some(v) = obj.remove("max_tokens") {
+        obj.entry("max_completion_tokens").or_insert(v);
+    }
+}
+
 /// 出站前按已学到的上限收敛 `max_tokens`。
 ///
 /// 只**向下**调整：客户端要得少就照它的（那是它的意图），要得多则收到上限
@@ -204,6 +269,9 @@ pub fn clamp_max_tokens(body: &mut Value, provider: &str, model: &str) -> MaxTok
     let Some(obj) = body.as_object_mut() else {
         return note;
     };
+    // 参数名收敛与上限收敛合并到这里 —— 之前 rename 单独挂在调用点上，
+    // 6 个 clamp 调用点只覆盖了 3 个，漏掉的路径照原样发又被拒。
+    rename_to_completion_tokens(obj, &note.provider, &model);
     let Some(ceiling) = ceiling_for(provider, model) else {
         // 还没学到 —— 照原样发，等回错时再学。
         note.sent = obj.get("max_tokens").and_then(Value::as_i64);
@@ -347,6 +415,77 @@ mod tests {
         // 更宽的上限不该把已知更严的覆盖掉
         note.record_rejection("max_tokens must be less than or equal to 32768");
         assert_eq!(ceiling_for("p", "m"), Some(8192));
+        // 末尾也要清 —— renames/ceilings 是进程级全局，不隔离会污染后面的测试。
         reset_ceilings();
+        reset_renames();
+    }
+
+    /// 实测生产报文（gpt-6-luna 拒 max_tokens，2026-10-11）。
+    const NAME_REJECTION: &str = r#"{"error":{"message":"Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead.","type":"invalid_request_error","param":"max_tokens","code":"unsupported_parameter"}}"#;
+
+    /// 只有数值超限、没有点名新参数名的，不算「参数名拒绝」——
+    /// 那归 parse_ceiling 管，误判会导致该改名的不改。
+    #[test]
+    fn param_name_rejection_needs_the_new_name_or_an_unsupported_hint() {
+        assert!(is_param_name_rejection(NAME_REJECTION));
+        assert!(is_param_name_rejection(
+            r#"{"error":{"message":"Unsupported parameter: max_tokens"}}"#
+        ));
+        assert!(!is_param_name_rejection(
+            "max_tokens (current value: 65536) must be between 0 and 32768"
+        ));
+        assert!(!is_param_name_rejection("rate limit exceeded"));
+    }
+
+    #[test]
+    fn rename_is_learned_and_queryable() {
+        reset_renames();
+        assert!(!needs_completion_rename("p", "m"));
+        note_completion_rename("p", "m");
+        assert!(needs_completion_rename("p", "m"));
+        // 别的模型不受影响
+        assert!(!needs_completion_rename("p", "other"));
+        reset_renames();
+        assert!(!needs_completion_rename("p", "m"));
+    }
+
+    /// ceiling 与 rename 互不干扰：同一个 400 只该触发一种处理。
+    #[test]
+    fn a_name_rejection_does_not_teach_a_ceiling() {
+        reset_ceilings();
+        reset_renames();
+        note_completion_rename("p", "m");
+        assert_eq!(ceiling_for("p", "m"), None);
+        reset_renames();
+    }
+
+    /// 回归：rename 必须发生在 clamp_max_tokens 内部，而不是靠调用点记得挂。
+    /// 之前 6 个调用点只挂了 3 个，漏掉的那条路径照原样发又被上游拒。
+    #[test]
+    fn clamp_itself_renames_when_learned() {
+        reset_renames();
+        reset_ceilings();
+        reset_ceilings();
+        note_completion_rename("openai", "gpt-6-luna");
+
+        // 模拟任意调用点：只调 clamp_max_tokens，不碰任何 rename 辅助
+        let mut body = json!({"model": "gpt-6-luna", "max_tokens": 65536});
+        clamp_max_tokens(&mut body, "openai", "gpt-6-luna");
+        assert_eq!(body.get("max_tokens"), None, "max_tokens 必须被改名");
+        assert_eq!(body["max_completion_tokens"], 65536);
+
+        // 没学过就不动
+        let mut body = json!({"model": "other", "max_tokens": 65536});
+        clamp_max_tokens(&mut body, "openai", "other");
+        assert_eq!(body["max_tokens"], 65536);
+        assert!(body.get("max_completion_tokens").is_none());
+
+        // 显式设了 max_completion_tokens 的不覆盖
+        let mut body = json!({"model": "gpt-6-luna", "max_tokens": 100, "max_completion_tokens": 200});
+        clamp_max_tokens(&mut body, "openai", "gpt-6-luna");
+        assert_eq!(body["max_completion_tokens"], 200);
+        assert!(body.get("max_tokens").is_none());
+
+        reset_renames();
     }
 }
