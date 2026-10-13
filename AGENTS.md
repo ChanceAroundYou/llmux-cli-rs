@@ -127,7 +127,7 @@ BASE_PATH=llmux ./deploy/deploy.sh -y           # 带基路径前缀（build 时
 ## 部署关键事实
 
 - 路由器 SSH 别名：`router`（openwrt.xiaokubao.space）
-- Docker：`/root/docker/llmux/`，`docker-compose.yml` 为双服务 `llmux` + `codex-api`（`25977:25976`，`BASE_PATH=llmux`），挂载 `./data` → `/data/llmux`；nginx `llmux.locations` 直通 `25977` 且已无 `sub_filter`（基路径由后端 `BASE_PATH` + 前端 `Vite base` 原生支持）
+- Docker：`/root/docker/llmux/`，`docker-compose.yml` 为单服务 `llmux`（`25977:25976`，`BASE_PATH=llmux`），挂载 `./data` → `/data/llmux`；nginx `llmux.locations` 直通 `25977` 且已无 `sub_filter`（基路径由后端 `BASE_PATH` + 前端 `Vite base` 原生支持）
 - 镜像 tag：统一 `llmux:latest`（不做版本管理，build 即覆盖）
 - 端口：容器内 25976 固定，宿主机当前为 25977（曾为 25976，基路径迁移时改；公网经 nginx 443 统一入口，内部 `localhost:25977`）
 - 日志：按天滚动 `llmux.log.YYYY-MM-DD`，启动时自动清理超期旧日志（`LOG_RETAIN_DAYS` 可覆盖，**compose 里默认 30**）；`docker logs` 另有 `json-file 50m*2`。
@@ -141,7 +141,7 @@ BASE_PATH=llmux ./deploy/deploy.sh -y           # 带基路径前缀（build 时
   在途流都全量缓冲一份上游响应：4998 条流实测 p50=6KB、p90=87KB、**p99=615KB、
   max=1.2MB**。已改为 `helpers::StreamCapture` 头尾有界缓冲（上限 128KB），
   详见该结构体注释。**新增流式路径时别再写 `let mut received: Vec<u8>`**。
-- **`docker-compose.yml` 现在是双服务**：`llmux` + `codex-api`（ChatGPT/Codex 订阅上游 sidecar，见「Codex 订阅上游」节）。`deploy.sh` 的 `docker compose up -d` 会一并管理它。
+- **`docker-compose.yml` 是单服务**：只有 `llmux`（2026-10-13 起 codex sidecar 已退役，见「Codex 订阅上游（原生）」节）。
 
 ## `of` 别名生产排障授权与约束（2026-10-13）
 
@@ -222,36 +222,20 @@ BASE_PATH=llmux ./deploy/deploy.sh -y           # 带基路径前缀（build 时
   再被 0024 删掉（实测每次启动白花 0.33s）。终态正确，**不要为此重构迁移机制，
   也绝不要回头改已发布的历史迁移**。
 
-## Codex 订阅上游（sidecar）
+## Codex 订阅上游（原生，2026-10-13 起；sidecar 已退役）
 
-把 ChatGPT Plus 的 Codex 额度当 OpenAI 兼容上游接进 llmux：路由器上旁挂第二个容器
-`codex-api`，llmux 用一个 custom 账户指向它。**llmux 自身零代码改动。**
+ChatGPT Plus 的 Codex 额度直连 `chatgpt.com/backend-api/codex`，llmux 原生实现
+令牌生命周期 + 私有头 + Responses 翻译（`codex_auth.rs` / `codex_compat.rs`）。
+路由器 `docker-compose.yml` 已删 `codex-api` 服务，`./codex-auth/` 目录留作
+`codex-login.sh --from-router` 的凭据来源（只读，不再挂给任何容器）。
 
-为什么旁挂而不是原生实现：codex 私有后端（`chatgpt.com/backend-api/codex`）要
-`originator` / `chatgpt-account-id` 等私有头 + OAuth 刷新，llmux 都没实现 —— llmux 里
-`crates/llmux-core/src/balance.rs` 的 `BalanceKind::ChatGPT` **只是用量探测**（读
-`~/.codex/auth.json` 打 `wham/usage`，在面板显示额度），**不含推理转发**。sidecar 吸收
-这部分，私有后端变更由上游项目吸收。
-
-- 镜像 `ghcr.io/hotchpotch/openai-api-server-via-codex:latest`（Go，0.2.x）；compose 里
-  服务名 `codex-api`，容器内 18080，**不 publish 端口** —— 只在 `llmux_default` 网络内，
-  llmux 走 `http://codex-api:18080/v1`。
-- 凭据挂 `./codex-auth:/home/app/.codex`（容器内 UID 1000，目录须 `chown 1000:1000`）。
-  `auth.json` 是**独立 device-auth 会话**（`CODEX_HOME=/tmp/codex-sidecar codex login --device-auth`），
-  **刻意不与本机 `~/.codex` 共用** —— 同一份凭据两处刷新会互相踢下线。
-  token 失效重跑 device-auth 覆盖 `auth.json` 即可，容器不用重建。
-- compose 环境变量 `OPENAI_VIA_CODEX_API_KEY=${CODEX_API_KEY}`（值在 `.env`，内网 key）；
-  llmux 账户的 `api_key` 必须是同一个值。
-- llmux 账户：`provider_id=codex`、`chat_endpoint=http://codex-api:18080/v1`、
-  **`balance_provider` 必须显式设 `none`** —— 否则 `detect_kind` 把 provider_id=codex
-  映射成 ChatGPT 探测，会拿 sidecar 的内网 key 去打 `chatgpt.com/wham/usage` 而失败。
-- 模型别名 / 网关 key 在面板自己配（`/v1/models` 暴露的模型 ID 直接用）。
-- ⚠️ sidecar 的 Responses SSE **不发 `event:` 行**（事件类型只在 JSON 体的 `type` 里）。
-  llmux 已兼容（`proxy/responses.rs` 的 `resolve_event_type` 会回退读 body）——2026-10-12
-  之前这会让**流式退化成空消息**（非流式不受影响），排查该别名流式问题时先想这条。
-- 排障：`docker compose logs codex-api`（reason code：`token_refresh_failed` /
-  `expired_without_refresh_token` 等）；升级 `docker compose pull codex-api && up -d codex-api`。
+- llmux 账户：`provider_id=codex`，`codex_auth_json` 存完整 auth.json，
+  `balance_provider=codex`（余额走 access_token 打 `wham/usage`）。
+- 登录：`./scripts/codex-login.sh --account-id 60`（device-auth，隔离 CODEX_HOME）；
+  或 `--from-router` 复用路由器 `./codex-auth/auth.json`（免登录）。
 - ⚠️ 走的是 codex **未公开私有后端**，随时可能被上游改掉而失效；**可能违背 OpenAI ToS、有账号风控风险**。
+- 归档：sidecar 方案见 `docs/codex-absorption-plan.md`；旧 compose 备份在路由器
+  `docker-compose.yml.bak-before-codex-remove-20261013`。
 
 ## 上游请求超时
 
