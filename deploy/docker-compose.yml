@@ -32,8 +32,14 @@ services:
 
   # ── OpenCode Zen 免费档 → OpenAI/Anthropic/Responses 兼容上游 (sidecar) ──
   # llmux 不能直连 opencode.ai/zen/v1（TLS 指纹门），只能经 Node 旁挂。
-  # 账户：provider_id=zen-free，四端点全填 http://zen-free:6446/v1，
-  # api_key 与 ZEN_API_KEY 同值，balance_provider=none。
+  #
+  # 账户：category=zen_free。端点**不用填**，由 `llmux_core::adapters::ZEN_FREE_BASE`
+  # 钉死成 http://zen-free:6446/v1（创建/更新会覆盖，迁移 0034 归位存量行）。
+  # 唯一要配的是 api_key = 本容器 `/app/api-keys.json` 里的一把（不是下面的
+  # ZEN_API_KEY —— 那个 env 这一版 sidecar 根本不读，key 由 sidecar 首次启动
+  # 自己生成落盘）。另配 balance_provider=none。
+  #
+  # 取 key：ssh router "docker exec zen-free node -e \"console.log(require('/app/api-keys.json'))\""
   zen-free:
     build: ./zen-free
     image: llmux/zen-free:latest

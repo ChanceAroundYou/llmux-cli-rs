@@ -43,8 +43,21 @@
     `deploy/` 的注释要求账户四端点全填同一个地址，手填必错）。
   - 界面：zen_free 与 codex 共用只读端点展示（各自列出它支持的协议）。
 
-  验证：`cargo test` 全量 463 通过；`zen_free` / `codex-Messages` / custom 三个
-  方向各有回归测试，逐个反向验证过会红（改回旧逻辑确认失败后再恢复）。
+  生产落地（2026-10-13，走管理 API 改的数据，不经手 DB）：`zen1`(43) / `zen2`(62)
+  原先是 `category=custom` + 直连 `https://opencode.ai/zen/v1`，其上的免费模型
+  全部被指纹门拒（`OpenCode's free tier can only be used from within OpenCode`）。
+  现改为 `category=zen_free`、端点归位到 sidecar、api_key 换成 sidecar
+  `/app/api-keys.json` 里的 `user-default`，并启用。
+
+  ⚠️ **账户的 api_key 必须是 sidecar 自己的 key**，不是 opencode 的 `oc_sk_…`：
+  sidecar 的 `auth()` 拿请求 Bearer 跟 `api-keys.json` 逐个比对，不匹配就 401
+  `Invalid API key`。下面 compose 里那个 `ZEN_API_KEY` env **这一版 sidecar 不读**，
+  key 是它首次启动时自己生成落盘的 —— 别照着旧注释去填。
+
+  验证（真机）：拨测 `cat-jam-free` → OK，sidecar 日志出现来自 llmux 的
+  `[OAI] … user-default cat-jam-free`，即请求确实经内网 sidecar 而不再直连。
+  `step-5-preview-free` 同一时刻回 upstream `Endpoint is unavailable`
+  （直接打 sidecar 也是同一结果，是上游侧的 per-model 限流，不是配置问题）。
 
 - **定向拨测与按密钥筛选统计的测试隔离**。`shared_state()` 用**具名**共享内存库
   （`file:keyid_shared?mode=memory&cache=shared`），4 个测试传同一个名字 ——
