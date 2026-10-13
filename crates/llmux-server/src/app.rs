@@ -399,6 +399,10 @@ fn core_router() -> AppRouter {
                 .delete(system::delete_codex_backup),
         )
         .route(
+            "/api/system/codex-import",
+            post(system::import_codex_auth),
+        )
+        .route(
             "/api/system/gemini-settings",
             get(system::get_gemini_settings).post(system::apply_gemini_settings),
         )

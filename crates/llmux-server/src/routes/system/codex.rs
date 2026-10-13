@@ -356,3 +356,62 @@ pub async fn delete_codex_backup(
         Err(e) => crate::error::simple_error(format!("Failed to delete: {e}"), StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
+
+/// 把 Codex `auth.json` 导入到指定账户的 `codex_auth_json` 字段。
+/// POST /api/system/codex-import {"account_id": 60}
+/// POST /api/system/codex-import {"account_id": 60, "auth_json": "{...}"}
+///
+/// 凭据两路：`auth_json` 内联（外置登录脚本从路由器 sidecar 取回后直传）；
+/// 缺省时读本机 `~/.codex/auth.json`（面板手工导入）。
+/// 导入前校验 `auth_mode=chatgpt` 且 access_token 非空（`CodexCreds::from_auth_json`
+/// 同一判据）。成功后账户即切原生路径（`is_codex_native` 为真），sidecar 可停。
+pub async fn import_codex_auth(
+    Extension(state): Extension<AppState>,
+    Json(body): Json<Value>,
+) -> Response {
+    let account_id = match body.get("account_id").and_then(Value::as_i64) {
+        Some(id) => id,
+        None => return crate::error::simple_error("Missing 'account_id'", StatusCode::BAD_REQUEST),
+    };
+    // 内联优先：脚本已把远端 auth.json 取回本地，直接用它，不碰本机文件。
+    let content = match body.get("auth_json").and_then(Value::as_str).filter(|s| !s.trim().is_empty()) {
+        Some(inline) => inline.to_string(),
+        None => {
+            let auth_path = match codex_auth_path() {
+                Some(p) => p,
+                None => return crate::error::simple_error("Cannot determine Codex directory", StatusCode::INTERNAL_SERVER_ERROR),
+            };
+            if !auth_path.exists() {
+                return crate::error::simple_error(
+                    format!("Codex auth file not found at {} — run `codex login` first", auth_path.display()),
+                    StatusCode::NOT_FOUND,
+                );
+            }
+            match fs::read_to_string(&auth_path) {
+                Ok(c) => c,
+                Err(e) => return crate::error::simple_error(format!("Failed to read auth.json: {e}"), StatusCode::INTERNAL_SERVER_ERROR),
+            }
+        }
+    };
+    // 先校验再入库：脏 JSON 进 DB 会让该账户每次请求都走 refresh 失败分支。
+    let creds = match llmux_core::codex_auth::CodexCreds::from_auth_json(&content) {
+        Ok(c) => c,
+        Err(e) => return crate::error::simple_error(format!("Invalid auth.json: {e}"), StatusCode::BAD_REQUEST),
+    };
+    match sqlx::query("UPDATE accounts SET codex_auth_json = ? WHERE id = ?")
+        .bind(&content)
+        .bind(account_id)
+        .execute(&state.pool)
+        .await
+    {
+        Ok(r) if r.rows_affected() == 1 => Json(json!({
+            "success": true,
+            "account_id": account_id,
+            "account_id_hint": creds.account_id,
+            "token_expired": creds.is_expired(),
+        }))
+        .into_response(),
+        Ok(_) => crate::error::simple_error(format!("Account {account_id} not found"), StatusCode::NOT_FOUND),
+        Err(e) => crate::error::simple_error(format!("Failed to save: {e}"), StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}

@@ -28,6 +28,7 @@ fn account(provider_id: &str) -> Account {
         default_protocol: None,
         balance_provider: String::new(),
         balance_auth: String::new(),
+        codex_auth_json: String::new(),
     }
 }
 
@@ -153,7 +154,7 @@ fn build_passthrough_selects_endpoint_by_protocol() {
     let acc = Account { id: 1, alias: "x".into(), provider_id: "custom".into(), api_key: "sk".into(),
         base_url: Some("https://old/v1".into()), anthropic_base_url: None,
         chat_endpoint: Some("https://a.example/v1".into()), responses_endpoint: Some("https://a.example/v1".into()),
-        messages_endpoint: Some("https://a.example/v1".into()), default_protocol: Some("chat".into()), balance_provider: String::new(), balance_auth: String::new(),
+        messages_endpoint: Some("https://a.example/v1".into()), default_protocol: Some("chat".into()), balance_provider: String::new(), balance_auth: String::new(), codex_auth_json: String::new(),
         is_active: 1, weight: 1, openai_compatible: 0 };
     let req = llmux_core::adapters::build_passthrough(&acc, Protocol::Messages, &json!({"model":"m"}));
     assert!(req.url.ends_with("/v1/messages"));

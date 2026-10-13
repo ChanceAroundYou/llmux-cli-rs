@@ -19,6 +19,7 @@ pub struct Account {
     pub default_protocol: Option<String>,
     pub balance_provider: Option<String>,
     pub balance_auth: Option<String>,
+    pub codex_auth_json: Option<String>,
     pub limits_cache: Option<String>,
     pub limits_cache_updated_at: Option<String>,
     pub created_at: Option<String>,

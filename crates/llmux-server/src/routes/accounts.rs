@@ -19,7 +19,7 @@ pub async fn get_account_balance(
     use sqlx::Row as _;
 
     let row = match sqlx::query(
-        "SELECT provider_id, api_key, base_url, anthropic_base_url, chat_endpoint, responses_endpoint, messages_endpoint, balance_provider, balance_auth FROM accounts WHERE id = ?",
+        "SELECT provider_id, api_key, base_url, anthropic_base_url, chat_endpoint, responses_endpoint, messages_endpoint, balance_provider, balance_auth, codex_auth_json FROM accounts WHERE id = ?",
     )
     .bind(id)
     .fetch_optional(&state.pool)
@@ -61,33 +61,52 @@ pub async fn get_account_balance(
 
     // Dedicated balance_auth (cookie/token) wins; the upstream API key is the fallback —
     // except for opencode-go accounts that also carry an API key (see the helper).
-    let decrypt = |cipher: &str| -> Result<String, String> {
-        if cipher.is_empty() {
-            Ok(String::new())
-        } else {
-            llmux_core::crypto::decrypt_api_key(cipher, &state.master_key).map_err(|e| e.to_string())
+    // codex 原生账户例外：余额凭据是 codex_auth_json 里的 access_token，
+    // api_key 存的是 sidecar 内网 key，拿它打 wham/usage 必 401。
+    let credential = if provider_id == "codex" {
+        match row
+            .try_get::<Option<String>, _>("codex_auth_json")
+            .unwrap_or_default()
+            .filter(|s| !s.trim().is_empty())
+            .and_then(|j| llmux_core::codex_auth::CodexCreds::from_auth_json(&j).ok())
+        {
+            Some(creds) => creds.access_token,
+            None => {
+                return crate::error::simple_error(
+                    "codex 账户未配置凭据：先跑 scripts/codex-login.sh 导入 auth.json",
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                )
+            }
         }
-    };
-    let auth_plain = decrypt(&auth_cipher);
-    let key_plain = decrypt(&enc_key);
-    // Dedicated balance_auth (cookie/token) wins; empty falls back to the API key —
-    // except for opencode-go accounts that also carry an sk- key (see the helper).
-    let chosen = if llmux_core::balance::balance_uses_api_key(
-        kind,
-        auth_plain.as_deref().unwrap_or(""),
-        key_plain.as_deref().unwrap_or(""),
-    ) {
-        key_plain
     } else {
-        auth_plain
-    };
-    let credential = match chosen {
-        Ok(k) => k,
-        Err(e) => {
-            return crate::error::simple_error(
-                format!("Failed to decrypt API key: {e}"),
-                StatusCode::INTERNAL_SERVER_ERROR,
-            )
+        let decrypt = |cipher: &str| -> Result<String, String> {
+            if cipher.is_empty() {
+                Ok(String::new())
+            } else {
+                llmux_core::crypto::decrypt_api_key(cipher, &state.master_key).map_err(|e| e.to_string())
+            }
+        };
+        let auth_plain = decrypt(&auth_cipher);
+        let key_plain = decrypt(&enc_key);
+        // Dedicated balance_auth (cookie/token) wins; empty falls back to the API key —
+        // except for opencode-go accounts that also carry an sk- key (see the helper).
+        let chosen = if llmux_core::balance::balance_uses_api_key(
+            kind,
+            auth_plain.as_deref().unwrap_or(""),
+            key_plain.as_deref().unwrap_or(""),
+        ) {
+            key_plain
+        } else {
+            auth_plain
+        };
+        match chosen {
+            Ok(k) => k,
+            Err(e) => {
+                return crate::error::simple_error(
+                    format!("Failed to decrypt API key: {e}"),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                )
+            }
         }
     };
 
@@ -144,7 +163,7 @@ pub async fn list_accounts(Extension(state): Extension<AppState>) -> Response {
         "SELECT a.id, a.alias, a.provider_id, a.base_url, a.anthropic_base_url, \
                 a.is_active, a.weight, a.notes, a.openai_compatible, a.created_at, \
                 a.chat_endpoint, a.responses_endpoint, a.messages_endpoint, \
-                a.default_protocol, a.balance_provider, a.limits_cache, \
+                a.default_protocol, a.balance_provider, a.limits_cache, a.codex_auth_json, \
                 COALESCE(s.c5, 0) AS c5, COALESCE(s.c24, 0) AS c24, COALESCE(s.c7, 0) AS c7 \
          FROM accounts a \
          LEFT JOIN ( \
@@ -188,6 +207,7 @@ pub async fn list_accounts(Extension(state): Extension<AppState>) -> Response {
         default_protocol: Option<String>,
         balance_provider: Option<String>,
         limits_cache: Option<String>,
+        codex_auth_json: Option<String>,
         c5: f64,
         c24: f64,
         c7: f64,
@@ -232,6 +252,7 @@ pub async fn list_accounts(Extension(state): Extension<AppState>) -> Response {
                 default_protocol: r.try_get::<Option<String>, _>("default_protocol").unwrap_or_default(),
                 balance_provider: r.try_get::<Option<String>, _>("balance_provider").unwrap_or_default(),
                 limits_cache: r.try_get::<Option<String>, _>("limits_cache").unwrap_or_default(),
+                codex_auth_json: r.try_get::<Option<String>, _>("codex_auth_json").unwrap_or_default(),
                 c5,
                 c24,
                 c7,
@@ -284,6 +305,7 @@ pub async fn list_accounts(Extension(state): Extension<AppState>) -> Response {
                 "default_protocol": r.default_protocol,
                 "balance_provider": r.balance_provider,
                 "balance_auth": Value::Null,
+                "codex_configured": r.codex_auth_json.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false),
                 // Activity (read-only, for UI ordering / hints)
                 "requests_5h": r.c5,
                 "requests_24h": r.c24,
@@ -465,6 +487,7 @@ pub async fn create_account(
         default_protocol: Some(default_protocol.clone()),
         balance_provider: balance_provider.clone(),
         balance_auth: balance_auth_plain.clone(),
+        codex_auth_json: body["codex_auth_json"].as_str().unwrap_or("").to_string(),
     };
 
     let provider_type = {
@@ -513,8 +536,8 @@ pub async fn create_account(
     };
 
     match sqlx::query(
-        "INSERT INTO accounts (alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight, notes, openai_compatible, chat_endpoint, responses_endpoint, messages_endpoint, default_protocol, balance_provider, balance_auth)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO accounts (alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight, notes, openai_compatible, chat_endpoint, responses_endpoint, messages_endpoint, default_protocol, balance_provider, balance_auth, codex_auth_json)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&alias)
     .bind(&provider_id)
@@ -531,6 +554,7 @@ pub async fn create_account(
     .bind(&default_protocol)
     .bind(&balance_provider)
     .bind(&balance_auth_cipher)
+    .bind(body["codex_auth_json"].as_str().unwrap_or("").trim())
     .execute(&state.pool)
     .await
     {
@@ -559,7 +583,7 @@ pub async fn update_account(
 ) -> Response {
     // Verify the account exists.
     let existing = sqlx::query_as::<_, llmux_core::models::Account>(
-        "SELECT id, alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight, notes, limits_cache, limits_cache_updated_at, openai_compatible, created_at, chat_endpoint, responses_endpoint, messages_endpoint, default_protocol, balance_provider, balance_auth FROM accounts WHERE id = ?",
+        "SELECT id, alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight, notes, limits_cache, limits_cache_updated_at, openai_compatible, created_at, chat_endpoint, responses_endpoint, messages_endpoint, default_protocol, balance_provider, balance_auth, codex_auth_json FROM accounts WHERE id = ?",
     )
     .bind(id)
     .fetch_optional(&state.pool)
@@ -674,6 +698,15 @@ pub async fn update_account(
         }
     };
 
+    // Codex auth.json: missing = keep existing, null = clear (回退 sidecar 路径),
+    // string = set. 纯文本存（auth.json 里只有 OAuth token，没有 api_key 级别的
+    // 机密要求；且 refresh 写回要频繁 UPDATE，加密会让每次都要解密再解析）。
+    let codex_auth_json = match body.get("codex_auth_json") {
+        None => existing.codex_auth_json.clone().unwrap_or_default(),
+        Some(Value::Null) => String::new(),
+        Some(v) => v.as_str().unwrap_or("").trim().to_string(),
+    };
+
     // New multi-endpoint fields: explicit null/empty = disabled; missing = keep existing; legacy fallback only for create.
     let has_chat_key = body.as_object().map(|m| m.contains_key("chat_endpoint")).unwrap_or(false);
     let has_resp_key = body.as_object().map(|m| m.contains_key("responses_endpoint")).unwrap_or(false);
@@ -768,6 +801,7 @@ pub async fn update_account(
                 default_protocol: Some(default_protocol.clone()),
         balance_provider: balance_provider.clone(),
         balance_auth: balance_auth_plain.clone(),
+        codex_auth_json: body["codex_auth_json"].as_str().unwrap_or("").to_string(),
             };
 
             let provider_type = {
@@ -806,7 +840,7 @@ pub async fn update_account(
     };
 
     let update_res = sqlx::query(
-        "UPDATE accounts SET alias = ?, provider_id = ?, api_key = ?, base_url = ?, anthropic_base_url = ?, is_active = ?, weight = ?, notes = ?, openai_compatible = ?, chat_endpoint = ?, responses_endpoint = ?, messages_endpoint = ?, default_protocol = ?, balance_provider = ?, balance_auth = ? WHERE id = ?",
+        "UPDATE accounts SET alias = ?, provider_id = ?, api_key = ?, base_url = ?, anthropic_base_url = ?, is_active = ?, weight = ?, notes = ?, openai_compatible = ?, chat_endpoint = ?, responses_endpoint = ?, messages_endpoint = ?, default_protocol = ?, balance_provider = ?, balance_auth = ?, codex_auth_json = ? WHERE id = ?",
     )
     .bind(&alias)
     .bind(&provider_id)
@@ -823,6 +857,7 @@ pub async fn update_account(
     .bind(&default_protocol)
     .bind(&balance_provider)
     .bind(&balance_auth_cipher)
+    .bind(&codex_auth_json)
     .bind(id)
     .execute(&state.pool)
     .await;

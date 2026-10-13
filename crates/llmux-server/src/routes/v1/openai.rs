@@ -242,6 +242,30 @@ pub(crate) async fn dispatch_with_conversion(
 
         // Build the provider request for the target protocol, preserving the
         // existing base_url / anthropic_base_url transport (read-only).
+        // codex 原生账户：JWT 过期就先 refresh（`auth.go:borrow` 的 proactive 路径）。
+        // `account` 是 `&` 借用不能改 —— refresh 后重建 owned 副本再 build。
+        let mut refreshed_owned;
+        let mut account = if llmux_core::adapters::is_codex_native(account) {
+            match llmux_core::codex_auth::load_creds(account) {
+                Some(creds) if creds.is_expired() => {
+                    match llmux_core::codex_auth::refresh_and_save(&state.pool, account.id, &account.codex_auth_json).await {
+                        Ok(new_json) => {
+                            tracing::info!("🔑 codex token refreshed pre-request for account {}", account.alias);
+                            refreshed_owned = llmux_core::adapters::Account { codex_auth_json: new_json, ..account.clone() };
+                            &refreshed_owned
+                        }
+                        Err(e) => {
+                            last_error = Some(format!("Codex token refresh failed for {}: {e}", account.alias));
+                            failed_candidates += 1;
+                            continue;
+                        }
+                    }
+                }
+                _ => account,
+            }
+        } else {
+            account
+        };
         let mut provider_request = build_target_request(account, target, &forward_body, &anthropic_beta);
         provider_request.first_byte_timeout_secs = res.first_byte_timeout_secs;
         let log_url = provider_request.url.clone();
@@ -266,7 +290,41 @@ pub(crate) async fn dispatch_with_conversion(
                 continue;
             }
         };
-        let status = response.status();
+        let mut status = response.status();
+        let mut response = response;
+        // codex 原生账户 401 → refresh 后重建请求重试一次
+        //（`backend.go:doAuthenticated` 的 reactive 路径：reload + retry）。
+        if !status.is_success()
+            && status.as_u16() == 401
+            && llmux_core::adapters::is_codex_native(account)
+        {
+            match llmux_core::codex_auth::refresh_and_save(&state.pool, account.id, &account.codex_auth_json).await {
+                Ok(new_json) => {
+                    tracing::info!("🔑 codex 401 → refreshed token for account {}, retrying once", account.alias);
+                    refreshed_owned = llmux_core::adapters::Account { codex_auth_json: new_json, ..(*account).clone() };
+                    account = &refreshed_owned;
+                    provider_request = build_target_request(account, target, &forward_body, &anthropic_beta);
+                    provider_request.first_byte_timeout_secs = res.first_byte_timeout_secs;
+                    match execute_provider_request(&provider_request).await {
+                        Ok(r) => {
+                            status = r.status();
+                            response = r;
+                        }
+                        Err(e) => {
+                            last_error = Some(format!("Codex retry request failed: {e}"));
+                            failed_candidates += 1;
+                            continue;
+                        }
+                    }
+                }
+                Err(e) => {
+                    // refresh 失败 = 凭据彻底失效。别的账户还能试 —— continue 让 failover 继续。
+                    last_error = Some(format!("Codex token refresh failed for {}: {e}（凭据失效，请重新登录）", account.alias));
+                    failed_candidates += 1;
+                    continue;
+                }
+            }
+        }
         if !status.is_success() {
             let error_body = response.text().await.unwrap_or_default();
             provider_request.effort.record_rejection(&error_body);
@@ -355,7 +413,21 @@ pub(crate) async fn dispatch_with_conversion(
             }
             (Back::Passthrough, false) => {
                 let body_bytes = match response.bytes().await { Ok(b) => b, Err(e) => { last_error = Some(format!("Failed to read response: {e}")); failed_candidates += 1; continue; } };
-                let data: Value = match serde_json::from_slice(&body_bytes) { Ok(v) => v, Err(e) => { last_error = Some(format!("Failed to parse response: {e}")); failed_candidates += 1; continue; } };
+                let data: Value = match serde_json::from_slice(&body_bytes) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // codex 原生非流式：后端回的是 SSE 不是 JSON，走流组装。
+                        let text = String::from_utf8_lossy(&body_bytes);
+                        if llmux_core::adapters::is_codex_native(account) && text.contains("data:") {
+                            match collect_codex_response(&body_bytes, &provider_request.body).await {
+                                Some(assembled) => assembled,
+                                None => { last_error = Some(format!("Failed to assemble codex stream: {e}")); failed_candidates += 1; continue; }
+                            }
+                        } else {
+                            last_error = Some(format!("Failed to parse response: {e}")); failed_candidates += 1; continue;
+                        }
+                    }
+                };
                 let latency_ms = start.elapsed().as_millis() as i64;
                 let (prompt_tokens, completion_tokens, cache_read, cache_create) = passthrough_usage(&data);
                 spawn_log_usage(state.pool.clone(), (*account).clone(), model_name.clone(), res.provider_id.clone(), prompt_tokens, completion_tokens, cache_read, cache_create, latency_ms, true, None, Some(forward_body.to_string()), Some(data.to_string()), Some(latency_ms), false);
@@ -370,7 +442,21 @@ pub(crate) async fn dispatch_with_conversion(
             }
             (Back::ChatFromResponses, false) => {
                 let body_bytes = match response.bytes().await { Ok(b) => b, Err(e) => { last_error = Some(format!("Failed to read response: {e}")); failed_candidates += 1; continue; } };
-                let data: Value = match serde_json::from_slice(&body_bytes) { Ok(v) => v, Err(e) => { last_error = Some(format!("Failed to parse response: {e}")); failed_candidates += 1; continue; } };
+                let data: Value = match serde_json::from_slice(&body_bytes) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // codex 原生非流式：后端回的是 SSE 不是 JSON，走流组装。
+                        let text = String::from_utf8_lossy(&body_bytes);
+                        if llmux_core::adapters::is_codex_native(account) && text.contains("data:") {
+                            match collect_codex_response(&body_bytes, &provider_request.body).await {
+                                Some(assembled) => assembled,
+                                None => { last_error = Some(format!("Failed to assemble codex stream: {e}")); failed_candidates += 1; continue; }
+                            }
+                        } else {
+                            last_error = Some(format!("Failed to parse response: {e}")); failed_candidates += 1; continue;
+                        }
+                    }
+                };
                 let chat_resp = responses_to_chat(&data, &model_name);
                 let (raw_prompt, completion_tokens) = adapters::usage_from_openai_response_body(&chat_resp);
                 let (cache_read, _) = cache_usage_from_openai(&data["usage"]);
@@ -388,7 +474,21 @@ pub(crate) async fn dispatch_with_conversion(
             // needs dedicated state machines; add when a client needs live tokens here.
             (Back::ResponsesFromChat, _) => {
                 let body_bytes = match response.bytes().await { Ok(b) => b, Err(e) => { last_error = Some(format!("Failed to read response: {e}")); failed_candidates += 1; continue; } };
-                let data: Value = match serde_json::from_slice(&body_bytes) { Ok(v) => v, Err(e) => { last_error = Some(format!("Failed to parse response: {e}")); failed_candidates += 1; continue; } };
+                let data: Value = match serde_json::from_slice(&body_bytes) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // codex 原生非流式：后端回的是 SSE 不是 JSON，走流组装。
+                        let text = String::from_utf8_lossy(&body_bytes);
+                        if llmux_core::adapters::is_codex_native(account) && text.contains("data:") {
+                            match collect_codex_response(&body_bytes, &provider_request.body).await {
+                                Some(assembled) => assembled,
+                                None => { last_error = Some(format!("Failed to assemble codex stream: {e}")); failed_candidates += 1; continue; }
+                            }
+                        } else {
+                            last_error = Some(format!("Failed to parse response: {e}")); failed_candidates += 1; continue;
+                        }
+                    }
+                };
                 let resp_body = chat_resp_to_responses_resp(&data, &model_name);
                 let (raw_prompt, completion_tokens) = adapters::usage_from_openai_response_body(&data);
                 let (cache_read, _) = cache_usage_from_openai(&data["usage"]);
@@ -402,7 +502,21 @@ pub(crate) async fn dispatch_with_conversion(
             }
             (Back::ResponsesFromMessages, _) => {
                 let body_bytes = match response.bytes().await { Ok(b) => b, Err(e) => { last_error = Some(format!("Failed to read response: {e}")); failed_candidates += 1; continue; } };
-                let data: Value = match serde_json::from_slice(&body_bytes) { Ok(v) => v, Err(e) => { last_error = Some(format!("Failed to parse response: {e}")); failed_candidates += 1; continue; } };
+                let data: Value = match serde_json::from_slice(&body_bytes) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // codex 原生非流式：后端回的是 SSE 不是 JSON，走流组装。
+                        let text = String::from_utf8_lossy(&body_bytes);
+                        if llmux_core::adapters::is_codex_native(account) && text.contains("data:") {
+                            match collect_codex_response(&body_bytes, &provider_request.body).await {
+                                Some(assembled) => assembled,
+                                None => { last_error = Some(format!("Failed to assemble codex stream: {e}")); failed_candidates += 1; continue; }
+                            }
+                        } else {
+                            last_error = Some(format!("Failed to parse response: {e}")); failed_candidates += 1; continue;
+                        }
+                    }
+                };
                 let resp_body = anthropic_resp_to_responses_resp(&data, &model_name);
                 let (prompt_tokens, completion_tokens) = (data["usage"]["input_tokens"].as_i64().unwrap_or(0), data["usage"]["output_tokens"].as_i64().unwrap_or(0));
                 let cache_read = data["usage"]["cache_read_input_tokens"].as_i64().unwrap_or(0);
@@ -420,7 +534,21 @@ pub(crate) async fn dispatch_with_conversion(
             }
             (Back::ChatFromMessages, false) => {
                 let body_bytes = match response.bytes().await { Ok(b) => b, Err(e) => { last_error = Some(format!("Failed to read response: {e}")); failed_candidates += 1; continue; } };
-                let data: Value = match serde_json::from_slice(&body_bytes) { Ok(v) => v, Err(e) => { last_error = Some(format!("Failed to parse response: {e}")); failed_candidates += 1; continue; } };
+                let data: Value = match serde_json::from_slice(&body_bytes) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // codex 原生非流式：后端回的是 SSE 不是 JSON，走流组装。
+                        let text = String::from_utf8_lossy(&body_bytes);
+                        if llmux_core::adapters::is_codex_native(account) && text.contains("data:") {
+                            match collect_codex_response(&body_bytes, &provider_request.body).await {
+                                Some(assembled) => assembled,
+                                None => { last_error = Some(format!("Failed to assemble codex stream: {e}")); failed_candidates += 1; continue; }
+                            }
+                        } else {
+                            last_error = Some(format!("Failed to parse response: {e}")); failed_candidates += 1; continue;
+                        }
+                    }
+                };
                 let chat_resp = anthropic_to_openai_response(&data, &model_name);
                 let (raw_prompt, completion_tokens) = adapters::usage_from_openai_response_body(&chat_resp);
                 let (cache_read, _) = cache_usage_from_openai(&chat_resp["usage"]);
@@ -439,7 +567,21 @@ pub(crate) async fn dispatch_with_conversion(
             }
             (Back::MessagesFromResponses, false) => {
                 let body_bytes = match response.bytes().await { Ok(b) => b, Err(e) => { last_error = Some(format!("Failed to read response: {e}")); failed_candidates += 1; continue; } };
-                let data: Value = match serde_json::from_slice(&body_bytes) { Ok(v) => v, Err(e) => { last_error = Some(format!("Failed to parse response: {e}")); failed_candidates += 1; continue; } };
+                let data: Value = match serde_json::from_slice(&body_bytes) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // codex 原生非流式：后端回的是 SSE 不是 JSON，走流组装。
+                        let text = String::from_utf8_lossy(&body_bytes);
+                        if llmux_core::adapters::is_codex_native(account) && text.contains("data:") {
+                            match collect_codex_response(&body_bytes, &provider_request.body).await {
+                                Some(assembled) => assembled,
+                                None => { last_error = Some(format!("Failed to assemble codex stream: {e}")); failed_candidates += 1; continue; }
+                            }
+                        } else {
+                            last_error = Some(format!("Failed to parse response: {e}")); failed_candidates += 1; continue;
+                        }
+                    }
+                };
                 let anth_resp = responses_to_anthropic(&data, &model_name);
                 let (input_tokens, output_tokens, cache_read, cache_create) = anthropic_usage(&data);
                 let latency_ms = start.elapsed().as_millis() as i64;
@@ -455,7 +597,21 @@ pub(crate) async fn dispatch_with_conversion(
             }
             (Back::MessagesFromChat, false) => {
                 let body_bytes = match response.bytes().await { Ok(b) => b, Err(e) => { last_error = Some(format!("Failed to read response: {e}")); failed_candidates += 1; continue; } };
-                let data: Value = match serde_json::from_slice(&body_bytes) { Ok(v) => v, Err(e) => { last_error = Some(format!("Failed to parse response: {e}")); failed_candidates += 1; continue; } };
+                let data: Value = match serde_json::from_slice(&body_bytes) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // codex 原生非流式：后端回的是 SSE 不是 JSON，走流组装。
+                        let text = String::from_utf8_lossy(&body_bytes);
+                        if llmux_core::adapters::is_codex_native(account) && text.contains("data:") {
+                            match collect_codex_response(&body_bytes, &provider_request.body).await {
+                                Some(assembled) => assembled,
+                                None => { last_error = Some(format!("Failed to assemble codex stream: {e}")); failed_candidates += 1; continue; }
+                            }
+                        } else {
+                            last_error = Some(format!("Failed to parse response: {e}")); failed_candidates += 1; continue;
+                        }
+                    }
+                };
                 let anth_resp = openai_to_anthropic_response(&data, &model_name);
                 let (raw_prompt, completion_tokens) = adapters::usage_from_openai_response_body(&data);
                 let (cache_read, _) = cache_usage_from_openai(&data["usage"]);
@@ -748,11 +904,32 @@ pub(crate) async fn dispatch_aggregate_with_conversion(
             state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len);
             continue;
         }
-        let account = match get_account_by_id(&state.pool, cand.account_id, &state.master_key).await {
+        let mut account = match get_account_by_id(&state.pool, cand.account_id, &state.master_key).await {
             Ok(Some(a)) => a,
             Ok(None) => { state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); crate::routes::v1::helpers::note_skip_reason(&mut last_error, format!("Candidate {} account {} not found", i, cand.account_id)); failed_candidates += 1; continue; }
             Err(e) => { state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); crate::routes::v1::helpers::note_skip_reason(&mut last_error, format!("Failed to load account {}: {e}", cand.account_id)); failed_candidates += 1; continue; }
         };
+        // codex 原生账户：JWT 过期就先 refresh（与 dispatch_with_conversion 主循环同逻辑）。
+        let mut refreshed_owned_agg;
+        if llmux_core::adapters::is_codex_native(&account) {
+            match llmux_core::codex_auth::load_creds(&account) {
+                Some(creds) if creds.is_expired() => {
+                    match llmux_core::codex_auth::refresh_and_save(&state.pool, account.id, &account.codex_auth_json).await {
+                        Ok(new_json) => {
+                            tracing::info!("🔑 codex token refreshed pre-request for account {}", account.alias);
+                            refreshed_owned_agg = llmux_core::adapters::Account { codex_auth_json: new_json, ..account.clone() };
+                            account = refreshed_owned_agg;
+                        }
+                        Err(e) => {
+                            last_error = Some(format!("Codex token refresh failed for {}: {e}", account.alias));
+                            failed_candidates += 1;
+                            continue;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
         // Per-candidate target computation (Task 6).
         let target = target_protocol(ingress, mode, &account);
         if target != Protocol::Responses {
@@ -862,9 +1039,21 @@ pub(crate) async fn dispatch_aggregate_with_conversion(
             Ok(b) => b,
             Err(e) => { last_error = Some(format!("Failed to read response: {e}")); state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); failed_candidates += 1; continue; }
         };
+        // codex 原生非流式：后端回的不是标准 JSON 而是 SSE（`collect` 语义）。
+        // 先按 JSON 试，失败且 body 含 `data:` 行时走流组装，避免把 SSE 当 JSON 炸掉。
         let data: Value = match serde_json::from_slice(&body_bytes) {
             Ok(v) => v,
-            Err(e) => { last_error = Some(format!("Failed to parse response: {e}")); state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); continue; }
+            Err(e) => {
+                let text = String::from_utf8_lossy(&body_bytes);
+                if llmux_core::adapters::is_codex_native(&account) && text.contains("data:") {
+                    match collect_codex_response(&body_bytes, &provider_request.body).await {
+                        Some(assembled) => assembled,
+                        None => { last_error = Some(format!("Failed to assemble codex stream: {e}")); state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); continue; }
+                    }
+                } else {
+                    last_error = Some(format!("Failed to parse response: {e}")); state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); continue;
+                }
+            }
         };
         let (converted, pt, ct, cr, cc) = match ingress {
             Protocol::Chat => {
@@ -932,6 +1121,50 @@ pub(crate) async fn dispatch_aggregate_with_conversion(
         return super::helpers::rate_limited_response(&error_msg, is_anthropic);
     }
     middleware::send_error(&error_msg, "upstream_error", StatusCode::BAD_GATEWAY, is_anthropic)
+}
+
+/// Codex SSE body → 完整 Responses JSON（`backend.go:collect` 的调用点封装）。
+///
+/// codex 后端对非流式请求回的也是 SSE（首字节是 `event:` 行），不能直接
+/// `serde_json::from_slice`。按行切 `data:`、逐个 `normalize_backend_event`、
+/// 最后 `collect_stream` 组装。空流返回 None（调用方记失败换候选）。
+async fn collect_codex_response(body: &[u8], request: &Value) -> Option<Value> {
+    let text = String::from_utf8_lossy(body);
+    let mut events: Vec<Value> = Vec::new();
+    let mut current = String::new();
+    for line in text.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            if !current.is_empty() {
+                if let Some(payload) = sse_data_payload(&current) {
+                    if payload != "[DONE]" {
+                        if let Ok(mut v) = serde_json::from_str::<Value>(payload) {
+                            llmux_core::codex_compat::normalize_backend_event(&mut v);
+                            events.push(v);
+                        }
+                    }
+                }
+                current.clear();
+            }
+            continue;
+        }
+        current.push_str(t);
+        current.push('\n');
+    }
+    if !current.is_empty() {
+        if let Some(payload) = sse_data_payload(&current) {
+            if payload != "[DONE]" {
+                if let Ok(mut v) = serde_json::from_str::<Value>(payload) {
+                    llmux_core::codex_compat::normalize_backend_event(&mut v);
+                    events.push(v);
+                }
+            }
+        }
+    }
+    if events.is_empty() {
+        return None;
+    }
+    Some(llmux_core::codex_compat::collect_stream(&events, request))
 }
 
 async fn responses_to_chat_streaming(
@@ -1546,7 +1779,9 @@ async fn dispatch_aggregate_openai(
         let mut patched_body = body.clone();
         patched_body["model"] = Value::String(cand.model.clone());
 
-        // Build provider request via new *_endpoint columns (migrated) with fallback.
+        // Build provider request via the shared builder so codex 原生账户走
+        // 私有后端 + 私有头（之前这里手拼 base_url/authorization，把
+        // is_codex_native 完全绕过去了 —— op 聚合打 sidecar 的根因）。
         let proto = if endpoint == "v1/messages" {
             llmux_core::protocol::Protocol::Messages
         } else if endpoint == "responses" {
@@ -1554,37 +1789,13 @@ async fn dispatch_aggregate_openai(
         } else {
             llmux_core::protocol::Protocol::Chat
         };
-        let base_from_new = llmux_core::protocol::endpoint_for(&account, proto);
-        let base_url = normalize_base_url(
-            base_from_new.unwrap_or(if proto == llmux_core::protocol::Protocol::Messages {
-                "https://api.anthropic.com/v1"
-            } else if account.provider_id == "gemini" {
-                "https://generativelanguage.googleapis.com/v1beta/openai"
-            } else {
-                "https://api.openai.com/v1"
-            }),
-        );
-        // Headers: Messages needs x-api-key
-        let mut req_headers = BTreeMap::from([("content-type".to_string(), "application/json".to_string())]);
-        if proto == llmux_core::protocol::Protocol::Messages {
-            let pr = llmux_core::adapters::build_passthrough_with_beta(&account, proto, &patched_body, None);
-            req_headers = pr.headers.clone();
-        } else {
-            req_headers.insert("authorization".to_string(), format!("Bearer {}", account.api_key));
-        }
-        let mut agg_body = patched_body.clone();
-        let effort = llmux_core::reasoning_effort::apply_reasoning_effort(
-            &mut agg_body,
-            &account.provider_id,
-            &cand.model,
-            proto,
-        );
-        let max_tokens = llmux_core::max_tokens::clamp_max_tokens(&mut agg_body, &account.provider_id, &cand.model);
-        let provider_request = ProviderRequest { method: "POST".to_string(), url: format!("{base_url}/{endpoint}"), headers: req_headers, body: agg_body, effort, max_tokens, first_byte_timeout_secs: agg.first_byte_timeout_secs };
+        let mut provider_request = llmux_core::adapters::build_passthrough_with_beta(&account, proto, &patched_body, None);
+        provider_request.first_byte_timeout_secs = agg.first_byte_timeout_secs;
+        let log_url = provider_request.url.clone();
 
-        tracing::info!("🔀 [agg:{} V={}] {} → {} → {}/{}", alias, active, account.alias, cand.model, base_url, endpoint);
+        tracing::info!("🔀 [agg:{} V={}] {} → {} → {}", alias, active, account.alias, cand.model, log_url);
         if let Some(tx) = &state.tui_tx {
-            let _ = tx.send(TuiEvent::Dispatch { timestamp: time::OffsetDateTime::now_utc().format(&DISPATCH_TIME_FMT).unwrap_or_default(), account: account.alias.clone(), model: cand.model.clone(), url: format!("{}/{}", base_url, endpoint), tag: Some(format!("agg:{alias}")) });
+            let _ = tx.send(TuiEvent::Dispatch { timestamp: time::OffsetDateTime::now_utc().format(&DISPATCH_TIME_FMT).unwrap_or_default(), account: account.alias.clone(), model: cand.model.clone(), url: log_url, tag: Some(format!("agg:{alias}")) });
         }
 
         let response = match execute_provider_request(&provider_request).await {

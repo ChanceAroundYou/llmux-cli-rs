@@ -990,6 +990,7 @@ mod tests {
             default_protocol: Some("chat".into()),
             balance_provider: String::new(),
             balance_auth: String::new(),
+            codex_auth_json: String::new(),
         }
     }
 

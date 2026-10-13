@@ -224,6 +224,10 @@ pub struct Account {
     pub balance_provider: String,
     /// Dedicated balance-probe credential (encrypted cookie/token); empty = use api_key.
     pub balance_auth: String,
+    /// Raw Codex `auth.json` for `provider_id=codex` accounts. Empty/None =
+    /// 未配置（回退到 sidecar 直连的 `base_url` 路径）—— 不在这里 fail，
+    /// 因为绝大多数账户根本不是 codex。
+    pub codex_auth_json: String,
 }
 
 impl From<crate::models::Account> for Account {
@@ -244,6 +248,7 @@ impl From<crate::models::Account> for Account {
             default_protocol: value.default_protocol,
             balance_provider: value.balance_provider.unwrap_or_default(),
             balance_auth: value.balance_auth.unwrap_or_default(),
+            codex_auth_json: value.codex_auth_json.unwrap_or_default(),
         }
     }
 }
@@ -267,6 +272,7 @@ impl From<Account> for crate::models::Account {
             notes: None,
             balance_provider: None,
             balance_auth: None,
+            codex_auth_json: if value.codex_auth_json.is_empty() { None } else { Some(value.codex_auth_json) },
             limits_cache: None,
             limits_cache_updated_at: None,
             created_at: None,
@@ -416,7 +422,14 @@ pub fn build_passthrough_with_beta(
     anthropic_beta: Option<&str>,
 ) -> ProviderRequest {
     let proto = protocol;
-    let base = crate::protocol::endpoint_for(account, proto).unwrap_or("https://api.openai.com/v1");
+    // codex 原生账户：直连 codex 私有后端，私有头 + payload 预处理。
+    // `codex_auth_json` 为空 = 未配置，回退 sidecar 直连路径（旧 base_url）。
+    let is_codex_native = is_codex_native(account);
+    let base = if is_codex_native && proto != crate::protocol::Protocol::Messages {
+        crate::codex_compat::CODEX_BACKEND_BASE
+    } else {
+        crate::protocol::endpoint_for(account, proto).unwrap_or("https://api.openai.com/v1")
+    };
     let base = normalize_base_url(base);
     let suffix = match proto {
         crate::protocol::Protocol::Chat => "chat/completions",
@@ -430,6 +443,27 @@ pub fn build_passthrough_with_beta(
         headers.insert("anthropic-version".to_string(), "2023-06-01".to_string());
         if let Some(beta) = anthropic_beta.filter(|s| !s.is_empty()) {
             headers.insert("anthropic-beta".to_string(), beta.to_string());
+        }
+    } else if is_codex_native {
+        // 私有头（`backend.go:headers`）：access_token 作 Bearer。
+        // 401 时的 refresh 由调用点的 dispatch 循环处理（需要 pool + async）。
+        if let Some(creds) = crate::codex_auth::load_creds(account) {
+            headers.insert("authorization".into(), format!("Bearer {}", creds.access_token));
+            headers.insert("originator".to_string(), crate::codex_compat::CODEX_ORIGINATOR.to_string());
+            if !creds.account_id.is_empty() {
+                headers.insert("ChatGPT-Account-ID".to_string(), creds.account_id.clone());
+            }
+            if crate::codex_auth::is_streaming_body(body) {
+                headers.insert("OpenAI-Beta".to_string(), "responses=experimental".to_string());
+            }
+            if let Some(prompt_cache_key) = body.get("prompt_cache_key").and_then(Value::as_str) {
+                if !prompt_cache_key.is_empty() {
+                    headers.insert("session_id".to_string(), prompt_cache_key.to_string());
+                    headers.insert("x-client-request-id".to_string(), prompt_cache_key.to_string());
+                }
+            }
+        } else {
+            headers.insert("authorization".into(), format!("Bearer {}", account.api_key));
         }
     } else {
         headers.insert("authorization".into(), format!("Bearer {}", account.api_key));
@@ -449,6 +483,14 @@ pub fn build_passthrough_with_beta(
         model,
         proto,
     );
+    // codex 原生：请求预处理（`compat.go:prepareResponse` + `backend.go:normalizeCodexPayload`）。
+    // 只对 Responses 目标做 —— Chat/Messages 走标准路径，dispatch 循环里已经
+    // 由 (ingress,target) 转换表处理过协议互转。
+    // prepareResponse 在前：string input → 规范数组（codex 后端要 list，给 string 就 400）。
+    if is_codex_native && proto == crate::protocol::Protocol::Responses {
+        body = crate::codex_compat::prepare_response(&body, model);
+        body = crate::codex_compat::normalize_codex_payload(&body, &[]);
+    }
     // 记账句柄挂在 request 上：调用点已经在传 `&ProviderRequest`，不必改签名。
     ProviderRequest {
         method: "POST".into(),
@@ -476,6 +518,13 @@ pub fn usage_from_openai_response_body(data: &Value) -> (i64, i64) {
 
 fn json_headers() -> BTreeMap<String, String> {
     BTreeMap::from([("content-type".to_string(), "application/json".to_string())])
+}
+
+/// codex 原生账户判定：`provider_id=codex` 且配了 `codex_auth_json`。
+/// 为空 = 未配置，回退 sidecar 直连路径（旧 base_url）。三处调用点
+/// （base 覆盖 / 头注入 / payload 预处理）共用这一个判据，别各写各的。
+pub fn is_codex_native(account: &Account) -> bool {
+    account.provider_id == "codex" && !account.codex_auth_json.is_empty()
 }
 
 fn normalize_base_url(value: &str) -> String {

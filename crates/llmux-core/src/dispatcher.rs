@@ -411,7 +411,7 @@ pub async fn get_accounts_by_ids(
     // Build query with dynamic placeholders
     let placeholders: Vec<String> = ids.iter().map(|_| "?".to_string()).collect();
     let sql = format!(
-        "SELECT id, alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight, openai_compatible, chat_endpoint, responses_endpoint, messages_endpoint, default_protocol, balance_provider \
+        "SELECT id, alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight, openai_compatible, chat_endpoint, responses_endpoint, messages_endpoint, default_protocol, balance_provider, balance_auth, codex_auth_json \
          FROM accounts WHERE id IN ({}) AND is_active = 1 ORDER BY weight DESC, id ASC",
         placeholders.join(",")
     );
@@ -441,6 +441,7 @@ pub async fn get_accounts_by_ids(
                 default_protocol: row.try_get("default_protocol").ok(),
                 balance_provider: row.try_get::<Option<String>, _>("balance_provider").ok().flatten().unwrap_or_default(),
                 balance_auth: row.try_get::<Option<String>, _>("balance_auth").ok().flatten().unwrap_or_default(),
+                codex_auth_json: row.try_get::<Option<String>, _>("codex_auth_json").ok().flatten().unwrap_or_default(),
             });
         } else {
             let alias: String = row.try_get("alias").unwrap_or_default();
@@ -462,12 +463,12 @@ pub async fn get_active_accounts(
 ) -> anyhow::Result<Vec<Account>> {
     let rows = if let Some(provider) = provider_or_alias {
         // ponytail: single query path — try provider_id first, alias fallback only if empty (saves one COUNT(*) RTT)
-        let rows = sqlx::query("SELECT id, alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight, openai_compatible, chat_endpoint, responses_endpoint, messages_endpoint, default_protocol, balance_provider, balance_auth FROM accounts WHERE provider_id = ? AND is_active = 1 ORDER BY weight DESC, id ASC")
+        let rows = sqlx::query("SELECT id, alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight, openai_compatible, chat_endpoint, responses_endpoint, messages_endpoint, default_protocol, balance_provider, balance_auth, codex_auth_json FROM accounts WHERE provider_id = ? AND is_active = 1 ORDER BY weight DESC, id ASC")
                 .bind(provider)
                 .fetch_all(pool)
                 .await?;
         if rows.is_empty() {
-            sqlx::query("SELECT id, alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight, openai_compatible, chat_endpoint, responses_endpoint, messages_endpoint, default_protocol, balance_provider, balance_auth FROM accounts WHERE alias = ? AND is_active = 1 ORDER BY weight DESC, id ASC")
+            sqlx::query("SELECT id, alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight, openai_compatible, chat_endpoint, responses_endpoint, messages_endpoint, default_protocol, balance_provider, balance_auth, codex_auth_json FROM accounts WHERE alias = ? AND is_active = 1 ORDER BY weight DESC, id ASC")
                 .bind(provider)
                 .fetch_all(pool)
                 .await?
@@ -475,7 +476,7 @@ pub async fn get_active_accounts(
             rows
         }
     } else {
-        sqlx::query("SELECT id, alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight, openai_compatible, chat_endpoint, responses_endpoint, messages_endpoint, default_protocol, balance_provider, balance_auth FROM accounts WHERE is_active = 1 ORDER BY weight DESC, id ASC")
+        sqlx::query("SELECT id, alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight, openai_compatible, chat_endpoint, responses_endpoint, messages_endpoint, default_protocol, balance_provider, balance_auth, codex_auth_json FROM accounts WHERE is_active = 1 ORDER BY weight DESC, id ASC")
             .fetch_all(pool)
             .await?
     };
@@ -500,6 +501,7 @@ pub async fn get_active_accounts(
                 default_protocol: row.try_get("default_protocol").ok(),
                 balance_provider: row.try_get::<Option<String>, _>("balance_provider").ok().flatten().unwrap_or_default(),
                 balance_auth: row.try_get::<Option<String>, _>("balance_auth").ok().flatten().unwrap_or_default(),
+                codex_auth_json: row.try_get::<Option<String>, _>("codex_auth_json").ok().flatten().unwrap_or_default(),
             });
         } else {
             let alias: String = row.try_get("alias").unwrap_or_default();

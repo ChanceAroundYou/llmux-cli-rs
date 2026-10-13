@@ -13,8 +13,8 @@ pub use claude::{
     restore_claude_backup,
 };
 pub use codex::{
-    apply_codex_settings, delete_codex_backup, get_codex_settings, list_codex_backups,
-    restore_codex_backup,
+    apply_codex_settings, delete_codex_backup, get_codex_settings, import_codex_auth,
+    list_codex_backups, restore_codex_backup,
 };
 pub use gemini::{
     apply_gemini_settings, delete_gemini_backup, get_gemini_settings, list_gemini_backups,
