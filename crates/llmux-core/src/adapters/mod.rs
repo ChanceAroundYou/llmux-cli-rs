@@ -461,12 +461,28 @@ pub fn build_passthrough_with_beta(
             if crate::codex_auth::is_streaming_body(body) {
                 headers.insert("OpenAI-Beta".to_string(), "responses=experimental".to_string());
             }
-            if let Some(prompt_cache_key) = body.get("prompt_cache_key").and_then(Value::as_str) {
-                if !prompt_cache_key.is_empty() {
-                    headers.insert("session_id".to_string(), prompt_cache_key.to_string());
-                    headers.insert("x-client-request-id".to_string(), prompt_cache_key.to_string());
-                }
-            }
+            // Codex uses `session_id` as its prompt-cache routing key. Requests
+            // translated from Anthropic usually have no `prompt_cache_key`, so
+            // give each account a stable default to let repeated rules/prefixes
+            // reuse the same cache. A caller-provided key still scopes its own
+            // conversation. Keep the request id unique; it is tracing metadata,
+            // not the cache key.
+            let session_id = body
+                .get("prompt_cache_key")
+                .and_then(Value::as_str)
+                .filter(|key| !key.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    let mut hasher = Sha1::new();
+                    hasher.update(b"llmux-codex-session:");
+                    hasher.update(account.id.to_be_bytes());
+                    format!("llmux-{}", hex::encode(hasher.finalize())[..24].to_string())
+                });
+            headers.insert("session_id".to_string(), session_id);
+            headers.insert(
+                "x-client-request-id".to_string(),
+                uuid::Uuid::new_v4().to_string(),
+            );
         } else {
             headers.insert("authorization".into(), format!("Bearer {}", account.api_key));
         }

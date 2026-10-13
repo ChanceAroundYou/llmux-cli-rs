@@ -7,6 +7,11 @@
 
 ### Added
 
+- **Codex 原生请求默认使用稳定的提示缓存 session**。此前只有请求自带
+  `prompt_cache_key` 时才发送 Codex 私有头 `session_id`；Anthropic 转换请求通常没有该字段，
+  使重复的规则前缀无法稳定复用同一缓存分区。现在缺省按账户生成稳定 session，显式
+  `prompt_cache_key` 仍优先；`x-client-request-id` 改为每次请求单独生成。
+
 - **OpenCode Zen 免费档 sidecar（`deploy/zen-free/`）**。
   `opencode.ai/zen/v1` 的 `*-free` 模型按 TLS ClientHello 指纹拦截 —— 2026-10-13
   实测 curl / reqwest(rustls) / reqwest(native-tls) 的推理 POST 一律 403
