@@ -1625,7 +1625,9 @@ async fn dispatch_aggregate_openai(
         let mut patched_body = body.clone();
         patched_body["model"] = Value::String(cand.model.clone());
 
-        // Build provider request via new *_endpoint columns (migrated) with fallback.
+        // Build provider request via the shared builder so codex 原生账户走
+        // 私有后端 + 私有头（之前这里手拼 base_url/authorization，把
+        // is_codex_native 完全绕过去了 —— op 聚合打 sidecar 的根因）。
         let proto = if endpoint == "v1/messages" {
             llmux_core::protocol::Protocol::Messages
         } else if endpoint == "responses" {
@@ -1633,37 +1635,13 @@ async fn dispatch_aggregate_openai(
         } else {
             llmux_core::protocol::Protocol::Chat
         };
-        let base_from_new = llmux_core::protocol::endpoint_for(&account, proto);
-        let base_url = normalize_base_url(
-            base_from_new.unwrap_or(if proto == llmux_core::protocol::Protocol::Messages {
-                "https://api.anthropic.com/v1"
-            } else if account.provider_id == "gemini" {
-                "https://generativelanguage.googleapis.com/v1beta/openai"
-            } else {
-                "https://api.openai.com/v1"
-            }),
-        );
-        // Headers: Messages needs x-api-key
-        let mut req_headers = BTreeMap::from([("content-type".to_string(), "application/json".to_string())]);
-        if proto == llmux_core::protocol::Protocol::Messages {
-            let pr = llmux_core::adapters::build_passthrough_with_beta(&account, proto, &patched_body, None);
-            req_headers = pr.headers.clone();
-        } else {
-            req_headers.insert("authorization".to_string(), format!("Bearer {}", account.api_key));
-        }
-        let mut agg_body = patched_body.clone();
-        let effort = llmux_core::reasoning_effort::apply_reasoning_effort(
-            &mut agg_body,
-            &account.provider_id,
-            &cand.model,
-            proto,
-        );
-        let max_tokens = llmux_core::max_tokens::clamp_max_tokens(&mut agg_body, &account.provider_id, &cand.model);
-        let provider_request = ProviderRequest { method: "POST".to_string(), url: format!("{base_url}/{endpoint}"), headers: req_headers, body: agg_body, effort, max_tokens, first_byte_timeout_secs: agg.first_byte_timeout_secs };
+        let mut provider_request = llmux_core::adapters::build_passthrough_with_beta(&account, proto, &patched_body, None);
+        provider_request.first_byte_timeout_secs = agg.first_byte_timeout_secs;
+        let log_url = provider_request.url.clone();
 
-        tracing::info!("🔀 [agg:{} V={}] {} → {} → {}/{}", alias, active, account.alias, cand.model, base_url, endpoint);
+        tracing::info!("🔀 [agg:{} V={}] {} → {} → {}", alias, active, account.alias, cand.model, log_url);
         if let Some(tx) = &state.tui_tx {
-            let _ = tx.send(TuiEvent::Dispatch { timestamp: time::OffsetDateTime::now_utc().format(&DISPATCH_TIME_FMT).unwrap_or_default(), account: account.alias.clone(), model: cand.model.clone(), url: format!("{}/{}", base_url, endpoint), tag: Some(format!("agg:{alias}")) });
+            let _ = tx.send(TuiEvent::Dispatch { timestamp: time::OffsetDateTime::now_utc().format(&DISPATCH_TIME_FMT).unwrap_or_default(), account: account.alias.clone(), model: cand.model.clone(), url: log_url, tag: Some(format!("agg:{alias}")) });
         }
 
         let response = match execute_provider_request(&provider_request).await {
