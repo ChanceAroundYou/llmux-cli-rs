@@ -253,6 +253,41 @@ BASE_PATH=llmux ./deploy/deploy.sh -y           # 带基路径前缀（build 时
   `expired_without_refresh_token` 等）；升级 `docker compose pull codex-api && up -d codex-api`。
 - ⚠️ 走的是 codex **未公开私有后端**，随时可能被上游改掉而失效；**可能违背 OpenAI ToS、有账号风控风险**。
 
+## OpenCode Zen 免费上游（sidecar）
+
+把 OpenCode Zen 免费档（`opencode.ai/zen/v1` 的 `*-free` 模型）当 OpenAI 兼容上游接进
+llmux：路由器上旁挂第三个容器 `zen-free`，llmux 用一个 `provider_id=zen-free` 账户
+指向它。**llmux 自身零代码改动。**
+
+为什么只能旁挂：免费档按 **TLS ClientHello 指纹（JA3/JA4）**拦截，HTTP 头伪装无效 ——
+2026-10-13 实测 curl / reqwest(rustls) / reqwest(native-tls) 的推理 POST 一律 403
+`FreeTierError`，而 Node 客户端 200。llmux 是 Rust/reqwest，**无论怎么伪装头都进不去**，
+和 codex 是同一处境。详见 `deploy/zen-free/` 头注释与排障入口。
+
+- 镜像自建：`deploy/zen-free/Dockerfile`（node:22-slim + vendor 的 `server.mjs`），
+  compose 服务名 `zen-free`，容器内 6446，**不 publish 端口** —— 只在 `llmux_default`
+  网络内，llmux 走 `http://zen-free:6446/v1`。隔离靠"不 publish"保证，不要设
+  `PROXY_HOST=127.0.0.1`（那会让它只监听容器 loopback，连 llmux 都够不着）。
+- 源码出处：`https://github.com/dinhkarate/opencode-zen-free-proxy`（v12）。
+  **唯一的改动是模型不限白名单**：上游写死的 6 个模型已有 3 个被 deprecate
+  （`mimo-v2.5-free` 实测回 "use mimo-v2.6-flash-free"），所以存在性改从
+  `GET /zen/v1/models`（免鉴权）取，端点按模型单次探测 + `models-cache.json` 记住。
+  免费档的三道硬门（`bash`+`read` 工具、`stream:true`、TLS 指纹）**原样保留，不能放开**。
+- llmux 账户：`provider_id=zen-free`，四端点全填 `http://zen-free:6446/v1`，
+  `api_key` 与 compose 的 `ZEN_API_KEY` 同值，`default_protocol=chat`，
+  **`balance_provider` 必须显式设 `none`**（与 codex 同因：内网 key 打外网余额必失败）。
+- 模型别名用户自建（实现侧不建）：chat 系（`big-pickle` / `cat-jam-free` /
+  `ling-3.1-flash-free` / `mimo-v2.6-flash-free` …）走 Chat；
+  `muse-spark-*-contributor-free` 走 Responses（`upstream_api=responses`）。
+  绑定前先看 `GET http://zen-free:6446/v1/models` 的当前清单 —— 免费模型会换代。
+- 模型↔端点硬绑定：跨端点回 `400 ModelProtocolUnsupported`（sidecar 侧已前置拦截，
+  省一次上游调用）。`muse-spark-*` 只认 responses，其余 `*-free` 只认 chat。
+- 排障：`docker compose logs zen-free`（`[PROBE] <model> → chat|responses` 是端点判定；
+  `[ZEN RATE LIMITED]` / `FreeUsageLimitError` 是免费档全局配额，打满后退避重跑，
+  **不是 sidecar 故障**）。自检 `node scripts/probe-zen-free.mjs --key oc-...`。
+- ⚠️ 免费档随时可能收紧（模型换代、配额缩水、指纹库更新）；模型换代时 sidecar
+  自动跟（动态发现），但别名里绑的旧 id 要人手工换。
+
 ## 上游请求超时
 
 - **非流式请求有 30s 首字节超时**（`FIRST_BYTE_TIMEOUT_SECS`，在

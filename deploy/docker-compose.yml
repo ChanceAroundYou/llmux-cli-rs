@@ -1,0 +1,48 @@
+# llmux 本地 compose（路由器 /root/docker/llmux/docker-compose.yml 的受控子集）
+#
+# 只放 llmux + 两个 sidecar 的接线形状，真正的生产 compose 在路由器上，
+# deploy.sh 只管 llmux 主服务。zen-free 与 codex-api 的生产段以路由器为准，
+# 这里保留一份可构建验证（docker compose build）。
+#
+# 生产 .env（路由器，不入仓）：ADMIN_USERNAME / ADMIN_PASSWORD / BASE_PATH /
+# ZEN_API_KEY（zen-free 的 Bearer）/ CODEX_API_KEY（codex-api 的 Bearer）。
+
+services:
+  llmux:
+    build: .
+    image: llmux:latest
+    container_name: llmux
+    restart: unless-stopped
+    ports:
+      - "25977:25976"
+    environment:
+      - DATA_DIR=/data/llmux
+      - LOG_DIR=/data/llmux-logs
+      - BASE_PATH=${BASE_PATH:-llmux}
+      - TZ=Asia/Shanghai
+      - RUST_LOG=llmux=info
+      - LOG_RETAIN_DAYS=${LOG_RETAIN_DAYS:-30}
+      - BODY_RETAIN_DAYS=${BODY_RETAIN_DAYS:-1}
+      - LOG_ROW_RETAIN_DAYS=${LOG_ROW_RETAIN_DAYS:-30}
+      - ADMIN_USERNAME=${ADMIN_USERNAME}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD}
+    volumes:
+      - ./data:/data/llmux
+      - /mnt/openwrt/log-archive/llmux:/data/llmux-logs
+
+  # ── OpenCode Zen 免费档 → OpenAI/Anthropic/Responses 兼容上游 (sidecar) ──
+  # llmux 不能直连 opencode.ai/zen/v1（TLS 指纹门），只能经 Node 旁挂。
+  # 账户：provider_id=zen-free，四端点全填 http://zen-free:6446/v1，
+  # api_key 与 ZEN_API_KEY 同值，balance_provider=none。
+  zen-free:
+    build: ./zen-free
+    image: llmux/zen-free:latest
+    container_name: zen-free
+    restart: unless-stopped
+    environment:
+      - ZEN_API_KEY=${ZEN_API_KEY}
+      - PROXY_PORT=6446
+    # no `ports:` — 只在 compose 内网可达，公网不可直达。
+    # 注意 PROXY_HOST 刻意不在这里设：Dockerfile 里的 127.0.0.1 会让 sidecar
+    # 只监听容器 loopback，连同一 compose 网络的 llmux 都够不着，所以这里
+    # 不设（默认 0.0.0.0 全网卡监听）；隔离靠"不 publish 端口"保证。

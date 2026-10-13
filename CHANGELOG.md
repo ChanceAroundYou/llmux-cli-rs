@@ -5,6 +5,20 @@
 
 ## [Unreleased]
 
+### Added
+
+- **OpenCode Zen 免费档 sidecar（`deploy/zen-free/`）**。
+  `opencode.ai/zen/v1` 的 `*-free` 模型按 TLS ClientHello 指纹拦截 —— 2026-10-13
+  实测 curl / reqwest(rustls) / reqwest(native-tls) 的推理 POST 一律 403
+  `FreeTierError`，只有 Node 客户端能过；llmux（Rust/reqwest）无法直连，只能像
+  codex 一样旁挂。`deploy/zen-free/server.mjs` 是上游
+  `opencode-zen-free-proxy` v12 的 fork，唯一改动是模型不限白名单（存在性取自
+  `GET /zen/v1/models`，端点按模型单次探测 + `models-cache.json` 记住；
+  上游写死的 6 个里已有 3 个被 deprecate）。compose 加 `zen-free` 服务
+  （不 publish 端口，隔离靠 compose 内网）。llmux 侧零代码改动：
+  `provider_id=zen-free` 账户 + `balance_provider=none`，别名用户自建。
+  自检：`node scripts/probe-zen-free.mjs --key oc-...`。
+
 ### Fixed
 
 - **Anthropic 请求顶层 `system` 里的 `x-anthropic-billing-header` 块不再转发上游**。
