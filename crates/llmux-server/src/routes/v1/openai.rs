@@ -577,7 +577,13 @@ fn responses_body_shape(body: &Value) -> String {
     let mut input_items = 0usize;
     let mut function_call_ids = std::collections::BTreeSet::new();
     let mut output_call_ids = Vec::new();
+    let mut function_call_names = std::collections::BTreeSet::new();
+    let mut duplicate_function_call_ids = 0usize;
+    let mut max_function_arguments_bytes = 0usize;
     let mut max_tool_name_bytes = 0usize;
+    let mut tool_names = std::collections::BTreeSet::new();
+    let mut tool_schema_bytes = 0usize;
+    let mut tool_description_bytes = 0usize;
     let mut tool_schema_keywords: BTreeMap<&str, usize> = BTreeMap::new();
     fn count_schema_keywords(value: &Value, counts: &mut BTreeMap<&'static str, usize>) {
         const KEYWORDS: &[&str] = &["$ref", "$defs", "anyOf", "oneOf", "allOf", "not", "const", "enum", "patternProperties", "dependentRequired", "if", "then", "else"];
@@ -606,7 +612,13 @@ fn responses_body_shape(body: &Value) -> String {
                 .unwrap_or("-");
             *input_types.entry(kind).or_insert(0) += 1;
             match kind {
-                "function_call" => if let Some(id) = item.get("call_id").and_then(Value::as_str) { function_call_ids.insert(id); },
+                "function_call" => {
+                    if let Some(id) = item.get("call_id").and_then(Value::as_str) {
+                        if !function_call_ids.insert(id) { duplicate_function_call_ids += 1; }
+                    }
+                    if let Some(name) = item.get("name").and_then(Value::as_str) { function_call_names.insert(name); }
+                    max_function_arguments_bytes = max_function_arguments_bytes.max(item.get("arguments").and_then(Value::as_str).map(str::len).unwrap_or(0));
+                }
                 "function_call_output" => if let Some(id) = item.get("call_id").and_then(Value::as_str) { output_call_ids.push(id); },
                 _ => {}
             }
@@ -617,14 +629,22 @@ fn responses_body_shape(body: &Value) -> String {
     }
     let unmatched_tool_outputs = output_call_ids.iter().filter(|id| !function_call_ids.contains(**id)).count();
     if let Some(tools) = body.get("tools").and_then(Value::as_array) {
+        tool_schema_bytes = serde_json::to_vec(tools).map_or(0, |bytes| bytes.len());
         for tool in tools {
-            max_tool_name_bytes = max_tool_name_bytes.max(tool.get("name").and_then(Value::as_str).map(str::len).unwrap_or(0));
-            if let Some(schema) = tool.get("parameters") { count_schema_keywords(schema, &mut tool_schema_keywords); }
+            if let Some(name) = tool.get("name").and_then(Value::as_str) {
+                max_tool_name_bytes = max_tool_name_bytes.max(name.len());
+                tool_names.insert(name);
+            }
+            tool_description_bytes += tool.get("description").and_then(Value::as_str).map(str::len).unwrap_or(0);
+            if let Some(schema) = tool.get("parameters") {
+                count_schema_keywords(schema, &mut tool_schema_keywords);
+            }
         }
     }
+    let undeclared_function_calls = function_call_names.difference(&tool_names).count();
 
     format!(
-        "fields=[{}] max_output_tokens={} stream={} stop={} instructions={} reasoning_effort={} stream_options={} tools={} max_tool_name_bytes={} tool_schema_keywords={:?} input_items={} input_text_bytes={} input_types={} unmatched_tool_outputs={}",
+        "fields=[{}] max_output_tokens={} stream={} stop={} instructions={} reasoning_effort={} stream_options={} tools={} tool_schema_bytes={} tool_description_bytes={} max_tool_name_bytes={} tool_schema_keywords={:?} input_items={} input_text_bytes={} input_types={} unmatched_tool_outputs={} duplicate_function_call_ids={} undeclared_function_calls={} max_function_arguments_bytes={}",
         fields.join(","),
         body.get("max_output_tokens").and_then(Value::as_i64).map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()),
         body.get("stream").and_then(Value::as_bool).map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()),
@@ -633,12 +653,17 @@ fn responses_body_shape(body: &Value) -> String {
         body.get("reasoning").and_then(|v| v.get("effort")).and_then(Value::as_str).unwrap_or("-"),
         flag("stream_options"),
         body.get("tools").and_then(Value::as_array).map_or(0, Vec::len),
+        tool_schema_bytes,
+        tool_description_bytes,
         max_tool_name_bytes,
         tool_schema_keywords,
         input_items,
         input_text_bytes,
         input_types.iter().map(|(kind, count)| format!("{kind}={count}")).collect::<Vec<_>>().join(","),
         unmatched_tool_outputs,
+        duplicate_function_call_ids,
+        undeclared_function_calls,
+        max_function_arguments_bytes,
     )
 }
 
