@@ -172,7 +172,7 @@ ssh router "curl -s -X POST http://127.0.0.1:25977/admin/api/accounts/{id} \
 ## 给下游 agent 的一句话 prompt
 
 ```
-按 /home/xiaokubao/projects/llmux/src/docs/llmux-endpoint-unavailable-fix.md 修 llmux：
+按 /home/xiaokubao/projects/llmux/docs/llmux-endpoint-unavailable-fix.md 修 llmux：
 B1 把瞬时 500 纳入重试且不冷却账户、B2 让瞬时错误立即切聚合候选并给 os 配跨账户候选、
 B3 补 thinking_tokens 映射，每个 bug 配 e2e_error_status.rs 同款测试，跑通 cargo 门禁后停，
 部署等确认。
