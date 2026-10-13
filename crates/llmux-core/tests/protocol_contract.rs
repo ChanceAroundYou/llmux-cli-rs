@@ -87,6 +87,29 @@ fn forced_mode_always_targets_forced() {
 }
 
 #[test]
+fn codex_account_always_targets_responses_whatever_the_alias_says() {
+    // 回归（2026-10-13）：别名把 upstream_api 配成 /chat 时，路由曾照办，
+    // 拼出 `…/backend-api/codex/chat/completions` 这种不存在的路径。
+    // codex 的地址是固定的，协议没有可选项 —— 任何 mode 都不例外。
+    let mut a = acc(Some("http://codex-api:18080/v1"), None, None, "chat");
+    a.category = "codex".into();
+    for mode in [
+        DownstreamMode::Default,
+        DownstreamMode::Chat,
+        DownstreamMode::Messages,
+        DownstreamMode::Responses,
+    ] {
+        for ingress in [Protocol::Chat, Protocol::Messages, Protocol::Responses] {
+            assert_eq!(
+                target_protocol(ingress, mode, &a),
+                Protocol::Responses,
+                "ingress={ingress:?} mode={mode:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn auto_maps_to_default() {
     assert_eq!(DownstreamMode::from_str("auto"), DownstreamMode::Default);
     assert_eq!(

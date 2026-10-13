@@ -692,6 +692,75 @@ async fn server_rejects_alias_forced_protocol_unsupported_by_bound_account() {
     assert_eq!(status, StatusCode::OK, "forced-mode save must pass, got {:?}", body);
 }
 
+/// 绑定 codex 账户的别名：无论客户端传什么 upstream_api，存下来都是
+/// responses —— codex 上游只有一种形状，留个 /chat 只会让每轮拨测报一次
+/// 「配置可能写错了」。运行时 (protocol::target_protocol) 也会兜底，这里是把
+/// 错误挡在写入侧，让库里的状态与行为一致。
+#[tokio::test]
+async fn alias_bound_to_codex_account_stores_responses_whatever_was_sent() {
+    use http::header;
+    let state = llmux_server::test_state().await;
+    let app = llmux_server::app(state.clone());
+
+    let login_req = Request::builder()
+        .method(Method::POST)
+        .uri("/api/auth/login")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::json!({"username":"admin","password":"admin"}).to_string(),
+        ))
+        .unwrap();
+    let login_resp = llmux_server::test_request(app.clone(), login_req).await;
+    let cookie = extract_session_cookie(&login_resp).expect("session cookie");
+
+    let create_req = Request::builder()
+        .method(Method::POST)
+        .uri("/api/accounts")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::COOKIE, &cookie)
+        .body(Body::from(
+            json!({
+                "alias": "codex-alias",
+                "provider_id": "codex",
+                "api_key": "unused",
+                "skip_validation": true,
+                "category": "codex",
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let create_resp = llmux_server::test_request(app.clone(), create_req).await;
+    let bytes = axum::body::to_bytes(create_resp.into_body(), usize::MAX).await.unwrap();
+    let created: Value = serde_json::from_slice(&bytes).unwrap();
+    let acct_id = created["id"].as_i64().expect("account id");
+
+    let alias_req = Request::builder()
+        .method(Method::POST)
+        .uri("/api/models/aliases")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::COOKIE, &cookie)
+        .body(Body::from(
+            json!({
+                "alias": "codex-alias-probe",
+                "target_model": "gpt-6-luna",
+                "account_ids": [acct_id],
+                "upstream_api": "chat",
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let alias_resp = llmux_server::test_request(app.clone(), alias_req).await;
+    assert_eq!(alias_resp.status(), StatusCode::OK);
+
+    let stored: String =
+        sqlx::query_scalar("SELECT upstream_api FROM model_aliases WHERE alias = ?")
+            .bind("codex-alias-probe")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+    assert_eq!(stored, "responses", "codex 别名不该留下 /chat");
+}
+
 #[tokio::test]
 async fn account_create_syncs_chat_endpoint_into_base_url() {
     use http::header;

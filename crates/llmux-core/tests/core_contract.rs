@@ -499,6 +499,74 @@ async fn migration_0028_creates_upstream_prices_keyed_by_account_and_model() {
     assert_eq!(n, 2);
 }
 
+/// 0033：存量 codex 账户的端点/协议归位到代码固定值，绑定它的别名协议也
+/// 从失效的 /chat 改成 /responses。留旧值时账户页会显示已退役 sidecar 的地址
+/// `http://codex-api:18080/v1`，排障会照着它去找一个不存在的容器。
+#[tokio::test]
+async fn migration_0033_pins_existing_codex_accounts_and_their_aliases() {
+    let pool = memory_db().await;
+    // memory_db 已跑完全部迁移 —— 直接塞「迁移前」形状的数据，再手跑一次
+    // 0033 的 SQL，验证它对存量行做了什么（迁移本身幂等，重复执行无害）。
+    sqlx::query(
+        "INSERT INTO accounts (id, alias, provider_id, api_key, base_url, chat_endpoint,
+                               category, default_protocol)
+         VALUES (90, 'codex', 'codex', 'k', 'http://codex-api:18080/v1',
+                 'http://codex-api:18080/v1', 'codex', 'chat'),
+                (91, 'plain', 'custom', 'k', 'https://api.example.com/v1',
+                 'https://api.example.com/v1', 'custom', 'chat')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO model_aliases (id, alias, target_model, account_ids, upstream_api)
+         VALUES (90, 'op', 'gpt-6-luna', '[90]', 'chat'),
+                (91, 'plain', 'some-model', '[91]', 'chat')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(llmux_core::db::MIGRATION_0033)
+        .execute(&pool)
+        .await
+        .expect("0033 应在存量数据上执行成功");
+
+    let (base, resp, chat, proto): (String, String, Option<String>, String) = sqlx::query_as(
+        "SELECT base_url, responses_endpoint, chat_endpoint, default_protocol
+         FROM accounts WHERE id = 90",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(base, "https://chatgpt.com/backend-api/codex");
+    assert_eq!(resp, "https://chatgpt.com/backend-api/codex");
+    assert_eq!(chat, None);
+    assert_eq!(proto, "responses");
+
+    // 绑定 codex 账户的别名：/chat → /responses
+    let codex_alias: String =
+        sqlx::query_scalar("SELECT upstream_api FROM model_aliases WHERE id = 90")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(codex_alias, "responses");
+
+    // 普通账户与普通别名一个字都不能动。
+    let plain_alias: String =
+        sqlx::query_scalar("SELECT upstream_api FROM model_aliases WHERE id = 91")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(plain_alias, "chat");
+    let plain_base: String =
+        sqlx::query_scalar("SELECT base_url FROM accounts WHERE id = 91")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(plain_base, "https://api.example.com/v1");
+}
+
 /// 0027 给 model_prices 加缓存价与来源列，并种入公开渠道查不到报价的免费模型。
 /// `source` 默认 `'openrouter'` 是刷新「只覆盖自动行」这条规矩的地基。
 #[tokio::test]

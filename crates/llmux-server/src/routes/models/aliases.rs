@@ -10,6 +10,44 @@ use llmux_core::models::ModelAlias;
 
 use crate::app::AppState;
 
+/// 别名绑定的账户里有没有 codex（`identifier` 是账户 id 的 JSON 数组字符串，
+/// 缺省 = 按 `provider_id` 匹配该 provider 下的全部账户 —— 与路由侧同一套
+/// 语义）。
+///
+/// 账户查询失败时返回 false：宁可把旧的 upstream_api 原样存下，也不因为一次
+/// 查询抖动就把别名悄悄改掉。
+async fn alias_binds_codex_account(
+    pool: &sqlx::SqlitePool,
+    identifier: Option<&str>,
+    provider_id: Option<&str>,
+) -> bool {
+    let ids: Vec<i64> = identifier
+        .and_then(|s| serde_json::from_str::<Vec<i64>>(s).ok())
+        .unwrap_or_default();
+    if !ids.is_empty() {
+        let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT COUNT(*) FROM accounts WHERE id IN ({placeholders}) AND category = 'codex'"
+        );
+        let mut query = sqlx::query_scalar::<_, i64>(&sql);
+        for id in &ids {
+            query = query.bind(id);
+        }
+        return query.fetch_one(pool).await.unwrap_or(0) > 0;
+    }
+    let Some(provider_id) = provider_id.filter(|p| !p.is_empty()) else {
+        return false;
+    };
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM accounts WHERE provider_id = ? AND category = 'codex'",
+    )
+    .bind(provider_id)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0)
+        > 0
+}
+
 pub async fn get_model_aliases(Extension(state): Extension<AppState>) -> Response {
     match sqlx::query_as::<_, ModelAlias>(
         "SELECT id, alias, target_model, provider_id, account_ids, preferred_account_id, upstream_api, first_byte_timeout_secs FROM model_aliases ORDER BY id",
@@ -82,6 +120,22 @@ pub async fn set_model_alias(
         .get("preferred_account_id")
         .and_then(|v| v.as_i64());
     let upstream_api = llmux_core::protocol::DownstreamMode::from_str(body.get("upstream_api").and_then(Value::as_str).unwrap_or("default")).as_str().to_string();
+
+    // codex 账户只有 Responses 一种形状（`…/backend-api/codex` 拼不出
+    // `/chat/completions`）。别名指向 codex 账户时，无论客户端传什么
+    // upstream_api 一律存 responses —— 否则库里留着一个永远不该生效的值，
+    // 拨测每轮都要为它报一次「配置可能写错了」。运行时 target_protocol 也会
+    // 兜底，这里是把错误挡在写入侧（不静默：日志留一行）。
+    let upstream_api = if upstream_api != "responses"
+        && alias_binds_codex_account(&state.pool, account_ids.as_deref(), provider_id.as_deref()).await
+    {
+        tracing::info!(
+            "🏷️ alias {alias}: upstream_api {upstream_api} → responses（绑定的 codex 账户只有 responses）"
+        );
+        "responses".to_string()
+    } else {
+        upstream_api
+    };
     let first_byte_timeout_secs = match body.get("first_byte_timeout_secs") {
         None | Some(Value::Null) => None,
         Some(value) => match value.as_i64() {

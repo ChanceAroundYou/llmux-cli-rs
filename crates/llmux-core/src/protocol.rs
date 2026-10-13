@@ -92,6 +92,13 @@ pub fn target_protocol(
     mode: DownstreamMode,
     account: &Account,
 ) -> Protocol {
+    // codex 原生账户只有 Responses 一种形状：它的后端是 `…/backend-api/codex`，
+    // 拼 `/chat/completions` 只会 404。所以别名把 upstream_api 配成 /chat 时
+    // **不能照办** —— 否则配置一错，路由就静默拼出一个不存在的路径。
+    // 放在最前面：任何 mode（含 forced）都不例外，配置对 codex 不再有影响。
+    if crate::adapters::is_codex_native(account) {
+        return Protocol::Responses;
+    }
     match mode {
         DownstreamMode::Default => {
             if supports(account, ingress) {

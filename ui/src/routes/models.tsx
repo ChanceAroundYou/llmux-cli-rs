@@ -53,6 +53,11 @@ const supports = (acc: any, proto: string) =>
   : proto === 'responses' ? !!acc.responses_endpoint
   : !!acc.messages_endpoint;
 
+/// codex 账户只有 responses 一种形状（上游是固定的 `…/backend-api/codex`），
+/// 它的下游协议不是可选项 —— `supports` 会照端点字段回答，而 codex 账户的
+/// 端点由后端钉死，所以这里单独判：别让表单给出一个存不下来的选择。
+const isCodexAccount = (acc: any) => acc?.category === 'codex';
+
 type TestScope = 'aliases' | 'aggregates' | 'models';
 type QueueStatus = { isRunning: boolean; current: number; total: number; progress: number };
 const IDLE_QUEUE: QueueStatus = { isRunning: false, current: 0, total: 0, progress: 0 };
@@ -107,6 +112,10 @@ export default function Models() {
   const [targetFilter, setTargetFilter] = useState('');
   const [targetOpen, setTargetOpen] = useState(false);
   const [aliasForm, setAliasForm] = useState({ alias: '', target: '', provider: '', selectedAccountIds: [] as number[], preferredAccountId: null as number | null, downstreamMode: 'chat' as string, firstByteTimeoutSecs: null as number | null });
+  // 选中的账户全是 codex → 下游协议只能是 responses，选择器改为只读展示。
+  const aliasBoundCodex = aliasForm.selectedAccountIds.length > 0
+    && aliasForm.selectedAccountIds.every(id => isCodexAccount(safeAccounts.find(a => a.id === id)));
+  const aliasDownstreamMode = aliasBoundCodex ? 'responses' : (aliasForm.downstreamMode || 'default');
   // 提交时若强制模式选中了不支持的账户，提示并高亮
   const [aliasModeNotice, setAliasModeNotice] = useState<string | null>(null);
   // 测速/健康按账户隔离：key = accountId:modelId（避免同名模型互串）
@@ -393,13 +402,13 @@ export default function Models() {
         }
       }
       // 强制模式（非 default）下，选中账户必须支持该协议，否则 409 提示
-      if (aliasForm.downstreamMode !== 'default') {
+      if (aliasDownstreamMode !== 'default') {
         const unsupported = aliasForm.selectedAccountIds.filter(id => {
           const acc = safeAccounts.find(a => a.id === id);
-          return acc ? !supports(acc, aliasForm.downstreamMode) : true;
+          return acc ? !supports(acc, aliasDownstreamMode) : true;
         });
         if (unsupported.length > 0) {
-          setAliasModeNotice(`有 ${unsupported.length} 个已选账户不支持「${aliasForm.downstreamMode}」下游模式，请取消勾选或更换模式。`);
+          setAliasModeNotice(`有 ${unsupported.length} 个已选账户不支持「${aliasDownstreamMode}」下游模式，请取消勾选或更换模式。`);
           return;
         }
       }
@@ -410,7 +419,7 @@ export default function Models() {
         aliasForm.selectedAccountIds.length > 0 ? aliasForm.selectedAccountIds : undefined,
         aliasForm.preferredAccountId ?? undefined,
         undefined,
-        aliasForm.downstreamMode || 'default',
+        aliasDownstreamMode,
         aliasForm.firstByteTimeoutSecs
       );
       showBgVerifyHint();
@@ -1140,26 +1149,35 @@ export default function Models() {
           </div>
           <div className="space-y-1.5 border-t border-border pt-3">
             <label className="text-xs font-bold text-muted-foreground uppercase">{t('models.downstreamMode')}</label>
-            <p className="text-xs text-muted-foreground">{t(downstreamHintKey(aliasForm.downstreamMode))}</p>
-            <select
-              value={aliasForm.downstreamMode}
-              onChange={e => {
-                const mode = e.target.value;
-                // 切换模式时，移除不再支持该协议的已选账户
-                const nextSelected = mode === 'default' ? aliasForm.selectedAccountIds
-                  : aliasForm.selectedAccountIds.filter(id => {
-                      const acc = safeAccounts.find(a => a.id === id);
-                      return acc ? supports(acc, mode) : false;
-                    });
-                setAliasModeNotice(null);
-                setAliasForm({ ...aliasForm, downstreamMode: mode, selectedAccountIds: nextSelected });
-              }}
-              className="w-full h-10 px-3 py-2 rounded-md border border-input bg-background text-sm"
-            >
-              {DOWNSTREAM_MODES.map(m => (
-                <option key={m} value={m}>{t(downstreamLabelKey(m))}</option>
-              ))}
-            </select>
+            {aliasBoundCodex ? (
+              <>
+                <p className="text-xs font-mono text-muted-foreground">responses</p>
+                <p className="text-xs text-muted-foreground">codex 账户只有 responses 一种协议（上游地址由后端固定），此项不可选。</p>
+              </>
+            ) : (
+              <>
+                <p className="text-xs text-muted-foreground">{t(downstreamHintKey(aliasForm.downstreamMode))}</p>
+                <select
+                  value={aliasForm.downstreamMode}
+                  onChange={e => {
+                    const mode = e.target.value;
+                    // 切换模式时，移除不再支持该协议的已选账户
+                    const nextSelected = mode === 'default' ? aliasForm.selectedAccountIds
+                      : aliasForm.selectedAccountIds.filter(id => {
+                          const acc = safeAccounts.find(a => a.id === id);
+                          return acc ? supports(acc, mode) : false;
+                        });
+                    setAliasModeNotice(null);
+                    setAliasForm({ ...aliasForm, downstreamMode: mode, selectedAccountIds: nextSelected });
+                  }}
+                  className="w-full h-10 px-3 py-2 rounded-md border border-input bg-background text-sm"
+                >
+                  {DOWNSTREAM_MODES.map(m => (
+                    <option key={m} value={m}>{t(downstreamLabelKey(m))}</option>
+                  ))}
+                </select>
+              </>
+            )}
             {aliasModeNotice && (
               <p className="text-xs text-destructive font-medium bg-destructive/10 border border-destructive/30 rounded px-2 py-1.5">{aliasModeNotice}</p>
             )}

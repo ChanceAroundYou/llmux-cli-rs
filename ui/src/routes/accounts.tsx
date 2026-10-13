@@ -39,6 +39,11 @@ type Protocol = typeof PROTOCOLS[number];
 type AccountCategory = 'custom' | 'codex' | 'zen_free';
 const ACCOUNT_CATEGORIES: AccountCategory[] = ['custom', 'codex', 'zen_free'];
 
+// codex 账户的上游地址由后端固定（`llmux_core::codex_compat::CODEX_BACKEND_BASE`），
+// 这里只是**展示**它，不是配置项 —— 提交时服务端会覆盖任何传入的端点。
+// 改地址只改 Rust 常量，改完记得同步这个字符串（仅影响这行只读展示）。
+const CODEX_FIXED_ENDPOINT = 'https://chatgpt.com/backend-api/codex';
+
 // 需要网页登录凭据（Cookie/Token）而非 API Key 的余额查询类型。
 const COOKIE_KINDS = ['copilot', 'commandcode', 'opencode', 'opencode-go', 'opencode-zen', 'deepseek', 'chatgpt', 'openai', 'bailian'];
 
@@ -354,6 +359,25 @@ function t_balanceHint(): string {
   return '余额未查询';
 }
 
+/// codex 账户只有一个固定端点，且不可编辑 —— 与其摆三个禁用输入框，不如
+/// 直说「地址是内置的」。服务端在创建/更新时也会把端点覆盖成同一个值。
+function CodexFixedEndpoint({ label }: { label: string }) {
+  return (
+    <div className="space-y-1.5 border-t border-border pt-3">
+      <label className="text-xs font-bold text-muted-foreground uppercase">{label}</label>
+      <div className="rounded-md border border-input bg-muted/40 px-3 py-2 space-y-1">
+        <div className="flex items-center gap-2">
+          <span className="text-xs font-bold uppercase">responses</span>
+          <span className="rounded px-1.5 py-0.5 text-[10px] uppercase tracking-wide bg-muted text-muted-foreground">
+            built-in
+          </span>
+        </div>
+        <p className="text-xs font-mono text-muted-foreground break-all">{CODEX_FIXED_ENDPOINT}</p>
+      </div>
+    </div>
+  );
+}
+
 function EndpointRow({ label, enabled, url, urls, onToggle, onChange }: { label: Protocol; enabled: boolean; url: string; urls: string[]; onToggle: (v: boolean) => void; onChange: (v: string) => void }) {
   const resolved = enabled ? resolvedEndpointUrl(url, label) : '';
   const [open, setOpen] = useState(false);
@@ -536,15 +560,23 @@ export default function Accounts() {
     return [...new Set([...distinctUrls, ...own])];
   }, [distinctUrls, editingAccount]);
 
+  // codex 账户的端点由后端钉死：表单里没有可配的端点，所以也不该报
+  // 「至少要启用一个端点」——那条规则只对 custom 账户成立。
+  const isCodexForm = formData.category === 'codex';
   const formEnabledProtocols = PROTOCOLS.filter(p => formEnabled[p]);
-  const formError = formEnabledProtocols.length === 0
+  const formError = isCodexForm
+    ? null
+    : formEnabledProtocols.length === 0
     ? t('accounts.needEndpoint', 'At least one endpoint must be enabled')
     : (!formData.default_protocol || !formEnabledProtocols.includes(formData.default_protocol as Protocol))
       ? t('accounts.defaultInEnabled', 'Default protocol must be one of the enabled endpoints')
       : null;
 
+  const isCodexEdit = editData.category === 'codex';
   const editEnabledProtocols = PROTOCOLS.filter(p => editEnabled[p]);
-  const editError = editEnabledProtocols.length === 0
+  const editError = isCodexEdit
+    ? null
+    : editEnabledProtocols.length === 0
     ? t('accounts.needEndpoint', 'At least one endpoint must be enabled')
     : (!editData.default_protocol || !editEnabledProtocols.includes(editData.default_protocol as Protocol))
       ? t('accounts.defaultInEnabled', 'Default protocol must be one of the enabled endpoints')
@@ -564,10 +596,11 @@ export default function Accounts() {
         provider_id: 'custom',
         category: formData.category,
         api_key: formData.api_key,
-        chat_endpoint: formEnabled.chat ? formData.chat_endpoint.trim() || null : null,
-        responses_endpoint: formEnabled.responses ? formData.responses_endpoint.trim() || null : null,
-        messages_endpoint: formEnabled.messages ? formData.messages_endpoint.trim() || null : null,
-        default_protocol: formData.default_protocol,
+        // codex 的端点是内置的：传 null，让服务端钉死（传什么都不生效）。
+        chat_endpoint: !isCodexForm && formEnabled.chat ? formData.chat_endpoint.trim() || null : null,
+        responses_endpoint: !isCodexForm && formEnabled.responses ? formData.responses_endpoint.trim() || null : null,
+        messages_endpoint: !isCodexForm && formEnabled.messages ? formData.messages_endpoint.trim() || null : null,
+        default_protocol: isCodexForm ? 'responses' : formData.default_protocol,
         balance_provider: formData.balance_provider,
         balance_auth: COOKIE_KINDS.includes(formData.balance_provider) ? formData.balance_auth : '',
         openai_compatible: 0,
@@ -622,10 +655,11 @@ export default function Accounts() {
         provider_id: editingAccount.provider_id,
         category: editData.category,
         notes: editData.notes,
-        chat_endpoint: editEnabled.chat ? editData.chat_endpoint.trim() || null : null,
-        responses_endpoint: editEnabled.responses ? editData.responses_endpoint.trim() || null : null,
-        messages_endpoint: editEnabled.messages ? editData.messages_endpoint.trim() || null : null,
-        default_protocol: editData.default_protocol,
+        // codex 的端点是内置的：传 null，让服务端钉死（传什么都不生效）。
+        chat_endpoint: !isCodexEdit && editEnabled.chat ? editData.chat_endpoint.trim() || null : null,
+        responses_endpoint: !isCodexEdit && editEnabled.responses ? editData.responses_endpoint.trim() || null : null,
+        messages_endpoint: !isCodexEdit && editEnabled.messages ? editData.messages_endpoint.trim() || null : null,
+        default_protocol: isCodexEdit ? 'responses' : editData.default_protocol,
         balance_provider: editData.balance_provider,
       };
       // 凭据只在填入且类型匹配时提交；留空 = 不修改已有值。
@@ -816,53 +850,59 @@ export default function Accounts() {
               </div>
             </div>
 
-            <div className="space-y-3 border-t border-border pt-3">
-              <label className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.endpoints', 'Endpoints')}</label>
-              <EndpointRow
-                label="chat"
-                enabled={formEnabled.chat}
-                url={formData.chat_endpoint}
-                urls={distinctUrls}
-                onToggle={v => handleToggle('chat', v)}
-                onChange={v => setFormData({ ...formData, chat_endpoint: v })}
-              />
-              <EndpointRow
-                label="responses"
-                enabled={formEnabled.responses}
-                url={formData.responses_endpoint}
-                urls={distinctUrls}
-                onToggle={v => handleToggle('responses', v)}
-                onChange={v => setFormData({ ...formData, responses_endpoint: v })}
-              />
-              <EndpointRow
-                label="messages"
-                enabled={formEnabled.messages}
-                url={formData.messages_endpoint}
-                urls={distinctUrls}
-                onToggle={v => handleToggle('messages', v)}
-                onChange={v => setFormData({ ...formData, messages_endpoint: v })}
-              />
-              {formError && (
-                <p className="text-xs font-medium text-destructive">{formError}</p>
-              )}
-            </div>
+            {isCodexForm ? (
+              <CodexFixedEndpoint label={t('accounts.endpoints', 'Endpoints')} />
+            ) : (
+              <div className="space-y-3 border-t border-border pt-3">
+                <label className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.endpoints', 'Endpoints')}</label>
+                <EndpointRow
+                  label="chat"
+                  enabled={formEnabled.chat}
+                  url={formData.chat_endpoint}
+                  urls={distinctUrls}
+                  onToggle={v => handleToggle('chat', v)}
+                  onChange={v => setFormData({ ...formData, chat_endpoint: v })}
+                />
+                <EndpointRow
+                  label="responses"
+                  enabled={formEnabled.responses}
+                  url={formData.responses_endpoint}
+                  urls={distinctUrls}
+                  onToggle={v => handleToggle('responses', v)}
+                  onChange={v => setFormData({ ...formData, responses_endpoint: v })}
+                />
+                <EndpointRow
+                  label="messages"
+                  enabled={formEnabled.messages}
+                  url={formData.messages_endpoint}
+                  urls={distinctUrls}
+                  onToggle={v => handleToggle('messages', v)}
+                  onChange={v => setFormData({ ...formData, messages_endpoint: v })}
+                />
+                {formError && (
+                  <p className="text-xs font-medium text-destructive">{formError}</p>
+                )}
+              </div>
+            )}
 
-            <div className="space-y-1.5">
-              <label className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.defaultProtocol', 'Default protocol')}</label>
-              <ToggleGroup
-                type="single"
-                variant="outline"
-                value={formData.default_protocol}
-                disabled={formEnabledProtocols.length === 0 || isValidating}
-                onValueChange={v => { if (v) setFormData({ ...formData, default_protocol: v }); }}
-                className="justify-start flex-wrap"
-              >
-                {formEnabledProtocols.map(p => (
-                  <ToggleGroupItem key={p} value={p} className="capitalize">{p}</ToggleGroupItem>
-                ))}
-              </ToggleGroup>
-              <p className="text-xs text-muted-foreground">{t('accounts.defaultProtocolHint', 'Used when a request does not specify a protocol')}</p>
-            </div>
+            {!isCodexForm && (
+              <div className="space-y-1.5">
+                <label className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.defaultProtocol', 'Default protocol')}</label>
+                <ToggleGroup
+                  type="single"
+                  variant="outline"
+                  value={formData.default_protocol}
+                  disabled={formEnabledProtocols.length === 0 || isValidating}
+                  onValueChange={v => { if (v) setFormData({ ...formData, default_protocol: v }); }}
+                  className="justify-start flex-wrap"
+                >
+                  {formEnabledProtocols.map(p => (
+                    <ToggleGroupItem key={p} value={p} className="capitalize">{p}</ToggleGroupItem>
+                  ))}
+                </ToggleGroup>
+                <p className="text-xs text-muted-foreground">{t('accounts.defaultProtocolHint', 'Used when a request does not specify a protocol')}</p>
+              </div>
+            )}
 
             <div className="space-y-1.5">
               <label className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.balanceProvider', '余额查询接口')}</label>
@@ -990,53 +1030,59 @@ export default function Accounts() {
               </div>
             </div>
 
-            <div className="space-y-3 border-t border-border pt-3">
-              <label className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.endpoints', 'Endpoints')}</label>
-              <EndpointRow
-                label="chat"
-                enabled={editEnabled.chat}
-                url={editData.chat_endpoint}
-                urls={editUrlSuggestions}
-                onToggle={v => handleEditToggle('chat', v)}
-                onChange={v => setEditData({ ...editData, chat_endpoint: v })}
-              />
-              <EndpointRow
-                label="responses"
-                enabled={editEnabled.responses}
-                url={editData.responses_endpoint}
-                urls={editUrlSuggestions}
-                onToggle={v => handleEditToggle('responses', v)}
-                onChange={v => setEditData({ ...editData, responses_endpoint: v })}
-              />
-              <EndpointRow
-                label="messages"
-                enabled={editEnabled.messages}
-                url={editData.messages_endpoint}
-                urls={editUrlSuggestions}
-                onToggle={v => handleEditToggle('messages', v)}
-                onChange={v => setEditData({ ...editData, messages_endpoint: v })}
-              />
-              {editError && (
-                <p className="text-xs font-medium text-destructive">{editError}</p>
-              )}
-            </div>
+            {isCodexEdit ? (
+              <CodexFixedEndpoint label={t('accounts.endpoints', 'Endpoints')} />
+            ) : (
+              <div className="space-y-3 border-t border-border pt-3">
+                <label className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.endpoints', 'Endpoints')}</label>
+                <EndpointRow
+                  label="chat"
+                  enabled={editEnabled.chat}
+                  url={editData.chat_endpoint}
+                  urls={editUrlSuggestions}
+                  onToggle={v => handleEditToggle('chat', v)}
+                  onChange={v => setEditData({ ...editData, chat_endpoint: v })}
+                />
+                <EndpointRow
+                  label="responses"
+                  enabled={editEnabled.responses}
+                  url={editData.responses_endpoint}
+                  urls={editUrlSuggestions}
+                  onToggle={v => handleEditToggle('responses', v)}
+                  onChange={v => setEditData({ ...editData, responses_endpoint: v })}
+                />
+                <EndpointRow
+                  label="messages"
+                  enabled={editEnabled.messages}
+                  url={editData.messages_endpoint}
+                  urls={editUrlSuggestions}
+                  onToggle={v => handleEditToggle('messages', v)}
+                  onChange={v => setEditData({ ...editData, messages_endpoint: v })}
+                />
+                {editError && (
+                  <p className="text-xs font-medium text-destructive">{editError}</p>
+                )}
+              </div>
+            )}
 
-            <div className="space-y-1.5">
-              <label className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.defaultProtocol', 'Default protocol')}</label>
-              <ToggleGroup
-                type="single"
-                variant="outline"
-                value={editData.default_protocol}
-                disabled={editEnabledProtocols.length === 0 || isValidating}
-                onValueChange={v => { if (v) setEditData({ ...editData, default_protocol: v }); }}
-                className="justify-start flex-wrap"
-              >
-                {editEnabledProtocols.map(p => (
-                  <ToggleGroupItem key={p} value={p} className="capitalize">{p}</ToggleGroupItem>
-                ))}
-              </ToggleGroup>
-              <p className="text-xs text-muted-foreground">{t('accounts.defaultProtocolHint', 'Used when a request does not specify a protocol')}</p>
-            </div>
+            {!isCodexEdit && (
+              <div className="space-y-1.5">
+                <label className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.defaultProtocol', 'Default protocol')}</label>
+                <ToggleGroup
+                  type="single"
+                  variant="outline"
+                  value={editData.default_protocol}
+                  disabled={editEnabledProtocols.length === 0 || isValidating}
+                  onValueChange={v => { if (v) setEditData({ ...editData, default_protocol: v }); }}
+                  className="justify-start flex-wrap"
+                >
+                  {editEnabledProtocols.map(p => (
+                    <ToggleGroupItem key={p} value={p} className="capitalize">{p}</ToggleGroupItem>
+                  ))}
+                </ToggleGroup>
+                <p className="text-xs text-muted-foreground">{t('accounts.defaultProtocolHint', 'Used when a request does not specify a protocol')}</p>
+              </div>
+            )}
 
             <div className="space-y-1.5">
               <label className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.balanceProvider', '余额查询接口')}</label>
