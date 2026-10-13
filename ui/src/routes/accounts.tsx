@@ -39,10 +39,21 @@ type Protocol = typeof PROTOCOLS[number];
 type AccountCategory = 'custom' | 'codex' | 'zen_free';
 const ACCOUNT_CATEGORIES: AccountCategory[] = ['custom', 'codex', 'zen_free'];
 
-// codex 账户的上游地址由后端固定（`llmux_core::codex_compat::CODEX_BACKEND_BASE`），
-// 这里只是**展示**它，不是配置项 —— 提交时服务端会覆盖任何传入的端点。
-// 改地址只改 Rust 常量，改完记得同步这个字符串（仅影响这行只读展示）。
+// 固定端点账户的上游地址由代码决定（`llmux_core::codex_compat::CODEX_BACKEND_BASE`
+// 与 `llmux_core::adapters::ZEN_FREE_BASE`），这里只是**展示**它，不是配置项 ——
+// 提交时服务端会覆盖任何传入的端点。改地址只改 Rust 常量（zen_free 同时要改
+// `deploy/` 的 compose），改完记得同步这两个字符串（仅影响只读展示）。
 const CODEX_FIXED_ENDPOINT = 'https://chatgpt.com/backend-api/codex';
+const ZEN_FREE_FIXED_ENDPOINT = 'http://zen-free:6446/v1';
+
+/// 该类别是否属于「上游地址由代码钉死」。是则返回它的类别键（用于展示哪几个
+/// 协议 / 哪个地址），否则 null。
+const fixedEndpointCategory = (category: string): 'codex' | 'zen_free' | null =>
+  category === 'codex' ? 'codex' : category === 'zen_free' ? 'zen_free' : null;
+
+/// 固定端点账户提交时的默认协议：codex 只有 responses，zen_free 走 chat。
+const defaultProtocolFor = (category: string, fallback: string): string =>
+  category === 'codex' ? 'responses' : category === 'zen_free' ? 'chat' : fallback;
 
 // 需要网页登录凭据（Cookie/Token）而非 API Key 的余额查询类型。
 const COOKIE_KINDS = ['copilot', 'commandcode', 'opencode', 'opencode-go', 'opencode-zen', 'deepseek', 'chatgpt', 'openai', 'bailian'];
@@ -359,20 +370,28 @@ function t_balanceHint(): string {
   return '余额未查询';
 }
 
-/// codex 账户只有一个固定端点，且不可编辑 —— 与其摆三个禁用输入框，不如
-/// 直说「地址是内置的」。服务端在创建/更新时也会把端点覆盖成同一个值。
-function CodexFixedEndpoint({ label }: { label: string }) {
+/// 固定端点账户（codex / zen_free）的只读端点展示 —— 与其摆三个可编辑输入框，
+/// 不如直说「地址是内置的」。服务端在创建/更新时也会把端点覆盖成同一个值
+/// （见 `routes/accounts.rs::pin_fixed_endpoints`）。
+///
+/// codex 只列 responses（它的后端只有那一种形状）；zen_free 列全三种 ——
+/// sidecar 三种都实现了，哪种能通由拨测按模型探出来，不是配置决定的。
+function FixedEndpointNotice({ label, category }: { label: string; category: 'codex' | 'zen_free' }) {
+  const base = category === 'codex' ? CODEX_FIXED_ENDPOINT : ZEN_FREE_FIXED_ENDPOINT;
+  const protocols = category === 'codex' ? ['responses'] : ['chat', 'responses', 'messages'];
   return (
     <div className="space-y-1.5 border-t border-border pt-3">
       <label className="text-xs font-bold text-muted-foreground uppercase">{label}</label>
       <div className="rounded-md border border-input bg-muted/40 px-3 py-2 space-y-1">
-        <div className="flex items-center gap-2">
-          <span className="text-xs font-bold uppercase">responses</span>
+        <div className="flex items-center gap-2 flex-wrap">
+          {protocols.map(p => (
+            <span key={p} className="text-xs font-bold uppercase">{p}</span>
+          ))}
           <span className="rounded px-1.5 py-0.5 text-[10px] uppercase tracking-wide bg-muted text-muted-foreground">
             built-in
           </span>
         </div>
-        <p className="text-xs font-mono text-muted-foreground break-all">{CODEX_FIXED_ENDPOINT}</p>
+        <p className="text-xs font-mono text-muted-foreground break-all">{base}</p>
       </div>
     </div>
   );
@@ -560,11 +579,11 @@ export default function Accounts() {
     return [...new Set([...distinctUrls, ...own])];
   }, [distinctUrls, editingAccount]);
 
-  // codex 账户的端点由后端钉死：表单里没有可配的端点，所以也不该报
-  // 「至少要启用一个端点」——那条规则只对 custom 账户成立。
-  const isCodexForm = formData.category === 'codex';
+  // 固定端点账户（codex / zen_free）的地址由后端钉死：表单里没有可配的端点，
+  // 所以也不该报「至少要启用一个端点」——那条规则只对 custom 账户成立。
+  const formFixedCategory = fixedEndpointCategory(formData.category);
   const formEnabledProtocols = PROTOCOLS.filter(p => formEnabled[p]);
-  const formError = isCodexForm
+  const formError = formFixedCategory
     ? null
     : formEnabledProtocols.length === 0
     ? t('accounts.needEndpoint', 'At least one endpoint must be enabled')
@@ -572,9 +591,9 @@ export default function Accounts() {
       ? t('accounts.defaultInEnabled', 'Default protocol must be one of the enabled endpoints')
       : null;
 
-  const isCodexEdit = editData.category === 'codex';
+  const editFixedCategory = fixedEndpointCategory(editData.category);
   const editEnabledProtocols = PROTOCOLS.filter(p => editEnabled[p]);
-  const editError = isCodexEdit
+  const editError = editFixedCategory
     ? null
     : editEnabledProtocols.length === 0
     ? t('accounts.needEndpoint', 'At least one endpoint must be enabled')
@@ -596,11 +615,11 @@ export default function Accounts() {
         provider_id: 'custom',
         category: formData.category,
         api_key: formData.api_key,
-        // codex 的端点是内置的：传 null，让服务端钉死（传什么都不生效）。
-        chat_endpoint: !isCodexForm && formEnabled.chat ? formData.chat_endpoint.trim() || null : null,
-        responses_endpoint: !isCodexForm && formEnabled.responses ? formData.responses_endpoint.trim() || null : null,
-        messages_endpoint: !isCodexForm && formEnabled.messages ? formData.messages_endpoint.trim() || null : null,
-        default_protocol: isCodexForm ? 'responses' : formData.default_protocol,
+        // 固定端点账户传 null，让服务端钉死（传什么都不生效）。
+        chat_endpoint: !formFixedCategory && formEnabled.chat ? formData.chat_endpoint.trim() || null : null,
+        responses_endpoint: !formFixedCategory && formEnabled.responses ? formData.responses_endpoint.trim() || null : null,
+        messages_endpoint: !formFixedCategory && formEnabled.messages ? formData.messages_endpoint.trim() || null : null,
+        default_protocol: defaultProtocolFor(formData.category, formData.default_protocol),
         balance_provider: formData.balance_provider,
         balance_auth: COOKIE_KINDS.includes(formData.balance_provider) ? formData.balance_auth : '',
         openai_compatible: 0,
@@ -655,11 +674,11 @@ export default function Accounts() {
         provider_id: editingAccount.provider_id,
         category: editData.category,
         notes: editData.notes,
-        // codex 的端点是内置的：传 null，让服务端钉死（传什么都不生效）。
-        chat_endpoint: !isCodexEdit && editEnabled.chat ? editData.chat_endpoint.trim() || null : null,
-        responses_endpoint: !isCodexEdit && editEnabled.responses ? editData.responses_endpoint.trim() || null : null,
-        messages_endpoint: !isCodexEdit && editEnabled.messages ? editData.messages_endpoint.trim() || null : null,
-        default_protocol: isCodexEdit ? 'responses' : editData.default_protocol,
+        // 固定端点账户传 null，让服务端钉死（传什么都不生效）。
+        chat_endpoint: !editFixedCategory && editEnabled.chat ? editData.chat_endpoint.trim() || null : null,
+        responses_endpoint: !editFixedCategory && editEnabled.responses ? editData.responses_endpoint.trim() || null : null,
+        messages_endpoint: !editFixedCategory && editEnabled.messages ? editData.messages_endpoint.trim() || null : null,
+        default_protocol: defaultProtocolFor(editData.category, editData.default_protocol),
         balance_provider: editData.balance_provider,
       };
       // 凭据只在填入且类型匹配时提交；留空 = 不修改已有值。
@@ -850,8 +869,8 @@ export default function Accounts() {
               </div>
             </div>
 
-            {isCodexForm ? (
-              <CodexFixedEndpoint label={t('accounts.endpoints', 'Endpoints')} />
+            {formFixedCategory ? (
+              <FixedEndpointNotice label={t('accounts.endpoints', 'Endpoints')} category={formFixedCategory} />
             ) : (
               <div className="space-y-3 border-t border-border pt-3">
                 <label className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.endpoints', 'Endpoints')}</label>
@@ -885,7 +904,7 @@ export default function Accounts() {
               </div>
             )}
 
-            {!isCodexForm && (
+            {!formFixedCategory && (
               <div className="space-y-1.5">
                 <label className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.defaultProtocol', 'Default protocol')}</label>
                 <ToggleGroup
@@ -1030,8 +1049,8 @@ export default function Accounts() {
               </div>
             </div>
 
-            {isCodexEdit ? (
-              <CodexFixedEndpoint label={t('accounts.endpoints', 'Endpoints')} />
+            {editFixedCategory ? (
+              <FixedEndpointNotice label={t('accounts.endpoints', 'Endpoints')} category={editFixedCategory} />
             ) : (
               <div className="space-y-3 border-t border-border pt-3">
                 <label className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.endpoints', 'Endpoints')}</label>
@@ -1065,7 +1084,7 @@ export default function Accounts() {
               </div>
             )}
 
-            {!isCodexEdit && (
+            {!editFixedCategory && (
               <div className="space-y-1.5">
                 <label className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.defaultProtocol', 'Default protocol')}</label>
                 <ToggleGroup

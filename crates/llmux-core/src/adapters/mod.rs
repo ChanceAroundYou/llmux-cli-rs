@@ -244,6 +244,20 @@ pub const ACCOUNT_COLUMNS: &str = "id, alias, provider_id, api_key, base_url, \
      responses_endpoint, messages_endpoint, default_protocol, balance_provider, \
      balance_auth, codex_auth_json, category";
 
+/// `zen_free` 账户的固定前缀。
+///
+/// 与 codex 同构，但地址来源不同：codex 打的是外网固定后端，zen_free 打的是
+/// **部署里旁挂的 `zen-free` sidecar** —— `opencode.ai/zen/v1` 免费档按 TLS
+/// ClientHello 指纹拦截，llmux（Rust/reqwest）直连一律 403，只能经 Node 旁挂
+/// （`deploy/zen-free/`，compose 内网，不发布端口）。
+///
+/// 改 sidecar 的地址/端口时，**改这个常量**（并同步 compose）。账户侧不需要、
+/// 也不允许配：那三个端点字段对 zen_free 没有意义，可编辑只会被写错 ——
+/// 写错就是直连被指纹门 403，或者指向一个不存在的容器（codex-api 那次的形状）。
+/// sidecar 服务 `/v1/chat/completions`、`/v1/responses`、`/v1/messages` 三个形状，
+/// 所以三种协议共用这一个前缀。
+pub const ZEN_FREE_BASE: &str = "http://zen-free:6446/v1";
+
 impl From<crate::models::Account> for Account {
     fn from(value: crate::models::Account) -> Self {
         Self {
@@ -439,7 +453,7 @@ pub fn build_passthrough_with_beta(
 ) -> ProviderRequest {
     let proto = protocol;
     // codex 原生账户：直连 codex 私有后端，私有头 + payload 预处理。
-    // `codex_auth_json` 为空 = 未配置，回退 sidecar 直连路径（旧 base_url）。
+    // zen_free 的 sidecar 前缀由 `endpoint_for` 统一处理（见该函数）。
     let is_codex_native = is_codex_native(account);
     let base = if is_codex_native && proto != crate::protocol::Protocol::Messages {
         crate::codex_compat::CODEX_BACKEND_BASE

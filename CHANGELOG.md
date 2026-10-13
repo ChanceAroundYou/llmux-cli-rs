@@ -26,6 +26,33 @@
 
 ### Fixed
 
+- **zen_free 账户的上游地址同样不再可配，钉死为 sidecar 前缀**。与 codex 同一类
+  问题、同一个形状：`opencode.ai/zen/v1` 免费档按 TLS ClientHello 指纹拦截
+  （curl / reqwest 一律 403 `FreeTierError`，只有 Node 能过），llmux 只能经旁挂的
+  `zen-free` sidecar 走 compose 内网。地址配成直连唯一的后果就是 403，配成别的
+  则指向一个不存在的容器。
+
+  - `endpoint_for` 对 `category=zen_free` 直接返回固定前缀（三种协议都是它 ——
+    sidecar 实现了 `/v1/chat/completions`、`/v1/responses`、`/v1/messages`，
+    哪种能通是 per-model 的事，由探测决定，不是配置决定）。放在函数最前，
+    路由 / 拨测 / 别名校验一次覆盖。
+  - ⚠️ codex 的 `Messages` 仍返回 `None`，**没有**跟着改成固定值：codex 后端没有
+    `/v1/messages`，返回它会让 Anthropic 入口走成「假 passthrough」去打一个不
+    存在的路径。两者共用分支但语义不同，注释写在 `endpoint_for` 里。
+  - 写入侧 `pin_fixed_endpoints` 与迁移 `0034` 把存量行三列都归位（此前
+    `deploy/` 的注释要求账户四端点全填同一个地址，手填必错）。
+  - 界面：zen_free 与 codex 共用只读端点展示（各自列出它支持的协议）。
+
+  验证：`cargo test` 全量 463 通过；`zen_free` / `codex-Messages` / custom 三个
+  方向各有回归测试，逐个反向验证过会红（改回旧逻辑确认失败后再恢复）。
+
+- **定向拨测与按密钥筛选统计的测试隔离**。`shared_state()` 用**具名**共享内存库
+  （`file:keyid_shared?mode=memory&cache=shared`），4 个测试传同一个名字 ——
+  具名内存库是进程级共享的，于是它们往同一张 `usage_logs` 里插行：不带 key_id 的
+  兼容护栏（断言「2 行都在」）会读到 4/6/8 行而随机失败。实测 8 连跑 1 次红。
+  每个测试改用各自的库名后 6 连跑全绿；把名字改回共用即可复现（1/8 红）。
+  产品代码无问题，是测试之间互相污染。
+
 - **Codex 账户的上游地址不再可配，协议钉死 `responses` —— 拨测打到已退役 sidecar
   的根因**。2026-10-13 生产拨测报
   `error sending request for url (http://codex-api:18080/v1/chat/completions)`，

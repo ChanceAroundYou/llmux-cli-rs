@@ -10,16 +10,22 @@ use serde_json::{json, Value};
 use crate::app::AppState;
 use crate::routes::models::fetch_provider_models;
 
-/// codex 账户的上游地址是代码固定的（[`CODEX_BACKEND_BASE`]），不接受用户配置。
+/// 固定地址账户（codex / zen_free）的上游地址由代码决定，不接受用户配置。
 /// 创建/更新时把端点钉成固定值并**覆盖**客户端传来的任何 URL —— 不是忽略，
 /// 否则库里会留着没人用的旧地址（`http://codex-api:18080/v1` 就是退役 sidecar
 /// 留下的），下次排障还会照着它去查一个不存在的容器。
 ///
-/// 只留 responses：codex 后端只认这一个形状，留个 chat 端点只会让
-/// 「别名配成 /chat」时静默拼出 `…/codex/chat/completions` 这种不存在的路径。
+/// 两类各按自己的形状钉：
+///
+/// * **codex**：只留 responses。它的后端只认这一个形状，留个 chat 端点只会让
+///   「别名配成 /chat」时静默拼出 `…/codex/chat/completions` 这种不存在的路径。
+/// * **zen_free**：三种协议共用同一个 sidecar 前缀（`/v1/chat/completions`、
+///   `/v1/responses`、`/v1/messages` 都实现了），所以三列都填同一个地址 ——
+///   哪种能通是 per-model 的事，`probeable` 探测决定，不是配置决定。
 ///
 /// [`CODEX_BACKEND_BASE`]: llmux_core::codex_compat::CODEX_BACKEND_BASE
-fn pin_codex_endpoints(
+/// [`ZEN_FREE_BASE`]: llmux_core::adapters::ZEN_FREE_BASE
+fn pin_fixed_endpoints(
     category: &str,
     base_url: &mut Option<String>,
     chat_endpoint: &mut Option<String>,
@@ -27,15 +33,22 @@ fn pin_codex_endpoints(
     messages_endpoint: &mut Option<String>,
     default_protocol: &mut String,
 ) {
-    if category != "codex" {
-        return;
-    }
-    let fixed = llmux_core::codex_compat::CODEX_BACKEND_BASE.to_string();
+    let (fixed, all_protocols, default) = match category {
+        "codex" => (llmux_core::codex_compat::CODEX_BACKEND_BASE, false, "responses"),
+        "zen_free" => (llmux_core::adapters::ZEN_FREE_BASE, true, "chat"),
+        _ => return,
+    };
+    let fixed = fixed.to_string();
     *base_url = Some(fixed.clone());
-    *chat_endpoint = None;
-    *messages_endpoint = None;
-    *responses_endpoint = Some(fixed);
-    *default_protocol = "responses".to_string();
+    *responses_endpoint = Some(fixed.clone());
+    if all_protocols {
+        *chat_endpoint = Some(fixed.clone());
+        *messages_endpoint = Some(fixed);
+    } else {
+        *chat_endpoint = None;
+        *messages_endpoint = None;
+    }
+    *default_protocol = default.to_string();
 }
 
 /// GET /api/accounts/:id/balance — probe the upstream balance/usage endpoint
@@ -486,7 +499,7 @@ pub async fn create_account(
     }
 
     // codex 账户：端点由代码钉死，客户端传什么都覆盖。
-    pin_codex_endpoints(
+    pin_fixed_endpoints(
         &category,
         &mut base_url,
         &mut chat_endpoint,
@@ -806,7 +819,7 @@ pub async fn update_account(
 
     // codex 账户：端点由代码钉死，客户端传什么都覆盖（含"没传"= 沿用旧值，
     // 旧值里可能就是退役 sidecar 地址）。
-    pin_codex_endpoints(
+    pin_fixed_endpoints(
         &category,
         &mut base_url,
         &mut chat_endpoint,

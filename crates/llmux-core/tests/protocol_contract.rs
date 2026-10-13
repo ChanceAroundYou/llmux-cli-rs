@@ -1,5 +1,5 @@
 use llmux_core::adapters::Account;
-use llmux_core::protocol::{target_protocol, DownstreamMode, Protocol};
+use llmux_core::protocol::{endpoint_for, supports, target_protocol, DownstreamMode, Protocol};
 
 fn acc(
     chat: Option<&str>,
@@ -107,6 +107,53 @@ fn codex_account_always_targets_responses_whatever_the_alias_says() {
             );
         }
     }
+}
+
+#[test]
+fn codex_account_still_has_no_messages_endpoint() {
+    // Messages 对 codex 返回 None 与改动前一致：调用方（`v1/anthropic.rs`）据此
+    // 走 OpenAI 转换分支，绝不能把它当 Anthropic 端点去 POST `/v1/messages`
+    // （codex 后端没有这个路径）。
+    let mut a = acc(None, None, None, "responses");
+    a.category = "codex".into();
+    assert_eq!(endpoint_for(&a, Protocol::Messages), None);
+    assert!(target_protocol(Protocol::Messages, DownstreamMode::Default, &a)
+        == Protocol::Responses);
+}
+
+#[test]
+fn zen_free_account_resolves_all_three_protocols_to_the_fixed_prefix() {
+    // sidecar 实现了 `/v1/chat/completions`、`/v1/responses`、`/v1/messages`，
+    // 账户字段里写什么都覆盖 —— 尤其是配错成直连 `opencode.ai/zen/v1` 时，
+    // 否则 TLS 指纹门直接 403（`deploy/zen-free/` 的注释）。
+    let mut a = acc(
+        Some("https://opencode.ai/zen/v1"),
+        Some("https://opencode.ai/zen/v1"),
+        Some("https://opencode.ai/zen/v1"),
+        "chat",
+    );
+    a.category = "zen_free".into();
+    assert_eq!(endpoint_for(&a, Protocol::Chat), Some("http://zen-free:6446/v1"));
+    assert_eq!(
+        endpoint_for(&a, Protocol::Responses),
+        Some("http://zen-free:6446/v1")
+    );
+    assert_eq!(
+        endpoint_for(&a, Protocol::Messages),
+        Some("http://zen-free:6446/v1")
+    );
+    assert!(supports(&a, Protocol::Chat)
+        && supports(&a, Protocol::Responses)
+        && supports(&a, Protocol::Messages));
+}
+
+#[test]
+fn custom_accounts_still_read_their_own_endpoints() {
+    // 固定分支不能漏下来：custom 照旧读自己的字段。
+    let a = acc(Some("https://a/v1"), Some("https://b/v1"), None, "responses");
+    assert_eq!(endpoint_for(&a, Protocol::Chat), Some("https://a/v1"));
+    assert_eq!(endpoint_for(&a, Protocol::Responses), Some("https://b/v1"));
+    assert_eq!(endpoint_for(&a, Protocol::Messages), None);
 }
 
 #[test]

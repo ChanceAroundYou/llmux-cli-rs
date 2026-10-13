@@ -166,9 +166,11 @@ impl ProbeOutcome {
 
 /// 该账户对某协议是否配了端点（探测只打配了的，避免无谓请求）。
 fn probeable(account: &Account, p: Protocol) -> bool {
-    // codex 原生账户的上游地址是代码固定的（`CODEX_BACKEND_BASE`），与账户里
-    // 那几个可编辑端点无关 —— 按需读端点会得出「没配就不探」，或者更糟：
-    // 拿遗留的 `base_url` 去探已退役的 sidecar（2026-10-13 就是后者）。
+    // codex 原生账户只有 Responses 一种形状 —— 遗留的 chat 端点曾让 chat 成为候选，
+    // 那一发正是打到已退役 sidecar 的请求（2026-10-13）。
+    //
+    // zen_free 不在这条分支里：它由 `endpoint_for` 对三种协议都返回固定前缀，
+    // 本函数直接 `is_some()` 即可 —— 哪种能通是 per-model 的，由探测决定。
     if crate::adapters::is_codex_native(account) {
         return p == Protocol::Responses;
     }

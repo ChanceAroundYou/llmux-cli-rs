@@ -567,6 +567,56 @@ async fn migration_0033_pins_existing_codex_accounts_and_their_aliases() {
     assert_eq!(plain_base, "https://api.example.com/v1");
 }
 
+/// 0034：存量 zen_free 账户的端点归位到 sidecar 前缀。留旧值（直连
+/// `opencode.ai/zen/v1`）只会被 TLS 指纹门 403，配成别的则指向不存在的容器。
+#[tokio::test]
+async fn migration_0034_pins_existing_zen_free_accounts() {
+    let pool = memory_db().await;
+    sqlx::query(
+        "INSERT INTO accounts (id, alias, provider_id, api_key, base_url, chat_endpoint,
+                               messages_endpoint, anthropic_base_url, category)
+         VALUES (92, 'zen', 'zen-free', 'k', 'https://opencode.ai/zen/v1',
+                 'https://opencode.ai/zen/v1', 'https://opencode.ai/zen/v1',
+                 'https://opencode.ai/zen/v1', 'zen_free'),
+                (93, 'plain', 'custom', 'k', 'https://api.example.com/v1',
+                 'https://api.example.com/v1', NULL, NULL, 'custom')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(llmux_core::db::MIGRATION_0034)
+        .execute(&pool)
+        .await
+        .expect("0034 应在存量数据上执行成功");
+
+    // 三列都归位到同一个 sidecar 前缀（sidecar 三种形状都实现了）。
+    let rows: Vec<(String, String, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT base_url, chat_endpoint, responses_endpoint, messages_endpoint, anthropic_base_url
+         FROM accounts WHERE id = 92",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows[0],
+        (
+            "http://zen-free:6446/v1".to_string(),
+            "http://zen-free:6446/v1".to_string(),
+            "http://zen-free:6446/v1".to_string(),
+            "http://zen-free:6446/v1".to_string(),
+            None,
+        )
+    );
+
+    // 普通账户一个字不能动。
+    let plain: String = sqlx::query_scalar("SELECT base_url FROM accounts WHERE id = 93")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(plain, "https://api.example.com/v1");
+}
+
 /// 0027 给 model_prices 加缓存价与来源列，并种入公开渠道查不到报价的免费模型。
 /// `source` 默认 `'openrouter'` 是刷新「只覆盖自动行」这条规矩的地基。
 #[tokio::test]

@@ -761,6 +761,71 @@ async fn alias_bound_to_codex_account_stores_responses_whatever_was_sent() {
     assert_eq!(stored, "responses", "codex 别名不该留下 /chat");
 }
 
+/// zen_free 账户的上游地址同样由代码固定（sidecar 前缀），三列都钉成同一个
+/// 地址：sidecar 实现了三种形状，哪种能通是 per-model 的。客户端传什么都不生效 ——
+/// 尤其是传直连 `opencode.ai/zen/v1` 时，那会被 TLS 指纹门 403。
+#[tokio::test]
+async fn zen_free_account_endpoints_are_pinned_to_the_sidecar_prefix() {
+    use http::header;
+    let state = llmux_server::test_state().await;
+    let app = llmux_server::app(state.clone());
+
+    let login_req = Request::builder()
+        .method(Method::POST)
+        .uri("/api/auth/login")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::json!({"username":"admin","password":"admin"}).to_string(),
+        ))
+        .unwrap();
+    let login_resp = llmux_server::test_request(app.clone(), login_req).await;
+    let cookie = extract_session_cookie(&login_resp).expect("session cookie");
+
+    let create_req = Request::builder()
+        .method(Method::POST)
+        .uri("/api/accounts")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::COOKIE, &cookie)
+        .body(Body::from(
+            json!({
+                "alias": "zen-pinned",
+                "provider_id": "zen-free",
+                "api_key": "oc-test",
+                "base_url": "https://opencode.ai/zen/v1",
+                "chat_endpoint": "https://opencode.ai/zen/v1",
+                "default_protocol": "chat",
+                "skip_validation": true,
+                "category": "zen_free",
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let create_resp = llmux_server::test_request(app.clone(), create_req).await;
+    assert_eq!(create_resp.status(), StatusCode::OK);
+
+    let list_req = Request::builder()
+        .method(Method::GET)
+        .uri("/api/accounts")
+        .header(header::COOKIE, &cookie)
+        .body(Body::empty())
+        .unwrap();
+    let list_resp = llmux_server::test_request(app.clone(), list_req).await;
+    let bytes = axum::body::to_bytes(list_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let accounts: Value = serde_json::from_slice(&bytes).unwrap();
+    let acct = accounts
+        .as_array()
+        .and_then(|a| a.iter().find(|a| a["alias"] == "zen-pinned"))
+        .expect("account zen-pinned must exist");
+
+    let fixed = "http://zen-free:6446/v1";
+    assert_eq!(acct["base_url"], fixed, "客户端传的直连地址必须被覆盖");
+    assert_eq!(acct["chat_endpoint"], fixed);
+    assert_eq!(acct["responses_endpoint"], fixed);
+    assert_eq!(acct["messages_endpoint"], fixed);
+}
+
 #[tokio::test]
 async fn account_create_syncs_chat_endpoint_into_base_url() {
     use http::header;
@@ -1200,12 +1265,17 @@ async fn request_json_on(
 /// 只是因为连接恰好被复用 —— 换个时序就读到另一个空库，测试会变成随机的绿/红。
 /// `cache=shared` + max_connections(1) 把这件事变成确定的。
 ///
+/// ⚠️ **`name` 必须每个测试各不相同**。具名内存库（`file:x?mode=memory&cache=shared`）
+/// 是**进程级共享**的：4 个测试都传同一个名字时，它们会往同一张 usage_logs 里插行，
+/// 于是「不带 key_id 应返回 2 行」的兼容护栏读到 4/6/8 行而随机失败（实测 5 连跑 1 红）。
+/// 传各自的名字 → 各用各的库，与并行无关。
+///
 /// 只给下面这组测试用，不动 test_state() 本身 —— 另有 19 个测试在用它，
 /// 而它们全是单次请求、碰不到这个问题。
-async fn shared_state() -> llmux_server::app::AppState {
+async fn shared_state(name: &str) -> llmux_server::app::AppState {
     let pool = sqlx::sqlite::SqlitePoolOptions::new()
         .max_connections(1)
-        .connect("sqlite:file:keyid_shared?mode=memory&cache=shared")
+        .connect(&format!("sqlite:file:{name}?mode=memory&cache=shared"))
         .await
         .expect("connect shared in-memory db");
     llmux_core::db::init_db(&pool)
@@ -1258,7 +1328,7 @@ async fn seed_two_keys_with_logs(state: &llmux_server::app::AppState) -> (i64, i
 
 #[tokio::test]
 async fn stats_by_key_id_only_aggregates_that_keys_rows() {
-    let state = shared_state().await;
+    let state = shared_state("keyid_stats_by_key").await;
     let (alpha, _beta) = seed_two_keys_with_logs(&state).await;
 
     let (status, body) =
@@ -1287,7 +1357,7 @@ async fn stats_by_key_id_only_aggregates_that_keys_rows() {
 
 #[tokio::test]
 async fn stats_logs_by_key_id_narrows_rows_and_total_together() {
-    let state = shared_state().await;
+    let state = shared_state("keyid_stats_logs").await;
     let (alpha, _beta) = seed_two_keys_with_logs(&state).await;
 
     // get_detailed_logs 与 count_detailed_logs 是两份**独立**的 SQL ——
@@ -1302,7 +1372,7 @@ async fn stats_logs_by_key_id_narrows_rows_and_total_together() {
 
 #[tokio::test]
 async fn activity_by_key_id_excludes_other_keys_and_null_rows() {
-    let state = shared_state().await;
+    let state = shared_state("keyid_activity").await;
     let (alpha, _beta) = seed_two_keys_with_logs(&state).await;
     // 0026 之前的老行：api_key_id 为 NULL，任何密钥筛选都该排除它。
     sqlx::query(
@@ -1333,7 +1403,7 @@ async fn activity_by_key_id_excludes_other_keys_and_null_rows() {
 async fn stats_without_key_id_keeps_returning_every_row() {
     // 兼容护栏：不带 key_id 必须是旧行为（两把密钥的行都在），
     // 否则「加个可选参数」就悄悄改变了既有调用方看到的东西。
-    let state = shared_state().await;
+    let state = shared_state("keyid_no_filter").await;
     let _ = seed_two_keys_with_logs(&state).await;
 
     let (status, body) =

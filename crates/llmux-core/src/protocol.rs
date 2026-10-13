@@ -59,6 +59,25 @@ pub fn supports(a: &Account, p: Protocol) -> bool {
 }
 
 pub fn endpoint_for(a: &Account, p: Protocol) -> Option<&str> {
+    // 固定地址账户不读用户配置的那三个端点字段：配错只会指向不存在的容器
+    // （codex-api 那次）或被指纹门 403（zen 直连）。放在最前，所有调用点
+    // （路由、拨测、别名校验）一并生效。
+    //
+    // 两者对 Messages 的态度**不同**，因为它们的上游真的不同：
+    //
+    // * codex 的后端只认 Responses（`…/backend-api/codex` 拼不出 chat/messages），
+    //   所以 Messages 仍返回 None —— 与改动前一致。调用方据此走 OpenAI 转换分支，
+    //   而不是把它当 Anthropic 端点去 POST `/v1/messages`
+    //   （见 `v1/anthropic.rs` 的 `anthropic_base` / `openai_base` 选择）。
+    // * zen_free 的 sidecar **确实实现了** `/v1/messages`（Anthropic 形状），
+    //   所以三种协议都返回固定前缀 —— 哪种能通是 per-model 的事，探测决定。
+    match a.category.as_str() {
+        "codex" if p != Protocol::Messages => {
+            return Some(crate::codex_compat::CODEX_BACKEND_BASE)
+        }
+        "zen_free" => return Some(crate::adapters::ZEN_FREE_BASE),
+        _ => {}
+    }
     // Since 0012 every write keeps base_url = chat_endpoint, so base_url is the
     // chat source of truth; chat_endpoint remains as legacy-compat fallback
     // (e.g. clients explicitly clearing base_url while keeping chat_endpoint).
