@@ -26,6 +26,71 @@
 
 ### Fixed
 
+- **Codex 账户的上游地址不再可配，协议钉死 `responses` —— 拨测打到已退役 sidecar
+  的根因**。2026-10-13 生产拨测报
+  `error sending request for url (http://codex-api:18080/v1/chat/completions)`，
+  2–69ms 就失败；而同一别名（`op` → `gpt-6-luna`）的真实请求一直 200。
+
+  根因不在凭据、也不在地址本身，而在**加载账户的查询漏了一列**：定向拨测那条
+  `SELECT` 没取 `category`（`routes/models/testing.rs`）。而
+  `row.try_get("category").ok().flatten().unwrap_or_default()` 不报错、静默给空串
+  → `is_codex_native` 为假 → 拨测退回读库里遗留的 `base_url`。真实流量走
+  `get_active_accounts`（查询完整）所以从来不受影响 —— 这就是「账号通、拨测不通」
+  的分歧点。`codex-api` 容器 2026-10-13 已从 compose 删除，`docker ps -a` 里连
+  停止态都没有，那个地址必然连接失败。
+
+  修法分几层，缺一层都留着同一个坑：
+
+  - **判据**：`is_codex_native` 只看 `category == "codex"`，不再因凭据为空回退遗留
+    URL —— sidecar 已退役，「回退」就是去打一个不存在的容器；宁可带空 Bearer 去
+    上游拿 401，错得清楚。新增 `ACCOUNT_COLUMNS` 常量收敛账户加载的列清单：漏列必须
+    是**不可能**的，而不是「看起来不可能」。
+  - **拨测**：`probeable` 对 codex 只探 Responses。遗留 chat 端点曾让 chat 成为候选，
+    那一发正是打到 sidecar 的请求。
+  - **写入 + 存量**：`pin_codex_endpoints` 在 create/update 两条路径把端点覆盖成
+    `CODEX_BACKEND_BASE`、清掉 chat/messages、default=responses；迁移 `0033` 把存量行
+    一并归位（此前页面照旧显示旧地址），并把绑定 codex 的 `model_aliases` /
+    `aggregate_aliases` 从失效的 `/chat` 改成 `/responses`。
+  - **运行时兜底**：`target_protocol` 对 codex 一律返回 Responses，放在最前，
+    任何 mode（含 forced）都不例外 —— 配置写错也不再能拼出
+    `…/backend-api/codex/chat/completions` 这种不存在的路径。
+  - **界面**：codex 账户的端点区改为只读展示固定地址、默认协议对 codex 隐藏；
+    别名弹窗在选中 codex 账户时把下游协议改为只读 `responses`。
+
+  验证：`cargo test` 全量 447 通过；4 个新回归测试逐个反向验证（临时改回旧逻辑
+  确认失败后再恢复），其中 `target_protocol` 那条覆盖 12 组 (ingress, mode) 组合。
+  生产库只读副本上确认账户 60 已归位、`op` 别名 `chat → responses`、全库无任何行
+  还含 `codex-api`；真实请求两种入口各打一发均 200（`Messages→responses`、
+  `Chat→responses`），日志 URL 为 `https://chatgpt.com/backend-api/codex/responses`。
+
+  > 注：`Chat` 入口的文件名是 chat、落地上游仍是 responses —— 协议转换发生在入口侧。
+  > 这也是界面不再让 codex 别名选协议的原因：选了也不生效。
+
+- **内联 `system` 折进前一条消息，不再提到最前**。引擎的 chat template 硬拒内联
+  system（`System message must be at the beginning.` → 400），所以这些消息必须挪位，
+  但原来的做法 —— 把所有 `role=system` 提到 prompt 最前合并 —— 会**破坏前缀缓存**。
+
+  Claude Code 每次工具往返都追加一条内联 system 提醒（hook 输出、`<total_tokens>`
+  计数器），数量逐轮 +1。提到最前等于每轮都把新文本插进整个对话之前，其后每个字节
+  都位移；上游前缀缓存按 64 token 一块从第 0 块链式匹配，于是整条前缀作废 —— 实测
+  12 万 token 会话命中率 **0%**，而头部稳定时是 90%+（GPU4 隔离引擎四臂对照）。
+
+  现在把内联 system 的文本**折进它前面那条消息**，位置不动：那条消息对下一个请求
+  而言逐字节相同，只有新消息被追加 = 严格扩展，缓存可复用。实测 88.1% → 92.0%，
+  墙钟从 6.9→11.6s 递增变为 1.1→1.5s 稳定。
+
+  - 顶格 system 是客户端自己的指令头，原位不动、逐字节不变 —— 单 system 的常见
+    形态完全不受影响。
+  - `content: null` 的纯 `tool_calls` assistant 没有文本位，且给它加文本会让提醒
+    渲染在它之后那次工具调用之前 —— 跳过它继续往前找。
+  - parts 数组只加 `{type:"text"}` 部件：引擎对数组里的裸字符串回
+    `message content parts must contain a string type`（400，已实测）。
+
+  验证（部署后真机）：`POST /llmux/v1/chat/completions`（别名 `qwv`，上游阿里百炼
+  `qwen3.8-2.4t-a95b`）发一条 system 夹在中间的 4 消息序列，HTTP 200，模型回复里
+  体现了该 system 的指令。⚠️ 这条只能证明折叠路径在线上可用、上游接受；它区分不了
+  「折进前一条」与旧的「提到最前」（两种都 200），折叠语义本身由单测钉死。
+
 - **Anthropic 请求顶层 `system` 里的 `x-anthropic-billing-header` 块不再转发上游**。
   Anthropic SDK 会往 `system` 数组开头塞一个文本块
   `x-anthropic-billing-header: cc_version=2.1.283.f99; cc_entrypoint=sdk-go;`，
