@@ -587,6 +587,8 @@ fn responses_body_shape(body: &Value) -> String {
     let mut max_pending_function_calls = 0usize;
     let mut max_function_arguments_bytes = 0usize;
     let mut total_function_arguments_bytes = 0usize;
+    let mut max_function_output_bytes = 0usize;
+    let mut total_function_output_bytes = 0usize;
     let mut max_tool_name_bytes = 0usize;
     let mut tool_names = std::collections::BTreeSet::new();
     let mut tool_schema_bytes = 0usize;
@@ -636,6 +638,9 @@ fn responses_body_shape(body: &Value) -> String {
                     } else if !pending_function_call_ids.remove(id) {
                         duplicate_function_call_outputs += 1;
                     }
+                    let output_bytes = item.get("output").and_then(Value::as_str).map(str::len).unwrap_or(0);
+                    max_function_output_bytes = max_function_output_bytes.max(output_bytes);
+                    total_function_output_bytes += output_bytes;
                 },
                 _ => {}
             }
@@ -667,8 +672,9 @@ fn responses_body_shape(body: &Value) -> String {
     let undeclared_function_calls = function_call_names.difference(&tool_names).count();
 
     format!(
-        "fields=[{}] max_output_tokens={} stream={} stop={} instructions={} instructions_bytes={} reasoning_effort={} stream_options={} tools={} tool_schema_bytes={} tool_description_bytes={} max_tool_name_bytes={} tool_schema_keywords={:?} input_items={} input_text_bytes={} input_types={} input_content_types={:?} unmatched_tool_outputs={} outputs_before_function_call={} duplicate_function_call_ids={} duplicate_function_call_outputs={} max_pending_function_calls={} undeclared_function_calls={} max_function_arguments_bytes={} total_function_arguments_bytes={}",
+        "fields=[{}] request_bytes={} max_output_tokens={} stream={} stop={} instructions={} instructions_bytes={} reasoning_effort={} stream_options={} tools={} tool_schema_bytes={} tool_description_bytes={} max_tool_name_bytes={} tool_schema_keywords={:?} input_items={} input_text_bytes={} input_types={} input_content_types={:?} unmatched_tool_outputs={} outputs_before_function_call={} duplicate_function_call_ids={} duplicate_function_call_outputs={} max_pending_function_calls={} undeclared_function_calls={} max_function_arguments_bytes={} total_function_arguments_bytes={} max_function_output_bytes={} total_function_output_bytes={}",
         fields.join(","),
+        serde_json::to_vec(body).map_or(0, |bytes| bytes.len()),
         body.get("max_output_tokens").and_then(Value::as_i64).map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()),
         body.get("stream").and_then(Value::as_bool).map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()),
         flag("stop"),
@@ -693,6 +699,8 @@ fn responses_body_shape(body: &Value) -> String {
         undeclared_function_calls,
         max_function_arguments_bytes,
         total_function_arguments_bytes,
+        max_function_output_bytes,
+        total_function_output_bytes,
     )
 }
 
@@ -2119,6 +2127,7 @@ mod tests {
         assert!(shape.contains("unmatched_tool_outputs=0"));
         assert!(shape.contains("outputs_before_function_call=1"));
         assert!(shape.contains("total_function_arguments_bytes=2"));
+        assert!(shape.contains("total_function_output_bytes=14"));
         assert!(!shape.contains("secret prompt"));
         assert!(!shape.contains("private result"));
     }
