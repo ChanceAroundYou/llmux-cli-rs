@@ -326,6 +326,7 @@ mod tests {
             balance_provider: String::new(),
             balance_auth: String::new(),
             codex_auth_json: String::new(),
+            category: "codex".into(),
         };
         assert!(load_creds(&account).is_none());
     }

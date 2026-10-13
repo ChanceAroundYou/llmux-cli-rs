@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Persisted account category. Keep in sync with the closed values accepted by the API.
+pub const ACCOUNT_CATEGORIES: [&str; 3] = ["custom", "codex", "zen_free"];
+
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, PartialEq)]
 pub struct Account {
     pub id: Option<i64>,
@@ -20,6 +23,8 @@ pub struct Account {
     pub balance_provider: Option<String>,
     pub balance_auth: Option<String>,
     pub codex_auth_json: Option<String>,
+    /// 账户类别，决定后端路由/处理路径。见迁移 0032：custom / codex / zen_free。
+    pub category: Option<String>,
     pub limits_cache: Option<String>,
     pub limits_cache_updated_at: Option<String>,
     pub created_at: Option<String>,

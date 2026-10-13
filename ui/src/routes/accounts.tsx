@@ -36,6 +36,8 @@ import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group';
 
 const PROTOCOLS = ['chat', 'responses', 'messages'] as const;
 type Protocol = typeof PROTOCOLS[number];
+type AccountCategory = 'custom' | 'codex' | 'zen_free';
+const ACCOUNT_CATEGORIES: AccountCategory[] = ['custom', 'codex', 'zen_free'];
 
 // 需要网页登录凭据（Cookie/Token）而非 API Key 的余额查询类型。
 const COOKIE_KINDS = ['copilot', 'commandcode', 'opencode', 'opencode-go', 'opencode-zen', 'deepseek', 'chatgpt', 'openai', 'bailian'];
@@ -431,10 +433,10 @@ export default function Accounts() {
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [isEditOpen, setIsEditOpen] = useState(false);
   const [editingAccount, setEditingAccount] = useState<any>(null);
-  const [formData, setFormData] = useState({ alias: '', api_key: '', chat_endpoint: '', responses_endpoint: '', messages_endpoint: '', default_protocol: '', balance_provider: '', balance_auth: '' });
+  const [formData, setFormData] = useState({ alias: '', category: 'custom' as AccountCategory, api_key: '', chat_endpoint: '', responses_endpoint: '', messages_endpoint: '', default_protocol: '', balance_provider: '', balance_auth: '' });
   const [formEnabled, setFormEnabled] = useState<Record<Protocol, boolean>>({ chat: false, responses: false, messages: false });
   const [formShowKey, setFormShowKey] = useState(false);
-  const [editData, setEditData] = useState({ alias: '', api_key: '', chat_endpoint: '', responses_endpoint: '', messages_endpoint: '', default_protocol: '', notes: '', balance_provider: '', balance_auth: '' });
+  const [editData, setEditData] = useState({ alias: '', category: 'custom' as AccountCategory, api_key: '', chat_endpoint: '', responses_endpoint: '', messages_endpoint: '', default_protocol: '', notes: '', balance_provider: '', balance_auth: '' });
   const [editEnabled, setEditEnabled] = useState<Record<Protocol, boolean>>({ chat: false, responses: false, messages: false });
   const [editShowKey, setEditShowKey] = useState(false);
   const [accountToDelete, setAccountToDelete] = useState<{ id: number; name: string } | null>(null);
@@ -560,6 +562,7 @@ export default function Accounts() {
       await addAccount({
         alias: formData.alias,
         provider_id: 'custom',
+        category: formData.category,
         api_key: formData.api_key,
         chat_endpoint: formEnabled.chat ? formData.chat_endpoint.trim() || null : null,
         responses_endpoint: formEnabled.responses ? formData.responses_endpoint.trim() || null : null,
@@ -570,7 +573,7 @@ export default function Accounts() {
         openai_compatible: 0,
       });
       setIsModalOpen(false);
-      setFormData({ alias: '', api_key: '', chat_endpoint: '', responses_endpoint: '', messages_endpoint: '', default_protocol: '', balance_provider: '', balance_auth: '' });
+      setFormData({ alias: '', category: 'custom', api_key: '', chat_endpoint: '', responses_endpoint: '', messages_endpoint: '', default_protocol: '', balance_provider: '', balance_auth: '' });
       setFormEnabled({ chat: false, responses: false, messages: false });
       setFormShowKey(false);
     } catch (err: any) {
@@ -591,6 +594,7 @@ export default function Accounts() {
     setEditEnabled(enabled);
     setEditData({
       alias: acc.alias,
+      category: ACCOUNT_CATEGORIES.includes(acc.category) ? acc.category : 'custom',
       api_key: '',
       chat_endpoint: acc.chat_endpoint || '',
       responses_endpoint: acc.responses_endpoint || '',
@@ -616,6 +620,7 @@ export default function Accounts() {
       const payload: any = {
         alias: editData.alias,
         provider_id: editingAccount.provider_id,
+        category: editData.category,
         notes: editData.notes,
         chat_endpoint: editEnabled.chat ? editData.chat_endpoint.trim() || null : null,
         responses_endpoint: editEnabled.responses ? editData.responses_endpoint.trim() || null : null,
@@ -733,6 +738,9 @@ export default function Accounts() {
               <div className="flex items-center justify-between gap-4">
                 <div className="flex items-center gap-2 min-w-0">
                   <h3 className="font-semibold text-sm truncate">{acc.alias}</h3>
+                  <span className="rounded px-1.5 py-0.5 text-[10px] uppercase tracking-wide bg-muted text-muted-foreground">
+                    {t(`accounts.categoryOptions.${acc.category || 'custom'}`, acc.category || 'Custom')}
+                  </span>
                   <StatusDot status={acc.is_active === 1 ? 'online' : 'offline'} />
                 </div>
                 <div className="flex items-center gap-2 shrink-0">
@@ -774,6 +782,17 @@ export default function Accounts() {
                 onChange={e => setFormData({ ...formData, alias: e.target.value })}
                 placeholder={t('accounts.aliasPlaceholder')}
               />
+            </div>
+            <div className="space-y-1.5">
+              <label className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.category', 'Account category')}</label>
+              <select
+                value={formData.category}
+                disabled={isValidating}
+                onChange={e => setFormData({ ...formData, category: e.target.value as AccountCategory })}
+                className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+              >
+                {ACCOUNT_CATEGORIES.map(category => <option key={category} value={category}>{t(`accounts.categoryOptions.${category}`, category)}</option>)}
+              </select>
             </div>
             <div className="space-y-1.5">
               <label className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.apiKey')}</label>
@@ -934,6 +953,17 @@ export default function Accounts() {
                 disabled={isValidating}
                 onChange={e => setEditData({ ...editData, alias: e.target.value })}
               />
+            </div>
+            <div className="space-y-1.5">
+              <label className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.category', 'Account category')}</label>
+              <select
+                value={editData.category}
+                disabled={isValidating}
+                onChange={e => setEditData({ ...editData, category: e.target.value as AccountCategory })}
+                className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+              >
+                {ACCOUNT_CATEGORIES.map(category => <option key={category} value={category}>{t(`accounts.categoryOptions.${category}`, category)}</option>)}
+              </select>
             </div>
             <div className="space-y-1.5">
               <div className="flex items-center justify-between">

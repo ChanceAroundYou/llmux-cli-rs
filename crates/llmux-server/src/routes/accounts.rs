@@ -19,7 +19,7 @@ pub async fn get_account_balance(
     use sqlx::Row as _;
 
     let row = match sqlx::query(
-        "SELECT provider_id, api_key, base_url, anthropic_base_url, chat_endpoint, responses_endpoint, messages_endpoint, balance_provider, balance_auth, codex_auth_json FROM accounts WHERE id = ?",
+        "SELECT category, provider_id, api_key, base_url, anthropic_base_url, chat_endpoint, responses_endpoint, messages_endpoint, balance_provider, balance_auth, codex_auth_json FROM accounts WHERE id = ?",
     )
     .bind(id)
     .fetch_optional(&state.pool)
@@ -40,6 +40,7 @@ pub async fn get_account_balance(
         }
     };
 
+    let category: String = row.try_get("category").unwrap_or_else(|_| "custom".to_string());
     let provider_id: String = row.try_get("provider_id").unwrap_or_default();
     let enc_key: String = row.try_get("api_key").unwrap_or_default();
     let auth_cipher: String = row.try_get("balance_auth").unwrap_or_default();
@@ -63,7 +64,7 @@ pub async fn get_account_balance(
     // except for opencode-go accounts that also carry an API key (see the helper).
     // codex 原生账户例外：余额凭据是 codex_auth_json 里的 access_token，
     // api_key 存的是 sidecar 内网 key，拿它打 wham/usage 必 401。
-    let credential = if provider_id == "codex" {
+    let credential = if category == "codex" {
         match row
             .try_get::<Option<String>, _>("codex_auth_json")
             .unwrap_or_default()
@@ -163,7 +164,7 @@ pub async fn list_accounts(Extension(state): Extension<AppState>) -> Response {
         "SELECT a.id, a.alias, a.provider_id, a.base_url, a.anthropic_base_url, \
                 a.is_active, a.weight, a.notes, a.openai_compatible, a.created_at, \
                 a.chat_endpoint, a.responses_endpoint, a.messages_endpoint, \
-                a.default_protocol, a.balance_provider, a.limits_cache, a.codex_auth_json, \
+                a.default_protocol, a.balance_provider, a.limits_cache, a.codex_auth_json, a.category, \
                 COALESCE(s.c5, 0) AS c5, COALESCE(s.c24, 0) AS c24, COALESCE(s.c7, 0) AS c7 \
          FROM accounts a \
          LEFT JOIN ( \
@@ -208,6 +209,7 @@ pub async fn list_accounts(Extension(state): Extension<AppState>) -> Response {
         balance_provider: Option<String>,
         limits_cache: Option<String>,
         codex_auth_json: Option<String>,
+        category: Option<String>,
         c5: f64,
         c24: f64,
         c7: f64,
@@ -253,6 +255,7 @@ pub async fn list_accounts(Extension(state): Extension<AppState>) -> Response {
                 balance_provider: r.try_get::<Option<String>, _>("balance_provider").unwrap_or_default(),
                 limits_cache: r.try_get::<Option<String>, _>("limits_cache").unwrap_or_default(),
                 codex_auth_json: r.try_get::<Option<String>, _>("codex_auth_json").unwrap_or_default(),
+                category: r.try_get::<Option<String>, _>("category").unwrap_or_default(),
                 c5,
                 c24,
                 c7,
@@ -306,6 +309,7 @@ pub async fn list_accounts(Extension(state): Extension<AppState>) -> Response {
                 "balance_provider": r.balance_provider,
                 "balance_auth": Value::Null,
                 "codex_configured": r.codex_auth_json.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false),
+                "category": r.category.unwrap_or_else(|| "custom".to_string()),
                 // Activity (read-only, for UI ordering / hints)
                 "requests_5h": r.c5,
                 "requests_24h": r.c24,
@@ -371,6 +375,14 @@ pub async fn create_account(
     let alias = body["alias"].as_str().unwrap_or_default().to_string();
     let provider_id = body["provider_id"].as_str().unwrap_or_default().to_string();
     let api_key_plain = body["api_key"].as_str().unwrap_or_default().to_string();
+    // Account category (封闭枚举 custom / codex / zen_free)。缺省 custom。
+    let category = match body.get("category").and_then(Value::as_str) {
+        None => "custom".to_string(),
+        Some(value) => match value.trim().to_ascii_lowercase().as_str() {
+            value if llmux_core::models::ACCOUNT_CATEGORIES.contains(&value.trim().to_ascii_lowercase().as_str()) => value.trim().to_ascii_lowercase(),
+            _ => return crate::error::simple_error("Invalid category", StatusCode::BAD_REQUEST),
+        },
+    };
     let mut base_url = body["base_url"].as_str().map(|s| s.to_string());
     let anthropic_base_url = body["anthropic_base_url"].as_str().map(|s| s.to_string());
     let is_active = body["is_active"].as_i64().unwrap_or(1);
@@ -488,6 +500,7 @@ pub async fn create_account(
         balance_provider: balance_provider.clone(),
         balance_auth: balance_auth_plain.clone(),
         codex_auth_json: body["codex_auth_json"].as_str().unwrap_or("").to_string(),
+        category: category.clone(),
     };
 
     let provider_type = {
@@ -536,8 +549,8 @@ pub async fn create_account(
     };
 
     match sqlx::query(
-        "INSERT INTO accounts (alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight, notes, openai_compatible, chat_endpoint, responses_endpoint, messages_endpoint, default_protocol, balance_provider, balance_auth, codex_auth_json)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO accounts (alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight, notes, openai_compatible, chat_endpoint, responses_endpoint, messages_endpoint, default_protocol, balance_provider, balance_auth, codex_auth_json, category)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&alias)
     .bind(&provider_id)
@@ -555,6 +568,7 @@ pub async fn create_account(
     .bind(&balance_provider)
     .bind(&balance_auth_cipher)
     .bind(body["codex_auth_json"].as_str().unwrap_or("").trim())
+    .bind(&category)
     .execute(&state.pool)
     .await
     {
@@ -583,7 +597,7 @@ pub async fn update_account(
 ) -> Response {
     // Verify the account exists.
     let existing = sqlx::query_as::<_, llmux_core::models::Account>(
-        "SELECT id, alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight, notes, limits_cache, limits_cache_updated_at, openai_compatible, created_at, chat_endpoint, responses_endpoint, messages_endpoint, default_protocol, balance_provider, balance_auth, codex_auth_json FROM accounts WHERE id = ?",
+        "SELECT id, alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight, notes, limits_cache, limits_cache_updated_at, openai_compatible, created_at, chat_endpoint, responses_endpoint, messages_endpoint, default_protocol, balance_provider, balance_auth, codex_auth_json, category FROM accounts WHERE id = ?",
     )
     .bind(id)
     .fetch_optional(&state.pool)
@@ -620,6 +634,13 @@ pub async fn update_account(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .unwrap_or(existing.provider_id);
+    let category = match body.get("category").and_then(Value::as_str) {
+        None => existing.category.clone().unwrap_or_else(|| "custom".to_string()),
+        Some(value) => match value.trim().to_ascii_lowercase().as_str() {
+            value if llmux_core::models::ACCOUNT_CATEGORIES.contains(&value.trim().to_ascii_lowercase().as_str()) => value.trim().to_ascii_lowercase(),
+            _ => return crate::error::simple_error("Invalid category", StatusCode::BAD_REQUEST),
+        },
+    };
     // Explicit null = clear (consistent with the *_endpoint columns below);
     // missing key = keep existing.
     let mut base_url = if body.as_object().map(|m| m.contains_key("base_url")).unwrap_or(false) {
@@ -802,6 +823,7 @@ pub async fn update_account(
         balance_provider: balance_provider.clone(),
         balance_auth: balance_auth_plain.clone(),
         codex_auth_json: body["codex_auth_json"].as_str().unwrap_or("").to_string(),
+        category: category.clone(),
             };
 
             let provider_type = {
@@ -840,7 +862,7 @@ pub async fn update_account(
     };
 
     let update_res = sqlx::query(
-        "UPDATE accounts SET alias = ?, provider_id = ?, api_key = ?, base_url = ?, anthropic_base_url = ?, is_active = ?, weight = ?, notes = ?, openai_compatible = ?, chat_endpoint = ?, responses_endpoint = ?, messages_endpoint = ?, default_protocol = ?, balance_provider = ?, balance_auth = ?, codex_auth_json = ? WHERE id = ?",
+        "UPDATE accounts SET alias = ?, provider_id = ?, api_key = ?, base_url = ?, anthropic_base_url = ?, is_active = ?, weight = ?, notes = ?, openai_compatible = ?, chat_endpoint = ?, responses_endpoint = ?, messages_endpoint = ?, default_protocol = ?, balance_provider = ?, balance_auth = ?, codex_auth_json = ?, category = ? WHERE id = ?",
     )
     .bind(&alias)
     .bind(&provider_id)
@@ -858,6 +880,7 @@ pub async fn update_account(
     .bind(&balance_provider)
     .bind(&balance_auth_cipher)
     .bind(&codex_auth_json)
+    .bind(&category)
     .bind(id)
     .execute(&state.pool)
     .await;

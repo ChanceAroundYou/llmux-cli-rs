@@ -224,10 +224,13 @@ pub struct Account {
     pub balance_provider: String,
     /// Dedicated balance-probe credential (encrypted cookie/token); empty = use api_key.
     pub balance_auth: String,
-    /// Raw Codex `auth.json` for `provider_id=codex` accounts. Empty/None =
+    /// Raw Codex `auth.json` for `category=codex` accounts. Empty/None =
     /// 未配置（回退到 sidecar 直连的 `base_url` 路径）—— 不在这里 fail，
     /// 因为绝大多数账户根本不是 codex。
     pub codex_auth_json: String,
+    /// 账户类别，决定后端路由/处理路径：custom / codex / zen_free。
+    /// 空 = 按 custom 处理（老数据未迁移时的兜底）。
+    pub category: String,
 }
 
 impl From<crate::models::Account> for Account {
@@ -249,6 +252,7 @@ impl From<crate::models::Account> for Account {
             balance_provider: value.balance_provider.unwrap_or_default(),
             balance_auth: value.balance_auth.unwrap_or_default(),
             codex_auth_json: value.codex_auth_json.unwrap_or_default(),
+            category: value.category.unwrap_or_default(),
         }
     }
 }
@@ -273,6 +277,7 @@ impl From<Account> for crate::models::Account {
             balance_provider: None,
             balance_auth: None,
             codex_auth_json: if value.codex_auth_json.is_empty() { None } else { Some(value.codex_auth_json) },
+            category: if value.category.is_empty() { None } else { Some(value.category) },
             limits_cache: None,
             limits_cache_updated_at: None,
             created_at: None,
@@ -520,11 +525,11 @@ fn json_headers() -> BTreeMap<String, String> {
     BTreeMap::from([("content-type".to_string(), "application/json".to_string())])
 }
 
-/// codex 原生账户判定：`provider_id=codex` 且配了 `codex_auth_json`。
+/// codex 原生账户判定：`category=codex` 且配了 `codex_auth_json`。
 /// 为空 = 未配置，回退 sidecar 直连路径（旧 base_url）。三处调用点
 /// （base 覆盖 / 头注入 / payload 预处理）共用这一个判据，别各写各的。
 pub fn is_codex_native(account: &Account) -> bool {
-    account.provider_id == "codex" && !account.codex_auth_json.is_empty()
+    account.category == "codex" && !account.codex_auth_json.is_empty()
 }
 
 fn normalize_base_url(value: &str) -> String {

@@ -749,6 +749,7 @@ fn model_structs_preserve_legacy_field_names() {
         balance_provider: None,
             balance_auth: None,
             codex_auth_json: None,
+        category: None,
         notes: None,
         limits_cache: None,
         limits_cache_updated_at: None,

@@ -21,6 +21,7 @@ fn acc(
         balance_provider: String::new(),
         balance_auth: String::new(),
         codex_auth_json: String::new(),
+        category: "custom".to_string(),
         is_active: 1,
         weight: 1,
         openai_compatible: 0,

@@ -163,6 +163,7 @@ mod tests {
             balance_provider: String::new(),
             balance_auth: String::new(),
             codex_auth_json: String::new(),
+            category: "custom".into(),
         }
     }
 
@@ -690,7 +691,7 @@ pub async fn start_test_queue(
             // 若前端已指定 accountId，直接定向到该账户，避免同名模型串到 provider 的首账户
             let targeted_accounts: Option<Vec<llmux_core::adapters::Account>> = if let Some(acc_id) = account_id_override {
                 match sqlx::query(
-                    "SELECT id, alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight, openai_compatible, chat_endpoint, responses_endpoint, messages_endpoint, default_protocol, balance_provider, balance_auth, codex_auth_json FROM accounts WHERE id = ? AND is_active = 1",
+                    "SELECT id, alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight, openai_compatible, chat_endpoint, responses_endpoint, messages_endpoint, default_protocol, balance_provider, balance_auth, codex_auth_json, category FROM accounts WHERE id = ? AND is_active = 1",
                 )
                 .bind(acc_id)
                 .fetch_optional(&pool)
@@ -716,6 +717,7 @@ pub async fn start_test_queue(
                                 balance_provider: row.try_get::<Option<String>, _>("balance_provider").ok().flatten().unwrap_or_default(),
                 balance_auth: row.try_get::<Option<String>, _>("balance_auth").ok().flatten().unwrap_or_default(),
                 codex_auth_json: row.try_get::<Option<String>, _>("codex_auth_json").ok().flatten().unwrap_or_default(),
+                category: row.try_get::<Option<String>, _>("category").ok().flatten().unwrap_or_default(),
                             }]),
                             Err(_) => Some(vec![]),
                         }
@@ -937,6 +939,7 @@ pub async fn test_model(
                                 balance_provider: row.try_get::<Option<String>, _>("balance_provider").ok().flatten().unwrap_or_default(),
                 balance_auth: row.try_get::<Option<String>, _>("balance_auth").ok().flatten().unwrap_or_default(),
                 codex_auth_json: row.try_get::<Option<String>, _>("codex_auth_json").ok().flatten().unwrap_or_default(),
+                category: row.try_get::<Option<String>, _>("category").ok().flatten().unwrap_or_default(),
                     }],
                     Err(_) => vec![],
                 }

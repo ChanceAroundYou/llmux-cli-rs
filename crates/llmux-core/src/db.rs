@@ -34,6 +34,7 @@ pub const MIGRATION_0028: &str = include_str!("migrations/0028_upstream_prices.s
 pub const MIGRATION_0029: &str = include_str!("migrations/0029_alias_first_byte_timeout.sql");
 pub const MIGRATION_0030: &str = include_str!("migrations/0030_disabled_models.sql");
 pub const MIGRATION_0031: &str = include_str!("migrations/0031_codex_auth_json.sql");
+pub const MIGRATION_0032: &str = include_str!("migrations/0032_account_category.sql");
 
 pub async fn connect_sqlite(database_url: &str) -> Result<SqlitePool> {
     let options = SqliteConnectOptions::from_str(database_url)?
@@ -91,6 +92,7 @@ pub async fn init_db(pool: &SqlitePool) -> Result<()> {
         ("0029", MIGRATION_0029),
         ("0030", MIGRATION_0030),
         ("0031", MIGRATION_0031),
+        ("0032", MIGRATION_0032),
     ];
     for (name, sql) in &migrations {
         for statement in sql.split(';') {

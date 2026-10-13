@@ -724,6 +724,7 @@ async fn account_create_syncs_chat_endpoint_into_base_url() {
                 "chat_endpoint": "http://127.0.0.1:9/v1",
                 "default_protocol": "chat",
                 "skip_validation": true,
+                "category": "codex",
             })
             .to_string(),
         ))
@@ -753,6 +754,7 @@ async fn account_create_syncs_chat_endpoint_into_base_url() {
         acct["base_url"]
     );
     assert_eq!(acct["chat_endpoint"], "http://127.0.0.1:9/v1");
+    assert_eq!(acct["category"], "codex");
 }
 
 

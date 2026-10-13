@@ -5,7 +5,7 @@
 # 这里保留一份可构建验证（docker compose build）。
 #
 # 生产 .env（路由器，不入仓）：ADMIN_USERNAME / ADMIN_PASSWORD / BASE_PATH /
-# ZEN_API_KEY（zen-free 的 Bearer）/ CODEX_API_KEY（codex-api 的 Bearer）。
+# ZEN_API_KEY（zen-free 的 Bearer）。
 
 services:
   llmux:
@@ -43,6 +43,4 @@ services:
       - ZEN_API_KEY=${ZEN_API_KEY}
       - PROXY_PORT=6446
     # no `ports:` — 只在 compose 内网可达，公网不可直达。
-    # 注意 PROXY_HOST 刻意不在这里设：Dockerfile 里的 127.0.0.1 会让 sidecar
-    # 只监听容器 loopback，连同一 compose 网络的 llmux 都够不着，所以这里
-    # 不设（默认 0.0.0.0 全网卡监听）；隔离靠"不 publish 端口"保证。
+    # PROXY_HOST 不设置：sidecar 必须监听容器网卡让 llmux 可连，公网隔离由不发布端口保证。

@@ -275,6 +275,8 @@
     "alias": "别名",
     "aliasPlaceholder": "例如：工作用 Claude",
     "provider": "服务商",
+    "category": "账户类别",
+    "categoryOptions": { "custom": "自定义", "codex": "Codex", "zen_free": "Zen Free" },
     "apiKey": "API Key",
     "baseUrl": "Base URL",
     "noAccounts": "暂无账户配置",
