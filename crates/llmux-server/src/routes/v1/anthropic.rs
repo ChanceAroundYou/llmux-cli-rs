@@ -46,8 +46,19 @@ pub async fn messages(
     Extension(auth): Extension<AuthContext>,
     axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
     headers: HeaderMap,
-    Json(mut body): Json<Value>,
+    raw_body: Bytes,
 ) -> Response {
+    let mut body: Value = match serde_json::from_slice(&raw_body) {
+        Ok(body) => body,
+        Err(error) => {
+            return middleware::send_error(
+                &format!("Invalid JSON request body: {error}"),
+                "invalid_request_error",
+                StatusCode::BAD_REQUEST,
+                true,
+            );
+        }
+    };
     // Messages ingress 同样可能带畸形 `tool_calls: []` / 字符串化的
     // `reasoning_details`（ingress==target 时走 Passthrough 原样转发）。
     // 无该字段即 no-op。
@@ -56,7 +67,7 @@ pub async fn messages(
     // Aggregate aliases keep their dedicated paths (V-anchored failover).
     if let Ok(Some(agg)) = state.resolve_aggregate_cached(&raw_model).await {
         if agg.upstream_api.wants_responses() {
-            return dispatch_aggregate_anthropic_via_responses(state, auth, uri, headers, body, agg).await;
+            return dispatch_aggregate_anthropic_via_responses(state, auth, uri, headers, body, raw_body, agg).await;
         }
         return dispatch_aggregate_anthropic(state, auth, headers, body, agg).await;
     }
@@ -1259,6 +1270,7 @@ async fn dispatch_aggregate_anthropic_via_responses(
     uri: axum::http::Uri,
     headers: HeaderMap,
     body: Value,
+    raw_body: Bytes,
     agg: llmux_core::aggregate::AggregateResolution,
 ) -> Response {
     // Aggregate Messages ingress → Responses upstream: reuse the per-candidate
@@ -1273,6 +1285,7 @@ async fn dispatch_aggregate_anthropic_via_responses(
         uri,
         headers,
         body,
+        Some(raw_body),
         agg,
     )
     .await

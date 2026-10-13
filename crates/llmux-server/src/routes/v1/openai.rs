@@ -104,7 +104,7 @@ async fn dispatch_aggregate_openai_responses(
     body: Value,
     agg: llmux_core::aggregate::AggregateResolution,
 ) -> Response {
-    dispatch_aggregate_with_conversion(Protocol::Chat, state, auth, uri, headers, body, agg).await
+    dispatch_aggregate_with_conversion(Protocol::Chat, state, auth, uri, headers, body, None, agg).await
 }
 
 #[allow(dead_code)]
@@ -715,6 +715,7 @@ pub(crate) async fn dispatch_aggregate_with_conversion(
     uri: axum::http::Uri,
     _headers: HeaderMap,
     body: Value,
+    raw_ingress_body: Option<Bytes>,
     agg: llmux_core::aggregate::AggregateResolution,
 ) -> Response {
     let normalized_uri = crate::app::normalize_gateway_uri(&uri);
@@ -770,13 +771,48 @@ pub(crate) async fn dispatch_aggregate_with_conversion(
         let mut provider_request = build_target_request(&account, Protocol::Responses, &translated, &None);
         provider_request.first_byte_timeout_secs = agg.first_byte_timeout_secs;
         tracing::info!("🔀 [agg:{} V={}] {} → {} → {} [{:?}→responses] outbound_shape={}", alias, active, account.alias, cand.model, provider_request.url, ingress, responses_body_shape(&translated));
+        let mut request_capture = if ingress == Protocol::Messages {
+            if let Some(raw_body) = raw_ingress_body.as_ref() {
+                let log_dir = std::env::var("LOG_DIR")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|_| state.data_dir.clone());
+                super::request_capture::RequestCapture::claim(
+                    &log_dir,
+                    &state.master_key,
+                    &alias,
+                    body.get("model").and_then(Value::as_str).unwrap_or_default(),
+                    &cand.model,
+                    raw_body,
+                    &provider_request.method,
+                    &provider_request.url,
+                    &provider_request.headers,
+                    &provider_request.body,
+                )
+                .await
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let response = match execute_provider_request(&provider_request).await {
             Ok(r) => r,
-            Err(e) => { state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); last_error = Some(format!("Provider request failed: {e}")); failed_candidates += 1; continue; }
+            Err(e) => {
+                if let Some(capture) = request_capture.take() {
+                    capture.finish(None, None, Some(e.to_string())).await;
+                }
+                state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len);
+                last_error = Some(format!("Provider request failed: {e}"));
+                failed_candidates += 1;
+                continue;
+            }
         };
         let status = response.status();
         if !status.is_success() {
             let error_body = response.text().await.unwrap_or_default();
+            if let Some(capture) = request_capture.take() {
+                capture.finish(Some(status.as_u16()), Some(error_body.clone()), None).await;
+            }
             provider_request.effort.record_rejection(&error_body);
             // 同一处回错顺便学 max_tokens 上限：客户端发 65536、上游只收
             // 32768 时整轮 400，不学会就会一直白打（见 max_tokens 模块注释）。
@@ -814,6 +850,9 @@ pub(crate) async fn dispatch_aggregate_with_conversion(
             state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len);
             failed_candidates += 1;
             continue;
+        }
+        if let Some(capture) = request_capture.take() {
+            capture.finish(Some(status.as_u16()), None, None).await;
         }
         if streaming {
             state.aggregate_router.lock().unwrap().note_candidate_success(&alias, i, len);

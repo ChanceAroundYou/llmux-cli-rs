@@ -148,6 +148,7 @@ BASE_PATH=llmux ./deploy/deploy.sh -y           # 带基路径前缀（build 时
 - 用户已明确授权：为排查 `of` 别名问题，可直接调用生产 llmux、查看本机 NAS 日志，并在定位及验证修复后使用 `deploy/deploy.sh -y` 部署；无需重复询问这些操作的许可。
 - 用户提供的 llmux API key 仅用于本次诊断请求。密钥是敏感凭据：**不得写入本文件、代码、提交、命令输出或排障记录**；请求脚本优先从环境变量/临时安全输入读取，并及时清理临时文件。
 - 生产请求日志在本机挂载的 `~/HD/openwrt/log-archive/llmux/llmux.log.YYYY-MM-DD`，不是 router 容器内；日志文件可能很大，只用 `rg`/`tail` 定位必要片段，避免整文件读取。
+- 完整请求只通过一次性捕获：在 `~/HD/openwrt/log-archive/llmux/request-captures/next.json` 写入 `{"alias":"of","model":"muse-spark-1.3-contributor"}`，下一个匹配的 Messages 请求会保存原始入站 JSON、实际出站 JSON 和上游响应。NAS 挂载可能忽略文件权限，因此 artifact 用 llmux `master.key` 加密；`REQUEST_CAPTURE_RETAIN_DAYS` 默认 7 天，到期自动清理。不要启用全量 TRACE body dump。
 - 当前问题：Anthropic Messages 经 `of` 路由到 OpenCode Zen 的 Responses endpoint，Muse Spark 返回泛化 400，llmux 将其表现为 502。应依据生产日志中脱敏后的请求形状和生产对照请求定位，不能把客户端 502 当作网关自身的根因，也不能声称拿到了未记录的完整请求正文。
 
 ## 环境变量

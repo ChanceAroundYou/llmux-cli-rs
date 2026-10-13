@@ -3,6 +3,7 @@ pub mod gemini;
 pub mod helpers;
 pub mod models;
 pub mod openai;
+pub mod request_capture;
 
 pub use anthropic::{count_tokens, messages};
 pub use gemini::gemini;

@@ -118,6 +118,7 @@ async fn start(port_override: Option<u16>, use_tui: bool) -> anyhow::Result<()> 
         .unwrap_or_else(|_| config.data_dir.clone());
     std::fs::create_dir_all(&log_dir).ok();
     cleanup_old_logs(&log_dir);
+    llmux_server::routes::v1::request_capture::cleanup_expired(&log_dir);
     let database_url = sqlite_url_from_path(&config.database_path);
     let pool = connect_sqlite(&database_url).await?;
     init_db(&pool).await?;
