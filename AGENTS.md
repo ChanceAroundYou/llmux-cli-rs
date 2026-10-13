@@ -143,6 +143,13 @@ BASE_PATH=llmux ./deploy/deploy.sh -y           # 带基路径前缀（build 时
   详见该结构体注释。**新增流式路径时别再写 `let mut received: Vec<u8>`**。
 - **`docker-compose.yml` 现在是双服务**：`llmux` + `codex-api`（ChatGPT/Codex 订阅上游 sidecar，见「Codex 订阅上游」节）。`deploy.sh` 的 `docker compose up -d` 会一并管理它。
 
+## `of` 别名生产排障授权与约束（2026-10-13）
+
+- 用户已明确授权：为排查 `of` 别名问题，可直接调用生产 llmux、查看本机 NAS 日志，并在定位及验证修复后使用 `deploy/deploy.sh -y` 部署；无需重复询问这些操作的许可。
+- 用户提供的 llmux API key 仅用于本次诊断请求。密钥是敏感凭据：**不得写入本文件、代码、提交、命令输出或排障记录**；请求脚本优先从环境变量/临时安全输入读取，并及时清理临时文件。
+- 生产请求日志在本机挂载的 `~/HD/openwrt/log-archive/llmux/llmux.log.YYYY-MM-DD`，不是 router 容器内；日志文件可能很大，只用 `rg`/`tail` 定位必要片段，避免整文件读取。
+- 当前问题：Anthropic Messages 经 `of` 路由到 OpenCode Zen 的 Responses endpoint，Muse Spark 返回泛化 400，llmux 将其表现为 502。应依据生产日志中脱敏后的请求形状和生产对照请求定位，不能把客户端 502 当作网关自身的根因，也不能声称拿到了未记录的完整请求正文。
+
 ## 环境变量
 
 | Variable | Default | 说明 |

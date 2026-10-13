@@ -577,10 +577,16 @@ fn responses_body_shape(body: &Value) -> String {
     let mut input_items = 0usize;
     let mut input_content_types: BTreeMap<&str, usize> = BTreeMap::new();
     let mut function_call_ids = std::collections::BTreeSet::new();
+    let mut seen_function_call_ids = std::collections::BTreeSet::new();
+    let mut pending_function_call_ids = std::collections::BTreeSet::new();
     let mut output_call_ids = Vec::new();
     let mut function_call_names = std::collections::BTreeSet::new();
     let mut duplicate_function_call_ids = 0usize;
+    let mut duplicate_function_call_outputs = 0usize;
+    let mut outputs_before_function_call = 0usize;
+    let mut max_pending_function_calls = 0usize;
     let mut max_function_arguments_bytes = 0usize;
+    let mut total_function_arguments_bytes = 0usize;
     let mut max_tool_name_bytes = 0usize;
     let mut tool_names = std::collections::BTreeSet::new();
     let mut tool_schema_bytes = 0usize;
@@ -614,11 +620,23 @@ fn responses_body_shape(body: &Value) -> String {
                 "function_call" => {
                     if let Some(id) = item.get("call_id").and_then(Value::as_str) {
                         if !function_call_ids.insert(id) { duplicate_function_call_ids += 1; }
+                        seen_function_call_ids.insert(id);
+                        pending_function_call_ids.insert(id);
                     }
                     if let Some(name) = item.get("name").and_then(Value::as_str) { function_call_names.insert(name); }
-                    max_function_arguments_bytes = max_function_arguments_bytes.max(item.get("arguments").and_then(Value::as_str).map(str::len).unwrap_or(0));
+                    let argument_bytes = item.get("arguments").and_then(Value::as_str).map(str::len).unwrap_or(0);
+                    max_function_arguments_bytes = max_function_arguments_bytes.max(argument_bytes);
+                    total_function_arguments_bytes += argument_bytes;
+                    max_pending_function_calls = max_pending_function_calls.max(pending_function_call_ids.len());
                 }
-                "function_call_output" => if let Some(id) = item.get("call_id").and_then(Value::as_str) { output_call_ids.push(id); },
+                "function_call_output" => if let Some(id) = item.get("call_id").and_then(Value::as_str) {
+                    output_call_ids.push(id);
+                    if !seen_function_call_ids.contains(id) {
+                        outputs_before_function_call += 1;
+                    } else if !pending_function_call_ids.remove(id) {
+                        duplicate_function_call_outputs += 1;
+                    }
+                },
                 _ => {}
             }
             if let Some(parts) = item.get("content").and_then(Value::as_array) {
@@ -649,12 +667,13 @@ fn responses_body_shape(body: &Value) -> String {
     let undeclared_function_calls = function_call_names.difference(&tool_names).count();
 
     format!(
-        "fields=[{}] max_output_tokens={} stream={} stop={} instructions={} reasoning_effort={} stream_options={} tools={} tool_schema_bytes={} tool_description_bytes={} max_tool_name_bytes={} tool_schema_keywords={:?} input_items={} input_text_bytes={} input_types={} input_content_types={:?} unmatched_tool_outputs={} duplicate_function_call_ids={} undeclared_function_calls={} max_function_arguments_bytes={}",
+        "fields=[{}] max_output_tokens={} stream={} stop={} instructions={} instructions_bytes={} reasoning_effort={} stream_options={} tools={} tool_schema_bytes={} tool_description_bytes={} max_tool_name_bytes={} tool_schema_keywords={:?} input_items={} input_text_bytes={} input_types={} input_content_types={:?} unmatched_tool_outputs={} outputs_before_function_call={} duplicate_function_call_ids={} duplicate_function_call_outputs={} max_pending_function_calls={} undeclared_function_calls={} max_function_arguments_bytes={} total_function_arguments_bytes={}",
         fields.join(","),
         body.get("max_output_tokens").and_then(Value::as_i64).map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()),
         body.get("stream").and_then(Value::as_bool).map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()),
         flag("stop"),
         flag("instructions"),
+        text_bytes(body.get("instructions")),
         body.get("reasoning").and_then(|v| v.get("effort")).and_then(Value::as_str).unwrap_or("-"),
         flag("stream_options"),
         body.get("tools").and_then(Value::as_array).map_or(0, Vec::len),
@@ -667,9 +686,13 @@ fn responses_body_shape(body: &Value) -> String {
         input_types.iter().map(|(kind, count)| format!("{kind}={count}")).collect::<Vec<_>>().join(","),
         input_content_types,
         unmatched_tool_outputs,
+        outputs_before_function_call,
         duplicate_function_call_ids,
+        duplicate_function_call_outputs,
+        max_pending_function_calls,
         undeclared_function_calls,
         max_function_arguments_bytes,
+        total_function_arguments_bytes,
     )
 }
 
@@ -2078,7 +2101,27 @@ async fn openai_streaming_passthrough(
 
 #[cfg(test)]
 mod tests {
-    use super::{observe_and_should_forward, should_forward_event, StreamAccounting};
+    use super::{observe_and_should_forward, responses_body_shape, should_forward_event, StreamAccounting};
+    use serde_json::json;
+
+    #[test]
+    fn responses_shape_reports_tool_results_that_precede_calls_without_logging_content() {
+        let body = json!({
+            "instructions": "secret prompt",
+            "input": [
+                {"type": "function_call_output", "call_id": "toolu_1", "output": "private result"},
+                {"type": "function_call", "call_id": "toolu_1", "name": "tool", "arguments": "{}"}
+            ]
+        });
+
+        let shape = responses_body_shape(&body);
+        assert!(shape.contains("instructions_bytes=13"));
+        assert!(shape.contains("unmatched_tool_outputs=0"));
+        assert!(shape.contains("outputs_before_function_call=1"));
+        assert!(shape.contains("total_function_arguments_bytes=2"));
+        assert!(!shape.contains("secret prompt"));
+        assert!(!shape.contains("private result"));
+    }
 
     fn ev(delta: &str, finish: &str) -> String {
         format!("data: {{\"choices\":[{{\"index\":0,\"delta\":{delta},\"finish_reason\":{finish}}}]}}\n\n")
