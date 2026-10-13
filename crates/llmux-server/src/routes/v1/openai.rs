@@ -242,6 +242,30 @@ pub(crate) async fn dispatch_with_conversion(
 
         // Build the provider request for the target protocol, preserving the
         // existing base_url / anthropic_base_url transport (read-only).
+        // codex 原生账户：JWT 过期就先 refresh（`auth.go:borrow` 的 proactive 路径）。
+        // `account` 是 `&` 借用不能改 —— refresh 后重建 owned 副本再 build。
+        let mut refreshed_owned;
+        let mut account = if llmux_core::adapters::is_codex_native(account) {
+            match llmux_core::codex_auth::load_creds(account) {
+                Some(creds) if creds.is_expired() => {
+                    match llmux_core::codex_auth::refresh_and_save(&state.pool, account.id, &account.codex_auth_json).await {
+                        Ok(new_json) => {
+                            tracing::info!("🔑 codex token refreshed pre-request for account {}", account.alias);
+                            refreshed_owned = llmux_core::adapters::Account { codex_auth_json: new_json, ..account.clone() };
+                            &refreshed_owned
+                        }
+                        Err(e) => {
+                            last_error = Some(format!("Codex token refresh failed for {}: {e}", account.alias));
+                            failed_candidates += 1;
+                            continue;
+                        }
+                    }
+                }
+                _ => account,
+            }
+        } else {
+            account
+        };
         let mut provider_request = build_target_request(account, target, &forward_body, &anthropic_beta);
         provider_request.first_byte_timeout_secs = res.first_byte_timeout_secs;
         let log_url = provider_request.url.clone();
@@ -266,7 +290,41 @@ pub(crate) async fn dispatch_with_conversion(
                 continue;
             }
         };
-        let status = response.status();
+        let mut status = response.status();
+        let mut response = response;
+        // codex 原生账户 401 → refresh 后重建请求重试一次
+        //（`backend.go:doAuthenticated` 的 reactive 路径：reload + retry）。
+        if !status.is_success()
+            && status.as_u16() == 401
+            && llmux_core::adapters::is_codex_native(account)
+        {
+            match llmux_core::codex_auth::refresh_and_save(&state.pool, account.id, &account.codex_auth_json).await {
+                Ok(new_json) => {
+                    tracing::info!("🔑 codex 401 → refreshed token for account {}, retrying once", account.alias);
+                    refreshed_owned = llmux_core::adapters::Account { codex_auth_json: new_json, ..(*account).clone() };
+                    account = &refreshed_owned;
+                    provider_request = build_target_request(account, target, &forward_body, &anthropic_beta);
+                    provider_request.first_byte_timeout_secs = res.first_byte_timeout_secs;
+                    match execute_provider_request(&provider_request).await {
+                        Ok(r) => {
+                            status = r.status();
+                            response = r;
+                        }
+                        Err(e) => {
+                            last_error = Some(format!("Codex retry request failed: {e}"));
+                            failed_candidates += 1;
+                            continue;
+                        }
+                    }
+                }
+                Err(e) => {
+                    // refresh 失败 = 凭据彻底失效。别的账户还能试 —— continue 让 failover 继续。
+                    last_error = Some(format!("Codex token refresh failed for {}: {e}（凭据失效，请重新登录）", account.alias));
+                    failed_candidates += 1;
+                    continue;
+                }
+            }
+        }
         if !status.is_success() {
             let error_body = response.text().await.unwrap_or_default();
             provider_request.effort.record_rejection(&error_body);
