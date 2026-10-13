@@ -3,7 +3,7 @@
 //! No model-name hardcoding — upstream_api decides routing.
 
 use serde_json::{json, Map, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// 上游 Responses 实现对 `max_output_tokens < 16` 直接 400
 /// (`integer below minimum value. Expected a value >= 16`)。Claude Desktop 的
@@ -84,6 +84,42 @@ fn function_call_output_item(call_id: &str, output: Value) -> Value {
         other => Value::String(other.to_string()),
     };
     json!({"type": "function_call_output", "call_id": call_id, "output": output})
+}
+
+/// Keep ordinary transcript messages out of a batch of pending tool calls.
+/// Some Responses providers reject a message inserted after several
+/// `function_call` items but before their matching `function_call_output`s.
+/// Anthropic histories can contain such interleaving, so defer those messages
+/// until every call in the batch has a result.
+fn group_responses_tool_history(input: Vec<Value>) -> Vec<Value> {
+    let mut ordered = Vec::with_capacity(input.len());
+    let mut pending = HashSet::new();
+    let mut deferred = Vec::new();
+
+    for item in input {
+        match item.get("type").and_then(Value::as_str) {
+            Some("function_call") => {
+                if let Some(call_id) = item.get("call_id").and_then(Value::as_str) {
+                    pending.insert(call_id.to_string());
+                }
+                ordered.push(item);
+            }
+            Some("function_call_output") => {
+                if let Some(call_id) = item.get("call_id").and_then(Value::as_str) {
+                    pending.remove(call_id);
+                }
+                ordered.push(item);
+                if pending.is_empty() {
+                    ordered.append(&mut deferred);
+                }
+            }
+            _ if !pending.is_empty() => deferred.push(item),
+            _ => ordered.push(item),
+        }
+    }
+
+    ordered.append(&mut deferred);
+    ordered
 }
 
 fn to_responses_content(content: &Value) -> Value {
@@ -281,7 +317,10 @@ pub fn anthropic_to_responses(anth_body: &Value, resolved_model: &str) -> Value 
             }
         }
     }
-    out.insert("input".to_string(), Value::Array(input));
+    out.insert(
+        "input".to_string(),
+        Value::Array(group_responses_tool_history(input)),
+    );
     for key in ["temperature", "top_p", "stream", "reasoning"] {
         if let Some(v) = anth_body.get(key) {
             out.insert(key.to_string(), v.clone());
@@ -1233,6 +1272,38 @@ mod tests {
             "type": "function_call_output", "call_id": "call_1", "output": "ok"
         }));
         assert_eq!(translated["input"][1]["content"][0], json!({"type": "input_text", "text": "call the tool"}));
+    }
+
+    #[test]
+    fn anthropic_parallel_tool_results_precede_intervening_messages() {
+        let body = json!({
+            "messages": [
+                {"role": "user", "content": "inspect this"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "call_1", "name": "Read", "input": {"path": "a"}},
+                    {"type": "tool_use", "id": "call_2", "name": "Read", "input": {"path": "b"}}
+                ]},
+                {"role": "user", "content": "tool progress"},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "call_2", "content": "b contents"},
+                    {"type": "tool_result", "tool_use_id": "call_1", "content": "a contents"}
+                ]},
+                {"role": "user", "content": "continue"}
+            ]
+        });
+
+        let translated = anthropic_to_responses(&body, "muse");
+        let input = translated["input"].as_array().unwrap();
+        assert_eq!(input[1]["type"], "function_call");
+        assert_eq!(input[2]["type"], "function_call");
+        assert_eq!(input[3], json!({
+            "type": "function_call_output", "call_id": "call_2", "output": "b contents"
+        }));
+        assert_eq!(input[4], json!({
+            "type": "function_call_output", "call_id": "call_1", "output": "a contents"
+        }));
+        assert_eq!(input[5]["content"], "tool progress");
+        assert_eq!(input[6]["content"], "continue");
     }
 
     /// Claude Desktop 的连通性探测发 `max_tokens: 1`；上游 Responses 实现对该
