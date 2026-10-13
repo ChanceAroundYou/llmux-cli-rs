@@ -575,6 +575,27 @@ fn responses_body_shape(body: &Value) -> String {
     let mut input_types: BTreeMap<&str, usize> = BTreeMap::new();
     let mut input_text_bytes = 0usize;
     let mut input_items = 0usize;
+    let mut function_call_ids = std::collections::BTreeSet::new();
+    let mut output_call_ids = Vec::new();
+    let mut max_tool_name_bytes = 0usize;
+    let mut tool_schema_keywords: BTreeMap<&str, usize> = BTreeMap::new();
+    fn count_schema_keywords(value: &Value, counts: &mut BTreeMap<&'static str, usize>) {
+        const KEYWORDS: &[&str] = &["$ref", "$defs", "anyOf", "oneOf", "allOf", "not", "const", "enum", "patternProperties", "dependentRequired", "if", "then", "else"];
+        match value {
+            Value::Object(map) => {
+                for (key, child) in map {
+                    if KEYWORDS.contains(&key.as_str()) {
+                        *counts.entry(match key.as_str() {
+                            "$ref" => "$ref", "$defs" => "$defs", "anyOf" => "anyOf", "oneOf" => "oneOf", "allOf" => "allOf", "not" => "not", "const" => "const", "enum" => "enum", "patternProperties" => "patternProperties", "dependentRequired" => "dependentRequired", "if" => "if", "then" => "then", _ => "else",
+                        }).or_insert(0) += 1;
+                    }
+                    count_schema_keywords(child, counts);
+                }
+            }
+            Value::Array(items) => for item in items { count_schema_keywords(item, counts); },
+            _ => {}
+        }
+    }
     if let Some(items) = body.get("input").and_then(Value::as_array) {
         input_items = items.len();
         for item in items {
@@ -584,25 +605,40 @@ fn responses_body_shape(body: &Value) -> String {
                 .or_else(|| item.get("role").and_then(Value::as_str))
                 .unwrap_or("-");
             *input_types.entry(kind).or_insert(0) += 1;
+            match kind {
+                "function_call" => if let Some(id) = item.get("call_id").and_then(Value::as_str) { function_call_ids.insert(id); },
+                "function_call_output" => if let Some(id) = item.get("call_id").and_then(Value::as_str) { output_call_ids.push(id); },
+                _ => {}
+            }
             for key in ["text", "content"] {
                 input_text_bytes += text_bytes(item.get(key));
             }
         }
     }
+    let unmatched_tool_outputs = output_call_ids.iter().filter(|id| !function_call_ids.contains(**id)).count();
+    if let Some(tools) = body.get("tools").and_then(Value::as_array) {
+        for tool in tools {
+            max_tool_name_bytes = max_tool_name_bytes.max(tool.get("name").and_then(Value::as_str).map(str::len).unwrap_or(0));
+            if let Some(schema) = tool.get("parameters") { count_schema_keywords(schema, &mut tool_schema_keywords); }
+        }
+    }
 
     format!(
-        "fields=[{}] max_output_tokens={} stream={} stop={} instructions={} reasoning={} stream_options={} tools={} input_items={} input_text_bytes={} input_types={}",
+        "fields=[{}] max_output_tokens={} stream={} stop={} instructions={} reasoning_effort={} stream_options={} tools={} max_tool_name_bytes={} tool_schema_keywords={:?} input_items={} input_text_bytes={} input_types={} unmatched_tool_outputs={}",
         fields.join(","),
         body.get("max_output_tokens").and_then(Value::as_i64).map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()),
         body.get("stream").and_then(Value::as_bool).map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()),
         flag("stop"),
         flag("instructions"),
-        flag("reasoning"),
+        body.get("reasoning").and_then(|v| v.get("effort")).and_then(Value::as_str).unwrap_or("-"),
         flag("stream_options"),
         body.get("tools").and_then(Value::as_array).map_or(0, Vec::len),
+        max_tool_name_bytes,
+        tool_schema_keywords,
         input_items,
         input_text_bytes,
         input_types.iter().map(|(kind, count)| format!("{kind}={count}")).collect::<Vec<_>>().join(","),
+        unmatched_tool_outputs,
     )
 }
 
