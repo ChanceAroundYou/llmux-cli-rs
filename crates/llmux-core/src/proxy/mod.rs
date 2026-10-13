@@ -66,6 +66,120 @@ pub fn extract_anthropic_usage_from_json(data: &Value) -> AnthropicUsage {
     }
 }
 
+/// Normalize the message list so no `system` message sits inline.
+///
+/// Some OpenAI-compatible upstreams (notably Qwen/DashScope and ninfer's
+/// `chat_template.jinja`) require the system message to be first and reject an
+/// inline one outright: `invalid_prompt` / "System message must be at the
+/// beginning."
+///
+/// A **leading** system message (the common case — exactly one, first) is the
+/// client's own instruction header. It stays where it is, byte-for-byte.
+///
+/// An **inline** system message is a different animal: Claude Code emits one
+/// per tool round-trip (hook output, `<total_tokens>` reminders), so the set of
+/// inline systems grows by one every turn. The old approach — lifting them all
+/// to the front — inserted text *before the entire conversation* on every turn,
+/// shifting every later byte. An upstream prefix cache matches block-by-block
+/// from block 0, so that invalidates the whole cache: measured 0% hit rate on a
+/// 120k-token session, against 90%+ when the head is stable. Instead, fold each
+/// inline system's text into the **preceding** message and leave the position
+/// alone. That message then stays byte-identical for the next request and only
+/// new messages are appended — a strict extension, which the prefix cache can
+/// reuse.
+///
+/// Only system messages are folded; the relative order of every other message
+/// is untouched, so an assistant `tool_calls` message stays adjacent to the
+/// `tool` results that reference it.
+pub(crate) fn normalize_system_messages(messages: Vec<Value>) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::with_capacity(messages.len());
+    for (index, msg) in messages.into_iter().enumerate() {
+        let is_system = msg.get("role").and_then(Value::as_str) == Some("system");
+        // A leading system is the client's own header: keep it first and
+        // untouched, so the common single-system shape is byte-identical.
+        if !is_system || index == 0 {
+            out.push(msg);
+            continue;
+        }
+        let text = message_text(msg.get("content").unwrap_or(&Value::Null));
+        if text.is_empty() {
+            continue;
+        }
+        match out.iter().rposition(can_carry_text) {
+            Some(at) => append_text(&mut out[at], &text),
+            // Nothing usable behind it: the only earlier message is the leading
+            // system header itself. Merge into that — leaving this one inline
+            // would be rejected outright, and there is no queue position to
+            // preserve anyway.
+            None if out.first().is_some_and(is_system_message) => {
+                append_text(&mut out[0], &text);
+            }
+            // No earlier message at all.
+            None => out.push(msg),
+        }
+    }
+    out
+}
+
+fn is_system_message(msg: &Value) -> bool {
+    msg.get("role").and_then(Value::as_str) == Some("system")
+}
+
+/// Can folded-in text be appended to this message?
+///
+/// A `tool_calls`-only assistant turn has no text slot of its own, and giving
+/// it one would render the reminder *before* the tool call it followed — so it
+/// is skipped and the search continues further back.
+fn can_carry_text(msg: &Value) -> bool {
+    match msg.get("role").and_then(Value::as_str) {
+        Some("user") | Some("tool") => true,
+        Some("assistant") => msg.get("content").is_some_and(|c| !c.is_null()),
+        _ => false,
+    }
+}
+
+/// The plain text of a `content` value, dropping anything that cannot be
+/// flattened into a text slot (image / tool_use parts).
+fn message_text(content: &Value) -> String {
+    match content {
+        Value::String(s) => s.clone(),
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+        Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+/// Append folded-in text to a message's `content`, keeping the shape the client
+/// sent. A bare string stays a string; a parts array gains one text part. The
+/// engine rejects bare strings inside a parts array ("message content parts
+/// must contain a string type"), so a new part is always `{type: "text"}`.
+fn append_text(msg: &mut Value, text: &str) {
+    let Some(obj) = msg.as_object_mut() else {
+        return;
+    };
+    let content = obj.entry("content").or_insert(Value::Null);
+    *content = match std::mem::replace(content, Value::Null) {
+        Value::String(mut existing) => {
+            existing.push_str("\n\n");
+            existing.push_str(text);
+            Value::String(existing)
+        }
+        Value::Array(mut parts) => {
+            parts.push(json!({ "type": "text", "text": text }));
+            Value::Array(parts)
+        }
+        Value::Null => Value::Array(vec![json!({ "type": "text", "text": text })]),
+        other => Value::Array(vec![
+            json!({ "type": "text", "text": other.to_string() }),
+            json!({ "type": "text", "text": text }),
+        ]),
+    };
+}
+
 /// OpenAI chat 请求体清洗，修两类会被严格上游按 schema 拒收的畸形字段
 /// （400 → 网关 502），同一个 bug 的两个面：
 ///
@@ -82,55 +196,6 @@ pub fn extract_anthropic_usage_from_json(data: &Value) -> AnthropicUsage {
 /// 还原只对上面这一个白名单字段生效，**不做「任何能解析成 JSON 的字符串都还原」**
 /// —— `content` 本就是 string，且完全合法地可能是 `"[1, 2, 3]"` 这种字面量正文，
 /// 无差别还原会静默篡改用户内容。
-/// Normalize the message list so every `system` message sits at the front,
-/// merged into a single leading message.
-///
-/// Some OpenAI-compatible upstreams (notably Qwen/DashScope) require exactly
-/// one `system` message and require it to be first — an inline one is rejected
-/// with `invalid_prompt` / "System message must be at the beginning".
-///
-/// Only system messages move; the relative order of every other message is
-/// untouched, so an assistant `tool_calls` message stays adjacent to the `tool`
-/// results that reference it.
-pub(crate) fn normalize_system_messages(messages: Vec<Value>) -> Vec<Value> {
-    let mut system_contents: Vec<Value> = Vec::new();
-    let mut rest: Vec<Value> = Vec::with_capacity(messages.len());
-    for msg in messages {
-        if msg.get("role").and_then(Value::as_str) == Some("system") {
-            system_contents.push(msg.get("content").cloned().unwrap_or(Value::Null));
-        } else {
-            rest.push(msg);
-        }
-    }
-    if system_contents.is_empty() {
-        return rest;
-    }
-    let mut out = Vec::with_capacity(rest.len() + 1);
-    out.push(json!({ "role": "system", "content": merge_system_content(system_contents) }));
-    out.extend(rest);
-    out
-}
-
-/// Fold N system contents into one. A lone content passes through unchanged
-/// (string stays a string, so the common single-system case is byte-identical
-/// to before). Multiple contents become one array of text parts, concatenated
-/// in order.
-fn merge_system_content(contents: Vec<Value>) -> Value {
-    if contents.len() == 1 {
-        return contents.into_iter().next().unwrap();
-    }
-    let mut parts: Vec<Value> = Vec::new();
-    for c in contents {
-        match c {
-            Value::String(s) => parts.push(json!({ "type": "text", "text": s })),
-            Value::Array(a) => parts.extend(a),
-            Value::Null => {}
-            other => parts.push(json!({ "type": "text", "text": other.to_string() })),
-        }
-    }
-    Value::Array(parts)
-}
-
 pub fn sanitize_chat_messages(body: &mut Value) {
     let Some(msgs) = body.get_mut("messages").and_then(Value::as_array_mut) else {
         return;
@@ -317,9 +382,11 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_moves_inline_system_to_front() {
+    fn sanitize_folds_inline_system_into_preceding_message() {
         // hermes 等 OpenAI 客户端偶尔把 system 放在 user 之后，ninfer/Qwen 会
-        // 报 `invalid_prompt`。修复：把 system 提到开头。
+        // 报 `invalid_prompt`。**但不能提到开头** —— 内联 system 是逐轮追加的，
+        // 提到开头等于把新内容插进对话之前，上游前缀缓存从第 0 块起全废
+        // （实测 0% 命中，见 normalize_system_messages 的说明）。折进前一条。
         let mut body = json!({
             "messages": [
                 {"role": "user", "content": "hi"},
@@ -327,12 +394,13 @@ mod tests {
             ]
         });
         sanitize_chat_messages(&mut body);
-        assert_eq!(body["messages"][0]["role"], "system");
-        assert_eq!(body["messages"][1]["role"], "user");
+        assert_eq!(body["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(body["messages"][0]["role"], "user");
+        assert_eq!(body["messages"][0]["content"], "hi\n\nYou are a bot.");
     }
 
     #[test]
-    fn sanitize_merges_multiple_system_into_one_leading() {
+    fn sanitize_keeps_leading_system_and_folds_the_rest_forward() {
         let mut body = json!({
             "messages": [
                 {"role": "system", "content": "A"},
@@ -342,13 +410,100 @@ mod tests {
         });
         sanitize_chat_messages(&mut body);
         assert_eq!(body["messages"].as_array().unwrap().len(), 2);
+        // 顶格 system 是客户端自己的指令头：原位、逐字节不变
         assert_eq!(body["messages"][0]["role"], "system");
-        // 两个 system 合并成数组
-        assert_eq!(
-            body["messages"][0]["content"],
-            json!([{"type": "text", "text": "A"}, {"type": "text", "text": "B"}])
-        );
+        assert_eq!(body["messages"][0]["content"], "A");
+        // 内联的那条折进它前面的 user
         assert_eq!(body["messages"][1]["role"], "user");
+        assert_eq!(body["messages"][1]["content"], "hi\n\nB");
+    }
+
+    #[test]
+    fn sanitize_folds_into_content_parts_array() {
+        let mut body = json!({
+            "messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+                {"role": "system", "content": "rem"}
+            ]
+        });
+        sanitize_chat_messages(&mut body);
+        assert_eq!(
+            body["messages"][1]["content"],
+            json!([{"type": "text", "text": "hi"}, {"type": "text", "text": "rem"}])
+        );
+    }
+
+    #[test]
+    fn sanitize_folds_into_tool_result_and_skips_null_content_assistant() {
+        // 引擎实测（fold-shape-check.py）：tool 的 content 可以是 parts 数组；
+        // 但 assistant 的 content 为 null（纯 tool_calls）不行 —— 给它加文本会让
+        // 提醒渲染在它之后那次工具调用之前，语义就错了。所以跳过去往前找。
+        let mut body = json!({
+            "messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "call_1", "type": "function", "function": {"name": "f", "arguments": "{}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+                {"role": "system", "content": "rem"}
+            ]
+        });
+        sanitize_chat_messages(&mut body);
+        assert_eq!(body["messages"].as_array().unwrap().len(), 4);
+        // 折进了紧邻的 tool 消息
+        assert_eq!(body["messages"][3]["content"], "ok\n\nrem");
+        // assistant 没被动过
+        assert!(body["messages"][2]["content"].is_null());
+    }
+
+    #[test]
+    fn sanitize_skips_tool_calls_only_assistant_when_folding() {
+        let mut body = json!({
+            "messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "call_1", "type": "function", "function": {"name": "f", "arguments": "{}"}}
+                ]},
+                {"role": "system", "content": "rem"}
+            ]
+        });
+        sanitize_chat_messages(&mut body);
+        assert_eq!(body["messages"].as_array().unwrap().len(), 3);
+        // 跳过 content=null 的 assistant，折进了更前面的 user
+        assert_eq!(body["messages"][1]["content"], "hi\n\nrem");
+        assert!(body["messages"][2]["content"].is_null());
+    }
+
+    #[test]
+    fn sanitize_folds_into_leading_system_when_nothing_else_precedes() {
+        let mut body = json!({
+            "messages": [
+                {"role": "system", "content": "A"},
+                {"role": "system", "content": "B"},
+                {"role": "user", "content": "hi"}
+            ]
+        });
+        sanitize_chat_messages(&mut body);
+        assert_eq!(body["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(body["messages"][0]["content"], "A\n\nB");
+        assert_eq!(body["messages"][1]["content"], "hi");
+    }
+
+    #[test]
+    fn sanitize_drops_empty_inline_system() {
+        let mut body = json!({
+            "messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": ""}
+            ]
+        });
+        sanitize_chat_messages(&mut body);
+        assert_eq!(body["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(body["messages"][1]["content"], "hi");
     }
 
     #[test]

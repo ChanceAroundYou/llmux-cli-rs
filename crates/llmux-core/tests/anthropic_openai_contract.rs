@@ -9,7 +9,7 @@ use llmux_core::proxy::anthropic_openai::{
 use llmux_core::proxy::responses::{
     anthropic_to_responses, chat_to_responses, ResponsesToChatConverter,
 };
-use serde_json::json;
+use serde_json::{json, Value};
 
 // ---------------------------------------------------------------------------
 // Request conversion
@@ -147,9 +147,15 @@ fn request_converts_tool_use_and_tool_result() {
 }
 
 #[test]
-fn request_moves_inline_system_message_to_the_front() {
+fn request_folds_inline_system_into_the_preceding_message() {
     // Some OpenAI-style clients put a system turn inline (here after a user
-    // turn). Qwen/DashScope reject a system message that is not first.
+    // turn). Qwen/DashScope and ninfer reject a system message that is not
+    // first — but lifting it to the front is worse than useless: an inline
+    // system is appended once per tool round-trip, so lifting it inserts text
+    // *before the whole conversation* every turn, which invalidates an upstream
+    // prefix cache from block 0 (measured 0% hit on a 120k-token session).
+    // Fold it into the preceding message instead; that message stays
+    // byte-identical for the next request, so only new turns are appended.
     let req = anthropic_to_openai_request(
         &json!({
             "model": "m",
@@ -163,22 +169,17 @@ fn request_moves_inline_system_message_to_the_front() {
     )
     .unwrap();
 
-    assert_eq!(req["messages"][0]["role"], "system");
-    assert_eq!(req["messages"][0]["content"], "Be terse.");
-    assert_eq!(req["messages"][1]["content"], "hi");
-    assert_eq!(req["messages"][2]["content"], "again");
-    // Exactly one system message, and nothing after the first slot.
-    let systems = req["messages"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|m| m["role"] == "system")
-        .count();
-    assert_eq!(systems, 1);
+    let msgs = req["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 2);
+    assert_eq!(msgs[0]["role"], "user");
+    assert_eq!(msgs[0]["content"], "hi\n\nBe terse.");
+    assert_eq!(msgs[1]["content"], "again");
+    // No inline system survives.
+    assert_eq!(msgs.iter().filter(|m| m["role"] == "system").count(), 0);
 }
 
 #[test]
-fn request_merges_top_level_and_inline_system_into_one_leading_message() {
+fn request_keeps_top_level_system_and_folds_the_inline_one() {
     let req = anthropic_to_openai_request(
         &json!({
             "model": "m",
@@ -193,13 +194,13 @@ fn request_merges_top_level_and_inline_system_into_one_leading_message() {
     .unwrap();
 
     let msgs = req["messages"].as_array().unwrap();
-    // Single merged system message, then the user turn — no separate system.
     assert_eq!(msgs.len(), 2);
+    // The top-level system is the client's own header: first, and untouched
+    // (a lone string stays a string, byte-identical to before).
     assert_eq!(msgs[0]["role"], "system");
-    assert_eq!(msgs[0]["content"][0]["text"], "Top level.");
-    assert_eq!(msgs[0]["content"][1]["text"], "Inline.");
+    assert_eq!(msgs[0]["content"], "Top level.");
     assert_eq!(msgs[1]["role"], "user");
-    assert_eq!(msgs[1]["content"], "hi");
+    assert_eq!(msgs[1]["content"], "hi\n\nInline.");
 }
 
 #[test]
@@ -223,16 +224,75 @@ fn request_preserves_non_system_order_and_tool_pairing() {
     .unwrap();
 
     let msgs = req["messages"].as_array().unwrap();
-    assert_eq!(msgs[0]["role"], "system");
-    assert_eq!(msgs[0]["content"], "late system");
+    assert_eq!(msgs.len(), 3);
     // Non-system order is untouched: the assistant tool_calls stays adjacent to
-    // the tool result that references it, then the trailing user turn.
-    assert_eq!(msgs[1]["role"], "assistant");
-    assert_eq!(msgs[1]["tool_calls"][0]["id"], "toolu_1");
-    assert_eq!(msgs[2]["role"], "tool");
-    assert_eq!(msgs[2]["tool_call_id"], "toolu_1");
-    assert_eq!(msgs[3]["role"], "user");
-    assert_eq!(msgs[3]["content"], "next");
+    // the tool result that references it.
+    assert_eq!(msgs[0]["role"], "assistant");
+    assert_eq!(msgs[0]["tool_calls"][0]["id"], "toolu_1");
+    assert_eq!(msgs[1]["role"], "tool");
+    assert_eq!(msgs[1]["tool_call_id"], "toolu_1");
+    // The inline system folded into that tool result rather than moving.
+    assert_eq!(msgs[1]["content"], "sunny\n\nlate system");
+    assert_eq!(msgs[2]["role"], "user");
+    assert_eq!(msgs[2]["content"], "next");
+}
+
+#[test]
+fn consecutive_turns_stay_a_strict_extension_of_the_previous_request() {
+    // The invariant the upstream prefix cache depends on: turn N+1's converted
+    // body must contain turn N's converted messages as an exact prefix, so only
+    // new turns are appended and every cached block still matches.
+    //
+    // This mirrors the production shape that measured 0% cache hits on a
+    // 120k-token session (capture: 222 messages). Claude Code emits an inline
+    // `role: "system"` reminder after each tool round-trip (hook output, a
+    // `<total_tokens>` counter), so the number of inline systems grows by one
+    // every turn. Lifting them to the front inserted text *before the whole
+    // conversation* each turn, shifting every later byte — hence block-0-onward
+    // cache invalidation. Real order per round:
+    //
+    //   user → assistant(tool_use) → user(tool_result) → system(reminder)
+    fn turn(rounds: usize) -> Value {
+        let mut messages = vec![json!({"role": "user", "content": "start"})];
+        for n in 1..=rounds {
+            messages.push(json!({"role": "assistant", "content": [
+                {"type": "tool_use", "id": format!("call_{n}"), "name": "read_file", "input": {}}
+            ]}));
+            messages.push(json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": format!("call_{n}"), "content": format!("result {n}")}
+            ]}));
+            messages.push(json!({
+                "role": "system",
+                "content": format!("PostToolUse hook: read {n} files.\n\n<total_tokens>{} left</total_tokens>", 15000000 - n * 7919),
+            }));
+        }
+        anthropic_to_openai_request(
+            &json!({"model": "m", "system": [{"type": "text", "text": "You are a bot."}],
+                    "messages": messages}),
+            "t",
+        )
+        .unwrap()
+    }
+
+    for n in 1..5 {
+        let prev = turn(n)["messages"].as_array().unwrap().clone();
+        let next = turn(n + 1)["messages"].as_array().unwrap().clone();
+        assert!(
+            next.len() > prev.len(),
+            "turn {n} must append messages, got {} -> {}",
+            prev.len(),
+            next.len()
+        );
+        assert_eq!(
+            &next[..prev.len()],
+            &prev[..],
+            "turn {n} is not a strict extension: the head changed, which invalidates \
+             every cached block downstream"
+        );
+        // The engine rejects an inline system outright, so none may survive past
+        // the leading slot.
+        assert!(next[1..].iter().all(|m| m["role"] != "system"));
+    }
 }
 
 #[test]
