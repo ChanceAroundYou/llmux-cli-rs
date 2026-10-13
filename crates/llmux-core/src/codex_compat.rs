@@ -651,6 +651,97 @@ pub fn ensure_response(response: &Value, request: &Value) -> Value {
     Value::Object(result)
 }
 
+// --- collect_stream：SSE 事件流组装成完整 Responses 对象 ---
+
+/// Codex SSE 事件流 → 完整 Responses 对象（`backend.go:collect` 移植）。
+///
+/// codex 后端对非流式请求回的不是标准 JSON（实测首字节是 `event:` 行），
+/// 直接 `serde_json::from_slice` 必炸。按 sidecar 的做法：逐事件累积
+/// `output_item.done` 的 item、`output_text.delta` 的文本、`completed` 的
+/// response，拼出完整对象。调用方保证传进来的是**已解析的事件 JSON 数组**
+///（SSE 切分 + `normalize_backend_event` 由调用方做，纯函数不管 IO）。
+pub fn collect_stream(events: &[Value], request: &Value) -> Value {
+    let mut completed: Option<Value> = None;
+    let mut output: Vec<Value> = Vec::new();
+    let mut text = String::new();
+    let mut response_id = String::new();
+
+    for event in events {
+        match event.get("type").and_then(Value::as_str).unwrap_or("") {
+            "response.created" => {
+                if let Some(id) = event.get("response").and_then(|r| r.get("id")).and_then(Value::as_str) {
+                    response_id = id.to_string();
+                }
+            }
+            "response.output_text.delta" => {
+                if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                    text.push_str(delta);
+                }
+            }
+            "response.output_item.done" => {
+                if let Some(item) = event.get("item") {
+                    output.push(item.clone());
+                }
+            }
+            "response.completed" | "response.incomplete" => {
+                if let Some(resp) = event.get("response") {
+                    completed = Some(resp.clone());
+                }
+            }
+            "response.failed" => {
+                if let Some(resp) = event.get("response") {
+                    completed = Some(resp.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(mut done) = completed {
+        // completed.output 为空时用累积的 output 补上（sidecar 同逻辑）。
+        let empty = done.get("output").and_then(Value::as_array).map(|a| a.is_empty()).unwrap_or(true);
+        if empty && !output.is_empty() {
+            done["output"] = Value::Array(output);
+        }
+        return ensure_response(&done, request);
+    }
+    // 没收到 completed：用累积的文本拼一个最小响应（sidecar 的 fallback 分支）。
+    if response_id.is_empty() {
+        let rand_hex: String = (0..8).map(|_| format!("{:02x}", rand::random::<u8>())).collect();
+        response_id = format!("resp_{rand_hex}");
+    }
+    let model = str_of(request.get("model")).to_string();
+    let tool_choice = request.get("tool_choice").cloned().unwrap_or(json!("auto"));
+    let tools = request.get("tools").and_then(Value::as_array).cloned().unwrap_or_default();
+    let mut out = Map::new();
+    out.insert("id".to_string(), Value::String(response_id));
+    out.insert("object".to_string(), json!("response"));
+    out.insert(
+        "created_at".to_string(),
+        json!(std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0)),
+    );
+    out.insert("status".to_string(), json!("completed"));
+    out.insert("model".to_string(), Value::String(model));
+    out.insert(
+        "output".to_string(),
+        json!([{
+            "id": format!("msg_{}", &out.get("id").and_then(Value::as_str).unwrap_or("resp_x")[5..].chars().take(8).collect::<String>()),
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "phase": "final_answer",
+            "content": [{"type": "output_text", "text": text, "annotations": []}],
+        }]),
+    );
+    out.insert("parallel_tool_calls".to_string(), Value::Bool(true));
+    out.insert("tool_choice".to_string(), tool_choice);
+    out.insert("tools".to_string(), Value::Array(tools));
+    Value::Object(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -761,6 +852,30 @@ mod tests {
         assert_eq!(out["object"], json!("response"));
         assert_eq!(out["status"], json!("completed"));
         assert_eq!(out["model"], json!("m"));
+        assert!(str_of(out.get("id")).starts_with("resp_"));
+    }
+
+    #[test]
+    fn collect_stream_assembles_completed_response() {
+        let events = vec![
+            json!({"type": "response.created", "response": {"id": "resp_abc"}}),
+            json!({"type": "response.output_text.delta", "delta": "hel"}),
+            json!({"type": "response.output_text.delta", "delta": "lo"}),
+            json!({"type": "response.completed", "response": {"id": "resp_abc", "model": "m", "output": [], "status": "completed"}}),
+        ];
+        let out = collect_stream(&events, &json!({"model": "m"}));
+        assert_eq!(out["id"], json!("resp_abc"));
+        assert_eq!(out["status"], json!("completed"));
+    }
+
+    #[test]
+    fn collect_stream_falls_back_to_text_when_no_completed() {
+        let events = vec![
+            json!({"type": "response.output_text.delta", "delta": "hi"}),
+            json!({"type": "response.output_item.done", "item": {"type": "message", "content": []}}),
+        ];
+        let out = collect_stream(&events, &json!({"model": "m"}));
+        assert_eq!(out["status"], json!("completed"));
         assert!(str_of(out.get("id")).starts_with("resp_"));
     }
 }
