@@ -483,10 +483,12 @@ pub fn build_passthrough_with_beta(
         model,
         proto,
     );
-    // codex 原生：请求预处理（`backend.go:normalizeCodexPayload`）。
+    // codex 原生：请求预处理（`compat.go:prepareResponse` + `backend.go:normalizeCodexPayload`）。
     // 只对 Responses 目标做 —— Chat/Messages 走标准路径，dispatch 循环里已经
     // 由 (ingress,target) 转换表处理过协议互转。
+    // prepareResponse 在前：string input → 规范数组（codex 后端要 list，给 string 就 400）。
     if is_codex_native && proto == crate::protocol::Protocol::Responses {
+        body = crate::codex_compat::prepare_response(&body, model);
         body = crate::codex_compat::normalize_codex_payload(&body, &[]);
     }
     // 记账句柄挂在 request 上：调用点已经在传 `&ProviderRequest`，不必改签名。
