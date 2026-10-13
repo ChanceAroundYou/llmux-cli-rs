@@ -43,6 +43,7 @@ fn to_responses_tools(tools: &Value) -> Value {
                         "name": function.get("name")?,
                         "description": function.get("description").cloned().unwrap_or(Value::Null),
                         "parameters": function.get("parameters").cloned().unwrap_or_else(|| json!({"type": "object", "properties": {}})),
+                        "strict": false,
                     }))
                 }
                 Some("function") => Some(tool.clone()),
@@ -51,6 +52,7 @@ fn to_responses_tools(tools: &Value) -> Value {
                     "name": tool.get("name")?,
                     "description": tool.get("description").cloned().unwrap_or(Value::Null),
                     "parameters": tool.get("input_schema").cloned().unwrap_or_else(|| json!({"type": "object", "properties": {}})),
+                    "strict": false,
                 })),
                 _ => None,
             })
@@ -1283,6 +1285,7 @@ mod tests {
         let translated = chat_to_responses(&body, "muse");
         assert_eq!(translated["tools"][0]["type"], "function");
         assert_eq!(translated["tools"][0]["name"], "calculator");
+        assert_eq!(translated["tools"][0]["strict"], false);
         assert!(translated["tools"][0].get("function").is_none());
         assert_eq!(translated["tool_choice"], "auto");
     }
@@ -1299,6 +1302,7 @@ mod tests {
         assert_eq!(translated["tools"][0]["type"], "function");
         assert_eq!(translated["tools"][0]["name"], "calculator");
         assert_eq!(translated["tools"][0]["parameters"], json!({"type": "object"}));
+        assert_eq!(translated["tools"][0]["strict"], false);
         assert_eq!(translated["tool_choice"], "auto");
     }
 
