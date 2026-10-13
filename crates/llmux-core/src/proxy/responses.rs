@@ -987,7 +987,10 @@ impl ResponsesToChatConverter {
         let mut out = Vec::new();
         let Some(data_str) = sse_data(event_text) else { return out };
         if data_str == "[DONE]" { self.terminal = true; return out; }
-        let Ok(data) = serde_json::from_str::<Value>(data_str) else { return out };
+        let Ok(mut data) = serde_json::from_str::<Value>(data_str) else { return out };
+        // codex 私有后端事件规范化：`response.done` → `response.completed`，
+        // 非法 `status` 删掉（否则下游按未知状态走失败分支）。
+        crate::codex_compat::normalize_backend_event(&mut data);
         let etype = resolve_event_type(event_text, &data);
         if let Some(usage) = data.get("usage").or_else(|| data.get("response").and_then(|r| r.get("usage"))) {
             if usage.is_object() { self.last_usage = Some(usage.clone()); }
@@ -1152,7 +1155,10 @@ impl ResponsesToAnthropicConverter {
         let mut out = Vec::new();
         let Some(data_str) = sse_data(event_text) else { return out };
         if data_str == "[DONE]" { self.terminal = true; return out; }
-        let Ok(data) = serde_json::from_str::<Value>(data_str) else { return out };
+        let Ok(mut data) = serde_json::from_str::<Value>(data_str) else { return out };
+        // codex 私有后端事件规范化：`response.done` → `response.completed`，
+        // 非法 `status` 删掉（否则下游按未知状态走失败分支）。
+        crate::codex_compat::normalize_backend_event(&mut data);
         let etype = resolve_event_type(event_text, &data);
         if let Some(usage) = data.get("usage").or_else(|| data.get("response").and_then(|r| r.get("usage"))) {
             if usage.is_object() { self.last_usage = Some(usage.clone()); }
