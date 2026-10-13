@@ -575,6 +575,7 @@ fn responses_body_shape(body: &Value) -> String {
     let mut input_types: BTreeMap<&str, usize> = BTreeMap::new();
     let mut input_text_bytes = 0usize;
     let mut input_items = 0usize;
+    let mut input_content_types: BTreeMap<&str, usize> = BTreeMap::new();
     let mut function_call_ids = std::collections::BTreeSet::new();
     let mut output_call_ids = Vec::new();
     let mut function_call_names = std::collections::BTreeSet::new();
@@ -584,16 +585,14 @@ fn responses_body_shape(body: &Value) -> String {
     let mut tool_names = std::collections::BTreeSet::new();
     let mut tool_schema_bytes = 0usize;
     let mut tool_description_bytes = 0usize;
-    let mut tool_schema_keywords: BTreeMap<&str, usize> = BTreeMap::new();
-    fn count_schema_keywords(value: &Value, counts: &mut BTreeMap<&'static str, usize>) {
-        const KEYWORDS: &[&str] = &["$ref", "$defs", "anyOf", "oneOf", "allOf", "not", "const", "enum", "patternProperties", "dependentRequired", "if", "then", "else"];
+    let mut tool_schema_keywords: BTreeMap<String, usize> = BTreeMap::new();
+    fn count_schema_keywords(value: &Value, counts: &mut BTreeMap<String, usize>) {
+        const KEYWORDS: &[&str] = &["$schema", "$ref", "$defs", "$id", "$anchor", "$dynamicRef", "$dynamicAnchor", "type", "properties", "required", "additionalProperties", "patternProperties", "propertyNames", "items", "prefixItems", "contains", "minContains", "maxContains", "unevaluatedItems", "unevaluatedProperties", "anyOf", "oneOf", "allOf", "not", "if", "then", "else", "dependentSchemas", "dependentRequired", "const", "enum", "format", "contentEncoding", "contentMediaType", "contentSchema", "title", "description", "default", "examples", "deprecated", "readOnly", "writeOnly", "nullable", "discriminator", "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf", "minLength", "maxLength", "pattern", "minItems", "maxItems", "uniqueItems", "minProperties", "maxProperties"];
         match value {
             Value::Object(map) => {
                 for (key, child) in map {
                     if KEYWORDS.contains(&key.as_str()) {
-                        *counts.entry(match key.as_str() {
-                            "$ref" => "$ref", "$defs" => "$defs", "anyOf" => "anyOf", "oneOf" => "oneOf", "allOf" => "allOf", "not" => "not", "const" => "const", "enum" => "enum", "patternProperties" => "patternProperties", "dependentRequired" => "dependentRequired", "if" => "if", "then" => "then", _ => "else",
-                        }).or_insert(0) += 1;
+                        *counts.entry(key.clone()).or_insert(0) += 1;
                     }
                     count_schema_keywords(child, counts);
                 }
@@ -622,6 +621,12 @@ fn responses_body_shape(body: &Value) -> String {
                 "function_call_output" => if let Some(id) = item.get("call_id").and_then(Value::as_str) { output_call_ids.push(id); },
                 _ => {}
             }
+            if let Some(parts) = item.get("content").and_then(Value::as_array) {
+                for part in parts {
+                    let part_kind = part.get("type").and_then(Value::as_str).unwrap_or("-");
+                    *input_content_types.entry(part_kind).or_insert(0) += 1;
+                }
+            }
             for key in ["text", "content"] {
                 input_text_bytes += text_bytes(item.get(key));
             }
@@ -644,7 +649,7 @@ fn responses_body_shape(body: &Value) -> String {
     let undeclared_function_calls = function_call_names.difference(&tool_names).count();
 
     format!(
-        "fields=[{}] max_output_tokens={} stream={} stop={} instructions={} reasoning_effort={} stream_options={} tools={} tool_schema_bytes={} tool_description_bytes={} max_tool_name_bytes={} tool_schema_keywords={:?} input_items={} input_text_bytes={} input_types={} unmatched_tool_outputs={} duplicate_function_call_ids={} undeclared_function_calls={} max_function_arguments_bytes={}",
+        "fields=[{}] max_output_tokens={} stream={} stop={} instructions={} reasoning_effort={} stream_options={} tools={} tool_schema_bytes={} tool_description_bytes={} max_tool_name_bytes={} tool_schema_keywords={:?} input_items={} input_text_bytes={} input_types={} input_content_types={:?} unmatched_tool_outputs={} duplicate_function_call_ids={} undeclared_function_calls={} max_function_arguments_bytes={}",
         fields.join(","),
         body.get("max_output_tokens").and_then(Value::as_i64).map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()),
         body.get("stream").and_then(Value::as_bool).map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()),
@@ -660,6 +665,7 @@ fn responses_body_shape(body: &Value) -> String {
         input_items,
         input_text_bytes,
         input_types.iter().map(|(kind, count)| format!("{kind}={count}")).collect::<Vec<_>>().join(","),
+        input_content_types,
         unmatched_tool_outputs,
         duplicate_function_call_ids,
         undeclared_function_calls,
