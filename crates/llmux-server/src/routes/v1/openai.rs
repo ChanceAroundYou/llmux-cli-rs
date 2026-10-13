@@ -806,11 +806,32 @@ pub(crate) async fn dispatch_aggregate_with_conversion(
             state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len);
             continue;
         }
-        let account = match get_account_by_id(&state.pool, cand.account_id, &state.master_key).await {
+        let mut account = match get_account_by_id(&state.pool, cand.account_id, &state.master_key).await {
             Ok(Some(a)) => a,
             Ok(None) => { state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); crate::routes::v1::helpers::note_skip_reason(&mut last_error, format!("Candidate {} account {} not found", i, cand.account_id)); failed_candidates += 1; continue; }
             Err(e) => { state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); crate::routes::v1::helpers::note_skip_reason(&mut last_error, format!("Failed to load account {}: {e}", cand.account_id)); failed_candidates += 1; continue; }
         };
+        // codex 原生账户：JWT 过期就先 refresh（与 dispatch_with_conversion 主循环同逻辑）。
+        let mut refreshed_owned_agg;
+        if llmux_core::adapters::is_codex_native(&account) {
+            match llmux_core::codex_auth::load_creds(&account) {
+                Some(creds) if creds.is_expired() => {
+                    match llmux_core::codex_auth::refresh_and_save(&state.pool, account.id, &account.codex_auth_json).await {
+                        Ok(new_json) => {
+                            tracing::info!("🔑 codex token refreshed pre-request for account {}", account.alias);
+                            refreshed_owned_agg = llmux_core::adapters::Account { codex_auth_json: new_json, ..account.clone() };
+                            account = refreshed_owned_agg;
+                        }
+                        Err(e) => {
+                            last_error = Some(format!("Codex token refresh failed for {}: {e}", account.alias));
+                            failed_candidates += 1;
+                            continue;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
         // Per-candidate target computation (Task 6).
         let target = target_protocol(ingress, mode, &account);
         if target != Protocol::Responses {
