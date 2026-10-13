@@ -1874,7 +1874,21 @@ async fn dispatch_aggregate_openai(
         }
 
         let body_bytes = match response.bytes().await { Ok(b) => b, Err(e) => { last_error = Some(format!("Failed to read response: {e}")); state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); failed_candidates += 1; continue; } };
-        let data: Value = match serde_json::from_slice(&body_bytes) { Ok(v) => v, Err(e) => { last_error = Some(format!("Failed to parse response: {e}")); state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); failed_candidates += 1; continue; } };
+        // codex 原生非流式：后端回 SSE，JSON 解析失败时走流组装（与聚合转换路径同逻辑）。
+        let data: Value = match serde_json::from_slice(&body_bytes) {
+            Ok(v) => v,
+            Err(e) => {
+                let text = String::from_utf8_lossy(&body_bytes);
+                if llmux_core::adapters::is_codex_native(&account) && text.contains("data:") {
+                    match collect_codex_response(&body_bytes, &provider_request.body).await {
+                        Some(assembled) => assembled,
+                        None => { last_error = Some(format!("Failed to assemble codex stream: {e}")); state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); failed_candidates += 1; continue; }
+                    }
+                } else {
+                    last_error = Some(format!("Failed to parse response: {e}")); state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); failed_candidates += 1; continue;
+                }
+            }
+        };
         let (prompt_tokens, completion_tokens, cache_read, cache_create) = passthrough_usage(&data);
         let latency_ms = start.elapsed().as_millis() as i64;
         provider_request.effort.record_success();

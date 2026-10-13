@@ -1206,7 +1206,7 @@ export default function Models() {
                     </select>
                     {(() => {
                       const accAlias = safeAccounts.find(a => a.id === c.account_id)?.alias;
-                      const modelsForAccount = c.account_id ? safeModels.filter(m => m.owned_by === accAlias) : [];
+                      const modelsForAccount = c.account_id ? safeModels.filter(m => m.owned_by === accAlias && !m.disabled) : [];
                       const hasModels = modelsForAccount.length > 0;
                       const inList = hasModels && modelsForAccount.some(m => m.id === c.model);
                       return (
