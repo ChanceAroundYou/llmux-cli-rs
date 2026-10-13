@@ -690,9 +690,10 @@ pub async fn start_test_queue(
 
             // 若前端已指定 accountId，直接定向到该账户，避免同名模型串到 provider 的首账户
             let targeted_accounts: Option<Vec<llmux_core::adapters::Account>> = if let Some(acc_id) = account_id_override {
-                match sqlx::query(
-                    "SELECT id, alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight, openai_compatible, chat_endpoint, responses_endpoint, messages_endpoint, default_protocol, balance_provider, balance_auth, codex_auth_json, category FROM accounts WHERE id = ? AND is_active = 1",
-                )
+                match sqlx::query(&format!(
+                    "SELECT {} FROM accounts WHERE id = ? AND is_active = 1",
+                    llmux_core::adapters::ACCOUNT_COLUMNS
+                ))
                 .bind(acc_id)
                 .fetch_optional(&pool)
                 .await
@@ -909,10 +910,10 @@ pub async fn test_model(
 
     let accounts = if let Some(acc_id) = account_id_override {
         // Directly fetch the specified account
-        match sqlx::query(
-            "SELECT id, alias, provider_id, api_key, base_url, anthropic_base_url, is_active, weight, openai_compatible, chat_endpoint, responses_endpoint, messages_endpoint, default_protocol, balance_provider, balance_auth \
-             FROM accounts WHERE id = ? AND is_active = 1",
-        )
+        match sqlx::query(&format!(
+            "SELECT {} FROM accounts WHERE id = ? AND is_active = 1",
+            llmux_core::adapters::ACCOUNT_COLUMNS
+        ))
         .bind(acc_id)
         .fetch_optional(&state.pool)
         .await

@@ -711,6 +711,8 @@ async fn account_create_syncs_chat_endpoint_into_base_url() {
     let cookie = extract_session_cookie(&login_resp).expect("session cookie");
 
     // Create an account with chat_endpoint only (the UI's single endpoint field).
+    // category=custom：这条测的是「base_url 镜像 chat_endpoint」的普通账户规则，
+    // codex 账户的端点由代码钉死（见 codex_account_endpoints_are_pinned_to_the_fixed_backend）。
     let create_req = Request::builder()
         .method(Method::POST)
         .uri("/api/accounts")
@@ -724,7 +726,7 @@ async fn account_create_syncs_chat_endpoint_into_base_url() {
                 "chat_endpoint": "http://127.0.0.1:9/v1",
                 "default_protocol": "chat",
                 "skip_validation": true,
-                "category": "codex",
+                "category": "custom",
             })
             .to_string(),
         ))
@@ -754,7 +756,77 @@ async fn account_create_syncs_chat_endpoint_into_base_url() {
         acct["base_url"]
     );
     assert_eq!(acct["chat_endpoint"], "http://127.0.0.1:9/v1");
-    assert_eq!(acct["category"], "codex");
+    assert_eq!(acct["category"], "custom");
+}
+
+/// codex 账户的上游地址由代码固定：客户端传什么端点都覆盖，库里不留旧值。
+/// 回归（2026-10-13）：退役 sidecar 的 `http://codex-api:18080/v1` 曾留在库里，
+/// 拨测照它去打一个不存在的容器。
+#[tokio::test]
+async fn codex_account_endpoints_are_pinned_to_the_fixed_backend() {
+    use http::header;
+    let state = llmux_server::test_state().await;
+    let app = llmux_server::app(state.clone());
+
+    let login_req = Request::builder()
+        .method(Method::POST)
+        .uri("/api/auth/login")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::json!({"username":"admin","password":"admin"}).to_string(),
+        ))
+        .unwrap();
+    let login_resp = llmux_server::test_request(app.clone(), login_req).await;
+    let cookie = extract_session_cookie(&login_resp).expect("session cookie");
+
+    let create_req = Request::builder()
+        .method(Method::POST)
+        .uri("/api/accounts")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::COOKIE, &cookie)
+        .body(Body::from(
+            json!({
+                "alias": "codex-pinned",
+                "provider_id": "codex",
+                "api_key": "unused",
+                "base_url": "http://codex-api:18080/v1",
+                "chat_endpoint": "http://codex-api:18080/v1",
+                "responses_endpoint": "http://codex-api:18080/v1",
+                "default_protocol": "chat",
+                "skip_validation": true,
+                "category": "codex",
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let create_resp = llmux_server::test_request(app.clone(), create_req).await;
+    assert_eq!(create_resp.status(), StatusCode::OK);
+
+    let list_req = Request::builder()
+        .method(Method::GET)
+        .uri("/api/accounts")
+        .header(header::COOKIE, &cookie)
+        .body(Body::empty())
+        .unwrap();
+    let list_resp = llmux_server::test_request(app.clone(), list_req).await;
+    let bytes = axum::body::to_bytes(list_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let accounts: Value = serde_json::from_slice(&bytes).unwrap();
+    let acct = accounts
+        .as_array()
+        .and_then(|a| a.iter().find(|a| a["alias"] == "codex-pinned"))
+        .expect("account codex-pinned must exist");
+
+    let fixed = "https://chatgpt.com/backend-api/codex";
+    assert_eq!(acct["base_url"], fixed, "client-supplied URL must be replaced");
+    assert_eq!(acct["responses_endpoint"], fixed);
+    assert_eq!(acct["default_protocol"], "responses");
+    assert!(
+        acct["chat_endpoint"].is_null(),
+        "codex has no chat protocol, got {:?}",
+        acct["chat_endpoint"]
+    );
 }
 
 

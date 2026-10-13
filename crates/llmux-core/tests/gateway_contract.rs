@@ -164,6 +164,25 @@ fn build_passthrough_selects_endpoint_by_protocol() {
 }
 
 #[test]
+fn codex_accounts_always_target_the_fixed_backend_url() {
+    // 回归（2026-10-13）：库里留着退役 sidecar 的地址，且凭据暂时为空时，
+    // 请求**不能**回退到那个地址 —— 拨测就是照这个组合打到
+    // `http://codex-api:18080/v1` 上、连接失败报出来的。地址由代码固定，
+    // 与账户里可编辑的 base_url / *_endpoint 无关。
+    let acc = Account { id: 60, alias: "codex".into(), provider_id: "codex".into(), api_key: "k".into(),
+        base_url: Some("http://codex-api:18080/v1".into()), anthropic_base_url: None,
+        chat_endpoint: Some("http://codex-api:18080/v1".into()), responses_endpoint: None,
+        messages_endpoint: None, default_protocol: Some("chat".into()), balance_provider: String::new(), balance_auth: String::new(), codex_auth_json: String::new(), category: "codex".into(),
+        is_active: 1, weight: 1, openai_compatible: 0 };
+    assert!(llmux_core::adapters::is_codex_native(&acc));
+    for proto in [Protocol::Chat, Protocol::Responses] {
+        let req = llmux_core::adapters::build_passthrough(&acc, proto, &json!({"model":"gpt-6-luna"}));
+        assert!(req.url.starts_with("https://chatgpt.com/backend-api/codex/"), "{}", req.url);
+        assert!(!req.url.contains("codex-api"), "{}", req.url);
+    }
+}
+
+#[test]
 fn dispatcher_helpers_resolve_and_order_failover_attempts() {
     assert_eq!(
         resolve_model_by_prefix("claude-3-haiku").provider_id,

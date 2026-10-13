@@ -166,6 +166,12 @@ impl ProbeOutcome {
 
 /// 该账户对某协议是否配了端点（探测只打配了的，避免无谓请求）。
 fn probeable(account: &Account, p: Protocol) -> bool {
+    // codex 原生账户的上游地址是代码固定的（`CODEX_BACKEND_BASE`），与账户里
+    // 那几个可编辑端点无关 —— 按需读端点会得出「没配就不探」，或者更糟：
+    // 拿遗留的 `base_url` 去探已退役的 sidecar（2026-10-13 就是后者）。
+    if crate::adapters::is_codex_native(account) {
+        return p == Protocol::Responses;
+    }
     endpoint_for(account, p).is_some()
 }
 
@@ -993,6 +999,47 @@ mod tests {
             codex_auth_json: String::new(),
             category: "custom".to_string(),
         }
+    }
+
+    /// codex 账户：`category=codex` + 已导入凭据，但库里还留着退役 sidecar 的地址。
+    fn codex_account(stale: &str) -> Account {
+        Account {
+            provider_id: "codex".into(),
+            category: "codex".into(),
+            codex_auth_json: r#"{"auth_mode":"chatgpt","tokens":{"access_token":"tok"}}"#.into(),
+            ..account("codex", stale, None, None)
+        }
+    }
+
+    #[test]
+    fn codex_probe_targets_the_fixed_backend_not_the_stale_sidecar_url() {
+        // 回归（2026-10-13）：拨测打到了已退役的 `http://codex-api:18080/v1`。
+        // 原生地址是代码固定的，账户里那几个端点字段对它没有意义。
+        let a = codex_account("http://codex-api:18080/v1");
+        let req = build_probe_request(&a, "gpt-6-luna", Protocol::Responses);
+        assert_eq!(req.url, "https://chatgpt.com/backend-api/codex/responses");
+        assert!(req.headers["authorization"].starts_with("Bearer "));
+        assert_eq!(req.headers["originator"], "openai-api-server-via-codex");
+    }
+
+    #[test]
+    fn codex_probe_without_credentials_still_uses_the_fixed_backend() {
+        // 凭据为空**不**回退到遗留地址（旧判据是会回退的，那正是拨测打
+        // codex-api 的另一条路径）。宁可带空 Bearer 去上游拿 401。
+        let a = Account { codex_auth_json: String::new(), ..codex_account("http://codex-api:18080/v1") };
+        let req = build_probe_request(&a, "gpt-6-luna", Protocol::Responses);
+        assert_eq!(req.url, "https://chatgpt.com/backend-api/codex/responses");
+    }
+
+    #[test]
+    fn codex_probe_skips_chat_even_with_a_legacy_chat_endpoint() {
+        // 遗留 chat 端点会让 chat 成为探测候选 —— 那正是打到 sidecar 的那一发。
+        let a = codex_account("http://codex-api:18080/v1");
+        let candidates: Vec<Protocol> = PROTOCOL_PRIORITY
+            .into_iter()
+            .filter(|p| probeable(&a, *p))
+            .collect();
+        assert_eq!(candidates, vec![Protocol::Responses]);
     }
 
     fn probe(p: Protocol, ok: bool) -> ProtocolProbe {

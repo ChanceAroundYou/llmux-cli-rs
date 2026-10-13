@@ -224,14 +224,25 @@ pub struct Account {
     pub balance_provider: String,
     /// Dedicated balance-probe credential (encrypted cookie/token); empty = use api_key.
     pub balance_auth: String,
-    /// Raw Codex `auth.json` for `category=codex` accounts. Empty/None =
-    /// 未配置（回退到 sidecar 直连的 `base_url` 路径）—— 不在这里 fail，
-    /// 因为绝大多数账户根本不是 codex。
+    /// Raw Codex `auth.json` for `category=codex` accounts. 空 = 没导入凭据
+    /// （请求会带空 Bearer 去上游拿 401，不是回退到别的地址 —— 见
+    /// [`is_codex_native`]）。
     pub codex_auth_json: String,
     /// 账户类别，决定后端路由/处理路径：custom / codex / zen_free。
     /// 空 = 按 custom 处理（老数据未迁移时的兜底）。
     pub category: String,
 }
+
+/// `accounts` 表里 [`Account`] 需要的**全部**列，加载账户的 SELECT 一律用它拼。
+///
+/// 别手写列清单：漏一列时 `row.try_get("x").ok().flatten().unwrap_or_default()`
+/// 会静默给空串，而不是报错。2026-10-13 就是这样把 `category` 漏掉的 ——
+/// codex 账户被当成普通账户，原生 URL 分支不生效，拨测打回了已退役的
+/// `http://codex-api:18080/v1`。缺列必须是不可能的，不是不可能的。
+pub const ACCOUNT_COLUMNS: &str = "id, alias, provider_id, api_key, base_url, \
+     anthropic_base_url, is_active, weight, openai_compatible, chat_endpoint, \
+     responses_endpoint, messages_endpoint, default_protocol, balance_provider, \
+     balance_auth, codex_auth_json, category";
 
 impl From<crate::models::Account> for Account {
     fn from(value: crate::models::Account) -> Self {
@@ -541,11 +552,17 @@ fn json_headers() -> BTreeMap<String, String> {
     BTreeMap::from([("content-type".to_string(), "application/json".to_string())])
 }
 
-/// codex 原生账户判定：`category=codex` 且配了 `codex_auth_json`。
-/// 为空 = 未配置，回退 sidecar 直连路径（旧 base_url）。三处调用点
-/// （base 覆盖 / 头注入 / payload 预处理）共用这一个判据，别各写各的。
+/// codex 原生账户判定：`category=codex`。
+///
+/// 上游地址是代码里固定的 [`crate::codex_compat::CODEX_BACKEND_BASE`]，
+/// **不读账户的 `base_url`/`*_endpoint`** —— 那些字段对 codex 账户没有意义，
+/// 也不该由用户配置。sidecar 退役后不存在"回退到旧 URL"这条路径：真回退了
+/// 就是去打一个不存在的容器（2026-10-13 拨测报 `codex-api:18080` 连接失败，
+/// 根因正是某个加载账户的查询漏了 `category` 列，于是判据为假、走了回退）。
+/// 凭据为空也不回退：让请求带空 Bearer 去上游拿 401，错得清楚。
+/// 三处调用点（base 覆盖 / 头注入 / payload 预处理）共用这一个判据，别各写各的。
 pub fn is_codex_native(account: &Account) -> bool {
-    account.category == "codex" && !account.codex_auth_json.is_empty()
+    account.category == "codex"
 }
 
 fn normalize_base_url(value: &str) -> String {

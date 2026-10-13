@@ -10,6 +10,34 @@ use serde_json::{json, Value};
 use crate::app::AppState;
 use crate::routes::models::fetch_provider_models;
 
+/// codex 账户的上游地址是代码固定的（[`CODEX_BACKEND_BASE`]），不接受用户配置。
+/// 创建/更新时把端点钉成固定值并**覆盖**客户端传来的任何 URL —— 不是忽略，
+/// 否则库里会留着没人用的旧地址（`http://codex-api:18080/v1` 就是退役 sidecar
+/// 留下的），下次排障还会照着它去查一个不存在的容器。
+///
+/// 只留 responses：codex 后端只认这一个形状，留个 chat 端点只会让
+/// 「别名配成 /chat」时静默拼出 `…/codex/chat/completions` 这种不存在的路径。
+///
+/// [`CODEX_BACKEND_BASE`]: llmux_core::codex_compat::CODEX_BACKEND_BASE
+fn pin_codex_endpoints(
+    category: &str,
+    base_url: &mut Option<String>,
+    chat_endpoint: &mut Option<String>,
+    responses_endpoint: &mut Option<String>,
+    messages_endpoint: &mut Option<String>,
+    default_protocol: &mut String,
+) {
+    if category != "codex" {
+        return;
+    }
+    let fixed = llmux_core::codex_compat::CODEX_BACKEND_BASE.to_string();
+    *base_url = Some(fixed.clone());
+    *chat_endpoint = None;
+    *messages_endpoint = None;
+    *responses_endpoint = Some(fixed);
+    *default_protocol = "responses".to_string();
+}
+
 /// GET /api/accounts/:id/balance — probe the upstream balance/usage endpoint
 /// for this account and cache the normalized result into `limits_cache`.
 pub async fn get_account_balance(
@@ -435,7 +463,7 @@ pub async fn create_account(
     if let Some(ep) = &chat_endpoint {
         base_url = Some(ep.clone());
     }
-    let responses_endpoint = body
+    let mut responses_endpoint = body
         .get("responses_endpoint")
         .and_then(|v| if v.is_null() { Some(None) } else { v.as_str().map(|s| s.trim().to_string()).map(|s| if s.is_empty() { None } else { Some(s) }) })
         .unwrap_or(None);
@@ -456,6 +484,16 @@ pub async fn create_account(
     if !["chat", "responses", "messages"].contains(&default_protocol.as_str()) {
         default_protocol = "chat".to_string();
     }
+
+    // codex 账户：端点由代码钉死，客户端传什么都覆盖。
+    pin_codex_endpoints(
+        &category,
+        &mut base_url,
+        &mut chat_endpoint,
+        &mut responses_endpoint,
+        &mut messages_endpoint,
+        &mut default_protocol,
+    );
 
     // Validate at least one endpoint
     let enabled: Vec<&str> = [
@@ -734,7 +772,7 @@ pub async fn update_account(
     let has_msg_key = body.as_object().map(|m| m.contains_key("messages_endpoint")).unwrap_or(false);
     let has_default_key = body.as_object().map(|m| m.contains_key("default_protocol")).unwrap_or(false);
 
-    let chat_endpoint = if has_chat_key {
+    let mut chat_endpoint = if has_chat_key {
         body.get("chat_endpoint").and_then(parse_ep)
     } else {
         existing.chat_endpoint.clone()
@@ -747,12 +785,12 @@ pub async fn update_account(
             base_url = Some(ep.clone());
         }
     }
-    let responses_endpoint = if has_resp_key {
+    let mut responses_endpoint = if has_resp_key {
         body.get("responses_endpoint").and_then(parse_ep)
     } else {
         existing.responses_endpoint.clone()
     };
-    let messages_endpoint = if has_msg_key {
+    let mut messages_endpoint = if has_msg_key {
         body.get("messages_endpoint").and_then(parse_ep)
     } else {
         existing.messages_endpoint.clone()
@@ -765,6 +803,17 @@ pub async fn update_account(
     if !["chat", "responses", "messages"].contains(&default_protocol.as_str()) {
         default_protocol = "chat".to_string();
     }
+
+    // codex 账户：端点由代码钉死，客户端传什么都覆盖（含"没传"= 沿用旧值，
+    // 旧值里可能就是退役 sidecar 地址）。
+    pin_codex_endpoints(
+        &category,
+        &mut base_url,
+        &mut chat_endpoint,
+        &mut responses_endpoint,
+        &mut messages_endpoint,
+        &mut default_protocol,
+    );
 
     // Validate at least one endpoint and default in enabled set
     let enabled: Vec<&str> = [
