@@ -1014,6 +1014,51 @@ mod tests {
         }
     }
 
+    /// zen 账户：`category=zen` + 自配直连地址。
+    fn zen_account() -> Account {
+        Account {
+            provider_id: "zen".into(),
+            category: "zen".into(),
+            ..account("zen", "https://opencode.ai/zen/v1", Some("https://opencode.ai/zen/v1"), None)
+        }
+    }
+
+    #[test]
+    fn zen_probe_carries_identity_headers_and_free_tier_body() {
+        // spec §4/§5：拨测走真实改写路径（build_passthrough），不是裸 POST ——
+        // 否则门直接 403，拨测永远红。chat 形：stream 强制 true + bash/read 注入。
+        let a = zen_account();
+        let req = build_probe_request(&a, "cat-jam-free", Protocol::Chat);
+        assert_eq!(req.url, "https://opencode.ai/zen/v1/chat/completions");
+        assert_eq!(req.headers["user-agent"], crate::adapters::ZEN_USER_AGENT);
+        assert!(req.headers["x-opencode-session"].starts_with("ses_"));
+        assert_eq!(req.body["stream"], serde_json::json!(true));
+        let names: Vec<_> = req.body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap().to_string())
+            .collect();
+        assert!(names.contains(&"bash".to_string()) && names.contains(&"read".to_string()));
+    }
+
+    #[test]
+    fn zen_probe_responses_shape_uses_responses_tool_form() {
+        // responses 形错形会 400：工具名在顶层 `name`，不是 `function.name`。
+        let a = zen_account();
+        let req = build_probe_request(&a, "muse-spark-1.3-contributor-free", Protocol::Responses);
+        assert_eq!(req.url, "https://opencode.ai/zen/v1/responses");
+        assert_eq!(req.headers["user-agent"], crate::adapters::ZEN_USER_AGENT);
+        assert!(req.headers["x-opencode-session"].starts_with("ses_"));
+        let names: Vec<_> = req.body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect();
+        assert!(names.contains(&"bash".to_string()) && names.contains(&"read".to_string()));
+    }
+
     #[test]
     fn codex_probe_targets_the_fixed_backend_not_the_stale_sidecar_url() {
         // 回归（2026-10-13）：拨测打到了已退役的 `http://codex-api:18080/v1`。

@@ -16,11 +16,11 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
-use llmux_core::adapters::{self, execute_provider_request, join_upstream_url, ProviderRequest};
+use llmux_core::adapters::{self, execute_provider_request, ProviderRequest};
 use llmux_core::aggregate::get_account_by_id;
 use llmux_core::dispatcher::{self, get_accounts_by_ids, get_active_accounts, is_retryable_status};
 use llmux_core::proxy::anthropic_openai::{
-    anthropic_to_openai_request, anthropic_to_openai_request_with, cache_usage_from_openai,
+    anthropic_to_openai_request_with, cache_usage_from_openai,
     openai_to_anthropic_response, parse_sse_chunks, sse_data_payload, OpenAISseConverter,
 };
 use llmux_core::proxy::{build_anthropic_passthrough_request, extract_anthropic_usage_from_sse};
@@ -220,46 +220,65 @@ pub async fn messages(
             )
         } else if let Some(openai_base) = openai_base {
             // Anthropic → OpenAI protocol translation.
-            let add_bp = state.cache_breakpoint_ok(&account.provider_id);
-            match anthropic_to_openai_request_with(&body, &model_resolution.target_model, add_bp) {
-                Ok(mut openai_body) => {
-                    let mut req_headers = BTreeMap::new();
-                    req_headers.insert(
-                        "content-type".to_string(),
-                        "application/json".to_string(),
-                    );
-                    req_headers.insert(
-                        "authorization".to_string(),
-                        format!("Bearer {}", account.api_key),
-                    );
-                    let effort = llmux_core::reasoning_effort::apply_reasoning_effort(
-                        &mut openai_body,
-                        &account.provider_id,
-                        &model_resolution.target_model,
-                        llmux_core::protocol::Protocol::Chat,
-                    );
-                    let max_tokens = llmux_core::max_tokens::clamp_max_tokens(
-                        &mut openai_body,
-                        &account.provider_id,
-                        &model_resolution.target_model,
-                    );
-                    (
-                        Ok(ProviderRequest {
-                            method: "POST".to_string(),
-                            url: format!(
-                                "{}/chat/completions",
-                                openai_base.trim_end_matches('/')
-                            ),
-                            headers: req_headers,
-                            body: openai_body,
-                            effort,
-                            max_tokens,
-                            first_byte_timeout_secs: None,
-                        }),
+            // zen 原生走同一条转换路：build_passthrough 包了 UA+ses_ 与
+            // stream/tools 改写，手拼就会漏（`of` 别名的 Messages 入口就挂
+            // 在这个账户上，漏一次就是一次生产 403）。
+            if llmux_core::adapters::is_zen_native(account) {
+                let add_bp = state.cache_breakpoint_ok(&account.provider_id);
+                match anthropic_to_openai_request_with(&body, &model_resolution.target_model, add_bp) {
+                    Ok(openai_body) => (
+                        Ok(llmux_core::adapters::build_passthrough_with_beta(
+                            account,
+                            llmux_core::protocol::Protocol::Chat,
+                            &openai_body,
+                            None,
+                        )),
                         true,
-                    )
+                    ),
+                    Err(e) => (Err(anyhow::anyhow!(e)), true),
                 }
-                Err(e) => (Err(e), true),
+            } else {
+                let add_bp = state.cache_breakpoint_ok(&account.provider_id);
+                match anthropic_to_openai_request_with(&body, &model_resolution.target_model, add_bp) {
+                    Ok(mut openai_body) => {
+                        let mut req_headers = BTreeMap::new();
+                        req_headers.insert(
+                            "content-type".to_string(),
+                            "application/json".to_string(),
+                        );
+                        req_headers.insert(
+                            "authorization".to_string(),
+                            format!("Bearer {}", account.api_key),
+                        );
+                        let effort = llmux_core::reasoning_effort::apply_reasoning_effort(
+                            &mut openai_body,
+                            &account.provider_id,
+                            &model_resolution.target_model,
+                            llmux_core::protocol::Protocol::Chat,
+                        );
+                        let max_tokens = llmux_core::max_tokens::clamp_max_tokens(
+                            &mut openai_body,
+                            &account.provider_id,
+                            &model_resolution.target_model,
+                        );
+                        (
+                            Ok(ProviderRequest {
+                                method: "POST".to_string(),
+                                url: format!(
+                                    "{}/chat/completions",
+                                    openai_base.trim_end_matches('/')
+                                ),
+                                headers: req_headers,
+                                body: openai_body,
+                                effort,
+                                max_tokens,
+                                first_byte_timeout_secs: None,
+                            }),
+                            true,
+                        )
+                    }
+                    Err(e) => (Err(e), true),
+                }
             }
         } else {
             (
@@ -768,17 +787,20 @@ async fn dispatch_aggregate_anthropic(
         let (provider_request, is_conversion) = match agg_mode {
             llmux_core::protocol::DownstreamMode::Chat => {
                 match openai_base {
-                    Some(openai_base) => {
+                    Some(_) => {
                         let add_bp = state.cache_breakpoint_ok(&account.provider_id);
                         match anthropic_to_openai_request_with(&patched_body, &cand.model, add_bp) {
-                            Ok(mut openai_body) => {
-                                let mut req_headers = BTreeMap::new();
-                                req_headers.insert("content-type".to_string(), "application/json".to_string());
-                                req_headers.insert("authorization".to_string(), format!("Bearer {}", account.api_key));
-                                let effort = llmux_core::reasoning_effort::apply_reasoning_effort(&mut openai_body, &account.provider_id, &cand.model, llmux_core::protocol::Protocol::Chat);
-                                let max_tokens = llmux_core::max_tokens::clamp_max_tokens(&mut openai_body, &account.provider_id, &cand.model);
-                                (Ok(ProviderRequest { method: "POST".to_string(), url: join_upstream_url(openai_base, "chat/completions"), headers: req_headers, body: openai_body, effort, max_tokens, first_byte_timeout_secs: None }), true)
-                            }
+                            // zen 走共享构建器（UA+ses_ + stream/tools 改写），
+                            // 非 zen 保持原手拼（见单账户路径同处注释）。
+                            Ok(openai_body) => (
+                                Ok(llmux_core::adapters::build_passthrough_with_beta(
+                                    &account,
+                                    llmux_core::protocol::Protocol::Chat,
+                                    &openai_body,
+                                    None,
+                                )),
+                                true,
+                            ),
                             Err(e) => (Err(e), true),
                         }
                     }
@@ -794,17 +816,18 @@ async fn dispatch_aggregate_anthropic(
             | llmux_core::protocol::DownstreamMode::Responses => {
                 if let Some(anthropic_base) = anthropic_base {
                     (build_anthropic_passthrough_request(&patched_body, &account, anthropic_base, &cand.model, anthropic_beta.as_deref()), false)
-                } else if let Some(openai_base) = openai_base {
+                } else if openai_base.is_some() {
                     let add_bp = state.cache_breakpoint_ok(&account.provider_id);
                     match anthropic_to_openai_request_with(&patched_body, &cand.model, add_bp) {
-                        Ok(mut openai_body) => {
-                            let mut req_headers = BTreeMap::new();
-                            req_headers.insert("content-type".to_string(), "application/json".to_string());
-                            req_headers.insert("authorization".to_string(), format!("Bearer {}", account.api_key));
-                            let effort = llmux_core::reasoning_effort::apply_reasoning_effort(&mut openai_body, &account.provider_id, &cand.model, llmux_core::protocol::Protocol::Chat);
-                            let max_tokens = llmux_core::max_tokens::clamp_max_tokens(&mut openai_body, &account.provider_id, &cand.model);
-                            (Ok(ProviderRequest { method: "POST".to_string(), url: join_upstream_url(openai_base, "chat/completions"), headers: req_headers, body: openai_body, effort, max_tokens, first_byte_timeout_secs: None }), true)
-                        }
+                        Ok(openai_body) => (
+                            Ok(llmux_core::adapters::build_passthrough_with_beta(
+                                &account,
+                                llmux_core::protocol::Protocol::Chat,
+                                &openai_body,
+                                None,
+                            )),
+                            true,
+                        ),
                         Err(e) => (Err(e), true),
                     }
                 } else {
