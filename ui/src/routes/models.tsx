@@ -681,6 +681,7 @@ export default function Models() {
                     <div className="space-y-1">
                       {agg.candidates.map((c: any, idx: number) => {
                         const acc = safeAccounts.find(a => a.id === c.account_id);
+                        const lockedHere = !!(agg as any).locked && agg.active === idx;
                         return (
                           <div key={idx} className={cn("flex flex-col gap-1 text-xs px-2 py-1.5 rounded", isActive(idx) ? "bg-primary/10 border border-primary/20" : "bg-muted/30")}>
                             <div className="flex items-center gap-2 min-w-0">
@@ -688,6 +689,16 @@ export default function Models() {
                               <div className={cn("w-2 h-2 rounded-full shrink-0", statusDot(idx))} title={String(agg.last_status?.[idx] ?? "unknown")} />
                               <span className="font-bold truncate">{acc ? acc.alias : `account#${c.account_id}`}</span>
                               {isActive(idx) ? <span className="ml-auto shrink-0 text-primary font-bold text-[10px] px-1.5 py-0.5 rounded bg-primary/10 border border-primary/20">活跃</span> : <button onClick={(e) => { e.stopPropagation(); setAggregateActive(agg.id, idx).catch(()=>{}); }} className="ml-auto shrink-0 text-[10px] px-1.5 py-0.5 rounded border border-border bg-muted/50 hover:bg-primary/10 hover:text-primary transition-colors">设为活跃</button>}
+                              {/* 互斥锁：已有某 idx 被锁时，其它 candidate 的锁按钮禁用 */}
+                              {isLocked && !lockedHere ? (
+                                <span title="已锁 elsewhere，先解锁" className="shrink-0 text-muted-foreground/40 text-[10px]">🔒</span>
+                              ) : (
+                                <button
+                                  onClick={(e) => { e.stopPropagation(); if (lockedHere) { setAggregateLock(agg.id, false).catch(()=>{}); } else { setAggregateActive(agg.id, idx).then(()=>setAggregateLock(agg.id, true)).catch(()=>{}); } }}
+                                  title={lockedHere ? "解锁" : "锁定到此模型"}
+                                  className={cn("ml-1 shrink-0 text-[10px] px-1.5 py-0.5 rounded border transition-colors", lockedHere ? "bg-primary/10 text-primary border-primary/20" : "bg-muted/50 border-border hover:bg-primary/10 hover:text-primary")}
+                                >{lockedHere ? "已锁" : "锁定"}</button>
+                              )}
                             </div>
                             <div className="pl-6 truncate text-muted-foreground">{c.model}</div>
                           </div>
