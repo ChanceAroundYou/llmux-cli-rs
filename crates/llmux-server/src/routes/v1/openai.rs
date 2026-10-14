@@ -484,12 +484,17 @@ pub(crate) async fn dispatch_with_conversion(
                 let data: Value = match serde_json::from_slice(&body_bytes) {
                     Ok(v) => v,
                     Err(e) => {
-                        // codex 原生非流式：后端回的是 SSE 不是 JSON，走流组装。
+                        // codex/zen 原生非流式：后端回的是 SSE 不是 JSON，走流组装。
                         let text = String::from_utf8_lossy(&body_bytes);
                         if llmux_core::adapters::is_codex_native(account) && text.contains("data:") {
                             match collect_codex_response(&body_bytes, &provider_request.body).await {
                                 Some(assembled) => assembled,
                                 None => { last_error = Some(format!("Failed to assemble codex stream: {e}")); failed_candidates += 1; continue; }
+                            }
+                        } else if llmux_core::adapters::is_zen_native(account) && text.contains("data:") {
+                            match collect_zen_chat_response(&body_bytes).await {
+                                Some(assembled) => assembled,
+                                None => { last_error = Some(format!("Failed to assemble zen stream: {e}")); failed_candidates += 1; continue; }
                             }
                         } else {
                             last_error = Some(format!("Failed to parse response: {e}")); failed_candidates += 1; continue;
@@ -544,7 +549,10 @@ pub(crate) async fn dispatch_with_conversion(
                 let data: Value = match serde_json::from_slice(&body_bytes) {
                     Ok(v) => v,
                     Err(e) => {
-                        // codex 原生非流式：后端回的是 SSE 不是 JSON，走流组装。
+                        // codex/zen 原生非流式：后端回的是 SSE 不是 JSON，走流组装。
+                        // zen 侧：Messages 上游只有 Anthropic 形状，SSE 形是 anthropic
+                        // 事件 —— anthropic_to_openai_response 消费 JSON body，
+                        // 此处只处理 JSON 解析失败的 SSE 回退（与 codex 同形）。
                         let text = String::from_utf8_lossy(&body_bytes);
                         if llmux_core::adapters::is_codex_native(account) && text.contains("data:") {
                             match collect_codex_response(&body_bytes, &provider_request.body).await {
@@ -577,12 +585,19 @@ pub(crate) async fn dispatch_with_conversion(
                 let data: Value = match serde_json::from_slice(&body_bytes) {
                     Ok(v) => v,
                     Err(e) => {
-                        // codex 原生非流式：后端回的是 SSE 不是 JSON，走流组装。
+                        // codex/zen 原生非流式：后端回的是 SSE 不是 JSON，走流组装。
+                        // zen 侧 Responses 上游是标准 responses SSE —— 先按 JSON 试，
+                        // 失败且含 data: 行时按 responses 事件组装（collect_stream）。
                         let text = String::from_utf8_lossy(&body_bytes);
                         if llmux_core::adapters::is_codex_native(account) && text.contains("data:") {
                             match collect_codex_response(&body_bytes, &provider_request.body).await {
                                 Some(assembled) => assembled,
                                 None => { last_error = Some(format!("Failed to assemble codex stream: {e}")); failed_candidates += 1; continue; }
+                            }
+                        } else if llmux_core::adapters::is_zen_native(account) && text.contains("data:") {
+                            match collect_zen_responses_response(&body_bytes, &provider_request.body).await {
+                                Some(assembled) => assembled,
+                                None => { last_error = Some(format!("Failed to assemble zen stream: {e}")); failed_candidates += 1; continue; }
                             }
                         } else {
                             last_error = Some(format!("Failed to parse response: {e}")); failed_candidates += 1; continue;
@@ -607,12 +622,17 @@ pub(crate) async fn dispatch_with_conversion(
                 let data: Value = match serde_json::from_slice(&body_bytes) {
                     Ok(v) => v,
                     Err(e) => {
-                        // codex 原生非流式：后端回的是 SSE 不是 JSON，走流组装。
+                        // codex/zen 原生非流式：后端回的是 SSE 不是 JSON，走流组装。
                         let text = String::from_utf8_lossy(&body_bytes);
                         if llmux_core::adapters::is_codex_native(account) && text.contains("data:") {
                             match collect_codex_response(&body_bytes, &provider_request.body).await {
                                 Some(assembled) => assembled,
                                 None => { last_error = Some(format!("Failed to assemble codex stream: {e}")); failed_candidates += 1; continue; }
+                            }
+                        } else if llmux_core::adapters::is_zen_native(account) && text.contains("data:") {
+                            match collect_zen_chat_response(&body_bytes).await {
+                                Some(assembled) => assembled,
+                                None => { last_error = Some(format!("Failed to assemble zen stream: {e}")); failed_candidates += 1; continue; }
                             }
                         } else {
                             last_error = Some(format!("Failed to parse response: {e}")); failed_candidates += 1; continue;
@@ -1213,6 +1233,49 @@ async fn collect_zen_chat_response(body: &[u8]) -> Option<Value> {
         return None;
     }
     llmux_core::proxy::responses::collect_chat_stream(&events)
+}
+
+/// zen 免费档 responses SSE body → 完整 Responses JSON。Messages 入口经
+/// Responses 上游（muse 系）时，非流式下游在这里收成 JSON —— 与
+/// collect_codex_response 同形（`normalize_backend_event` + `collect_stream`，
+/// 空流 None）。chat 形走上面的 `collect_zen_chat_response`，两者各管一形。
+async fn collect_zen_responses_response(body: &[u8], request: &Value) -> Option<Value> {
+    let text = String::from_utf8_lossy(body);
+    let mut events: Vec<Value> = Vec::new();
+    let mut current = String::new();
+    for line in text.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            if !current.is_empty() {
+                if let Some(payload) = sse_data_payload(&current) {
+                    if payload != "[DONE]" {
+                        if let Ok(mut v) = serde_json::from_str::<Value>(payload) {
+                            llmux_core::codex_compat::normalize_backend_event(&mut v);
+                            events.push(v);
+                        }
+                    }
+                }
+                current.clear();
+            }
+            continue;
+        }
+        current.push_str(t);
+        current.push('\n');
+    }
+    if !current.is_empty() {
+        if let Some(payload) = sse_data_payload(&current) {
+            if payload != "[DONE]" {
+                if let Ok(mut v) = serde_json::from_str::<Value>(payload) {
+                    llmux_core::codex_compat::normalize_backend_event(&mut v);
+                    events.push(v);
+                }
+            }
+        }
+    }
+    if events.is_empty() {
+        return None;
+    }
+    Some(llmux_core::codex_compat::collect_stream(&events, request))
 }
 
 async fn responses_to_chat_streaming(
