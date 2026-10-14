@@ -3,8 +3,8 @@
 //! Pure functions and a streaming SSE state machine. No network I/O here —
 //! the route layer (llmux-server) drives HTTP. This mirrors the Bun version's
 //! `src/services/anthropic_ingress.ts` and additionally handles the gaps that
-//! version ignored: `thinking` request param, `cache_control` passthrough,
-//! cache usage fields, real streaming usage, tool_result `is_error`, and
+//! version ignored: `thinking` request param,
+//! cache usage fields, real streaming usage, and
 //! `image` url sources.
 
 use serde_json::{json, Map, Value};
@@ -60,6 +60,37 @@ fn strip_billing_header(system: &Value) -> Value {
     )
 }
 
+/// 剥掉 OpenAI chat 形状里没有的 Anthropic 专有字段。
+///
+/// 起因（2026-10-14 生产实测）：`os` 的首选 `cat-jam-free` 对带 `cache_control`
+/// 的 text 块回 `[invalid_value] Invalid value for 'messages[0].content'`，对带
+/// `is_error` 的 tool 消息回 `[unsupported_parameter]`，而**每个真实 Claude Code
+/// 请求都带这两个字段** —— 于是该候选对真实流量 20 次尝试 0 成功，只在用裸字符串
+/// 拨测时是绿的。
+///
+/// 为什么是**收尾遍历**而不是在 `transform_anthropic_message` 里删：顶层 `system`
+/// 的块数组不经过那个函数（见本函数开头单独构造 system 的那段），而生产的
+/// `messages[0]` 恰恰就是它。
+///
+/// 为什么删白名单外的一切（`zzz` 也会被同一条规则拒）不在这里实现：那种白名单
+/// 有静默丢掉未知字段的风险，见 docs/strict-chat-content-fields-fix.md §7。
+fn strip_anthropic_only_fields(messages: &mut [Value]) {
+    for msg in messages {
+        if let Some(parts) = msg.get_mut("content").and_then(Value::as_array_mut) {
+            for part in parts {
+                if let Some(obj) = part.as_object_mut() {
+                    obj.remove("cache_control");
+                }
+            }
+        }
+        if msg.get("role").and_then(Value::as_str) == Some("tool") {
+            if let Some(obj) = msg.as_object_mut() {
+                obj.remove("is_error");
+            }
+        }
+    }
+}
+
 /// Convert an Anthropic `/v1/messages` request body to an OpenAI
 /// `/chat/completions` request body. `resolved_model` is the dispatcher-resolved
 /// target model (alias expansion already applied upstream).
@@ -99,10 +130,9 @@ pub fn anthropic_to_openai_request_with(
 
     let mut out = Map::new();
     out.insert("model".to_string(), json!(resolved_model));
-    out.insert(
-        "messages".to_string(),
-        Value::Array(crate::proxy::normalize_system_messages(messages)),
-    );
+    let mut normalized = crate::proxy::normalize_system_messages(messages);
+    strip_anthropic_only_fields(&mut normalized);
+    out.insert("messages".to_string(), Value::Array(normalized));
 
     for key in ["max_tokens", "temperature", "top_p"] {
         if let Some(v) = body_obj.get(key) {
@@ -203,13 +233,18 @@ fn transform_anthropic_message(msg: &Value, messages: &mut Vec<Value>, add_cache
                         }
                     }
                     "text" => {
-                        // Keep `cache_control` on the part (OpenAI gateways ignore
-                        // unknown fields; those that understand it will honor it).
-                        // Also mark the part as an explicit shared-prefix boundary for
-                        // ninfer's KV-cache reuse. ninfer keeps the last four markers
+                        // `cache_control` is intentionally NOT carried over: it is an
+                        // Anthropic-only field and strict chat upstreams reject it
+                        // (real 400 from Console Go's cat-jam-free — it 400s even
+                        // on unknown keys, see `strip_anthropic_only_fields`).
+                        // Mark the part as an explicit shared-prefix boundary for
+                        // ninfer's KV-cache reuse instead. ninfer keeps the last four markers
                         // per request and drops the rest, so tagging every text block
                         // is safe there; gateways that don't know the field ignore it.
-                        let mut part = block.clone();
+                        let mut part = json!({
+                            "type": "text",
+                            "text": block.get("text").cloned().unwrap_or(Value::Null),
+                        });
                         if add_cache_breakpoint {
                             part["prompt_cache_breakpoint"] = json!({ "mode": "explicit" });
                         }
@@ -243,13 +278,14 @@ fn transform_anthropic_message(msg: &Value, messages: &mut Vec<Value>, add_cache
                             Some(v) => v.to_string(),
                             None => String::new(),
                         };
-                        let mut tool_msg =
+                        let tool_msg =
                             json!({ "role": "tool", "tool_call_id": tool_use_id, "content": content_str });
-                        // OpenAI has no is_error flag, but some gateways tolerate
-                        // the extra field; harmless otherwise.
-                        if let Some(err) = block.get("is_error") {
-                            tool_msg["is_error"] = err.clone();
-                        }
+                        // `is_error` is Anthropic-only: OpenAI has no such flag and
+                        // strict upstreams reject the message outright
+                        // (`[unsupported_parameter] ... messages[i].is_error`, real
+                        // 400 from Console Go's cat-jam-free). The error text itself
+                        // is already inside `content`, so dropping the flag loses
+                        // nothing the model can use.
                         tool_results.push(tool_msg);
                     }
                     _ => {

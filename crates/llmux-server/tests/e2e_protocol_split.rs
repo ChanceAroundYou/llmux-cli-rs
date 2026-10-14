@@ -645,3 +645,153 @@ async fn e2e_aggregate_chat_mode_forces_chat_over_messages_endpoint() {
         "forced chat must hit the chat upstream, got: {raw}"
     );
 }
+
+/// Aggregate alias with upstream_api=chat against a STRICT chat upstream:
+/// the mock rejects any content part carrying keys outside
+/// `{type, text, prompt_cache_breakpoint}` (real 400 from Console Go's
+/// `cat-jam-free`, 2026-10-14) and any message carrying `is_error`
+/// (real `[unsupported_parameter]` from the same model). llmux must strip both
+/// Anthropic-only fields in conversion — every real Claude Code request carries
+/// them, so without the strip the preferred candidate 400s on every real
+/// request while probes (bare-string body) stay green.
+///
+/// The allowlist deliberately INCLUDES `prompt_cache_breakpoint`: llmux adds
+/// that marker to every text part by default (`add_bp`) and the strict
+/// upstream accepts it (measured 200). A `{type, text}`-only allowlist would
+/// stay red after the fix — wrong mock, not wrong code.
+#[tokio::test]
+async fn e2e_aggregate_messages_ingress_chat_upstream_rejecting_anthropic_only_keys() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = axum::Router::new().route(
+        "/chat/completions",
+        axum::routing::post(|axum::Json(body): axum::Json<Value>| async move {
+            let msgs = body.get("messages").and_then(Value::as_array).cloned().unwrap_or_default();
+            for (i, m) in msgs.iter().enumerate() {
+                if m.get("is_error").is_some() {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        axum::Json(json!({
+                            "error": {
+                                "param": format!("messages[{i}].is_error"),
+                                "type": "invalid_request_error",
+                                "message": format!(
+                                    "Upstream request failed: [unsupported_parameter] Unrecognized request argument supplied: messages[{i}].is_error."
+                                ),
+                            }
+                        })),
+                    )
+                        .into_response();
+                }
+                if let Some(parts) = m.get("content").and_then(Value::as_array) {
+                    for p in parts {
+                        let extra: Vec<&String> = p
+                            .as_object()
+                            .map(|o| {
+                                o.keys()
+                                    .filter(|k| {
+                                        *k != "type" && *k != "text" && *k != "prompt_cache_breakpoint"
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        if !extra.is_empty() {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                axum::Json(json!({
+                                    "error": {
+                                        "param": format!("messages[{i}].content"),
+                                        "type": "invalid_request_error",
+                                        "message": format!(
+                                            "Upstream request failed: [invalid_value] Invalid value for 'messages[{i}].content': The contents of the message, either a string or a non-empty array of text parts, or null on an assistant message only."
+                                        ),
+                                    }
+                                })),
+                            )
+                                .into_response();
+                        }
+                    }
+                }
+            }
+            axum::Json(chat_completion_body("A-chat-strict")).into_response()
+        }),
+    );
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    let upstream = format!("http://{addr}");
+
+    let state = llmux_server::test_state().await;
+    let app = llmux_server::app(state.clone());
+
+    sqlx::query("INSERT INTO api_keys (name, key, allowed_models) VALUES (?, ?, ?)")
+        .bind("e2e-aggstrict")
+        .bind("sk-aggstrict")
+        .bind("*")
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    let cookie = login(app.clone()).await;
+
+    let (create_status, create_body) = api_post(
+        app.clone(),
+        &cookie,
+        "/api/accounts",
+        json!({
+            "alias": "strictacc",
+            "provider_id": "openai",
+            "api_key": "sk-mock",
+            "chat_endpoint": upstream,
+            "default_protocol": "chat",
+        }),
+    )
+    .await;
+    assert_eq!(create_status, StatusCode::OK, "{create_body:?}");
+    let acct_id = create_body["id"].as_i64().expect("account id");
+
+    let (st, body) = api_post(
+        app.clone(),
+        &cookie,
+        "/api/aggregate-aliases",
+        json!({
+            "alias": "agg-strict",
+            "candidates": [{"account_id": acct_id, "model": "strict-mock"}],
+            "upstream_api": "chat",
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body:?}");
+
+    // Fixture carries exactly the two fields llmux strips — and nothing else
+    // the strict mock would reject (no `zzz`-style unknown keys; see the
+    // spec's known-gap note on a general allowlist).
+    let (st, _resp, raw) = v1_post(
+        app.clone(),
+        "sk-aggstrict",
+        "/v1/messages",
+        json!({
+            "model": "agg-strict",
+            "max_tokens": 64,
+            "system": [
+                {"type": "text", "text": "You are terse.", "cache_control": {"type": "ephemeral"}}
+            ],
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}
+                ]},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_1", "name": "f", "input": {}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": "boom", "is_error": true}
+                ]}
+            ],
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "expected 200, got {st:?}\nraw={raw}");
+    assert!(
+        raw.contains("A-chat-strict"),
+        "strict chat upstream must be reached, got: {raw}"
+    );
+}

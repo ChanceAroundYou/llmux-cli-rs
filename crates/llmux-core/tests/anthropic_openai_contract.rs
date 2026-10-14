@@ -2,9 +2,9 @@
 //! Pure function tests — no network.
 
 use llmux_core::proxy::anthropic_openai::{
-    anthropic_to_openai_request, cache_usage_from_openai, map_tool_choice_to_openai,
-    map_tools_to_openai, openai_to_anthropic_response, parse_sse_chunks, sse_data_payload,
-    OpenAISseConverter,
+    anthropic_to_openai_request, anthropic_to_openai_request_with, cache_usage_from_openai,
+    map_tool_choice_to_openai, map_tools_to_openai, openai_to_anthropic_response,
+    parse_sse_chunks, sse_data_payload, OpenAISseConverter,
 };
 use llmux_core::proxy::responses::{
     anthropic_to_responses, chat_to_responses, ResponsesToChatConverter,
@@ -58,6 +58,139 @@ fn request_keeps_single_text_block_as_array_for_its_marker() {
         req["messages"][0]["content"],
         json!([{"type": "text", "text": "hi", "prompt_cache_breakpoint": {"mode": "explicit"}}])
     );
+}
+
+#[test]
+fn request_drops_cache_control_from_the_system_blocks() {
+    // 生产实测：Claude Code 的顶层 system 是带 cache_control 的块数组，转换后成为
+    // messages[0]；严格 chat 上游（Console Go 的 cat-jam-free）对它回
+    // `[invalid_value] Invalid value for 'messages[0].content'`。块数组与文本都要留住，
+    // 只把 cache_control 拿掉。
+    let req = anthropic_to_openai_request_with(
+        &json!({
+            "model": "m",
+            "system": [
+                {"type": "text", "text": "You are terse.", "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": "Tools are available.", "cache_control": {"type": "ephemeral"}}
+            ],
+            "messages": [{"role": "user", "content": "hi"}]
+        }),
+        "t",
+        false, // 不给 user 块加 marker，排除干扰
+    )
+    .unwrap();
+
+    let sys = &req["messages"][0];
+    assert_eq!(sys["role"], "system");
+    let parts = sys["content"].as_array().expect("system 块数组必须保持数组");
+    assert_eq!(parts.len(), 2, "块个数不得改变");
+    assert_eq!(parts[0]["text"], "You are terse.");
+    assert_eq!(parts[1]["text"], "Tools are available.");
+    assert!(parts[0].get("cache_control").is_none(), "system 块不得带 cache_control");
+    assert!(parts[1].get("cache_control").is_none(), "system 块不得带 cache_control");
+}
+
+#[test]
+fn request_drops_cache_control_from_user_text_blocks() {
+    // 与 U1 同一类，但走 transform_anthropic_message 的 text 分支。
+    // add_bp = true，让 lone text block 因 marker 保持数组形态，从而能断言 part 内部。
+    let req = anthropic_to_openai_request_with(
+        &json!({
+            "model": "m",
+            "messages": [{
+                "role": "user",
+                "content": [{"type": "text", "text": "big", "cache_control": {"type": "ephemeral"}}]
+            }]
+        }),
+        "t",
+        true,
+    )
+    .unwrap();
+
+    let part = &req["messages"][0]["content"][0];
+    assert_eq!(part["type"], "text");
+    assert_eq!(part["text"], "big");
+    assert!(part.get("cache_control").is_none(), "text 块不得带 cache_control");
+    assert_eq!(part["prompt_cache_breakpoint"], json!({"mode": "explicit"}), "llmux 自己的 marker 必须保留");
+}
+
+#[test]
+fn request_drops_is_error_from_tool_messages() {
+    // 实测：cat-jam-free 对带 is_error 的 tool 消息回 400
+    // `[unsupported_parameter] Unrecognized request argument supplied: messages[2].is_error`。
+    // 剥掉它，其余必须原样。
+    let req = anthropic_to_openai_request(
+        &json!({
+            "model": "m",
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_1", "name": "f", "input": {}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": "boom", "is_error": true}
+                ]}
+            ]
+        }),
+        "t",
+    )
+    .unwrap();
+
+    let tool_msg = &req["messages"][1];
+    assert_eq!(tool_msg["role"], "tool");
+    assert_eq!(tool_msg["tool_call_id"], "toolu_1");
+    assert_eq!(tool_msg["content"], "boom");
+    assert!(tool_msg.get("is_error").is_none(), "tool 消息不得带 is_error");
+}
+
+#[test]
+fn request_emits_no_anthropic_only_keys_anywhere() {
+    // 覆盖所有会产出这两种字段的形状（system 数组 / text 块 / tool_result / 多轮），
+    // 断言序列化后的整体里一个都不剩。这是「新加一条路径时忘了剥」的兜底。
+    let req = anthropic_to_openai_request_with(
+        &json!({
+            "model": "m",
+            "system": [{"type": "text", "text": "sys", "cache_control": {"type": "ephemeral"}}],
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "a", "cache_control": {"type": "ephemeral"}}
+                ]},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "f", "input": {}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "err", "is_error": true}
+                ]}
+            ]
+        }),
+        "t",
+        true,
+    )
+    .unwrap();
+
+    let serialized = serde_json::to_string(&req).unwrap();
+    assert!(!serialized.contains("cache_control"), "转换结果里不得出现 cache_control: {serialized}");
+    assert!(!serialized.contains("is_error"), "转换结果里不得出现 is_error: {serialized}");
+}
+
+#[test]
+fn request_flattens_a_lone_text_block_whose_only_extra_was_cache_control() {
+    // 单个 text 块只因 cache_control 而保持数组形态。剥掉之后它就该拍平成裸字符串 ——
+    // 那是所有上游都接受的形状，对严格后端最稳。注意 llmux 自己的 marker 依旧
+    // 会让数组保留（见 U2 与 request_keeps_single_text_block_as_array_for_its_marker）。
+    let req = anthropic_to_openai_request_with(
+        &json!({
+            "model": "m",
+            "messages": [{
+                "role": "user",
+                "content": [{"type": "text", "text": "big", "cache_control": {"type": "ephemeral"}}]
+            }]
+        }),
+        "t",
+        false,
+    )
+    .unwrap();
+
+    assert_eq!(req["messages"][0]["content"], json!("big"));
 }
 
 #[test]
@@ -143,7 +276,6 @@ fn request_converts_tool_use_and_tool_result() {
     assert_eq!(tool_msg["role"], "tool");
     assert_eq!(tool_msg["tool_call_id"], "toolu_1");
     assert_eq!(tool_msg["content"], "sunny");
-    assert_eq!(tool_msg["is_error"], false);
 }
 
 #[test]
@@ -319,7 +451,11 @@ fn request_maps_thinking_block_to_reasoning_fields() {
 }
 
 #[test]
-fn request_keeps_cache_control_on_text_block() {
+fn request_drops_cache_control_from_a_text_block() {
+    // 曾叫 request_keeps_cache_control_on_text_block。2026-10-14 生产实测后改契约：
+    // 严格 chat 上游（Console Go 的 cat-jam-free）对带 cache_control 的 text 块回 400
+    // `[invalid_value]`，而每个真实 Claude Code 请求都带它。该字段只在「上游是
+    // Anthropic Messages 端点」时有语义，那条路径不经此转换器（逐字节直通）。
     let req = anthropic_to_openai_request(
         &json!({
             "model": "m",
@@ -336,7 +472,7 @@ fn request_keeps_cache_control_on_text_block() {
 
     assert_eq!(req["messages"][0]["content"][0]["type"], "text");
     assert_eq!(req["messages"][0]["content"][0]["text"], "big");
-    assert_eq!(req["messages"][0]["content"][0]["cache_control"]["type"], "ephemeral");
+    assert!(req["messages"][0]["content"][0].get("cache_control").is_none());
 }
 
 #[test]
