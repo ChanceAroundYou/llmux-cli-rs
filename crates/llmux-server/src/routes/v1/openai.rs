@@ -424,9 +424,10 @@ pub(crate) async fn dispatch_with_conversion(
                                 None => { last_error = Some(format!("Failed to assemble codex stream: {e}")); failed_candidates += 1; continue; }
                             }
                         // zen 原生非流式：免费档强制上游 stream（缺了 403），
-                        // 回来的只能是 SSE —— chat 形组装。透传不做幽灵过滤。
+                        // 回来的只能是 SSE。Responses 入口走 responses 形组装，
+                        // Chat 入口走 chat 形组装。透传不做幽灵过滤。
                         } else if llmux_core::adapters::is_zen_native(account) && text.contains("data:") {
-                            match collect_zen_chat_response(&body_bytes).await {
+                            match collect_zen_passthrough_response(&body_bytes, &provider_request.body, ingress).await {
                                 Some(assembled) => assembled,
                                 None => { last_error = Some(format!("Failed to assemble zen stream: {e}")); failed_candidates += 1; continue; }
                             }
@@ -1198,6 +1199,23 @@ async fn collect_codex_response(body: &[u8], request: &Value) -> Option<Value> {
 ///（缺了 403），非流式下游在这里收成 JSON —— 与 collect_codex_response 同形，
 /// 只是组装器是 chat 形的（`collect_chat_stream`），不用 normalize（标准 OpenAI
 /// 形状）。空流返回 None（调用方记失败换候选）。
+/// Passthrough 分发：zen 免费档强制上游 stream，非流式下游收 SSE。
+/// 入口是什么形、就用什么组装器 —— Responses 入口经 Responses 上游（muse 系）
+/// 走 responses 形（`collect_stream`），Chat 入口经 chat 上游走 chat 形。
+/// 形错了组装出来的是另一个协议的 JSON，下游按错形解析直接 502。
+async fn collect_zen_passthrough_response(
+    body: &[u8],
+    request: &Value,
+    ingress: Protocol,
+) -> Option<Value> {
+    if ingress == Protocol::Responses {
+        collect_zen_responses_response(body, request).await
+    } else {
+        collect_zen_chat_response(body).await
+    }
+}
+
+/// zen 免费档 chat SSE body → 完整 chat.completion JSON。
 async fn collect_zen_chat_response(body: &[u8]) -> Option<Value> {
     let text = String::from_utf8_lossy(body);
     let mut events: Vec<Value> = Vec::new();
