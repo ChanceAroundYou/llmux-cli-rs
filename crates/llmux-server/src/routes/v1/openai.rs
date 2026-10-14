@@ -423,6 +423,13 @@ pub(crate) async fn dispatch_with_conversion(
                                 Some(assembled) => assembled,
                                 None => { last_error = Some(format!("Failed to assemble codex stream: {e}")); failed_candidates += 1; continue; }
                             }
+                        // zen 原生非流式：免费档强制上游 stream（缺了 403），
+                        // 回来的只能是 SSE —— chat 形组装。透传不做幽灵过滤。
+                        } else if llmux_core::adapters::is_zen_native(account) && text.contains("data:") {
+                            match collect_zen_chat_response(&body_bytes).await {
+                                Some(assembled) => assembled,
+                                None => { last_error = Some(format!("Failed to assemble zen stream: {e}")); failed_candidates += 1; continue; }
+                            }
                         } else {
                             last_error = Some(format!("Failed to parse response: {e}")); failed_candidates += 1; continue;
                         }
@@ -1165,6 +1172,47 @@ async fn collect_codex_response(body: &[u8], request: &Value) -> Option<Value> {
         return None;
     }
     Some(llmux_core::codex_compat::collect_stream(&events, request))
+}
+
+/// zen 免费档 chat SSE body → 完整 chat.completion JSON。zen 强制上游 `stream:true`
+///（缺了 403），非流式下游在这里收成 JSON —— 与 collect_codex_response 同形，
+/// 只是组装器是 chat 形的（`collect_chat_stream`），不用 normalize（标准 OpenAI
+/// 形状）。空流返回 None（调用方记失败换候选）。
+async fn collect_zen_chat_response(body: &[u8]) -> Option<Value> {
+    let text = String::from_utf8_lossy(body);
+    let mut events: Vec<Value> = Vec::new();
+    let mut current = String::new();
+    for line in text.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            if !current.is_empty() {
+                if let Some(payload) = sse_data_payload(&current) {
+                    if payload != "[DONE]" {
+                        if let Ok(v) = serde_json::from_str::<Value>(payload) {
+                            events.push(v);
+                        }
+                    }
+                }
+                current.clear();
+            }
+            continue;
+        }
+        current.push_str(t);
+        current.push('\n');
+    }
+    if !current.is_empty() {
+        if let Some(payload) = sse_data_payload(&current) {
+            if payload != "[DONE]" {
+                if let Ok(v) = serde_json::from_str::<Value>(payload) {
+                    events.push(v);
+                }
+            }
+        }
+    }
+    if events.is_empty() {
+        return None;
+    }
+    llmux_core::proxy::responses::collect_chat_stream(&events)
 }
 
 async fn responses_to_chat_streaming(

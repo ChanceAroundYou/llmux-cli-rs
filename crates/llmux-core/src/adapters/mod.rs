@@ -205,6 +205,153 @@ fn stable_oc_session(headers: &BTreeMap<String, String>) -> String {
     format!("llmux-{}", hex::encode(hasher.finalize())[..24].to_string())
 }
 
+/// zen 免费档的门是两个纯 HTTP 头（2026-10-14 实测钉死：llmux 自己的
+/// reqwest+rustls 栈带上这两个头直接 200 —— `AGENTS.md`/CHANGELOG 里的
+/// 「TLS 指纹拦截」是误判，那次 curl 实验混杂了手搓的假 ses_ 值）：
+/// `User-Agent: opencode/<ver>`（ver ≥ 1.18.0，1.17.x 回 426）+ `x-opencode-session`
+///（`ses_` + 12 位小写 hex + 14 位 base62；hex 低 12 位必须落在 [ff0, fff] ——
+/// nibble 突变探针（/tmp/rustprobe/src/bin/nibble.rs）：逐位改一个真实 id，
+/// 只有改 hex 第 9、10 位（低 12 位的高 8 位）时才 403，即门验的是
+/// `~hex & 0xfff ∈ [0x000, 0x00f]`，也就是 counter < 16）。
+///
+/// 只在 `category=zen` 的 POST 推理请求上注入，由调用点按判据显式传参 ——
+/// 不嗅 URL、不分模型、不分免费/付费。门对付费档只是「放行到计费墙」（402），
+/// 对 go/v1 无害但也不需要：go 账户是 `custom`，天然走不到这里（见
+/// [`is_console_go`] 那套）。
+pub const ZEN_USER_AGENT: &str =
+    "opencode/1.18.31 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14";
+
+/// 降序 session id：sidecar 的 `ocId("ses")` 原算法 —— `!(ms * 0x1000 + counter)`
+/// 的低 48 位 + 14 位随机 base62。counter 按毫秒重置（同毫秒连调才递增），
+/// 所以低 12 位恒为 `fff - counter` —— 门验的正是这个（nibble 突变探针：
+/// hex 低 12 位 ∈ [ff0, fff]，即 `~hex & 0xfff`（= counter）< 16）。
+/// 注意 counter 不能是全局单调的：跑到 16 以后低 12 位掉出 [ff0, fff]，
+/// 门直接 403 —— 必须像 sidecar 那样按毫秒清零；同毫秒超过 15 次则等下一
+/// 毫秒（否则紧循环测试 / 突发高并发下第 16 个起全是 403，且静默）。
+pub fn zen_session_id() -> String {
+    use std::sync::Mutex;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static STATE: Mutex<(u64, u64)> = Mutex::new((0, 0));
+    const B62: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+    let (ms, counter) = loop {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        {
+            let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+            if state.0 != now {
+                state.0 = now;
+                state.1 = 1;
+                break (now, 1);
+            }
+            if state.1 < 15 {
+                state.1 += 1;
+                break (now, state.1);
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    };
+    let n = !(ms.wrapping_mul(0x1000).wrapping_add(counter));
+    let mut id = String::from("ses_");
+    for i in 0..6 {
+        id.push_str(&format!("{:02x}", (n >> (40 - 8 * i)) & 0xff));
+    }
+    // ponytail: 裸 rand 逐字节取余。门只验后缀是 14 位 base62 字符（`-`→403、
+    // 长度 10/20→403），不验熵质量 —— xorshift 够了，不引入 rand 以外的依赖
+    // （rand 已是 workspace 依赖，无新增）。
+    let mut rand = rand::random::<u64>() | 1;
+    for _ in 0..14 {
+        rand ^= rand >> 12;
+        rand ^= rand << 25;
+        rand ^= rand >> 27;
+        id.push(B62[(rand.wrapping_mul(0x2545F4914F6CDD1D) % 62) as usize] as char);
+    }
+    id
+}
+
+/// zen 账户的出站身份头：UA + ses_，调用方自带永远优先（幂等）。
+/// `is_zen` 只能是 `account.category == "zen"` —— 不许嗅 URL（spec §2）。
+pub fn apply_zen_identity_headers(
+    is_zen: bool,
+    method: &str,
+    headers: &mut BTreeMap<String, String>,
+) {
+    if !is_zen || !method.eq_ignore_ascii_case("POST") {
+        return;
+    }
+    if !headers.contains_key("x-opencode-session") {
+        headers.insert("x-opencode-session".to_string(), zen_session_id());
+    }
+    if !headers.contains_key("user-agent") {
+        headers.insert("user-agent".to_string(), ZEN_USER_AGENT.to_string());
+    }
+}
+
+/// 免费档的硬性 body 要求（缺任一 →403，多带无碍，大小写敏感）：
+/// `stream:true` + tools 里同时有 `bash` 和 `read`。把调用方 body 就地改写，
+/// 返回是否动过 —— 非流式下游走聚合器时调用点用它判断上游形态。
+/// `is_zen` 同样只能是 category 判据。responses 形错形会 400，所以两形分开。
+pub fn apply_zen_free_tier_body(is_zen: bool, body: &mut Value, responses_shape: bool) -> bool {
+    if !is_zen {
+        return false;
+    }
+    let mut touched = false;
+    if body.get("stream").and_then(Value::as_bool) != Some(true) {
+        body["stream"] = Value::Bool(true);
+        touched = true;
+    }
+    let tools = body.get_mut("tools");
+    let has_tool = |t: &Value, want: &str| {
+        t.as_array().map(|a| {
+            a.iter().any(|item| {
+                let name = if responses_shape {
+                    item.get("name")
+                } else {
+                    item.get("function").and_then(|f| f.get("name"))
+                };
+                name.and_then(Value::as_str) == Some(want)
+            })
+        }).unwrap_or(false)
+    };
+    // 缺哪个补哪个 —— 不能见缺就全补，否则已有 bash 时会塞出第二个（实测：
+    // ["bash","bash","read"]，门倒是不拦，但下游会收到重复工具声明）。
+    let need = |t: Option<&Value>| {
+        ["bash", "read"]
+            .into_iter()
+            .filter(|want| t.map(|v| !has_tool(v, want)).unwrap_or(true))
+            .collect::<Vec<_>>()
+    };
+    let dummy = |name: &str| {
+        if responses_shape {
+            json!({"type": "function", "name": name, "description": "Available tool",
+                   "parameters": {"type": "object", "properties": {}}})
+        } else {
+            json!({"type": "function", "function": {"name": name, "description": "Available tool",
+                   "parameters": {"type": "object", "properties": {}}}})
+        }
+    };
+    match tools {
+        Some(t) => {
+            let missing = need(Some(t));
+            if missing.is_empty() {
+            } else {
+                let arr = t.as_array_mut().expect("need() checked is_array");
+                for name in missing {
+                    arr.push(dummy(name));
+                }
+                touched = true;
+            }
+        }
+        None => {
+            body["tools"] = Value::Array(["bash", "read"].map(dummy).to_vec());
+            touched = true;
+        }
+    }
+    touched
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Account {
     pub id: i64,
@@ -228,7 +375,7 @@ pub struct Account {
     /// （请求会带空 Bearer 去上游拿 401，不是回退到别的地址 —— 见
     /// [`is_codex_native`]）。
     pub codex_auth_json: String,
-    /// 账户类别，决定后端路由/处理路径：custom / codex / zen_free。
+    /// 账户类别，决定后端路由/处理路径：custom / codex / zen。
     /// 空 = 按 custom 处理（老数据未迁移时的兜底）。
     pub category: String,
 }
@@ -243,20 +390,6 @@ pub const ACCOUNT_COLUMNS: &str = "id, alias, provider_id, api_key, base_url, \
      anthropic_base_url, is_active, weight, openai_compatible, chat_endpoint, \
      responses_endpoint, messages_endpoint, default_protocol, balance_provider, \
      balance_auth, codex_auth_json, category";
-
-/// `zen_free` 账户的固定前缀。
-///
-/// 与 codex 同构，但地址来源不同：codex 打的是外网固定后端，zen_free 打的是
-/// **部署里旁挂的 `zen-free` sidecar** —— `opencode.ai/zen/v1` 免费档按 TLS
-/// ClientHello 指纹拦截，llmux（Rust/reqwest）直连一律 403，只能经 Node 旁挂
-/// （`deploy/zen-free/`，compose 内网，不发布端口）。
-///
-/// 改 sidecar 的地址/端口时，**改这个常量**（并同步 compose）。账户侧不需要、
-/// 也不允许配：那三个端点字段对 zen_free 没有意义，可编辑只会被写错 ——
-/// 写错就是直连被指纹门 403，或者指向一个不存在的容器（codex-api 那次的形状）。
-/// sidecar 服务 `/v1/chat/completions`、`/v1/responses`、`/v1/messages` 三个形状，
-/// 所以三种协议共用这一个前缀。
-pub const ZEN_FREE_BASE: &str = "http://zen-free:6446/v1";
 
 impl From<crate::models::Account> for Account {
     fn from(value: crate::models::Account) -> Self {
@@ -453,8 +586,8 @@ pub fn build_passthrough_with_beta(
 ) -> ProviderRequest {
     let proto = protocol;
     // codex 原生账户：直连 codex 私有后端，私有头 + payload 预处理。
-    // zen_free 的 sidecar 前缀由 `endpoint_for` 统一处理（见该函数）。
     let is_codex_native = is_codex_native(account);
+    let is_zen = is_zen_native(account);
     let base = if is_codex_native && proto != crate::protocol::Protocol::Messages {
         crate::codex_compat::CODEX_BACKEND_BASE
     } else {
@@ -537,6 +670,12 @@ pub fn build_passthrough_with_beta(
         body = crate::codex_compat::prepare_response(&body, model);
         body = crate::codex_compat::normalize_codex_payload(&body, &[]);
     }
+    // zen 免费档硬门：stream:true + bash/read（缺任一 →403）。透传不做过滤 ——
+    // 幽灵调用原样送达下游，客户端报错后以 tool_result 送回，模型自己消化。
+    if is_zen && proto != crate::protocol::Protocol::Messages {
+        apply_zen_free_tier_body(true, &mut body, proto == crate::protocol::Protocol::Responses);
+        apply_zen_identity_headers(true, "POST", &mut headers);
+    }
     // 记账句柄挂在 request 上：调用点已经在传 `&ProviderRequest`，不必改签名。
     ProviderRequest {
         method: "POST".into(),
@@ -577,6 +716,12 @@ fn json_headers() -> BTreeMap<String, String> {
 /// 三处调用点（base 覆盖 / 头注入 / payload 预处理）共用这一个判据，别各写各的。
 pub fn is_codex_native(account: &Account) -> bool {
     account.category == "codex"
+}
+
+/// zen 原生账户判定：`category=zen`。唯一门（spec §2）—— 不嗅 URL、不分模型、
+/// 不分免费/付费。go 账户是 `custom`，天然走不到 zen 分支。
+pub fn is_zen_native(account: &Account) -> bool {
+    account.category == "zen"
 }
 
 fn normalize_base_url(value: &str) -> String {
@@ -736,6 +881,151 @@ mod console_go_header_tests {
         );
         assert_eq!(explicit["x-opencode-session"], "caller-sess");
         assert_eq!(explicit["user-agent"], "my-ua");
+    }
+}
+
+#[cfg(test)]
+mod zen_header_tests {
+    use super::*;
+
+    fn map(kvs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        kvs.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// spec §6: `ses_` 形状 ^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$，100 次全合规。
+    #[test]
+    fn zen_session_id_matches_the_gate_shape() {
+        for _ in 0..100 {
+            let id = zen_session_id();
+            assert!(
+                id.starts_with("ses_")
+                    && id.len() == 4 + 12 + 14
+                    && id[4..16].chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+                    && id[16..].chars().all(|c| c.is_ascii_alphanumeric()),
+                "ses_ id failed the shape: {id}"
+            );
+        }
+    }
+
+    /// spec §6 形状测试的姊妹断言：hex 低 12 位恒落在 [ff0, fff] —— 这是门
+    /// 真正验的东西（nibble 突变探针钉死：`~hex & 0xfff ∈ [0xff0, 0xfff]`，
+    /// 即 `!(ms*0x1000 + counter)` 里 counter < 16 的数学必然）。counter 按
+    /// 毫秒重置，所以正常调用永远满足；这个测试防的是将来有人把 counter
+    /// 改成全局单调（跑过 16 次后门直接 403，且静默）。
+    #[test]
+    fn zen_session_id_low_12_bits_are_near_all_ones() {
+        for _ in 0..100 {
+            let id = zen_session_id();
+            let low12 = u16::from_str_radix(&id[13..16], 16).unwrap_or(0) & 0x0fff;
+            assert!(
+                (0xff0..=0xfff).contains(&low12),
+                "ses_ low 12 bits must be in [ff0, fff] (gate rejects otherwise): {id}"
+            );
+        }
+    }
+
+    /// spec §6: UA 常量以 `opencode/` 开头，版本 ≥ 1.18（防手滑改小：1.17.x →426）。
+    #[test]
+    fn zen_user_agent_declares_a_supported_opencode_version() {
+        assert!(ZEN_USER_AGENT.starts_with("opencode/"), "UA must start with opencode/: {ZEN_USER_AGENT}");
+        let ver = ZEN_USER_AGENT.split_whitespace().next().unwrap()["opencode/".len()..].to_string();
+        let mut parts = ver.split('.');
+        let major: u64 = parts.next().unwrap_or("0").parse().unwrap_or(0);
+        let minor: u64 = parts.next().unwrap_or("0").parse().unwrap_or(0);
+        assert!(
+            major > 1 || (major == 1 && minor >= 18),
+            "UA version must be >= 1.18 (1.17.x gets 426): {ZEN_USER_AGENT}"
+        );
+    }
+
+    /// spec §4: zen 账户 POST 补齐两头；custom 原样不动；非 POST 不动。
+    #[test]
+    fn apply_zen_identity_headers_fills_both_for_zen_posts_only() {
+        let mut h = map(&[("authorization", "Bearer oc-xxx")]);
+        super::apply_zen_identity_headers(true, "POST", &mut h);
+        assert_eq!(h["user-agent"], super::ZEN_USER_AGENT);
+        assert!(h["x-opencode-session"].starts_with("ses_"));
+
+        let mut custom = map(&[("authorization", "Bearer sk-aaa")]);
+        super::apply_zen_identity_headers(false, "POST", &mut custom);
+        assert!(!custom.contains_key("x-opencode-session"));
+        assert!(!custom.contains_key("user-agent"));
+
+        let mut get = map(&[("authorization", "Bearer oc-xxx")]);
+        super::apply_zen_identity_headers(true, "GET", &mut get);
+        assert!(!get.contains_key("x-opencode-session"));
+    }
+
+    /// spec §4: 调用方自带 UA/ses 永远优先（幂等）。
+    #[test]
+    fn caller_supplied_zen_identity_always_wins() {
+        let mut h = map(&[("x-opencode-session", "caller-sess"), ("user-agent", "my-ua")]);
+        super::apply_zen_identity_headers(true, "POST", &mut h);
+        assert_eq!(h["x-opencode-session"], "caller-sess");
+        assert_eq!(h["user-agent"], "my-ua");
+    }
+
+    /// spec §6: 同毫秒连调不重复（counter 解决同毫秒去重）。
+    #[test]
+    fn zen_session_ids_are_unique_within_the_same_millisecond() {
+        let a = zen_session_id();
+        let b = zen_session_id();
+        assert_ne!(a, b, "back-to-back ids must differ");
+    }
+
+    /// spec §4/§6 工具注入：chat/responses 两形各补；已有不重复；
+    /// [Bash,Read] 大写照补（大小写敏感）；custom 不动；调用方第 3 个工具保留。
+    #[test]
+    fn zen_free_tier_body_injects_bash_and_read() {
+        use serde_json::json;
+        // chat 形：缺 read → 只补 read
+        let mut b = json!({"model": "m", "stream": true, "tools": [
+            {"type": "function", "function": {"name": "bash", "description": "t", "parameters": {"type": "object", "properties": {}}}}
+        ]});
+        assert!(super::apply_zen_free_tier_body(true, &mut b, false));
+        let names: Vec<_> = b["tools"].as_array().unwrap().iter()
+            .map(|t| t["function"]["name"].as_str().unwrap().to_string()).collect();
+        assert_eq!(names, vec!["bash", "read"]);
+
+        // responses 形：无 tools → 建两个
+        let mut r = json!({"model": "m", "input": "hi", "stream": true});
+        assert!(super::apply_zen_free_tier_body(true, &mut r, true));
+        let names: Vec<_> = r["tools"].as_array().unwrap().iter()
+            .map(|t| t["name"].as_str().unwrap().to_string()).collect();
+        assert_eq!(names, vec!["bash", "read"]);
+
+        // 已有不重复
+        let mut full = json!({"model": "m", "stream": true, "tools": [
+            {"type": "function", "function": {"name": "bash", "description": "t", "parameters": {"type": "object", "properties": {}}}},
+            {"type": "function", "function": {"name": "read", "description": "t", "parameters": {"type": "object", "properties": {}}}}
+        ]});
+        assert!(!super::apply_zen_free_tier_body(true, &mut full, false));
+
+        // 大写不算数 + 第 3 个工具保留且顺序不变
+        let mut mixed = json!({"model": "m", "stream": true, "tools": [
+            {"type": "function", "function": {"name": "MyTool", "description": "t", "parameters": {"type": "object", "properties": {}}}},
+            {"type": "function", "function": {"name": "Bash", "description": "t", "parameters": {"type": "object", "properties": {}}}}
+        ]});
+        assert!(super::apply_zen_free_tier_body(true, &mut mixed, false));
+        let names: Vec<_> = mixed["tools"].as_array().unwrap().iter()
+            .map(|t| t["function"]["name"].as_str().unwrap().to_string()).collect();
+        assert_eq!(names, vec!["MyTool", "Bash", "bash", "read"]);
+
+        // custom 不动
+        let mut c = json!({"model": "m", "stream": false});
+        assert!(!super::apply_zen_free_tier_body(false, &mut c, false));
+        assert!(c.get("stream") != Some(&json!(true)));
+    }
+
+    /// spec §4：zen body stream=false → 改写后 true。
+    #[test]
+    fn zen_free_tier_body_forces_streaming() {
+        use serde_json::json;
+        let mut b = json!({"model": "m", "stream": false, "messages": []});
+        assert!(super::apply_zen_free_tier_body(true, &mut b, false));
+        assert_eq!(b["stream"], json!(true));
     }
 }
 

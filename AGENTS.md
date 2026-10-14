@@ -237,40 +237,36 @@ ChatGPT Plus 的 Codex 额度直连 `chatgpt.com/backend-api/codex`，llmux 原�
 - 归档：sidecar 方案见 `docs/codex-absorption-plan.md`；旧 compose 备份在路由器
   `docker-compose.yml.bak-before-codex-remove-20261013`。
 
-## OpenCode Zen 免费上游（sidecar）
+## OpenCode Zen 上游（原生，2026-10-14 起；sidecar 已退役）
 
-把 OpenCode Zen 免费档（`opencode.ai/zen/v1` 的 `*-free` 模型）当 OpenAI 兼容上游接进
-llmux：路由器上旁挂第三个容器 `zen-free`，llmux 用一个 `provider_id=zen-free` 账户
-指向它。**llmux 自身零代码改动。**
+把 OpenCode Zen（`opencode.ai/zen/v1` 的 `*-free` 免费档 + 付费模型）当 OpenAI
+兼容上游接进 llmux：llmux 原生实现身份伪装 + 免费档 body 改写（`adapters` 的
+`ZEN_USER_AGENT` / `zen_session_id` / `apply_zen_free_tier_body`）。路由器
+`docker-compose.yml` 已删 `zen-free` 服务，`deploy/zen-free/` 目录已删除
+（git 历史可回）。
 
-为什么只能旁挂：免费档按 **TLS ClientHello 指纹（JA3/JA4）**拦截，HTTP 头伪装无效 ——
-2026-10-13 实测 curl / reqwest(rustls) / reqwest(native-tls) 的推理 POST 一律 403
-`FreeTierError`，而 Node 客户端 200。llmux 是 Rust/reqwest，**无论怎么伪装头都进不去**，
-和 codex 是同一处境。详见 `deploy/zen-free/` 头注释与排障入口。
-
-- 镜像自建：`deploy/zen-free/Dockerfile`（node:22-slim + vendor 的 `server.mjs`），
-  compose 服务名 `zen-free`，容器内 6446，**不 publish 端口** —— 只在 `llmux_default`
-  网络内，llmux 走 `http://zen-free:6446/v1`。隔离靠"不 publish"保证，不要设
-  `PROXY_HOST=127.0.0.1`（那会让它只监听容器 loopback，连 llmux 都够不着）。
-- 源码出处：`https://github.com/dinhkarate/opencode-zen-free-proxy`（v12）。
-  **唯一的改动是模型不限白名单**：上游写死的 6 个模型已有 3 个被 deprecate
-  （`mimo-v2.5-free` 实测回 "use mimo-v2.6-flash-free"），所以存在性改从
-  `GET /zen/v1/models`（免鉴权）取，端点按模型单次探测 + `models-cache.json` 记住。
-  免费档的三道硬门（`bash`+`read` 工具、`stream:true`、TLS 指纹）**原样保留，不能放开**。
-- llmux 账户：`provider_id=zen-free`，四端点全填 `http://zen-free:6446/v1`，
-  `api_key` 与 compose 的 `ZEN_API_KEY` 同值，`default_protocol=chat`，
-  **`balance_provider` 必须显式设 `none`**（与 codex 同因：内网 key 打外网余额必失败）。
-- 模型别名用户自建（实现侧不建）：chat 系（`big-pickle` / `cat-jam-free` /
-  `ling-3.1-flash-free` / `mimo-v2.6-flash-free` …）走 Chat；
+- ⚠️ **勘误（2026-10-14）**：此前记的「按 TLS ClientHello 指纹（JA3/JA4）拦截，
+  Rust/reqwest 无论怎么伪装头都进不去」**是误判** —— 那次 curl 实验混杂了手搓的
+  假 `ses_` 值。单变量隔离 + llmux 自家 reqwest+rustls 栈实测：门是两个纯 HTTP
+  头（`User-Agent: opencode/≥1.18` + 合规降序 `ses_`），带上就 200。
+- llmux 账户：`category=zen`，base_url 账户自配（`https://opencode.ai/zen/v1`，
+  go 套餐走 `https://opencode.ai/zen/go/v1` —— go 账户保持 `custom`，不动）。
+  出站统一伪装成 OpenCode 客户端；免费档另需 `stream:true` + 注入 dummy
+  `bash`/`read`（缺任一 →403），非流式下游本地聚合 SSE。
+- 免费档匿名即可（`Authorization` 不发也 200；带了就必须真，假 key 反而 401）。
+  zen 付费档带我们的 go key 回 **402 Insufficient account funds** —— go 套餐凭据
+  在 zen 侧无额度，这是计费墙不是门，等充值自动生效。
+- 模型别名用户自建（实现侧不建）：chat 系（`cat-jam-free` / `longcat-…` …）走 Chat；
   `muse-spark-*-contributor-free` 走 Responses（`upstream_api=responses`）。
-  绑定前先看 `GET http://zen-free:6446/v1/models` 的当前清单 —— 免费模型会换代。
-- 模型↔端点硬绑定：跨端点回 `400 ModelProtocolUnsupported`（sidecar 侧已前置拦截，
-  省一次上游调用）。`muse-spark-*` 只认 responses，其余 `*-free` 只认 chat。
-- 排障：`docker compose logs zen-free`（`[PROBE] <model> → chat|responses` 是端点判定；
-  `[ZEN RATE LIMITED]` / `FreeUsageLimitError` 是免费档全局配额，打满后退避重跑，
-  **不是 sidecar 故障**）。自检 `node scripts/probe-zen-free.mjs --key oc-...`。
-- ⚠️ 免费档随时可能收紧（模型换代、配额缩水、指纹库更新）；模型换代时 sidecar
-  自动跟（动态发现），但别名里绑的旧 id 要人手工换。
+  绑定前先看 `GET https://opencode.ai/zen/v1/models` 的当前清单 —— 免费模型会换代。
+- 模型↔端点硬绑定：跨端点回 `400 ModelProtocolUnsupported`。
+  `muse-spark-*` 只认 responses，其余 `*-free` 只认 chat。
+- 幽灵调用：注入的 dummy `bash`/`read` 可能被模型真调（调用方没声明相关工具时），
+  llmux **透传不做过滤** —— 客户端报错后以 tool_result 送回，模型自己消化。
+- ⚠️ 走的是**伪装成 OpenCode 客户端**用免费额度（门上原文 *"free tier can only
+  be used from within OpenCode"*），有 ToS/风控风险；免费档规则随时可能收紧。
+- ⚠️ 免费档随时可能收紧（模型换代、配额缩水、门规则更新）；别名里绑的旧 id
+  要人手工换。
 
 ## 上游请求超时
 
@@ -332,6 +328,13 @@ context_length 字段：先查 models_cache（上游提供）→ 再查内置表
   **28 个文件 / ~2400 行**，而我真正的改动是 11 个文件 / 162 行。回退得逐 hunk 手工重建
   （7 个文件是「HEAD + 枚举改动」重建的）。格式不是本仓的约定，**按周围代码的风格手写**。
   真要跑就 `rustfmt --check` 单文件看差异，且别带 `--emit`，别让它落盘。
+- ⛔ **绝不丢弃不是你写的改动**：工作区冒出没见过的 diff（自己从没碰过的文件、mtime 异常的新内容），
+  禁止 `git checkout HEAD -- <file>`、`git stash drop`、`git clean -fd` 等任何丢弃操作——
+  不管它看起来多像「外部误写入」或「和本次任务无关」。先保到安全位置
+  （`git stash push` 后别 drop，或 `git diff -- <file> > /tmp/keep-xxx.patch`），
+  然后停下来问用户这是谁的、怎么处理。
+  2026-10-14 教训：全量测试期间 `adapters/mod.rs` 冒出 141 行别人的改动，被误判为外部写入而
+  `checkout` 还原，只能从 dangling commit 里捞 patch 碎片。
 
 ## 下游消费方
 

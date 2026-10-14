@@ -12,52 +12,34 @@
   使重复的规则前缀无法稳定复用同一缓存分区。现在缺省按账户生成稳定 session，显式
   `prompt_cache_key` 仍优先；`x-client-request-id` 改为每次请求单独生成。
 
-- **OpenCode Zen 免费档 sidecar（`deploy/zen-free/`）**。
-  `opencode.ai/zen/v1` 的 `*-free` 模型按 TLS ClientHello 指纹拦截 —— 2026-10-13
-  实测 curl / reqwest(rustls) / reqwest(native-tls) 的推理 POST 一律 403
-  `FreeTierError`，只有 Node 客户端能过；llmux（Rust/reqwest）无法直连，只能像
-  codex 一样旁挂。`deploy/zen-free/server.mjs` 是上游
-  `opencode-zen-free-proxy` v12 的 fork，唯一改动是模型不限白名单（存在性取自
-  `GET /zen/v1/models`，端点按模型单次探测 + `models-cache.json` 记住；
-  上游写死的 6 个里已有 3 个被 deprecate）。compose 加 `zen-free` 服务
-  （不 publish 端口，隔离靠 compose 内网）。llmux 侧零代码改动：
-  `provider_id=zen-free` 账户 + `balance_provider=none`，别名用户自建。
-  自检：`node scripts/probe-zen-free.mjs --key oc-...`。
+- **OpenCode Zen 上游原生直连（`category=zen`），sidecar 退役**。
+  2026-10-14 实测推翻旧前提：免费档的门是两个纯 HTTP 头
+  （`User-Agent: opencode/>=1.18` + 合规降序 `ses_`），llmux 自己的
+  reqwest+rustls 栈带上就 200 —— 此前记的「TLS ClientHello 指纹拦截」
+  是误判（那次 curl 实验混杂了手搓的假 `ses_` 值）。
+  `deploy/zen-free/` 目录已删除（git 历史可回），compose 删 `zen-free` 服务。
+
+  - 出站伪装（`adapters`）：`ZEN_USER_AGENT` + `zen_session_id()`（降序算法，
+    counter 按毫秒重置、同毫秒超 15 次等下一毫秒）+ `apply_zen_identity_headers`；
+    免费档另需 `apply_zen_free_tier_body`（强制 `stream:true` + 注入 dummy
+    `bash`/`read`，缺任一 →403）。
+  - 非流式下游本地聚合 SSE：responses 形复用 `collect_stream`，chat 形新增
+    `collect_chat_stream` + 服务端 `collect_zen_chat_response`。
+  - 迁移 `0035`：`zen_free`→`zen`，sidecar 前缀 → `https://opencode.ai/zen/v1`
+    （非 sidecar 的自定义地址不动，账户自配）。
+  - 应用范围由 `category == "zen"` 唯一决定（`is_zen_native`），不嗅 URL；
+    go 账户保持 `custom`，行为逐字不变。
+  - 幽灵调用（注入的 dummy 被模型真调）透传不做过滤，客户端报错后以
+    tool_result 送回，模型自己消化。
 
 ### Fixed
 
-- **zen_free 账户的上游地址同样不再可配，钉死为 sidecar 前缀**。与 codex 同一类
-  问题、同一个形状：`opencode.ai/zen/v1` 免费档按 TLS ClientHello 指纹拦截
-  （curl / reqwest 一律 403 `FreeTierError`，只有 Node 能过），llmux 只能经旁挂的
-  `zen-free` sidecar 走 compose 内网。地址配成直连唯一的后果就是 403，配成别的
-  则指向一个不存在的容器。
-
-  - `endpoint_for` 对 `category=zen_free` 直接返回固定前缀（三种协议都是它 ——
-    sidecar 实现了 `/v1/chat/completions`、`/v1/responses`、`/v1/messages`，
-    哪种能通是 per-model 的事，由探测决定，不是配置决定）。放在函数最前，
-    路由 / 拨测 / 别名校验一次覆盖。
-  - ⚠️ codex 的 `Messages` 仍返回 `None`，**没有**跟着改成固定值：codex 后端没有
-    `/v1/messages`，返回它会让 Anthropic 入口走成「假 passthrough」去打一个不
-    存在的路径。两者共用分支但语义不同，注释写在 `endpoint_for` 里。
-  - 写入侧 `pin_fixed_endpoints` 与迁移 `0034` 把存量行三列都归位（此前
-    `deploy/` 的注释要求账户四端点全填同一个地址，手填必错）。
-  - 界面：zen_free 与 codex 共用只读端点展示（各自列出它支持的协议）。
-
-  生产落地（2026-10-13，走管理 API 改的数据，不经手 DB）：`zen1`(43) / `zen2`(62)
-  原先是 `category=custom` + 直连 `https://opencode.ai/zen/v1`，其上的免费模型
-  全部被指纹门拒（`OpenCode's free tier can only be used from within OpenCode`）。
-  现改为 `category=zen_free`、端点归位到 sidecar、api_key 换成 sidecar
-  `/app/api-keys.json` 里的 `user-default`，并启用。
-
-  ⚠️ **账户的 api_key 必须是 sidecar 自己的 key**，不是 opencode 的 `oc_sk_…`：
-  sidecar 的 `auth()` 拿请求 Bearer 跟 `api-keys.json` 逐个比对，不匹配就 401
-  `Invalid API key`。下面 compose 里那个 `ZEN_API_KEY` env **这一版 sidecar 不读**，
-  key 是它首次启动时自己生成落盘的 —— 别照着旧注释去填。
-
-  验证（真机）：拨测 `cat-jam-free` → OK，sidecar 日志出现来自 llmux 的
-  `[OAI] … user-default cat-jam-free`，即请求确实经内网 sidecar 而不再直连。
-  `step-5-preview-free` 同一时刻回 upstream `Endpoint is unavailable`
-  （直接打 sidecar 也是同一结果，是上游侧的 per-model 限流，不是配置问题）。
+- **zen_free 退役 → `category=zen` 原生直连（推翻 0034 的钉死决定）**。
+  与 codex 同一类问题、但结论相反：`opencode.ai/zen/v1` 免费档的门是两个纯
+  HTTP 头（不是 TLS 指纹），llmux 原生能过 —— sidecar 下线，`ZEN_FREE_BASE`
+  常量删除，`endpoint_for` 的 `zen_free` 分支删除（zen 与 custom 同形读 base_url），
+  写入侧 `pin_fixed_endpoints` 只剩 codex（zen 地址账户自配），迁移 `0035` 归位
+  存量行，界面 `zen_free`→`zen` 并删掉只读端点展示。
 
 - **定向拨测与按密钥筛选统计的测试隔离**。`shared_state()` 用**具名**共享内存库
   （`file:keyid_shared?mode=memory&cache=shared`），4 个测试传同一个名字 ——

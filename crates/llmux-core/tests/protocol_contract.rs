@@ -122,29 +122,31 @@ fn codex_account_still_has_no_messages_endpoint() {
 }
 
 #[test]
-fn zen_free_account_resolves_all_three_protocols_to_the_fixed_prefix() {
-    // sidecar 实现了 `/v1/chat/completions`、`/v1/responses`、`/v1/messages`，
-    // 账户字段里写什么都覆盖 —— 尤其是配错成直连 `opencode.ai/zen/v1` 时，
-    // 否则 TLS 指纹门直接 403（`deploy/zen-free/` 的注释）。
+fn zen_account_reads_its_own_endpoints_like_custom() {
+    // spec §2/§3：zen 不钉常量，端点解析与 custom 同形（读 base_url）。
+    // base_url 为空 → None，不回退到任何常量。
     let mut a = acc(
         Some("https://opencode.ai/zen/v1"),
         Some("https://opencode.ai/zen/v1"),
-        Some("https://opencode.ai/zen/v1"),
+        None,
         "chat",
     );
-    a.category = "zen_free".into();
-    assert_eq!(endpoint_for(&a, Protocol::Chat), Some("http://zen-free:6446/v1"));
+    a.category = "zen".into();
+    a.base_url = Some("https://opencode.ai/zen/v1".into());
+    assert_eq!(
+        endpoint_for(&a, Protocol::Chat),
+        Some("https://opencode.ai/zen/v1")
+    );
     assert_eq!(
         endpoint_for(&a, Protocol::Responses),
-        Some("http://zen-free:6446/v1")
+        Some("https://opencode.ai/zen/v1")
     );
-    assert_eq!(
-        endpoint_for(&a, Protocol::Messages),
-        Some("http://zen-free:6446/v1")
-    );
-    assert!(supports(&a, Protocol::Chat)
-        && supports(&a, Protocol::Responses)
-        && supports(&a, Protocol::Messages));
+    assert_eq!(endpoint_for(&a, Protocol::Messages), None);
+
+    let mut empty = acc(None, None, None, "chat");
+    empty.category = "zen".into();
+    assert_eq!(endpoint_for(&empty, Protocol::Chat), None);
+    assert!(!supports(&empty, Protocol::Chat));
 }
 
 #[test]

@@ -36,24 +36,23 @@ import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group';
 
 const PROTOCOLS = ['chat', 'responses', 'messages'] as const;
 type Protocol = typeof PROTOCOLS[number];
-type AccountCategory = 'custom' | 'codex' | 'zen_free';
-const ACCOUNT_CATEGORIES: AccountCategory[] = ['custom', 'codex', 'zen_free'];
+type AccountCategory = 'custom' | 'codex' | 'zen';
+const ACCOUNT_CATEGORIES: AccountCategory[] = ['custom', 'codex', 'zen'];
 
-// 固定端点账户的上游地址由代码决定（`llmux_core::codex_compat::CODEX_BACKEND_BASE`
-// 与 `llmux_core::adapters::ZEN_FREE_BASE`），这里只是**展示**它，不是配置项 ——
-// 提交时服务端会覆盖任何传入的端点。改地址只改 Rust 常量（zen_free 同时要改
-// `deploy/` 的 compose），改完记得同步这两个字符串（仅影响只读展示）。
+// 固定端点账户（只有 codex）的上游地址由代码决定
+// （`llmux_core::codex_compat::CODEX_BACKEND_BASE`），这里只是**展示**它，
+// 不是配置项 —— 提交时服务端会覆盖任何传入的端点。改地址只改 Rust 常量。
+// zen 是普通账户同形，地址账户自配（spec §7），不进这套。
 const CODEX_FIXED_ENDPOINT = 'https://chatgpt.com/backend-api/codex';
-const ZEN_FREE_FIXED_ENDPOINT = 'http://zen-free:6446/v1';
 
 /// 该类别是否属于「上游地址由代码钉死」。是则返回它的类别键（用于展示哪几个
 /// 协议 / 哪个地址），否则 null。
-const fixedEndpointCategory = (category: string): 'codex' | 'zen_free' | null =>
-  category === 'codex' ? 'codex' : category === 'zen_free' ? 'zen_free' : null;
+const fixedEndpointCategory = (category: string): 'codex' | null =>
+  category === 'codex' ? 'codex' : null;
 
-/// 固定端点账户提交时的默认协议：codex 只有 responses，zen_free 走 chat。
+/// 固定端点账户提交时的默认协议：codex 只有 responses，其余走用户选择。
 const defaultProtocolFor = (category: string, fallback: string): string =>
-  category === 'codex' ? 'responses' : category === 'zen_free' ? 'chat' : fallback;
+  category === 'codex' ? 'responses' : fallback;
 
 // 需要网页登录凭据（Cookie/Token）而非 API Key 的余额查询类型。
 const COOKIE_KINDS = ['copilot', 'commandcode', 'opencode', 'opencode-go', 'opencode-zen', 'deepseek', 'chatgpt', 'openai', 'bailian'];
@@ -370,15 +369,14 @@ function t_balanceHint(): string {
   return '余额未查询';
 }
 
-/// 固定端点账户（codex / zen_free）的只读端点展示 —— 与其摆三个可编辑输入框，
+/// 固定端点账户（只有 codex）的只读端点展示 —— 与其摆三个可编辑输入框，
 /// 不如直说「地址是内置的」。服务端在创建/更新时也会把端点覆盖成同一个值
 /// （见 `routes/accounts.rs::pin_fixed_endpoints`）。
 ///
-/// codex 只列 responses（它的后端只有那一种形状）；zen_free 列全三种 ——
-/// sidecar 三种都实现了，哪种能通由拨测按模型探出来，不是配置决定的。
-function FixedEndpointNotice({ label, category }: { label: string; category: 'codex' | 'zen_free' }) {
-  const base = category === 'codex' ? CODEX_FIXED_ENDPOINT : ZEN_FREE_FIXED_ENDPOINT;
-  const protocols = category === 'codex' ? ['responses'] : ['chat', 'responses', 'messages'];
+/// codex 只列 responses（它的后端只有那一种形状）。
+function FixedEndpointNotice({ label, category }: { label: string; category: 'codex' }) {
+  const base = CODEX_FIXED_ENDPOINT;
+  const protocols = ['responses'];
   return (
     <div className="space-y-1.5 border-t border-border pt-3">
       <label className="text-xs font-bold text-muted-foreground uppercase">{label}</label>
@@ -579,7 +577,7 @@ export default function Accounts() {
     return [...new Set([...distinctUrls, ...own])];
   }, [distinctUrls, editingAccount]);
 
-  // 固定端点账户（codex / zen_free）的地址由后端钉死：表单里没有可配的端点，
+  // 固定端点账户（只有 codex）的地址由后端钉死：表单里没有可配的端点，
   // 所以也不该报「至少要启用一个端点」——那条规则只对 custom 账户成立。
   const formFixedCategory = fixedEndpointCategory(formData.category);
   const formEnabledProtocols = PROTOCOLS.filter(p => formEnabled[p]);

@@ -169,8 +169,8 @@ fn probeable(account: &Account, p: Protocol) -> bool {
     // codex 原生账户只有 Responses 一种形状 —— 遗留的 chat 端点曾让 chat 成为候选，
     // 那一发正是打到已退役 sidecar 的请求（2026-10-13）。
     //
-    // zen_free 不在这条分支里：它由 `endpoint_for` 对三种协议都返回固定前缀，
-    // 本函数直接 `is_some()` 即可 —— 哪种能通是 per-model 的，由探测决定。
+    // zen 是普通账户同形：读 base_url，哪种能通 per-model，由探测决定。
+    // spec §2：go 账户是 custom，天然走不到 zen 分支。
     if crate::adapters::is_codex_native(account) {
         return p == Protocol::Responses;
     }
@@ -209,7 +209,8 @@ async fn send_probe(
     let request = build_probe_request(account, model, protocol);
     let mut headers = request.headers.clone();
     // Console Go 的 x-opencode-session / UA：探测不走 execute_provider_request，
-    // 必须在这里补，否则 400 MissingSessionID。
+    // 必须在这里补，否则 400 MissingSessionID。zen 同理：build_passthrough 里
+    // 已经注入（UA + ses_），这里只补 Console Go 那套，别动 zen 的。
     crate::adapters::apply_upstream_identity_headers(&request.method, &request.url, &mut headers);
     let mut req = client.post(&request.url);
     for (key, value) in &headers {

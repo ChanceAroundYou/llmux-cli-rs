@@ -1221,6 +1221,124 @@ fn sse_event(event_type: &str, data: Value) -> String {
     format!("event: {}\ndata: {}\n\n", event_type, data)
 }
 
+/// OpenAI chat SSE chunk 流 → 完整 chat.completion 对象。zen 免费档强制上游
+/// `stream:true`，非流式下游在这里收成 JSON（spec §5：上游永远 SSE，下流要
+/// 流式直通、要非流式本地聚合）。调用方保证传的是**已解析的 data JSON 数组**
+///（SSE 切分由调用方做，`[DONE]` 不必预先剔除）；纯函数，不管 IO。
+///
+/// 组装规则：`choices[0].delta.content` 按序拼；`delta.tool_calls[]` 按 index
+/// 归并（`function.arguments` 是分片 JSON 字符串，到齐再拼）；首个 chunk 的
+/// `id`/`created` 留作响应头；`usage` 尾片保留；空流 → None（调用方记失败）。
+pub fn collect_chat_stream(events: &[Value]) -> Option<Value> {
+    struct Call {
+        id: String,
+        name: String,
+        args: String,
+    }
+    let mut resp_id: Option<String> = None;
+    let mut created: Option<Value> = None;
+    let mut model: Option<String> = None;
+    let mut content = String::new();
+    let mut calls: HashMap<usize, Call> = HashMap::new();
+    let mut finish: Option<String> = None;
+    let mut usage: Option<Value> = None;
+    let mut seen = false;
+
+    for event in events {
+        if event.get("object").and_then(Value::as_str) != Some("chat.completion.chunk") {
+            continue;
+        }
+        seen = true;
+        if resp_id.is_none() {
+            resp_id = event.get("id").and_then(Value::as_str).map(str::to_string);
+        }
+        if created.is_none() {
+            created = event.get("created").cloned();
+        }
+        if model.is_none() {
+            model = event.get("model").and_then(Value::as_str).map(str::to_string);
+        }
+        if let Some(u) = event.get("usage") {
+            if !u.is_null() {
+                usage = Some(u.clone());
+            }
+        }
+        let Some(choice) = event.get("choices").and_then(|c| c.as_array()).and_then(|a| a.first()) else {
+            continue;
+        };
+        if let Some(fr) = choice.get("finish_reason").and_then(Value::as_str) {
+            if !fr.is_empty() && fr != "null" {
+                finish = Some(fr.to_string());
+            }
+        }
+        let delta = choice.get("delta").unwrap_or(&Value::Null);
+        if let Some(t) = delta.get("content").and_then(Value::as_str) {
+            content.push_str(t);
+        }
+        if let Some(tcs) = delta.get("tool_calls").and_then(Value::as_array) {
+            for tc in tcs {
+                let idx = tc.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                let call = calls.entry(idx).or_insert(Call {
+                    id: String::new(),
+                    name: String::new(),
+                    args: String::new(),
+                });
+                if let Some(id) = tc.get("id").and_then(Value::as_str) {
+                    if !id.is_empty() {
+                        call.id = id.to_string();
+                    }
+                }
+                if let Some(name) = tc.get("function").and_then(|f| f.get("name")).and_then(Value::as_str) {
+                    if !name.is_empty() {
+                        call.name = name.to_string();
+                    }
+                }
+                if let Some(args) = tc.get("function").and_then(|f| f.get("arguments")).and_then(Value::as_str) {
+                    call.args.push_str(args);
+                }
+            }
+        }
+    }
+
+    if !seen {
+        return None;
+    }
+    let mut order: Vec<usize> = calls.keys().cloned().collect();
+    order.sort_unstable();
+    let mut tool_calls = Vec::new();
+    for idx in order {
+        let call = &calls[&idx];
+        tool_calls.push(json!({
+            "id": call.id,
+            "type": "function",
+            "index": idx,
+            "function": {"name": call.name, "arguments": call.args},
+        }));
+    }
+    let has_tools = !tool_calls.is_empty();
+    let mut message = Map::new();
+    message.insert("role".to_string(), json!("assistant"));
+    message.insert(
+        "content".to_string(),
+        if content.is_empty() { Value::Null } else { json!(content) },
+    );
+    if has_tools {
+        message.insert("tool_calls".to_string(), Value::Array(tool_calls));
+    }
+    // finish_reason 为空时按有没有 tool_calls 兜底（上游偶尔只发 tool_calls 终片）。
+    let finish_reason = finish.unwrap_or_else(|| if has_tools { "tool_calls".to_string() } else { "stop".to_string() });
+    let model_name = model.unwrap_or_default();
+    json!({
+        "id": resp_id.map(Value::String).unwrap_or_else(|| json!(format!("chatcmpl-{}", uuid_simple()))),
+        "object": "chat.completion",
+        "created": created.unwrap_or(json!(0)),
+        "model": model_name,
+        "choices": [{"index": 0, "message": Value::Object(message), "finish_reason": finish_reason}],
+        "usage": usage.unwrap_or(json!({"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0})),
+    })
+    .into()
+}
+
 fn uuid_simple() -> String {
     use uuid::Uuid;
     Uuid::new_v4().simple().to_string()
@@ -1229,6 +1347,63 @@ fn uuid_simple() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// spec §6：3 片 content + 2 片 tool_call arguments → 单 JSON；usage 尾片保留。
+    #[test]
+    fn collect_chat_stream_assembles_content_tool_calls_and_usage() {
+        let events: Vec<Value> = [
+            json!({"id": "chatcmpl-1", "object": "chat.completion.chunk", "created": 7, "model": "m",
+                   "choices": [{"index": 0, "delta": {"role": "assistant", "content": "hel"}, "finish_reason": null}]}),
+            json!({"id": "chatcmpl-1", "object": "chat.completion.chunk", "created": 7, "model": "m",
+                   "choices": [{"index": 0, "delta": {"content": "lo "}, "finish_reason": null}]}),
+            json!({"id": "chatcmpl-1", "object": "chat.completion.chunk", "created": 7, "model": "m",
+                   "choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": "call-1", "type": "function",
+                       "function": {"name": "bash", "arguments": "{\"comm"}}]}, "finish_reason": null}]}),
+            json!({"id": "chatcmpl-1", "object": "chat.completion.chunk", "created": 7, "model": "m",
+                   "choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0,
+                       "function": {"arguments": "and\": \"ls\"}"}}]}, "finish_reason": null}]}),
+            json!({"id": "chatcmpl-1", "object": "chat.completion.chunk", "created": 7, "model": "m",
+                   "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+                   "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}}),
+        ]
+        .into_iter()
+        .collect();
+        let out = collect_chat_stream(&events).expect("non-empty stream must assemble");
+        assert_eq!(out["id"], json!("chatcmpl-1"));
+        assert_eq!(out["object"], json!("chat.completion"));
+        assert_eq!(out["model"], json!("m"));
+        assert_eq!(out["choices"][0]["message"]["content"], json!("hello "));
+        let tc = &out["choices"][0]["message"]["tool_calls"][0];
+        assert_eq!(tc["id"], json!("call-1"));
+        assert_eq!(tc["function"]["name"], json!("bash"));
+        assert_eq!(tc["function"]["arguments"], json!("{\"command\": \"ls\"}"));
+        assert_eq!(out["choices"][0]["finish_reason"], json!("tool_calls"));
+        assert_eq!(out["usage"]["prompt_tokens"], json!(10));
+        assert_eq!(out["usage"]["completion_tokens"], json!(5));
+    }
+
+    /// spec §6：空流 → None（调用方记失败，不 panic）。
+    #[test]
+    fn collect_chat_stream_returns_none_for_empty_stream() {
+        assert!(collect_chat_stream(&[]).is_none());
+        let junk = vec![json!({"object": "not-a-chat-chunk"})];
+        assert!(collect_chat_stream(&junk).is_none());
+    }
+
+    /// spec §6：纯文本流 → content 有值、无 tool_calls、finish stop。
+    #[test]
+    fn collect_chat_stream_text_only_has_no_tool_calls() {
+        let events = vec![
+            json!({"id": "c1", "object": "chat.completion.chunk", "created": 1, "model": "m",
+                   "choices": [{"index": 0, "delta": {"content": "hi"}, "finish_reason": null}]}),
+            json!({"id": "c1", "object": "chat.completion.chunk", "created": 1, "model": "m",
+                   "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+        ];
+        let out = collect_chat_stream(&events).expect("must assemble");
+        assert_eq!(out["choices"][0]["message"]["content"], json!("hi"));
+        assert!(out["choices"][0]["message"].get("tool_calls").is_none());
+        assert_eq!(out["choices"][0]["finish_reason"], json!("stop"));
+    }
 
     #[test]
     fn chat_content_parts_use_responses_vocabulary() {

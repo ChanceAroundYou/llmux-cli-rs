@@ -763,9 +763,10 @@ async fn alias_bound_to_codex_account_stores_responses_whatever_was_sent() {
 
 /// zen_free 账户的上游地址同样由代码固定（sidecar 前缀），三列都钉成同一个
 /// 地址：sidecar 实现了三种形状，哪种能通是 per-model 的。客户端传什么都不生效 ——
-/// 尤其是传直连 `opencode.ai/zen/v1` 时，那会被 TLS 指纹门 403。
+/// zen 账户地址自配（spec 选了"账户自配"）：服务端不覆盖客户端传的端点，
+/// 与 codex 的钉死正相反。spec §2：应用范围由 category 唯一决定。
 #[tokio::test]
-async fn zen_free_account_endpoints_are_pinned_to_the_sidecar_prefix() {
+async fn zen_account_endpoints_are_user_configured_not_pinned() {
     use http::header;
     let state = llmux_server::test_state().await;
     let app = llmux_server::app(state.clone());
@@ -788,14 +789,14 @@ async fn zen_free_account_endpoints_are_pinned_to_the_sidecar_prefix() {
         .header(header::COOKIE, &cookie)
         .body(Body::from(
             json!({
-                "alias": "zen-pinned",
-                "provider_id": "zen-free",
+                "alias": "zen-native",
+                "provider_id": "zen",
                 "api_key": "oc-test",
                 "base_url": "https://opencode.ai/zen/v1",
                 "chat_endpoint": "https://opencode.ai/zen/v1",
                 "default_protocol": "chat",
                 "skip_validation": true,
-                "category": "zen_free",
+                "category": "zen",
             })
             .to_string(),
         ))
@@ -816,14 +817,12 @@ async fn zen_free_account_endpoints_are_pinned_to_the_sidecar_prefix() {
     let accounts: Value = serde_json::from_slice(&bytes).unwrap();
     let acct = accounts
         .as_array()
-        .and_then(|a| a.iter().find(|a| a["alias"] == "zen-pinned"))
-        .expect("account zen-pinned must exist");
+        .and_then(|a| a.iter().find(|a| a["alias"] == "zen-native"))
+        .expect("account zen-native must exist");
 
-    let fixed = "http://zen-free:6446/v1";
-    assert_eq!(acct["base_url"], fixed, "客户端传的直连地址必须被覆盖");
-    assert_eq!(acct["chat_endpoint"], fixed);
-    assert_eq!(acct["responses_endpoint"], fixed);
-    assert_eq!(acct["messages_endpoint"], fixed);
+    // 客户端传的地址原样保留 —— zen 不钉常量。
+    assert_eq!(acct["base_url"], "https://opencode.ai/zen/v1");
+    assert_eq!(acct["category"], "zen");
 }
 
 #[tokio::test]

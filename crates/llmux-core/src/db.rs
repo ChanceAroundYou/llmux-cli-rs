@@ -37,6 +37,7 @@ pub const MIGRATION_0031: &str = include_str!("migrations/0031_codex_auth_json.s
 pub const MIGRATION_0032: &str = include_str!("migrations/0032_account_category.sql");
 pub const MIGRATION_0033: &str = include_str!("migrations/0033_pin_codex_account_endpoints.sql");
 pub const MIGRATION_0034: &str = include_str!("migrations/0034_pin_zen_free_account_endpoints.sql");
+pub const MIGRATION_0035: &str = include_str!("migrations/0035_zen_replaces_zen_free.sql");
 
 pub async fn connect_sqlite(database_url: &str) -> Result<SqlitePool> {
     let options = SqliteConnectOptions::from_str(database_url)?
@@ -97,6 +98,7 @@ pub async fn init_db(pool: &SqlitePool) -> Result<()> {
         ("0032", MIGRATION_0032),
         ("0033", MIGRATION_0033),
         ("0034", MIGRATION_0034),
+        ("0035", MIGRATION_0035),
     ];
     for (name, sql) in &migrations {
         for statement in sql.split(';') {

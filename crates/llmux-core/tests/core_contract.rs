@@ -617,6 +617,75 @@ async fn migration_0034_pins_existing_zen_free_accounts() {
     assert_eq!(plain, "https://api.example.com/v1");
 }
 
+/// 0035：zen_free 退役 → zen 原生直连。2026-10-14 实测推翻 0034 的前提：
+/// 免费档的门是两个纯 HTTP 头，reqwest+rustls 带上就 200 —— sidecar 下线，
+/// llmux 原生打 opencode.ai/zen/v1。
+#[tokio::test]
+async fn migration_0035_retires_zen_free_to_native_zen() {
+    let pool = memory_db().await;
+    sqlx::query(
+        "INSERT INTO accounts (id, alias, provider_id, api_key, base_url, chat_endpoint,
+                               responses_endpoint, messages_endpoint, category)
+         VALUES (94, 'zen', 'zen-free', 'k', 'http://zen-free:6446/v1',
+                 'http://zen-free:6446/v1', 'http://zen-free:6446/v1',
+                 'http://zen-free:6446/v1', 'zen_free'),
+                (95, 'custom-addr', 'zen-free', 'k', 'https://my-proxy.local/v1',
+                 'https://my-proxy.local/v1', 'https://my-proxy.local/v1',
+                 'https://my-proxy.local/v1', 'zen_free'),
+                (96, 'plain', 'custom', 'k', 'https://api.example.com/v1',
+                 'https://api.example.com/v1', NULL, NULL, 'custom')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(llmux_core::db::MIGRATION_0035)
+        .execute(&pool)
+        .await
+        .expect("0035 应在存量数据上执行成功");
+
+    // sidecar 前缀 → 直连，类别改名。
+    let rows: Vec<(String, String, String, String, String)> = sqlx::query_as(
+        "SELECT base_url, chat_endpoint, responses_endpoint, messages_endpoint, category
+         FROM accounts WHERE id = 94",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows[0],
+        (
+            "https://opencode.ai/zen/v1".to_string(),
+            "https://opencode.ai/zen/v1".to_string(),
+            "https://opencode.ai/zen/v1".to_string(),
+            "https://opencode.ai/zen/v1".to_string(),
+            "zen".to_string(),
+        )
+    );
+
+    // 非 sidecar 的自定义地址不动（账户自配），但类别照样改名。
+    let custom: (String, String) =
+        sqlx::query_as("SELECT base_url, category FROM accounts WHERE id = 95")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        custom,
+        ("https://my-proxy.local/v1".to_string(), "zen".to_string())
+    );
+
+    // 普通账户一个字不能动。
+    let plain: (String, String) =
+        sqlx::query_as("SELECT base_url, category FROM accounts WHERE id = 96")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        plain,
+        ("https://api.example.com/v1".to_string(), "custom".to_string())
+    );
+}
+
 /// 0027 给 model_prices 加缓存价与来源列，并种入公开渠道查不到报价的免费模型。
 /// `source` 默认 `'openrouter'` 是刷新「只覆盖自动行」这条规矩的地基。
 #[tokio::test]

@@ -274,7 +274,11 @@
     "aliasPlaceholder": "e.g., Work Claude",
     "provider": "Provider",
     "category": "Account category",
-    "categoryOptions": { "custom": "Custom", "codex": "Codex", "zen_free": "Zen Free" },
+    "categoryOptions": {
+      "custom": "Custom",
+      "codex": "Codex",
+      "zen": "Zen"
+    },
     "apiKey": "API Key",
     "baseUrl": "Base URL",
     "noAccounts": "No accounts configured",
