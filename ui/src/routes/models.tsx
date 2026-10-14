@@ -662,7 +662,7 @@ export default function Models() {
                   if (s === false) return "bg-destructive";
                   return "bg-muted-foreground/30";
                 };
-                const pendingNote = isLocked ? " 🔒已锁定（探测与升降级暂停）" : (agg.pending_target != null ? ` ⏳待切换到 #${agg.pending_target + 1} (${agg.confirm_count}/3)` : "");
+                const pendingNote = isLocked ? " 已锁定（探测与升降级暂停）" : (agg.pending_target != null ? ` ⏳待切换到 #${agg.pending_target + 1} (${agg.confirm_count}/3)` : "");
                 return (
                   <div
                     key={agg.id}
@@ -675,7 +675,6 @@ export default function Models() {
                         <CopyButton value={agg.alias} size={10} className="p-1 opacity-0 group-hover:opacity-100 transition-opacity shrink-0" />
                         {pendingNote && <span className="text-xs text-warning font-bold truncate">{pendingNote}</span>}
                       </div>
-                      <Button variant="ghost" size="icon" onClick={(e) => { e.stopPropagation(); setAggregateLock(agg.id, !isLocked).catch(()=>{}); }} title={isLocked ? "解锁（恢复探测与升降级）" : "锁定（暂停探测与升降级）"} className="h-6 w-6 shrink-0 text-muted-foreground hover:text-primary transition-all">{isLocked ? <Lock size={12} /> : <Unlock size={12} />}</Button>
                       <Button variant="ghost" size="icon" onClick={(e) => { e.stopPropagation(); setAggregateToDelete({ id: agg.id, name: agg.alias }); }} className="h-6 w-6 shrink-0 text-muted-foreground hover:text-destructive transition-all"><Trash2 size={12} /></Button>
                     </div>
                     <div className="space-y-1">
@@ -688,17 +687,14 @@ export default function Models() {
                               <span className="font-bold text-muted-foreground w-4 shrink-0">#{idx+1}</span>
                               <div className={cn("w-2 h-2 rounded-full shrink-0", statusDot(idx))} title={String(agg.last_status?.[idx] ?? "unknown")} />
                               <span className="font-bold truncate">{acc ? acc.alias : `account#${c.account_id}`}</span>
-                              {isActive(idx) ? <span className="ml-auto shrink-0 text-primary font-bold text-[10px] px-1.5 py-0.5 rounded bg-primary/10 border border-primary/20">活跃</span> : <button onClick={(e) => { e.stopPropagation(); setAggregateActive(agg.id, idx).catch(()=>{}); }} className="ml-auto shrink-0 text-[10px] px-1.5 py-0.5 rounded border border-border bg-muted/50 hover:bg-primary/10 hover:text-primary transition-colors">设为活跃</button>}
-                              {/* 互斥锁：已有某 idx 被锁时，其它 candidate 的锁按钮禁用 */}
-                              {isLocked && !lockedHere ? (
-                                <span title="已锁 elsewhere，先解锁" className="shrink-0 text-muted-foreground/40 text-[10px]">🔒</span>
-                              ) : (
-                                <button
-                                  onClick={(e) => { e.stopPropagation(); if (lockedHere) { setAggregateLock(agg.id, false).catch(()=>{}); } else { setAggregateActive(agg.id, idx).then(()=>setAggregateLock(agg.id, true)).catch(()=>{}); } }}
-                                  title={lockedHere ? "解锁" : "锁定到此模型"}
-                                  className={cn("ml-1 shrink-0 text-[10px] px-1.5 py-0.5 rounded border transition-colors", lockedHere ? "bg-primary/10 text-primary border-primary/20" : "bg-muted/50 border-border hover:bg-primary/10 hover:text-primary")}
-                                >{lockedHere ? "已锁" : "锁定"}</button>
-                              )}
+                              {isActive(idx) ? <span className="ml-auto shrink-0 text-primary font-bold text-[10px] px-1.5 py-0.5 rounded bg-primary/10 border border-primary/20">活跃</span> : <button disabled={isLocked} onClick={(e) => { e.stopPropagation(); setAggregateActive(agg.id, idx).catch(()=>{}); }} className={cn("ml-auto shrink-0 text-[10px] px-1.5 py-0.5 rounded border border-border transition-colors", isLocked ? "bg-muted/30 text-muted-foreground/40 cursor-not-allowed" : "bg-muted/50 hover:bg-primary/10 hover:text-primary")}>设为活跃</button>}
+                              {/* per-model 互斥锁：锁定时仅被锁模型显示「解锁」，其余禁用 */}
+                              <button
+                                disabled={isLocked && !lockedHere}
+                                onClick={(e) => { e.stopPropagation(); if (lockedHere) { setAggregateLock(agg.id, false).catch(()=>{}); } else { setAggregateActive(agg.id, idx).then(()=>setAggregateLock(agg.id, true)).catch(()=>{}); } }}
+                                title={lockedHere ? "解锁" : "锁定到此模型"}
+                                className={cn("ml-1 shrink-0 text-[10px] px-1.5 py-0.5 rounded border transition-colors", lockedHere ? "bg-primary/10 text-primary border-primary/20" : isLocked ? "bg-muted/30 text-muted-foreground/40 cursor-not-allowed border-border" : "bg-muted/50 border-border hover:bg-primary/10 hover:text-primary")}
+                              >{lockedHere ? "解锁" : "锁定"}</button>
                             </div>
                             <div className="pl-6 truncate text-muted-foreground">{c.model}</div>
                           </div>
