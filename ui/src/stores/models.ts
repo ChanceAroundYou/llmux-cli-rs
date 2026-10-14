@@ -49,6 +49,7 @@ export interface AggregateAlias {
   interval_secs: number;
   upstream_api?: string | null;
   active: number;
+  locked?: number | boolean | null;
   last_status: (boolean | null)[];
   pending_target: number | null;
   confirm_count: number;
@@ -77,6 +78,7 @@ interface ModelsState {
   saveAggregateAlias: (alias: string, candidates: AggregateCandidate[], intervalSecs?: number, confirm?: boolean, upstreamApi?: string, firstByteTimeoutSecs?: number | null) => Promise<void>;
   deleteAggregateAlias: (id: number) => Promise<void>;
   setAggregateActive: (id: number, active: number) => Promise<void>;
+  setAggregateLock: (id: number, locked: boolean) => Promise<void>;
   setModelDisabled: (accountId: number, model: string, disabled: boolean) => Promise<void>;
   testModel: (modelId: string, providerId?: string, accountId?: number) => Promise<{ success: boolean; error?: string; latency?: number; status?: number; via?: string | null; supported?: string[]; mismatchedConfig?: string | null }>;
   startTestQueue: (models: { model: string, providerId: string, accountId?: number }[], scope?: string) => Promise<{ success: boolean; error?: string }>;
@@ -308,6 +310,13 @@ export const useModelsStore = create<ModelsState>((set, get) => ({
     try {
       const res = await apiFetch(`/api/aggregate-aliases/${id}/active`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ active }) });
       if (!res.ok) { const data = await res.json(); throw new Error(data.error || 'Failed to set active'); }
+      await get().fetchAggregateAliases();
+    } catch (err: any) { set({ error: err.message }); throw err; }
+  },
+  setAggregateLock: async (id, locked) => {
+    try {
+      const res = await apiFetch(`/api/aggregate-aliases/${id}/lock`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ locked }) });
+      if (!res.ok) { const data = await res.json(); throw new Error(data.error || 'Failed to set lock'); }
       await get().fetchAggregateAliases();
     } catch (err: any) { set({ error: err.message }); throw err; }
   },

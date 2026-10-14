@@ -12,7 +12,7 @@ use crate::app::AppState;
 
 pub async fn list_aggregate_aliases(Extension(state): Extension<AppState>) -> Response {
     let rows = match sqlx::query_as::<_, AggregateAliasRow>(
-        "SELECT id, alias, candidates, interval_secs, upstream_api, first_byte_timeout_secs, created_at, updated_at FROM aggregate_aliases ORDER BY id",
+        "SELECT id, alias, candidates, interval_secs, upstream_api, first_byte_timeout_secs, active_idx, locked, created_at, updated_at FROM aggregate_aliases ORDER BY id",
     )
     .fetch_all(&state.pool)
     .await
@@ -46,6 +46,7 @@ pub async fn list_aggregate_aliases(Extension(state): Extension<AppState>) -> Re
             "upstream_api": row.upstream_api.clone().unwrap_or_else(|| "chat".to_string()),
             "first_byte_timeout_secs": row.first_byte_timeout_secs,
             "active": active,
+            "locked": row.locked.unwrap_or(0),
             "last_status": last_status,
             "pending_target": pending_target,
             "confirm_count": confirm_count,
@@ -235,7 +236,7 @@ pub async fn set_aggregate_alias(
     }
 
     match sqlx::query(
-        "INSERT INTO aggregate_aliases (alias, candidates, interval_secs, upstream_api, first_byte_timeout_secs, updated_at) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP) ON CONFLICT(alias) DO UPDATE SET candidates=excluded.candidates, interval_secs=excluded.interval_secs, upstream_api=excluded.upstream_api, first_byte_timeout_secs=excluded.first_byte_timeout_secs, updated_at=CURRENT_TIMESTAMP",
+        "INSERT INTO aggregate_aliases (alias, candidates, interval_secs, upstream_api, first_byte_timeout_secs, active_idx, updated_at) VALUES (?, ?, ?, ?, ?, 0, CURRENT_TIMESTAMP) ON CONFLICT(alias) DO UPDATE SET candidates=excluded.candidates, interval_secs=excluded.interval_secs, upstream_api=excluded.upstream_api, first_byte_timeout_secs=excluded.first_byte_timeout_secs, active_idx=0, updated_at=CURRENT_TIMESTAMP",
     )
     .bind(&alias)
     .bind(&candidates_json)
@@ -289,7 +290,7 @@ pub async fn delete_aggregate_alias(
     Path(id): Path<String>,
 ) -> Response {
     let row = match sqlx::query_as::<_, AggregateAliasRow>(
-        "SELECT id, alias, candidates, interval_secs, upstream_api, first_byte_timeout_secs, created_at, updated_at FROM aggregate_aliases WHERE id = ?",
+        "SELECT id, alias, candidates, interval_secs, upstream_api, first_byte_timeout_secs, active_idx, locked, created_at, updated_at FROM aggregate_aliases WHERE id = ?",
     )
     .bind(&id)
     .fetch_optional(&state.pool)
@@ -361,7 +362,7 @@ pub async fn set_aggregate_active(
     Json(body): Json<Value>,
 ) -> Response {
     let row = match sqlx::query_as::<_, AggregateAliasRow>(
-        "SELECT id, alias, candidates, interval_secs, upstream_api, first_byte_timeout_secs, created_at, updated_at FROM aggregate_aliases WHERE id = ?",
+        "SELECT id, alias, candidates, interval_secs, upstream_api, first_byte_timeout_secs, active_idx, locked, created_at, updated_at FROM aggregate_aliases WHERE id = ?",
     )
     .bind(&id)
     .fetch_optional(&state.pool)
@@ -389,10 +390,57 @@ pub async fn set_aggregate_active(
     let alias = row.alias.clone();
     let changed = state.aggregate_router.lock().unwrap().set_active(&alias, target, len);
     state.invalidate_aggregate_cache(&alias);
+    // C-A2：落库，否则重启回到 0。失败只打日志 —— 内存已切成功，
+    // 库写失败不能把一次成功的手动操作变成 500。
+    if let Err(e) = sqlx::query("UPDATE aggregate_aliases SET active_idx = ? WHERE alias = ?")
+        .bind(target as i64)
+        .bind(&alias)
+        .execute(&state.pool)
+        .await
+    {
+        tracing::warn!("🔀 [agg:{}] active_idx persist failed: {e}", alias);
+    }
     if let Ok(mut cache) = state.models_cache.lock() {
         *cache = None;
     }
     tracing::info!("🔀 [agg:{}] active switched -> {} (manual)", alias, target);
     let _ = changed;
     Json(json!({ "success": true, "active": target })).into_response()
+}
+
+/// C-B2/B3：锁定/解锁。锁定后该别名的后台探活跳过、请求侧三个 record_* no-op，
+/// 只剩手动 set_active 可用；解锁后探活保留择优（从当前 active 往上找）。
+pub async fn set_aggregate_lock(
+    Extension(state): Extension<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    let row = match sqlx::query_as::<_, AggregateAliasRow>(
+        "SELECT id, alias, candidates, interval_secs, upstream_api, first_byte_timeout_secs, active_idx, locked, created_at, updated_at FROM aggregate_aliases WHERE id = ?",
+    )
+    .bind(&id)
+    .fetch_optional(&state.pool)
+    .await
+    {
+        Ok(Some(r)) => r,
+        Ok(None) => return crate::error::simple_error("Aggregate alias not found", StatusCode::NOT_FOUND),
+        Err(e) => return crate::error::simple_error(format!("Failed to lookup aggregate alias: {e}"), StatusCode::INTERNAL_SERVER_ERROR),
+    };
+    let Some(locked) = body.get("locked").and_then(Value::as_bool) else {
+        return crate::error::simple_error("Missing required field: locked", StatusCode::BAD_REQUEST);
+    };
+    let len = serde_json::from_str::<Vec<Value>>(&row.candidates).map(|v| v.len()).unwrap_or(0).max(1);
+    if let Err(e) = sqlx::query("UPDATE aggregate_aliases SET locked = ? WHERE id = ?")
+        .bind(if locked { 1 } else { 0 })
+        .bind(&id)
+        .execute(&state.pool)
+        .await
+    {
+        return crate::error::simple_error(format!("Failed to persist lock: {e}"), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+    // 先落库、后改内存：重启恢复以库为准，顺序反了会丢一次锁定。
+    state.aggregate_router.lock().unwrap().set_locked(&row.alias, locked, len);
+    state.invalidate_aggregate_cache(&row.alias);
+    tracing::info!("🔒 [agg:{}] {} by user", row.alias, if locked { "locked" } else { "unlocked" });
+    Json(json!({ "success": true, "locked": locked })).into_response()
 }

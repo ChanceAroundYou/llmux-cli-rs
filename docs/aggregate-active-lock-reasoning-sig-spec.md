@@ -91,5 +91,61 @@
 - **C-B2.** 锁定后该别名：
   - 后台探活跳过（`run_probe_round` 里 `continue`，不更新 `last_probe` ——
     否则解锁瞬间 `is_due` 立刻到期，连探三轮）；
-  - 请求侧 `record_request_outcome` / `record_request_all_failed` / 
-...[truncated 3147 chars]
+  - 请求侧 `record_request_outcome` / `record_request_all_failed` /
+    `record_probe_candidate` 全部 no-op（冻结升降级，只观察不迁移）；
+  - 加锁时清掉半截的 pending（否则解锁瞬间旧计数接着攒，老迁移穿过去）。
+- **C-B3.** 锁定状态落库（`locked` 列）+ 内存同步：先 UPDATE 库、后改内存
+  （顺序反了重启会丢一次锁定）。`POST /api/aggregate-aliases/:id/lock`
+  `{locked: bool}`；`GET /api/aggregate-aliases` 列表返回 `locked` 字段；
+  UI 卡片加锁/解锁按钮（锁定时显示"已锁定"，pending 提示让位）。
+- **C-B4.** 解锁后探活保留择优：从当前 active 开始 `stage1_range(active, len)`
+  往上找更优候选（§A 的 floor 语义不变）。
+
+### B3. 测试（RED→GREEN 顺序）
+
+1. `locked_alias_freezes_migration`（core 单测）：锁定后下游连中 3 次不迁移、
+   全失败不回 0、探活 V' 不启动 pending；解锁后恢复正常。
+2. `locked_alias_is_skipped_for_the_whole_probe_round`（server 单测）：
+   锁定的别名整轮跳过，库锁同步到内存，不读候选、不发请求（账户不存在
+   也能走完即证明零请求）。
+3. `aggregate_lock_route_round_trip`（e2e）：建别名 → 锁定（库=1、内存锁）
+   → 解锁（库=0、内存解锁），口径与 UI 共用列表 `locked` 字段。
+
+### B4. 实现（只改这些地方）
+
+- `aggregate.rs`：`AggregateEntry` 加 `locked: bool`；`set_locked` /
+  `is_locked`；三个 `record_*` 入口加锁检查。
+- `aggregate_probe.rs`：`load_alias_intervals` 同时读 `locked`；
+  `run_probe_round` 开头按库锁跳过并同步内存锁。
+- `routes/models/aggregate.rs`：`set_aggregate_lock` + 列表返回 `locked`；
+  `app.rs` 注册 `POST /api/aggregate-aliases/:id/lock`；
+  `models/mod.rs` 加 re-export。
+- UI：`models.ts` 加 `locked` 类型 + `setAggregateLock`；
+  `models.tsx` 卡片加锁/解锁按钮；`dashboard.tsx` 本地类型补 `locked`。
+
+---
+
+## §C. `reasoning_signature` 剥离（已合入 ✅）
+
+### C1. 根因（2026-10-14 生产实测）
+
+经 llmux 调 cat-jam 类严格 chat 上游回 400
+`[unsupported_parameter] messages[2].reasoning_signature`；
+对照实验：只带 `reasoning_content` → 200，
+再加 `reasoning_signature` → 400。同 28b0ccd 修过的
+`cache_control` / `is_error` 一类问题（Anthropic 特有字段污染 OpenAI 兼容出站）。
+
+### C2. 契约
+
+- **C-C1.** 出站 chat 转换剥顶层 `reasoning_signature`，留 `reasoning_content`
+  （后者严格上游可通过，200 实测）。
+- **C-C2.** 回程组装不动：`openai_to_anthropic_response` 的 thinking 块
+  仍保留 signature（下游 Anthropic 客户端要它）。
+- **C-C3.** 契约测试 `request_maps_thinking_block_to_reasoning_fields`
+  改断言：signature 不存在、content 保留。
+
+### C3. 测试与实现（已绿，47 个契约测试全过）
+
+- 测试：`crates/llmux-core/tests/anthropic_openai_contract.rs`
+- 实现：`strip_anthropic_only_fields` 加 `obj.remove("reasoning_signature")`
+- 状态：已合入（commit `15d61ee fix(proxy): 剥掉 chat 转换顶层的 reasoning_signature`）。

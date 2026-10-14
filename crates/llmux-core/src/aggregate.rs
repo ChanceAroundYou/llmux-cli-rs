@@ -23,6 +23,8 @@ pub struct AggregateAliasRow {
     pub first_byte_timeout_secs: Option<i64>,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
+    pub active_idx: Option<i64>,
+    pub locked: Option<i64>,
 }
 
 pub fn parse_candidates(raw: &str) -> anyhow::Result<Vec<AggregateCandidate>> {
@@ -73,6 +75,9 @@ pub struct AggregateEntry {
     pub probe_backoff_secs: u64,
     pub last_probe: Instant,
     pub last_status: Vec<Option<bool>>,
+    /// C-B2：锁定后该别名的探测与升降级全部冻结，直至解锁。
+    /// 只在内存 + `aggregate_aliases.locked` 列（重启恢复），pending 状态不落库。
+    pub locked: bool,
 }
 
 impl Default for AggregateEntry {
@@ -84,6 +89,7 @@ impl Default for AggregateEntry {
             probe_backoff_secs: PROBE_BACKOFF_BASE_SECS,
             last_probe: Instant::now(),
             last_status: Vec::new(),
+            locked: false,
         }
     }
 }
@@ -115,6 +121,38 @@ impl AggregateRouter {
 
     pub fn remove(&mut self, alias: &str) {
         self.entries.remove(alias);
+    }
+
+    /// C-B2：锁定/解锁。锁定只冻结「迁移」（三个 record_* no-op），不碰
+    /// active 值本身 —— 手动指定的起点还在，解锁后探活从它开始择优。
+    pub fn set_locked(&mut self, alias: &str, locked: bool, len: usize) {
+        let e = self.ensure_entry(alias, len);
+        e.locked = locked;
+        // 加锁时清掉半截的 pending：否则解锁瞬间旧计数接着攒，老迁移穿过去。
+        if locked {
+            e.pending_target = None;
+            e.confirm_count = 0;
+        }
+    }
+
+    pub fn is_locked(&self, alias: &str) -> bool {
+        self.entries.get(alias).map(|e| e.locked).unwrap_or(false)
+    }
+
+    /// C-A3：内存没有 entry 时用库里的 `active_idx` 播种（clamp：越界归 0，
+    /// 与 C-A4 的 reset 语义一致）。已存在 entry 不动 —— 内存是运行时的
+    /// 真实位置，库只是重启后的起点。返回 true 表示存量越界、调用点应把
+    /// 库回写为 0（ensure_entry 拿不到 pool，由调用点落库）。
+    pub fn seed_active_if_absent(&mut self, alias: &str, stored: usize, len: usize) -> bool {
+        if self.entries.contains_key(alias) || len == 0 {
+            return false;
+        }
+        let (active, need_reset) = if stored < len { (stored, false) } else { (0, true) };
+        let mut e = AggregateEntry::default();
+        e.active = active;
+        e.last_status = vec![None; len];
+        self.entries.insert(alias.to_string(), e);
+        need_reset
     }
 
     pub fn set_active(&mut self, alias: &str, target: usize, len: usize) -> bool {
@@ -171,9 +209,14 @@ impl AggregateRouter {
 
     /// Called when a request succeeds at `hit` (hit may equal active or downstream).
     /// 连续 3 次命中同一非 active 候选才迁移；命中 active 则连续计数清零。
+    /// C-B2：锁定后 no-op（只观察、不迁移）—— 命中 active 的清零/退避恢复
+    /// 也一起冻结，否则锁定时请求仍在改状态机，"暂停"名存实亡。
     /// Returns true if V actually migrated.
     pub fn record_request_outcome(&mut self, alias: &str, hit: usize, len: usize) -> bool {
         let e = self.ensure_entry(alias, len);
+        if e.locked {
+            return false;
+        }
         if hit < e.last_status.len() {
             e.last_status[hit] = Some(true);
         }
@@ -192,9 +235,13 @@ impl AggregateRouter {
 
     /// Called when a request exhausts all candidates (502). Treat as pending V=0.
     /// 同样要求连续 3 次才生效，不连续清零。
+    /// C-B2：锁定后 no-op。
     /// Returns true if V migrated.
     pub fn record_request_all_failed(&mut self, alias: &str, len: usize) -> bool {
         let e = self.ensure_entry(alias, len);
+        if e.locked {
+            return false;
+        }
         for v in e.last_status.iter_mut() {
             *v = Some(false);
         }
@@ -223,10 +270,25 @@ impl AggregateRouter {
     }
 
     /// Probe gives candidate V' — 升级同样连续 3 次才切，不连续清零。
+    /// C-B2：锁定后 no-op（后台探活也会跳过，这是请求侧探活都绕过内存直调
+    /// 状态机时的兜底）。
     /// Returns true if switched.
     pub fn record_probe_candidate(&mut self, alias: &str, v_prime: usize, len: usize) -> bool {
         let e = self.ensure_entry(alias, len);
+        if e.locked {
+            return false;
+        }
         if v_prime >= len && len > 0 {
+            return false;
+        }
+        // C-A1: 手动 active 是起点（floor）—— 低于 active 的 V' 不得启动
+        // pending，否则探活把手动设置拽回去（2026-10-14 os 别名生产复现：
+        // 手动设 0→? 被 3-confirm 弹走）。只记录观察到的存活状态，不迁移。
+        if v_prime < e.active {
+            e.last_probe = Instant::now();
+            if v_prime < e.last_status.len() {
+                e.last_status[v_prime] = Some(true);
+            }
             return false;
         }
         if v_prime == e.active {
@@ -296,7 +358,7 @@ async fn find_aggregate_row(
     alias: &str,
 ) -> anyhow::Result<Option<AggregateAliasRow>> {
     Ok(sqlx::query_as::<_, AggregateAliasRow>(
-        "SELECT id, alias, candidates, interval_secs, upstream_api, first_byte_timeout_secs, created_at, updated_at FROM aggregate_aliases WHERE alias = ?",
+        "SELECT id, alias, candidates, interval_secs, upstream_api, first_byte_timeout_secs, active_idx, locked, created_at, updated_at FROM aggregate_aliases WHERE alias = ?",
     )
     .bind(alias)
     .fetch_optional(pool)
@@ -329,7 +391,14 @@ pub async fn resolve_aggregate(
         },
     };
     let candidates = parse_candidates(&row.candidates)?;
-    let active = router.get_active(&row.alias);
+    // C-A3：内存无 entry（重启刚起来、探活还没跑到这一轮）时回退到库里的
+    // active_idx，而不是 0 —— 否则重启后第一次请求永远从 0 开始，手动起点
+    // 要等探活跑一轮才恢复。有 entry 时内存是真实位置，库只是起点。
+    let stored = row.active_idx.unwrap_or(0).max(0) as usize;
+    let active = match router.entries.get(&row.alias) {
+        Some(_) => router.get_active(&row.alias),
+        None => stored,
+    };
     let active = if active < candidates.len() {
         active
     } else {
@@ -387,4 +456,68 @@ pub async fn get_account_by_id(
                 codex_auth_json: row.try_get::<Option<String>, _>("codex_auth_json").ok().flatten().unwrap_or_default(),
         category: row.try_get::<Option<String>, _>("category").ok().flatten().unwrap_or_default(),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// C-A1 状态机侧：手动 active 是起点（floor），不是上限。
+    /// set_active(a, 2, 3) 后，探活说 0 存活也不得启动向 0 的 pending。
+    #[test]
+    fn manual_active_is_a_floor_not_a_ceiling() {
+        let mut r = AggregateRouter::default();
+        assert!(r.set_active("a", 2, 3));
+        r.record_probe_candidate("a", 0, 3);
+        let e = r.entries.get("a").unwrap();
+        assert!(
+            e.pending_target.is_none(),
+            "manual active=2 must not be dragged back to 0, got {:?}",
+            e.pending_target
+        );
+    }
+
+    /// C-A3/A4：重启播种—— 库值在界内则恢复，越界归 0 并要求调用点回写。
+    /// 已有内存 entry 不动（内存是运行时的真实位置）。
+    #[test]
+    fn seed_active_restores_stored_value_and_reports_out_of_range() {
+        let mut r = AggregateRouter::default();
+        assert!(!r.seed_active_if_absent("a", 2, 3));
+        assert_eq!(r.get_active("a"), 2);
+        // 已有 entry：库里哪怕是别的值也不覆盖
+        assert!(!r.seed_active_if_absent("a", 0, 3));
+        assert_eq!(r.get_active("a"), 2);
+
+        let mut r = AggregateRouter::default();
+        assert!(r.seed_active_if_absent("b", 5, 3));
+        assert_eq!(r.get_active("b"), 0);
+    }
+
+    /// C-B2：锁定时请求侧的升降级全部冻结 —— 下游连中 3 次也不切，
+    /// 全失败也不回 0；解锁后恢复正常。
+    #[test]
+    fn locked_alias_freezes_migration() {
+        let mut r = AggregateRouter::default();
+        r.set_locked("a", true, 3);
+        assert!(r.is_locked("a"));
+        // 下游连中 3 次：不迁移
+        assert!(!r.record_request_outcome("a", 2, 3));
+        assert!(!r.record_request_outcome("a", 2, 3));
+        assert!(!r.record_request_outcome("a", 2, 3));
+        assert_eq!(r.get_active("a"), 0);
+        // 全失败：不回 0、不翻倍
+        assert!(!r.record_request_all_failed("a", 3));
+        assert_eq!(r.get_active("a"), 0);
+        // 探活 V'：不启动 pending
+        assert!(!r.record_probe_candidate("a", 1, 3));
+        assert!(r.entries.get("a").unwrap().pending_target.is_none());
+
+        // 解锁后恢复：下游 3 次切过去
+        r.set_locked("a", false, 3);
+        assert!(!r.is_locked("a"));
+        assert!(!r.record_request_outcome("a", 2, 3));
+        assert!(!r.record_request_outcome("a", 2, 3));
+        assert!(r.record_request_outcome("a", 2, 3));
+        assert_eq!(r.get_active("a"), 2);
+    }
 }

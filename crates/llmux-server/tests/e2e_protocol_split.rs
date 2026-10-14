@@ -795,3 +795,71 @@ async fn e2e_aggregate_messages_ingress_chat_upstream_rejecting_anthropic_only_k
         "strict chat upstream must be reached, got: {raw}"
     );
 }
+
+/// C-B3：lock 路由往返 —— 建别名 → 锁定（库=1、内存锁）→ 解锁（库=0、内存解锁）。
+/// 口径与 UI 共用 `/api/aggregate-aliases` 列表的 `locked` 字段。
+#[tokio::test]
+async fn aggregate_lock_route_round_trip() {
+    let state = llmux_server::test_state().await;
+    let app = llmux_server::app(state.clone());
+    let cookie = login(app.clone()).await;
+
+    // 建一个单候选别名（账户 id 随意写：建别名只校验存在，skip_validation 账户需先建）
+    let (st, body) = api_post(
+        app.clone(),
+        &cookie,
+        "/api/accounts",
+        json!({
+            "alias": "lockacct",
+            "provider_id": "openai",
+            "api_key": "sk-mock",
+            "base_url": "http://127.0.0.1:9",
+            "chat_endpoint": "http://127.0.0.1:9",
+            "default_protocol": "chat",
+            "skip_validation": true,
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body:?}");
+    let acct_id = body["id"].as_i64().expect("account id");
+
+    let (st, body) = api_post(
+        app.clone(),
+        &cookie,
+        "/api/aggregate-aliases",
+        json!({
+            "alias": "agg-lock",
+            "candidates": [{"account_id": acct_id, "model": "m"}],
+            "upstream_api": "chat",
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body:?}");
+
+    let row: (i64, String) = sqlx::query_as("SELECT id, alias FROM aggregate_aliases WHERE alias = 'agg-lock'")
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+
+    // 锁定
+    let (st, body) = api_post(app.clone(), &cookie, &format!("/api/aggregate-aliases/{}/lock", row.0), json!({"locked": true})).await;
+    assert_eq!(st, StatusCode::OK, "{body:?}");
+    assert_eq!(body["locked"], json!(true));
+    let locked: i64 = sqlx::query_scalar("SELECT locked FROM aggregate_aliases WHERE alias = 'agg-lock'")
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+    assert_eq!(locked, 1);
+    assert!(state.aggregate_router.lock().unwrap().is_locked(&row.1));
+
+    // 解锁
+    let (st, body) = api_post(app.clone(), &cookie, &format!("/api/aggregate-aliases/{}/lock", row.0), json!({"locked": false})).await;
+    assert_eq!(st, StatusCode::OK, "{body:?}");
+    assert_eq!(body["locked"], json!(false));
+    let locked: i64 = sqlx::query_scalar("SELECT locked FROM aggregate_aliases WHERE alias = 'agg-lock'")
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+    assert_eq!(locked, 0);
+    assert!(!state.aggregate_router.lock().unwrap().is_locked(&row.1));
+}

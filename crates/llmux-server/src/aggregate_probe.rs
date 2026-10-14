@@ -63,7 +63,7 @@ async fn compute_tick(
     let base = llmux_core::aggregate::PROBE_BACKOFF_BASE_SECS;
     aliases
         .iter()
-        .map(|(alias, interval)| {
+        .map(|(alias, (interval, _))| {
             let period = (*interval).max(0) as u64;
             let backoff = guard.get_backoff_secs(alias);
             let period = period.max(1);
@@ -79,15 +79,15 @@ async fn compute_tick(
 }
 
 /// 读所有聚合别名的 `interval_secs`（缺失按默认 300）。
-async fn load_alias_intervals(pool: &sqlx::SqlitePool) -> BTreeMap<String, i64> {
-    let rows: Vec<(String, Option<i64>)> = sqlx::query_as(
-        "SELECT alias, interval_secs FROM aggregate_aliases",
+async fn load_alias_intervals(pool: &sqlx::SqlitePool) -> BTreeMap<String, (i64, bool)> {
+    let rows: Vec<(String, Option<i64>, Option<i64>)> = sqlx::query_as(
+        "SELECT alias, interval_secs, locked FROM aggregate_aliases",
     )
     .fetch_all(pool)
     .await
     .unwrap_or_default();
     rows.into_iter()
-        .map(|(alias, secs)| (alias, secs.unwrap_or(DEFAULT_INTERVAL_SECS)))
+        .map(|(alias, secs, locked)| (alias, (secs.unwrap_or(DEFAULT_INTERVAL_SECS), locked.unwrap_or(0) != 0)))
         .collect()
 }
 
@@ -115,6 +115,13 @@ fn is_due(since_last_probe_secs: u64, interval_secs: i64, backoff_secs: u64) -> 
     since_last_probe_secs >= backoff
 }
 
+/// C-A1：stage1 只探 `active..len`，不往 active 之前看。
+/// 手动 active 是起点（floor）—— 往低看会把手动设置拽回去（2026-10-14
+/// os 别名生产复现）。抽成纯函数，照抄 `is_due` 的测试风格。
+fn stage1_range(active: usize, len: usize) -> std::ops::Range<usize> {
+    active.min(len)..len
+}
+
 async fn run_probe_round(
     pool: &sqlx::SqlitePool,
     master_key: &str,
@@ -123,7 +130,15 @@ async fn run_probe_round(
     let aliases = load_alias_intervals(pool).await;
     let now = Instant::now();
 
-    for (alias, interval_secs) in aliases {
+    for (alias, (interval_secs, db_locked)) in aliases {
+        // C-B2：锁定后整组探测暂停 —— continue 且不碰 last_probe（否则解锁
+        // 瞬间 is_due 立刻到期，连探三轮）。内存锁由 lock 接口同步，这里以
+        // 库值为准：重启后内存是空的，库才是真相。
+        if db_locked {
+            let len_hint = aggregate_router.lock().unwrap().entries.get(&alias).map(|e| e.last_status.len().max(1)).unwrap_or(1);
+            aggregate_router.lock().unwrap().set_locked(&alias, true, len_hint);
+            continue;
+        }
         // 按别名各自判到期 —— 快的别名按自己的节奏探，慢的/退避中的不受牵连。
         {
             let guard = aggregate_router.lock().unwrap();
@@ -134,14 +149,14 @@ async fn run_probe_round(
             }
         }
 
-        let row: Option<(String, Option<String>)> = sqlx::query_as(
-            "SELECT candidates, upstream_api FROM aggregate_aliases WHERE alias = ?",
+        let row: Option<(String, Option<String>, Option<i64>)> = sqlx::query_as(
+            "SELECT candidates, upstream_api, active_idx FROM aggregate_aliases WHERE alias = ?",
         )
         .bind(&alias)
         .fetch_optional(pool)
         .await
         .unwrap_or_default();
-        let Some((candidates_json, upstream_api)) = row else {
+        let Some((candidates_json, upstream_api, stored_active)) = row else {
             continue;
         };
 
@@ -155,6 +170,17 @@ async fn run_probe_round(
         let len = candidates.len();
         if len == 0 {
             continue;
+        }
+        // C-A3：内存无 entry 时用库里的 active_idx 播种（重启恢复手动起点）；
+        // 存量越界（stored >= len，候选列表被改短）回写 0（C-A4），否则下次
+        // 重启又读回越界值。
+        let stored = stored_active.unwrap_or(0).max(0) as usize;
+        let need_reset = aggregate_router.lock().unwrap().seed_active_if_absent(&alias, stored, len);
+        if need_reset {
+            let _ = sqlx::query("UPDATE aggregate_aliases SET active_idx = 0 WHERE alias = ?")
+                .bind(&alias)
+                .execute(pool)
+                .await;
         }
         let active = aggregate_router.lock().unwrap().get_active(&alias);
         let active = active.min(len.saturating_sub(1));
@@ -172,9 +198,18 @@ async fn run_probe_round(
             // 由 `probe_candidate` 内部处理，这里只需要把选出的 V' 交给状态机。
             guard.record_probe_candidate(&alias, vp, len)
         } else {
-            // all failed => treat as pending V=0 with 3-confirm
+            // all failed => treat as pending V=0 with 3-confirm.
+            // active == 0 时走 record_probe_candidate(0) 即 v_prime == active 的
+            // 确认分支（旧行为：清 pending、退避回基准）；active > 0 时 0 在
+            // floor 之下，record_probe_candidate 会按 C-A1 拒绝，改走
+            // record_request_all_failed（同样是 advance_pending(e, 0) 的 3-confirm，
+            // 还顺手把刚全死的 last_status 全标 false）。
             let mut guard = aggregate_router.lock().unwrap();
-            let switched = guard.record_probe_candidate(&alias, 0, len);
+            let switched = if guard.get_active(&alias) == 0 {
+                guard.record_probe_candidate(&alias, 0, len)
+            } else {
+                guard.record_request_all_failed(&alias, len)
+            };
             if switched {
                 guard.record_probe_all_failed_confirmed(&alias, len);
             }
@@ -196,8 +231,8 @@ async fn probe_dual_phase(
     pool: &sqlx::SqlitePool,
     master_key: &str,
 ) -> Option<usize> {
-    // Stage 1: 0..=active concurrent (spec); implement as concurrent with join_all for speed
-    let stage1_indices: Vec<usize> = (0..=active.min(candidates.len().saturating_sub(1))).collect();
+    // Stage 1: active..len concurrent (C-A1) — 手动 active 是起点，不往低看。
+    let stage1_indices: Vec<usize> = stage1_range(active, candidates.len()).collect();
     let mut stage1_alive: Vec<usize> = Vec::new();
 
     // Concurrent probe for stage1
@@ -225,16 +260,8 @@ async fn probe_dual_phase(
         return Some(best);
     }
 
-    // Stage 2: active+1..len sequential, first alive
-    for idx in (active + 1)..candidates.len() {
-        let cand = &candidates[idx];
-        if probe_candidate(cand, mode, pool, master_key).await {
-            tracing::debug!("🔍 [agg:{}] stage2 hit V={}", alias, idx);
-            return Some(idx);
-        }
-    }
-
-    // All failed
+    // Stage1 已覆盖 active..len 的全部候选 —— 一个都没活就是全死。
+    // （旧 stage2 在这里重探 active+1..，与 stage1 完全重复，全死时发两倍请求。）
     tracing::warn!("🔍 [agg:{}] all candidates failed", alias);
     None
 }
@@ -538,6 +565,7 @@ mod tests {
                 probe_backoff_secs: 300,
                 last_probe: Instant::now(),
                 last_status: vec![Some(true)],
+                locked: false,
             },
         );
         r.entries.insert(
@@ -549,6 +577,7 @@ mod tests {
                 probe_backoff_secs: 600,
                 last_probe: Instant::now(),
                 last_status: vec![Some(false)],
+                locked: false,
             },
         );
 
@@ -567,5 +596,34 @@ mod tests {
         let since = 120u64;
         assert!(is_due(since, 60, base), "快配的别名该按自己的 60s 探");
         assert!(!is_due(since, 300, base), "慢配的别名不该被快配的拖着一起探");
+    }
+
+    /// C-A1 探活侧：stage1 只探 active..len，不往 active 之前看。
+    /// 范围计算抽成纯函数（照抄 is_due 的测试风格），先红。
+    #[test]
+    fn probe_stage1_never_looks_below_active() {
+        assert_eq!(stage1_range(2, 4), 2..4);
+        assert_eq!(stage1_range(0, 3), 0..3);
+    }
+
+    /// C-B2：锁定的别名整轮跳过 —— 不建内存 entry、不读候选、不发请求。
+    /// （锁检查在读 candidates 之前：账户 99 根本不存在，能走完即证明零请求。）
+    /// 也不碰 last_probe，否则解锁瞬间 is_due 立刻到期、连探三轮。
+    #[tokio::test]
+    async fn locked_alias_is_skipped_for_the_whole_probe_round() {
+        let pool = llmux_core::db::connect_sqlite("sqlite::memory:").await.unwrap();
+        llmux_core::db::init_db(&pool).await.unwrap();
+        sqlx::query("INSERT INTO aggregate_aliases (alias, candidates, locked) VALUES ('l', '[{\"account_id\":99,\"model\":\"m\"}]', 1)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let router = Arc::new(Mutex::new(AggregateRouter::default()));
+        run_probe_round(&pool, "key", &router).await.unwrap();
+        // 锁从库同步到了内存；entry 若是探活建的会是未锁定 —— 锁定位证明
+        // 走的是跳过分支（该分支在读 candidates 之前 return，账户 99 根本
+        // 不存在也零请求）。last_probe 也没被碰，解锁后不会连探三轮。
+        let guard = router.lock().unwrap();
+        assert!(guard.is_locked("l"));
+        assert!(guard.entries.get("l").unwrap().pending_target.is_none());
     }
 }

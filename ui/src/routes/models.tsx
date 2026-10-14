@@ -18,7 +18,9 @@ import {
   ChevronDown,
   PauseCircle,
   Ban,
-  RotateCcw
+  RotateCcw,
+  Lock,
+  Unlock
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { Dialog, ConfirmDialog } from '../components/Modal';
@@ -102,7 +104,7 @@ function ScopeTestButton({
 
 export default function Models() {
   const { t, i18n } = useTranslation();
-  const { availableModels, aliases, aggregateAliases, accounts, isLoading, streaming, healthCache, queueCache, fetchModels, streamModels, fetchAliases, fetchAggregateAliases, fetchAccounts, fetchSummary, addAlias, deleteAlias, saveAggregateAlias, deleteAggregateAlias, setAggregateActive, setModelDisabled, testModel } = useModelsStore();
+  const { availableModels, aliases, aggregateAliases, accounts, isLoading, streaming, healthCache, queueCache, fetchModels, streamModels, fetchAliases, fetchAggregateAliases, fetchAccounts, fetchSummary, addAlias, deleteAlias, saveAggregateAlias, deleteAggregateAlias, setAggregateActive, setAggregateLock, setModelDisabled, testModel } = useModelsStore();
   const safeModels = availableModels || [];
   const safeAccounts = accounts || [];
   const [search, setSearch] = useState('');
@@ -653,13 +655,14 @@ export default function Models() {
         <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3">
               {aggregateAliases.map(agg => {
                 const isActive = (idx: number) => agg.active === idx;
+                const isLocked = !!(agg as any).locked;
                 const statusDot = (idx: number) => {
                   const s = agg.last_status?.[idx];
                   if (s === true) return "bg-success";
                   if (s === false) return "bg-destructive";
                   return "bg-muted-foreground/30";
                 };
-                const pendingNote = agg.pending_target != null ? ` ⏳待切换到 #${agg.pending_target + 1} (${agg.confirm_count}/3)` : "";
+                const pendingNote = isLocked ? " 🔒已锁定（探测与升降级暂停）" : (agg.pending_target != null ? ` ⏳待切换到 #${agg.pending_target + 1} (${agg.confirm_count}/3)` : "");
                 return (
                   <div
                     key={agg.id}
@@ -672,6 +675,7 @@ export default function Models() {
                         <CopyButton value={agg.alias} size={10} className="p-1 opacity-0 group-hover:opacity-100 transition-opacity shrink-0" />
                         {pendingNote && <span className="text-xs text-warning font-bold truncate">{pendingNote}</span>}
                       </div>
+                      <Button variant="ghost" size="icon" onClick={(e) => { e.stopPropagation(); setAggregateLock(agg.id, !isLocked).catch(()=>{}); }} title={isLocked ? "解锁（恢复探测与升降级）" : "锁定（暂停探测与升降级）"} className="h-6 w-6 shrink-0 text-muted-foreground hover:text-primary transition-all">{isLocked ? <Lock size={12} /> : <Unlock size={12} />}</Button>
                       <Button variant="ghost" size="icon" onClick={(e) => { e.stopPropagation(); setAggregateToDelete({ id: agg.id, name: agg.alias }); }} className="h-6 w-6 shrink-0 text-muted-foreground hover:text-destructive transition-all"><Trash2 size={12} /></Button>
                     </div>
                     <div className="space-y-1">

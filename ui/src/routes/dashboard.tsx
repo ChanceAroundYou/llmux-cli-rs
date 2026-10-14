@@ -23,7 +23,7 @@ interface ProviderHealth { id: string; name?: string; status: string; totalCheck
 interface ActivityEntry { id: number; timestamp: number; model: string; success: number; latency_ms: number; error_message: string | null; account_name: string; input_tokens: number; output_tokens: number; cache_tokens: number; ttft_ms: number | null; is_stream: number; }
 interface ModelHealthEntry { model: string; success: number; latency: number; error: string | null; last_checked: number; account_name: string; account_id: number; provider_id: string; }
 interface ModelAlias { id: number; alias: string; target_model: string; provider_id: string | null; }
-interface AggregateAlias { id: number; alias: string; candidates: { account_id: number; model: string }[]; interval_secs: number; active: number; last_status: (boolean | null)[]; pending_target: number | null; confirm_count: number; }
+interface AggregateAlias { id: number; alias: string; candidates: { account_id: number; model: string }[]; interval_secs: number; active: number; locked?: number | boolean | null; last_status: (boolean | null)[]; pending_target: number | null; confirm_count: number; }
 
 // t/s：流式按生成段(总耗时-首字时间)，非流式按总耗时。
 const calcTps = (outputTokens: number, latencyMs: number, ttftMs: number | null | undefined): number => {

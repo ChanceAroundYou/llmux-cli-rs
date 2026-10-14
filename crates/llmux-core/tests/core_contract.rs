@@ -1176,6 +1176,54 @@ async fn discovery_prefixed_aggregate_names_resolve_back_to_the_aggregate() {
     assert_eq!(agg.alias, "of");
 }
 
+/// C-A3：重启后内存空，请求路径直接读库里的 active_idx 做起点，
+/// 不等探活跑第一轮。
+#[tokio::test]
+async fn resolve_aggregate_falls_back_to_stored_active_when_memory_is_empty() {
+    let pool = memory_db().await;
+    let router = llmux_core::aggregate::AggregateRouter::default();
+
+    let account_id =
+        sqlx::query("INSERT INTO accounts (alias, provider_id, api_key) VALUES (?, ?, ?)")
+            .bind("go6")
+            .bind("openai")
+            .bind("k")
+            .execute(&pool)
+            .await
+            .expect("insert account")
+            .last_insert_rowid();
+
+    sqlx::query("INSERT INTO aggregate_aliases (alias, candidates, upstream_api) VALUES (?, ?, ?)")
+        .bind("ab")
+        .bind(json!([{"account_id": account_id, "model": "m0"}, {"account_id": account_id, "model": "m1"}, {"account_id": account_id, "model": "m2"}]).to_string())
+        .bind("chat")
+        .execute(&pool)
+        .await
+        .expect("insert aggregate alias");
+    sqlx::query("UPDATE aggregate_aliases SET active_idx = 2 WHERE alias = 'ab'")
+        .execute(&pool)
+        .await
+        .expect("store active");
+
+    // 内存空 router：直接从库恢复起点 2
+    let agg = llmux_core::aggregate::resolve_aggregate(&pool, "ab", &router)
+        .await
+        .expect("resolve")
+        .expect("aggregate should resolve");
+    assert_eq!(agg.active, 2);
+
+    // 存量越界：归 0（与 ensure_entry 的 reset 语义一致）
+    sqlx::query("UPDATE aggregate_aliases SET active_idx = 9 WHERE alias = 'ab'")
+        .execute(&pool)
+        .await
+        .expect("store oob");
+    let agg = llmux_core::aggregate::resolve_aggregate(&pool, "ab", &router)
+        .await
+        .expect("resolve")
+        .expect("aggregate should resolve");
+    assert_eq!(agg.active, 0);
+}
+
 /// 0023 给 `model_probe_suspensions` 加的 `traffic_suspended_until` 必须真的建出来。
 ///
 /// 这一列是整个「探活失败不挡生产流量」修复的地基，而 `init_db` 用
@@ -1443,4 +1491,45 @@ async fn migration_0030_is_idempotent_on_restart() {
     .await
     .expect("columns");
     assert_eq!(cols, vec!["account_id", "model"]);
+}
+
+/// 0036（C-A2/C-B1）：`aggregate_aliases` 加 `active_idx` + `locked` 列，
+/// 默认 0。重启重跑必须幂等（本仓无迁移记录表，靠吞 duplicate column）。
+#[tokio::test]
+async fn migration_0036_adds_active_idx_and_locked() {
+    let pool = memory_db().await;
+    // memory_db 已跑过 init_db（含 0036）：列必须存在
+    let cols: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM pragma_table_info('aggregate_aliases') WHERE name IN ('active_idx', 'locked') ORDER BY name",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("columns");
+    assert_eq!(cols, vec!["active_idx", "locked"]);
+
+    // 存量行默认值 0
+    sqlx::query("INSERT INTO aggregate_aliases (alias, candidates) VALUES ('agg36', '[{\"account_id\":1,\"model\":\"m\"}]')")
+        .execute(&pool)
+        .await
+        .expect("insert");
+    let (active, locked): (i64, i64) =
+        sqlx::query_as("SELECT active_idx, locked FROM aggregate_aliases WHERE alias = 'agg36'")
+            .fetch_one(&pool)
+            .await
+            .expect("defaults");
+    assert_eq!((active, locked), (0, 0));
+
+    // 模拟重启：再跑一遍 init_db 必须成功，且已写的值不丢
+    // （生产语义：init_db 吞 duplicate column；裸跑 SQL 不吞，所以这里走 init_db）
+    sqlx::query("UPDATE aggregate_aliases SET active_idx = 2 WHERE alias = 'agg36'")
+        .execute(&pool)
+        .await
+        .expect("update");
+    init_db(&pool).await.expect("restart reruns migrations");
+    let (active2, _): (i64, i64) =
+        sqlx::query_as("SELECT active_idx, locked FROM aggregate_aliases WHERE alias = 'agg36'")
+            .fetch_one(&pool)
+            .await
+            .expect("preserved");
+    assert_eq!(active2, 2);
 }

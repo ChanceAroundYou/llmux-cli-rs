@@ -353,6 +353,10 @@ fn core_router() -> AppRouter {
             post(models::set_aggregate_active),
         )
         .route(
+            "/api/aggregate-aliases/:id/lock",
+            post(models::set_aggregate_lock),
+        )
+        .route(
             "/api/aggregate-aliases/:id",
             delete(models::delete_aggregate_alias),
         )
@@ -548,9 +552,14 @@ impl AppState {
             tmp
         };
         let res = llmux_core::aggregate::resolve_aggregate(&self.pool, &key, &snapshot).await?;
-        // reconcile active from live router (may have changed)
+        // reconcile active from live router (may have changed). 内存无 entry 时
+        // resolve_aggregate 已回退到库里的 active_idx（C-A3），这里不得再用
+        // get_active().unwrap_or(0) 覆盖回去 —— 否则重启后第一次请求永远从 0 开始。
         let res = if let Some(mut r) = res {
-            r.active = self.aggregate_router.lock().unwrap().get_active(&key).min(r.candidates.len().saturating_sub(1));
+            let has_entry = self.aggregate_router.lock().unwrap().entries.contains_key(&key);
+            if has_entry {
+                r.active = self.aggregate_router.lock().unwrap().get_active(&key).min(r.candidates.len().saturating_sub(1));
+            }
             Some(r)
         } else { None };
         let _ = active; // keep for future probe logic
