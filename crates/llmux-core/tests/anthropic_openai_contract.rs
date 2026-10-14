@@ -447,7 +447,10 @@ fn request_maps_thinking_block_to_reasoning_fields() {
     let msg = &req["messages"][0];
     assert_eq!(msg["content"][0]["text"], "answer");
     assert_eq!(msg["reasoning_content"], "hmm");
-    assert_eq!(msg["reasoning_signature"], "sig1");
+    // 严格 chat 上游（Console Go / Zen 的 cat-jam 类）对顶层 reasoning_signature
+    // 回 400 `[unsupported_parameter]`（2026-10-14 生产实测），而 reasoning_content
+    // 可通过（200）。出站一律剥 signature、留 content；回程组装不受影响。
+    assert!(msg.get("reasoning_signature").is_none());
 }
 
 #[test]

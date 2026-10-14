@@ -88,6 +88,14 @@ fn strip_anthropic_only_fields(messages: &mut [Value]) {
                 obj.remove("is_error");
             }
         }
+        // `reasoning_signature` is Anthropic-only: strict chat upstreams reject
+        // it (`[unsupported_parameter] ... messages[i].reasoning_signature`,
+        // real 400 from cat-jam via llmux 2026-10-14), while `reasoning_content`
+        // passes through fine. Same class of fix as `cache_control`/`is_error`
+        // above (28b0ccd).
+        if let Some(obj) = msg.as_object_mut() {
+            obj.remove("reasoning_signature");
+        }
     }
 }
 
