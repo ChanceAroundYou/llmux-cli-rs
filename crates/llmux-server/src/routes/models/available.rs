@@ -408,6 +408,38 @@ pub async fn fetch_provider_models(
 
     let (url, headers): (String, std::collections::BTreeMap<String, String>) = match provider_type
     {
+        // codex 原生账户：`GET {CODEX_BACKEND_BASE}/models?client_version=…`。
+        //
+        // 三个坑都在这一个分支里：
+        // 1. 后端是 codex 私有 API，没有 OpenAI 兼容的 `/models` 形状 —— 回的是
+        //    `{"models": [{slug, context_window, display_name, …}]}`，不是 `{"data": […]}`。
+        // 2. 凭据是 `codex_auth_json` 里的 OAuth access_token + 私有头（`originator` /
+        //    `ChatGPT-Account-ID`），不是 `api_key`。带 api_key 去一律 401。
+        // 3. 必须带 `?client_version=`，否则 400 `missing query client_version`；
+        //    老版本（如 0.30.0）回空列表，取官方 CLI 最新 release（见
+        //    `CODEX_MODELS_CLIENT_VERSION`）。凭据缺失时不断言 —— 让请求带空
+        //    Bearer 去上游拿 401，错得清楚（与真实流量路径一致）。
+        "codex" => {
+            let version = llmux_core::codex_compat::CODEX_MODELS_CLIENT_VERSION;
+            let url = format!(
+                "{}/models?client_version={}",
+                llmux_core::codex_compat::CODEX_BACKEND_BASE.trim_end_matches('/'),
+                version
+            );
+            let mut headers = std::collections::BTreeMap::new();
+            let (token, account_id) = llmux_core::codex_auth::load_creds(account)
+                .map(|c| (c.access_token, c.account_id))
+                .unwrap_or_default();
+            headers.insert("authorization".to_string(), format!("Bearer {}", token));
+            headers.insert(
+                "originator".to_string(),
+                llmux_core::codex_compat::CODEX_ORIGINATOR.to_string(),
+            );
+            if !account_id.is_empty() {
+                headers.insert("ChatGPT-Account-ID".to_string(), account_id);
+            }
+            (url, headers)
+        }
         "openai" => {
             let base = base_from(account.base_url.as_ref())
                 .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
@@ -504,6 +536,38 @@ pub async fn fetch_provider_models(
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default()
+    } else if provider_type == "codex" {
+        // codex 私有后端回 `{"models": [{slug, context_window, display_name, …}]}`。
+        // `normalize_model` 只认 `id`，这里把 `slug` 映射成 `id`，`context_window`
+        // 映射成通用 `context_length`（`extract_context_length` 会读它，再与
+        // 内置表取 max，以较大者为准）。
+        data.get("models")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|m| {
+                let slug = m.get("slug").and_then(Value::as_str).unwrap_or("").to_string();
+                let display = m
+                    .get("display_name")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(&slug)
+                    .to_string();
+                let ctx = m.get("context_window").and_then(|v| {
+                    v.as_u64()
+                        .or_else(|| v.as_i64().and_then(|i| u64::try_from(i).ok()))
+                });
+                let mut obj = serde_json::json!({
+                    "id": slug,
+                    "name": display,
+                });
+                if let Some(c) = ctx {
+                    obj["context_length"] = serde_json::json!(c);
+                }
+                obj
+            })
+            .collect()
     } else {
         // OpenAI / Anthropic / Custom all return { data: [...] }
         data.get("data")

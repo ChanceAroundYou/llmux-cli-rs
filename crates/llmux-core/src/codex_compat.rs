@@ -12,6 +12,10 @@ use serde_json::{json, Map, Value};
 pub const CODEX_BACKEND_BASE: &str = "https://chatgpt.com/backend-api/codex";
 /// `originator` 私有头（`backend.go:headers`）。
 pub const CODEX_ORIGINATOR: &str = "openai-api-server-via-codex";
+/// `GET /codex/models` 的 `?client_version=`。服务端按它过滤兼容的模型：
+/// 老版本（如 0.30.0）回空列表，未知的新版本（如 1.0.0/99.0.0）直接放行全量。
+/// 取官方 CLI 最新 release（2026-10-14 实测 `0.162.1` 回 10 个模型），跟 CLI 走。
+pub const CODEX_MODELS_CLIENT_VERSION: &str = "0.162.1";
 
 // --- 小工具（对应 compat.go 顶部的 mapAny/sliceAny/stringValue/setDefault/valueOr）---
 

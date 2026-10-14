@@ -65,3 +65,7 @@ preview/
 Cargo.lock
 **/*.rs.bk
 *.pdb
+
+# One-shot probe keys (never commit)
+.zenkey
+/tmp/zm.py
