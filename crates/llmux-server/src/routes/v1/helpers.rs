@@ -1922,20 +1922,23 @@ pub fn read_body_from_local_logs(timestamp_ms: i64, model: &str, part: &str) -> 
         let mut i = 0;
         while i < lines.len() {
             let line = lines[i];
-            if line.contains(marker) && line.contains(model) {
+            if line.contains(marker) && (model.is_empty() || line.contains(model)) {
                 // collect body: everything after ": " on this line, plus subsequent lines
-                // until next log line (starts with '[')
+                // until next log line (starts with '[' followed by digit, i.e. timestamp)
                 let body_start = line.find(": ").map(|p| p + 2);
                 if let Some(start) = body_start {
                     let mut body = String::from(&line[start..]);
-                    // collect continuation lines
                     let mut j = i + 1;
-                    while j < lines.len() && !lines[j].starts_with('[') {
+                    while j < lines.len() {
+                        let next = lines[j];
+                        // next log entry starts with "[MM-DD" pattern
+                        if next.len() > 6 && next.starts_with('[') && next.chars().nth(1).map(|c| c.is_ascii_digit()).unwrap_or(false) {
+                            break;
+                        }
                         body.push('\n');
-                        body.push_str(lines[j]);
+                        body.push_str(next);
                         j += 1;
                     }
-                    // keep the last matching one (closest to end = latest)
                     best = Some(body);
                     i = j;
                     continue;
