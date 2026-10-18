@@ -821,7 +821,52 @@ fn extract_latest_user_message(body: &str) -> Option<String> {
     }
     let v: serde_json::Value = match serde_json::from_str(body) {
         Ok(v) => v,
-        Err(_) => return Some(body.to_string()),
+        Err(_) => {
+            // Try to find JSON in the body
+            if let Some(start) = body.find('{') {
+                // Try parsing from start to end, shrinking until valid
+                let mut end = body.len();
+                while end > start {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body[start..end]) {
+                        // Found valid JSON, use it
+                        let msgs = v.get("messages").and_then(|m| m.as_array());
+                        if let Some(messages) = msgs {
+                            for msg in messages.iter().rev() {
+                                if msg.get("role").and_then(|r| r.as_str()) != Some("user") {
+                                    continue;
+                                }
+                                if let Some(s) = msg.get("content").and_then(|c| c.as_str()) {
+                                    if !s.is_empty() {
+                                        return Some(s.to_string());
+                                    }
+                                }
+                                if let Some(arr) = msg.get("content").and_then(|c| c.as_array()) {
+                                    let mut texts = Vec::new();
+                                    for block in arr {
+                                        if let Some(t) = block.get("text").and_then(|t| t.as_str()) {
+                                            if !t.is_empty() {
+                                                texts.push(t.to_string());
+                                            }
+                                        }
+                                    }
+                                    if !texts.is_empty() {
+                                        return Some(texts.join("\n"));
+                                    }
+                                }
+                            }
+                        }
+                        // No user message found, return raw body
+                        return Some(body.to_string());
+                    }
+                    end -= 1;
+                    while end > start && body.as_bytes().get(end - 1) != Some(&b'}') {
+                        end -= 1;
+                    }
+                }
+            }
+            // Fall back to returning raw body
+            return Some(body.to_string());
+        }
     };
     let messages = match v.get("messages").and_then(|m| m.as_array()) {
         Some(m) => m,
@@ -829,7 +874,7 @@ fn extract_latest_user_message(body: &str) -> Option<String> {
             if let Some(p) = v.get("prompt").and_then(|p| p.as_str()) {
                 return Some(p.to_string());
             }
-            return None;
+            return Some(body.to_string());
         }
     };
     for msg in messages.iter().rev() {
@@ -855,7 +900,8 @@ fn extract_latest_user_message(body: &str) -> Option<String> {
             }
         }
     }
-    None
+    // No user message found, return raw body
+    Some(body.to_string())
 }
 
 /// 从响应 body 中提取结构化摘要。
