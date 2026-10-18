@@ -545,12 +545,26 @@ fn map_stop_reason(finish: &str) -> &str {
 /// i.e. `input = prompt - read`. DeepSeek's `prompt_cache_miss_tokens` is
 /// therefore *not* a creation count but the fresh input itself.
 pub fn cache_usage_from_openai(usage: &Value) -> (i64, i64) {
+    // Anthropic upstreams (including llmux's own post-conversion output) may
+    // already present canonical cache fields. Those are authoritative even if
+    // an alias also echoes OpenAI/Responses vendor spellings. Prefer them so
+    // the 4-store-3-display contract stays consistent across protocols.
+    if let Some(read) = usage.get("cache_read_input_tokens").and_then(Value::as_i64) {
+        let create = usage
+            .get("cache_creation_input_tokens")
+            .and_then(Value::as_i64)
+            .unwrap_or(0)
+            .max(0);
+        return (read.max(0), create);
+    }
+
     let cache_read = usage
         .get("prompt_cache_hit_tokens")
         .and_then(Value::as_i64)
         .or_else(|| detail_cached_tokens(usage))
         .or_else(|| usage.get("cached_tokens").and_then(Value::as_i64))
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .max(0);
 
     // creation is only valid for Anthropic native; for OpenAI-compatible
     // upstreams it is always 0 (uncached tokens belong to `input`).

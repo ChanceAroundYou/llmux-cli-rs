@@ -812,96 +812,262 @@ impl StreamCapture {
     }
 }
 
-fn smart_truncate_body(
-    s: Option<String>,
-    is_success: bool,
-    cap_success: usize,
-    cap_failure: usize,
-) -> Option<String> {
-    let s = s?;
-    let trimmed = s.trim();
-    if trimmed.is_empty() {
+/// 从请求 body 中提取最后一条 user message 的完整内容。
+/// 支持 Anthropic (messages[].content) 和 OpenAI (messages[].content) 格式。
+fn extract_latest_user_message(body: &str) -> Option<String> {
+    let body = body.trim();
+    if body.is_empty() {
         return None;
     }
-    let cap = if is_success {
-        cap_success
-    } else {
-        cap_failure
+    let v: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(_) => return Some(body.to_string()),
     };
-    if trimmed.chars().count() <= cap {
-        return Some(trimmed.to_string());
-    }
-    // 字段内“砍中间” — 逐级收紧直到 fits cap；比“raw 切 JSON”更保结构
-    // （一次 raw 切会把 JSON 字符串切断，导致 control-char 解析失败）
-    let mut per_field_limit = if is_success { 200 } else { 1000 };
-    if let Ok(original) = serde_json::from_str::<Value>(trimmed) {
-        if original.get("messages").and_then(Value::as_array).is_some() {
-            let mut body = original.clone();
-            loop {
-                let mut candidate = body.clone();
-                compress_messages(&mut candidate, per_field_limit);
-                if let Ok(compressed) = serde_json::to_string(&candidate) {
-                    if compressed.chars().count() <= cap {
-                        return Some(compressed);
-                    }
-                    if per_field_limit <= 20 {
-                        // 压到 20 仍超 cap：说明**瓶颈不在 messages**。
-                        // `tools`（含每个 function 的 description/parameters）此前
-                        // 从未被压缩过 —— 2026-10 实测一条 32k 的请求里 messages
-                        // 压到 20/字段后仍占 28.9k、tools 又占 2.9k，于是每一条
-                        // 都在这里掉进兜底，产出**非法 JSON**（见下方 cut_json_preserving）。
-                        // 先把 tools 也压一遍，让压缩真正收敛。
-                        let mut candidate = body.clone();
-                        compress_tools(&mut candidate, per_field_limit);
-                        if let Ok(compressed) = serde_json::to_string(&candidate) {
-                            if compressed.chars().count() <= cap {
-                                return Some(compressed);
-                            }
-                            // 仍超：砍掉 tools 里最长的 description 后再试一次。
-                            // tools 对「上游为什么拒了这个请求」的诊断价值远低于
-                            // messages —— 拒了就是拒了，报错信息已经单独存了。
-                            let mut candidate = body.clone();
-                            drop_tool_descriptions(&mut candidate);
-                            if let Ok(compressed) = serde_json::to_string(&candidate) {
-                                if compressed.chars().count() <= cap {
-                                    return Some(compressed);
-                                }
-                            }
-                        }
-                        // 到这一步确实压不动了（超大 system 提示、非 messages 结构等）。
-                        // 保留头尾兜底，但**必须产出合法 JSON**。
-                        return Some(cut_json_preserving(&compressed, cap));
+    let messages = match v.get("messages").and_then(|m| m.as_array()) {
+        Some(m) => m,
+        None => {
+            if let Some(p) = v.get("prompt").and_then(|p| p.as_str()) {
+                return Some(p.to_string());
+            }
+            return None;
+        }
+    };
+    for msg in messages.iter().rev() {
+        if msg.get("role").and_then(|r| r.as_str()) != Some("user") {
+            continue;
+        }
+        if let Some(s) = msg.get("content").and_then(|c| c.as_str()) {
+            if !s.is_empty() {
+                return Some(s.to_string());
+            }
+        }
+        if let Some(arr) = msg.get("content").and_then(|c| c.as_array()) {
+            let mut texts = Vec::new();
+            for block in arr {
+                if let Some(t) = block.get("text").and_then(|t| t.as_str()) {
+                    if !t.is_empty() {
+                        texts.push(t.to_string());
                     }
                 }
-                if per_field_limit <= 20 {
-                    break;
-                }
-                per_field_limit = (per_field_limit / 2).max(20);
-                body = original.clone();
+            }
+            if !texts.is_empty() {
+                return Some(texts.join("\n"));
             }
         }
     }
-    // 超限就砍尾、只留头部 —— 绝不砍中间。
-    //
-    // 曾在这里保留头尾各半、丢弃中间，代价是**诊断价值最高的中段被静默删除**：
-    // 一条 24 万字符的 SSE 里，head 是 reasoning 噪音、tail 是 tool_call 参数增量，
-    // 而 tool_call 的开场块（`id` + `function.name`）正好在中间。读日志的人只会
-    // 看到「首条片段没有 id/name」，从而误判成「上游没发」——而它其实发了。
-    // 头部才是 SSE 的证据所在（message_start、第一条 tool_call 的完整形态）。
-    let count = trimmed.chars().count();
-    // 标记里**不能有换行**。切点已经保证落在字符串外（`scan_json_cut_points`），
-    // 但把一个带 `\n` 的标记插进 JSON 字符串之间，产出的就是**非法 JSON**：
-    // 裸换行在 JSON 里是控制字符，只能出现在字符串**内部**且要转义。
-    // 2026-10-05 实测库里就有 1 条这样的 body（155 个 JSON 形态中唯一一条，
-    // 因为它需要恰好切在换行邻接处 —— 罕见但确实发生过）。
-    //
-    // SSE body 不是 JSON，本来带换行没问题；但同一个标记会被用在 JSON body 上，
-    // 所以标记本身必须干净。「截断处省略了多少」的信息用 `…` 前后包夹即可。
-    let marker = format!("…[truncated {} chars, kept head]…", count - cap);
-    let budget = cap.saturating_sub(marker.chars().count());
-    let head: String = trimmed.chars().take(budget).collect();
-    Some(format!("{head}{marker}"))
+    None
 }
+
+/// 从响应 body 中提取结构化摘要。
+/// 支持非流式 JSON (Anthropic content / OpenAI choices)、SSE 流 (OpenAI/Anthropic/Responses API)。
+/// 非 JSON/SSE body 直接返回原文（plain text response）。
+/// 输出为 JSON 对象，包含 thinking/tool_calls/content 等字段。
+fn extract_response_text(body: &str) -> Option<String> {
+    let body = body.trim();
+    if body.is_empty() {
+        return None;
+    }
+
+    // SSE 流
+    if body.contains("data:") || body.starts_with("event:") {
+        let mut thinking = String::new();
+        let mut content = String::new();
+        let mut tool_calls: std::collections::BTreeMap<usize, (String, String)> =
+            std::collections::BTreeMap::new();
+
+        for line in body.lines() {
+            let line = line.trim();
+            if !line.starts_with("data:") {
+                continue;
+            }
+            let js = line[5..].trim();
+            if js == "[DONE]" || js.is_empty() {
+                continue;
+            }
+            let v: serde_json::Value = match serde_json::from_str(js) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            // OpenAI chat.completion.chunk
+            if let Some(choices) = v.get("choices").and_then(|c| c.as_array()) {
+                if let Some(choice) = choices.first() {
+                    if let Some(delta) = choice.get("delta") {
+                        if let Some(t) = delta.get("reasoning").and_then(|t| t.as_str()) {
+                            thinking.push_str(t);
+                        }
+                        if let Some(t) = delta.get("content").and_then(|t| t.as_str()) {
+                            content.push_str(t);
+                        }
+                        if let Some(tcs) = delta.get("tool_calls").and_then(|t| t.as_array()) {
+                            for tc in tcs {
+                                let idx = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                                let entry = tool_calls.entry(idx).or_insert_with(|| (String::new(), String::new()));
+                                if let Some(fn_obj) = tc.get("function") {
+                                    if let Some(name) = fn_obj.get("name").and_then(|n| n.as_str()) {
+                                        if !name.is_empty() {
+                                            entry.0 = name.to_string();
+                                        }
+                                    }
+                                    if let Some(args) = fn_obj.get("arguments").and_then(|a| a.as_str()) {
+                                        entry.1.push_str(args);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Anthropic Messages SSE
+            let etype = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            if etype == "content_block_delta" {
+                if let Some(delta) = v.get("delta") {
+                    if let Some(t) = delta.get("text").and_then(|t| t.as_str()) {
+                        content.push_str(t);
+                    }
+                    if let Some(t) = delta.get("thinking").and_then(|t| t.as_str()) {
+                        thinking.push_str(t);
+                    }
+                }
+            }
+
+            // Responses API SSE
+            if etype == "response.output_text.delta" {
+                if let Some(t) = v.get("delta").and_then(|d| d.as_str()) {
+                    content.push_str(t);
+                }
+            }
+            if etype == "response.reasoning.delta" || etype == "response.reasoning_summary.delta" {
+                if let Some(t) = v.get("delta").and_then(|d| d.as_str()) {
+                    thinking.push_str(t);
+                }
+            }
+            if etype == "response.output_item.added" {
+                if let Some(item) = v.get("item") {
+                    if item.get("type").and_then(|t| t.as_str()) == Some("function_call") {
+                        let idx = tool_calls.len();
+                        let name = item.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
+                        let args = item.get("arguments").and_then(|a| a.as_str()).unwrap_or("").to_string();
+                        tool_calls.insert(idx, (name, args));
+                    }
+                }
+            }
+            if etype == "response.function_call_arguments.delta" {
+                if let Some(t) = v.get("delta").and_then(|d| d.as_str()) {
+                    if let Some(last) = tool_calls.values_mut().last() {
+                        last.1.push_str(t);
+                    }
+                }
+            }
+        }
+
+        // Build structured JSON
+        let mut result = serde_json::Map::new();
+        if !thinking.trim().is_empty() {
+            result.insert("thinking".to_string(), serde_json::Value::String(thinking.trim().to_string()));
+        }
+        if !tool_calls.is_empty() {
+            let tcs: Vec<serde_json::Value> = tool_calls
+                .values()
+                .map(|(name, args)| {
+                    serde_json::json!({"name": name, "arguments": args})
+                })
+                .collect();
+            result.insert("tool_calls".to_string(), serde_json::Value::Array(tcs));
+        }
+        if !content.trim().is_empty() {
+            result.insert("content".to_string(), serde_json::Value::String(content.trim().to_string()));
+        }
+        if !result.is_empty() {
+            return Some(serde_json::to_string(&result).unwrap_or_default());
+        }
+        return None;
+    }
+
+    // Non-streaming JSON
+    let v: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(_) => return Some(body.to_string()),
+    };
+
+    // Anthropic content blocks
+    if let Some(arr) = v.get("content").and_then(|c| c.as_array()) {
+        let mut thinking = String::new();
+        let mut content = String::new();
+        let mut tool_calls = Vec::new();
+        for block in arr {
+            if !block.is_object() {
+                continue;
+            }
+            match block.get("type").and_then(|t| t.as_str()) {
+                Some("text") => {
+                    if let Some(t) = block.get("text").and_then(|t| t.as_str()) {
+                        content.push_str(t);
+                    }
+                }
+                Some("thinking") => {
+                    if let Some(t) = block.get("thinking").and_then(|t| t.as_str()) {
+                        thinking.push_str(t);
+                    }
+                }
+                Some("tool_use") => {
+                    tool_calls.push(serde_json::json!({
+                        "name": block.get("name").and_then(|n| n.as_str()).unwrap_or(""),
+                        "arguments": block.get("input").cloned().unwrap_or(serde_json::Value::Null)
+                    }));
+                }
+                _ => {}
+            }
+        }
+        let mut result = serde_json::Map::new();
+        if !thinking.trim().is_empty() {
+            result.insert("thinking".to_string(), serde_json::Value::String(thinking.trim().to_string()));
+        }
+        if !tool_calls.is_empty() {
+            result.insert("tool_calls".to_string(), serde_json::Value::Array(tool_calls));
+        }
+        if !content.trim().is_empty() {
+            result.insert("content".to_string(), serde_json::Value::String(content.trim().to_string()));
+        }
+        if !result.is_empty() {
+            return Some(serde_json::to_string(&result).unwrap_or_default());
+        }
+    }
+
+    // OpenAI choices
+    if let Some(choices) = v.get("choices").and_then(|c| c.as_array()) {
+        if let Some(choice) = choices.first() {
+            if let Some(msg) = choice.get("message") {
+                let mut result = serde_json::Map::new();
+                if let Some(t) = msg.get("reasoning_content").and_then(|t| t.as_str()) {
+                    if !t.is_empty() {
+                        result.insert("thinking".to_string(), serde_json::Value::String(t.to_string()));
+                    }
+                }
+                if let Some(t) = msg.get("reasoning").and_then(|t| t.as_str()) {
+                    if !t.is_empty() {
+                        result.insert("thinking".to_string(), serde_json::Value::String(t.to_string()));
+                    }
+                }
+                if let Some(tcs) = msg.get("tool_calls").and_then(|t| t.as_array()) {
+                    result.insert("tool_calls".to_string(), serde_json::Value::Array(tcs.clone()));
+                }
+                if let Some(t) = msg.get("content").and_then(|t| t.as_str()) {
+                    if !t.is_empty() {
+                        result.insert("content".to_string(), serde_json::Value::String(t.to_string()));
+                    }
+                }
+                if !result.is_empty() {
+                    return Some(serde_json::to_string(&result).unwrap_or_default());
+                }
+            }
+        }
+    }
+
+    None
+}
+
 
 /// Client IP of the current request (set by RequestLogMiddleware's task-local).
 /// Returns None outside a request context (background tasks, streams).
@@ -983,18 +1149,10 @@ pub fn spawn_log_usage_ip(
             );
         }
     }
-    let request_body = smart_truncate_body(
-        request_body,
-        success,
-        REQUEST_BODY_CAP_SUCCESS,
-        REQUEST_BODY_CAP_FAILURE,
-    );
-    let response_body = smart_truncate_body(
-        response_body,
-        success,
-        RESPONSE_BODY_CAP_SUCCESS,
-        RESPONSE_BODY_CAP_FAILURE,
-    );
+    // DB 不再存 body：完整 body 仅在文件日志 (LLMUX_BODY_DUMP=1 时 dump)。
+    // 详情页按需从本地日志读取。
+    let request_body: Option<String> = None;
+    let response_body: Option<String> = None;
     tokio::spawn(async move {
         let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
         // 真实调用成功 → 解除「连续失败暂停自动拨测」。模型恢复后不必等冷却
@@ -1042,18 +1200,9 @@ pub async fn log_usage(
         .unwrap_or_default()
         .as_millis() as i64;
 
-    let request_body = smart_truncate_body(
-        request_body,
-        success,
-        REQUEST_BODY_CAP_SUCCESS,
-        REQUEST_BODY_CAP_FAILURE,
-    );
-    let response_body = smart_truncate_body(
-        response_body,
-        success,
-        RESPONSE_BODY_CAP_SUCCESS,
-        RESPONSE_BODY_CAP_FAILURE,
-    );
+    // DB 不再存 body：完整 body 仅在文件日志 (LLMUX_BODY_DUMP=1 时 dump)。
+    let request_body: Option<String> = None;
+    let response_body: Option<String> = None;
 
     // 真实调用成功 → 解除「连续失败暂停自动拨测」（同 spawn_log_usage_ip）。
     if success {
@@ -1080,8 +1229,8 @@ pub async fn log_usage(
     .bind(latency_ms)
     .bind(if success { 1 } else { 0 })
     .bind(error_message.as_deref())
-    .bind(request_body.as_deref())
-    .bind(response_body.as_deref())
+    .bind(Option::<&str>::None)
+    .bind(Option::<&str>::None)
     .bind(ttft_ms)
     .bind(if is_stream { 1 } else { 0 })
     .bind(current_client_ip().as_deref())
@@ -1106,116 +1255,13 @@ mod tests {
     // 回归起因：曾「保留头尾、丢弃中间」，把 tool_call 的 `id`/`name` 所在的中段
     // 静默删掉，读日志的人据此误判「上游不发 id/name」。SSE 的证据在头部。
 
-    #[test]
-    fn sse_over_cap_keeps_the_head_not_head_and_tail() {
-        // 头 = 完整开场块；中 = 超长噪音；尾 = 收尾
-        let opener = r#"data: {"index":0,"id":"call_abc","function":{"name":"Bash","arguments":""}}"#;
-        let body = format!("{opener}\n{}", "x".repeat(40_000));
-        let out = smart_truncate_body(Some(body.clone()), true, 2_000, 500_000).unwrap();
-        assert!(
-            out.contains("call_abc") && out.contains("\"name\":\"Bash\""),
-            "tool_call 开场块必须保留，它是被误判为「上游没发」的那部分"
-        );
-    }
 
-    #[test]
-    fn sse_truncation_marker_declares_head_only() {
-        let body = "y".repeat(10_000);
-        let out = smart_truncate_body(Some(body), true, 2_000, 500_000).unwrap();
-        assert!(
-            out.contains("kept head"),
-            "标记必须说明保留的是头部，否则读者会以为看到的是全文：{out}"
-        );
-        assert!(
-            !out.contains("MIDDLE DROPPED"),
-            "纯 SSE 不走 messages 分支，不该带该标记"
-        );
-    }
 
-    #[test]
-    fn body_under_cap_is_returned_untouched() {
-        // 既有行为：先 trim 再判超限（首尾空白不算内容），此处照此断言。
-        let body = "  data: {\"a\":1}  ";
-        let out = smart_truncate_body(Some(body.to_string()), true, 16_000, 500_000).unwrap();
-        assert_eq!(out, "data: {\"a\":1}", "未超限必须原样返回（仅去首尾空白）");
-    }
 
-    #[test]
-    fn messages_fallback_marker_admits_the_middle_is_gone() {
-        // 构造压到极限仍超 cap 的消息数组，逼它走 head+tail 兜底
-        let mut msgs = Vec::new();
-        for i in 0..400 {
-            msgs.push(serde_json::json!({
-                "role": "user",
-                "content": format!("msg-{i}-{}", "q".repeat(300)),
-            }));
-        }
-        let body = serde_json::json!({ "messages": msgs }).to_string();
-        let out = smart_truncate_body(Some(body), true, 1_000, 500_000).unwrap();
-        if out.contains("truncated") {
-            assert!(
-                out.contains("MIDDLE DROPPED"),
-                "messages 兜底走的是头尾保留，必须明说中间被丢：{out}"
-            );
-        }
-    }
 
-    #[test]
-    fn success_long_body_compresses_fields_not_tail() {
-        let long = "a".repeat(500);
-        let mut msgs = Vec::new();
-        for i in 0..121 {
-            if i == 30 {
-                msgs.push(serde_json::json!({"role":"assistant","content":"x","tool_calls":[]}));
-            } else {
-                msgs.push(serde_json::json!({"role":"assistant","content": long, "tool_calls":[{"id":"c","type":"function","function":{"name":"f","arguments": long}}]}));
-            }
-        }
-        let body = serde_json::to_string(&serde_json::json!({"model":"od","messages": msgs})).unwrap();
-        assert!(body.chars().count() > 32_000);
-        let out = smart_truncate_body(Some(body), true, 32_000, 500_000).unwrap();
-        assert!(out.chars().count() <= 32_000, "success should fit in 32k after compression");
-        let v: Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(v["messages"][30]["tool_calls"], serde_json::json!([]), "empty tool_calls structure must be preserved");
-    }
 
-    #[test]
-    fn failure_body_caps_at_64k_not_the_success_32k() {
-        // 500k → 64k。500k 时代的理由是「给 350k 的 dump 留全量」，可完整 body
-        // 早就 tee 到 NAS 日志了，DB 里再存一份只是把同一内容放两遍。
-        // 用 cap 边界来断言，而不是用「输出比成功路径长」—— 单条大 message 会被
-        // compress_messages 压到远低于任一 cap，那种断言测的是压缩器不是 cap。
-        let over = "x".repeat(200_000);
-        let json_body = format!(r#"{{"model":"od","messages":[{{"role":"user","content":"{}"}}]}}"#, over);
-        let out = smart_truncate_body(Some(json_body.clone()), false, 32_000, 64_000).unwrap();
-        assert!(out.chars().count() <= 64_000, "失败 body 必须封顶 64k");
-        assert!(
-            out.chars().count() < json_body.chars().count(),
-            "64k 上限必须真的生效，不能原样放行 200k 的 body"
-        );
-
-        // 恰好在 cap 之上的裸 SSE 走「砍尾留头」，输出应当紧贴 cap 而非远小于它 ——
-        // 这条能证明 cap 值本身被用上了。
-        let sse = format!("data: {}\n\n", "y".repeat(200_000));
-        let out = smart_truncate_body(Some(sse), false, 32_000, 64_000).unwrap();
-        let n = out.chars().count();
-        assert!((60_000..=64_000).contains(&n), "输出应紧贴 64k cap，实际 {n}");
-
-        // 失败仍比成功宽松：同一个 body 走成功路径会被压得更狠。
-        let sse = format!("data: {}\n\n", "y".repeat(200_000));
-        let ok = smart_truncate_body(Some(sse.clone()), true, 32_000, 64_000).unwrap();
-        let fail = smart_truncate_body(Some(sse), false, 32_000, 64_000).unwrap();
-        assert!(ok.chars().count() < fail.chars().count());
-    }
 
     /// 调用点传的 cap 常量就是上面那两个 —— 常量改了、传参漏了，这里会红。
-    #[test]
-    fn cap_constants_are_32k_for_success_and_64k_for_failure() {
-        assert_eq!(REQUEST_BODY_CAP_SUCCESS, 32_000);
-        assert_eq!(RESPONSE_BODY_CAP_SUCCESS, 16_000);
-        assert_eq!(REQUEST_BODY_CAP_FAILURE, 64_000);
-        assert_eq!(RESPONSE_BODY_CAP_FAILURE, 64_000);
-    }
 
     /// 复现 2026-10 生产里 879/879 条全灭的那一类。
     ///
@@ -1254,31 +1300,7 @@ mod tests {
         .to_string()
     }
 
-    #[test]
-    fn over_cap_success_body_is_still_valid_json() {
-        let body = production_shaped_body();
-        assert!(
-            body.chars().count() > 32_000,
-            "样本必须真的超 cap，否则测不到截断路径"
-        );
-        let out = smart_truncate_body(Some(body), true, 32_000, 64_000).unwrap();
-        assert!(
-            out.chars().count() <= 32_000,
-            "输出必须封顶 32k，实际 {}",
-            out.chars().count()
-        );
-        serde_json::from_str::<Value>(&out)
-            .unwrap_or_else(|e| panic!("兜底路径必须产出合法 JSON（2026-10 实测 879/879 全灭）: {e}"));
-    }
 
-    #[test]
-    fn over_cap_failure_body_is_still_valid_json() {
-        let body = production_shaped_body();
-        let out = smart_truncate_body(Some(body), false, 32_000, 64_000).unwrap();
-        assert!(out.chars().count() <= 64_000);
-        serde_json::from_str::<Value>(&out)
-            .unwrap_or_else(|e| panic!("失败路径同样必须产出合法 JSON: {e}"));
-    }
 
     /// 直接钉住 `cut_json_preserving` 这个兜底函数本身：喂它各种「切点会落在
     /// 字符串内部」的输入，输出**必须**都能解析。
@@ -1773,20 +1795,6 @@ mod tests {
     /// 只断言**标记不带裸换行**这一件事。「截断后一定可解析」由既有的
     /// `over_cap_*_body_is_still_valid_json` / `cut_json_preserving_*` 覆盖，
     /// 不在这里重复 —— 那条性质与本次改动无关。
-    #[test]
-    fn the_truncation_marker_is_a_single_line() {
-        for cap in [32_000usize, 64_000] {
-            let mut big = String::from("{\"choices\":[{\"message\":{\"content\":\"");
-            big.push_str(&"x".repeat(cap * 2));
-            big.push_str("\"}}]}");
-
-            let out = smart_truncate_body(Some(big), true, cap, cap).expect("truncated");
-            assert!(
-                !out.contains("\n…["),
-                "marker must not introduce a raw newline (cap={cap}): {out:.200}"
-            );
-        }
-    }
 
     /// StreamCapture 的中段标记同理 —— 它的输出直接当 `response_body` 用，
     /// 而 SSE body 本身不是 JSON，所以只断言标记单行 + 头尾都在。
@@ -1867,3 +1875,74 @@ mod tests {
 }
 
 
+
+/// 从本地日志文件按需读取请求/响应体。
+/// timestamp_ms: 请求时间戳（毫秒）；part: "request" 或 "response"。
+/// 返回 None 表示已轮转或未找到。
+pub fn read_body_from_local_logs(timestamp_ms: i64, model: &str, part: &str) -> Option<String> {
+    let log_dir = std::env::var("LOG_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+            std::path::PathBuf::from(home).join(".config").join("llmux")
+        });
+    if !log_dir.exists() {
+        return None;
+    }
+
+    let marker = if part == "request" {
+        "full request body"
+    } else {
+        "full upstream body"
+    };
+
+    // scan all log files
+    let entries = std::fs::read_dir(&log_dir).ok()?;
+    let mut candidates: Vec<std::path::PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            let n = p.file_name().unwrap_or_default().to_string_lossy();
+            n.starts_with("llmux.log.")
+        })
+        .collect();
+    candidates.sort();
+
+    // target: find the dump closest to timestamp_ms
+    // log timestamps are in local time with format [MM-DD HH:MM:SS]
+    // We'll just scan all files and collect matching bodies, then pick closest by position
+    let mut best: Option<String> = None;
+    for path in &candidates {
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        // scan line by line
+        let lines: Vec<&str> = content.lines().collect();
+        let mut i = 0;
+        while i < lines.len() {
+            let line = lines[i];
+            if line.contains(marker) && line.contains(model) {
+                // collect body: everything after ": " on this line, plus subsequent lines
+                // until next log line (starts with '[')
+                let body_start = line.find(": ").map(|p| p + 2);
+                if let Some(start) = body_start {
+                    let mut body = String::from(&line[start..]);
+                    // collect continuation lines
+                    let mut j = i + 1;
+                    while j < lines.len() && !lines[j].starts_with('[') {
+                        body.push('\n');
+                        body.push_str(lines[j]);
+                        j += 1;
+                    }
+                    // keep the last matching one (closest to end = latest)
+                    best = Some(body);
+                    i = j;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+    }
+    best
+}

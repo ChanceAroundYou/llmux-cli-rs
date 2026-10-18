@@ -1032,8 +1032,16 @@ pub(crate) async fn anthropic_streaming_passthrough(
         let resp_body = received.to_body_string().unwrap_or_default();
         // 头尾视图落文件日志（DB 里另有 smart_truncate_body 的二次封顶）
         // —— 同 anthropic_to_openai_streaming。
-        if tracing::enabled!(tracing::Level::TRACE) {
-            tracing::trace!(
+        if tracing::enabled!(tracing::Level::TRACE) || std::env::var("LLMUX_BODY_DUMP").as_deref() == Ok("1") {
+            if let Some(rb) = &request_body {
+                tracing::info!(
+                    "[stream:{model}] full request body ({} bytes, account={}): {}",
+                    rb.len(),
+                    account.alias,
+                    rb
+                );
+            }
+            tracing::info!(
                 "[stream:{model}] full upstream body ({} bytes, account={}): {}",
                 received.len(),
                 account.alias,
@@ -1227,8 +1235,16 @@ pub(crate) async fn anthropic_to_openai_streaming(
         // 必须看得到 tool_call 的开场块——它常落在 DB 存不到的中段。
         // 受 RUST_LOG 控制：TRACE 才打（2026-10-05 前挂在 DEBUG，一天能烧掉
         // 130MB+），日常 `llmux=info` 关闭，排查时临时设 `llmux=trace`。
-        if tracing::enabled!(tracing::Level::TRACE) {
-            tracing::trace!(
+        if tracing::enabled!(tracing::Level::TRACE) || std::env::var("LLMUX_BODY_DUMP").as_deref() == Ok("1") {
+            if let Some(rb) = &request_body {
+                tracing::info!(
+                    "[stream:{model}] full request body ({} bytes, account={}): {}",
+                    rb.len(),
+                    account.alias,
+                    rb
+                );
+            }
+            tracing::info!(
                 "[stream:{model}] full upstream body ({} bytes, account={}): {}",
                 received.len(),
                 account.alias,
@@ -1372,8 +1388,16 @@ pub(crate) async fn responses_to_anthropic_streaming(
         let (cache_read, cache_create) = conv.usage_cache();
         let latency_ms = start.elapsed().as_millis() as i64;
         // 完整流落文件日志（DB 里是截断视图）—— 同 anthropic_to_openai_streaming。
-        if tracing::enabled!(tracing::Level::TRACE) {
-            tracing::trace!(
+        if tracing::enabled!(tracing::Level::TRACE) || std::env::var("LLMUX_BODY_DUMP").as_deref() == Ok("1") {
+            if let Some(rb) = &request_body {
+                tracing::info!(
+                    "[stream:{model}] full request body ({} bytes, account={}): {}",
+                    rb.len(),
+                    account.alias,
+                    rb
+                );
+            }
+            tracing::info!(
                 "[stream:{model}] full upstream body ({} bytes, account={}): {}",
                 received.len(),
                 account.alias,

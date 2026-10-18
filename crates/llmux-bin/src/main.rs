@@ -66,7 +66,7 @@ async fn main() -> anyhow::Result<()> {
         // discard the last buffered lines on every start. Leaking it is the
         // documented pattern (and correct — the process is exiting anyway).
         let (file_writer, guard) = tracing_appender::non_blocking(
-            tracing_appender::rolling::daily(&log_dir, "llmux.log"),
+            tracing_appender::rolling::hourly(&log_dir, "llmux.log"),
         );
         let _guard = Box::leak(Box::new(guard));
 
@@ -118,6 +118,7 @@ async fn start(port_override: Option<u16>, use_tui: bool) -> anyhow::Result<()> 
         .unwrap_or_else(|_| config.data_dir.clone());
     std::fs::create_dir_all(&log_dir).ok();
     cleanup_old_logs(&log_dir);
+    spawn_log_cleanup(log_dir.clone());
     llmux_server::routes::v1::request_capture::cleanup_expired(&log_dir);
     let database_url = sqlite_url_from_path(&config.database_path);
     let pool = connect_sqlite(&database_url).await?;
@@ -239,14 +240,13 @@ async fn start(port_override: Option<u16>, use_tui: bool) -> anyhow::Result<()> 
     Ok(())
 }
 
-static CLEANUP_FMT: std::sync::LazyLock<Vec<time::format_description::BorrowedFormatItem<'static>>> = std::sync::LazyLock::new(|| time::format_description::parse_borrowed::<1>("[year]-[month]-[day]").unwrap());
-
 fn cleanup_old_logs(dir: &std::path::Path) {
-    let retain: i64 = std::env::var("LOG_RETAIN_DAYS")
+    let retain_hours: i64 = std::env::var("LOG_RETAIN_DAYS")
         .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(7);
-    if retain <= 0 {
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(2)
+        * 24;
+    if retain_hours <= 0 {
         return;
     }
     let entries = match std::fs::read_dir(dir) {
@@ -254,25 +254,79 @@ fn cleanup_old_logs(dir: &std::path::Path) {
         Err(_) => return,
     };
     let now = time::OffsetDateTime::now_local()
-        .unwrap_or_else(|_| time::OffsetDateTime::now_utc())
-        .date();
-    let fmt = &*CLEANUP_FMT;
+        .unwrap_or_else(|_| time::OffsetDateTime::now_utc());
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
         let Some(date_str) = name.strip_prefix("llmux.log.") else {
             continue;
         };
-        let Ok(date) = time::Date::parse(date_str, &fmt) else {
-            continue;
+        let date_str = date_str.trim_end_matches(".gz");
+        // try hourly format first, then daily
+        let hourly_format = match time::format_description::parse(
+            "[year]-[month]-[day]-[hour]:[minute]:[second] [offset_hour sign:mandatory]:[offset_minute]",
+        ) {
+            Ok(format) => format,
+            Err(error) => {
+                tracing::warn!("log cleanup: invalid hourly timestamp format: {error}");
+                continue;
+            }
         };
-        if (now - date).whole_days() > retain {
-            let p = entry.path();
-            match std::fs::remove_file(&p) {
-                Ok(_) => tracing::info!("🗑️  removed old log {}", p.display()),
-                Err(e) => tracing::warn!("log cleanup: failed to remove {}: {}", p.display(), e),
+        let daily_format = match time::format_description::parse(
+            "[year]-[month]-[day] [hour]:[minute]:[second] [offset_hour sign:mandatory]:[offset_minute]",
+        ) {
+            Ok(format) => format,
+            Err(error) => {
+                tracing::warn!("log cleanup: invalid daily timestamp format: {error}");
+                continue;
+            }
+        };
+        let file_time = time::OffsetDateTime::parse(
+            &format!("{}:00:00 +00:00", date_str),
+            &hourly_format,
+        )
+        .or_else(|_| {
+            time::OffsetDateTime::parse(
+                &format!("{} 00:00:00 +00:00", date_str),
+                &daily_format,
+            )
+        });
+        let Ok(file_time) = file_time else { continue; };
+        let age_hours = (now - file_time).whole_hours();
+        let p = entry.path();
+        // compress logs older than 1 hour
+        if age_hours > 1 && !name.ends_with(".gz") {
+            let gz_path = format!("{}.gz", p.display());
+            if !std::path::Path::new(&gz_path).exists() {
+                let status = std::process::Command::new("gzip")
+                    .arg("-k")
+                    .arg(&p)
+                    .status();
+                if status.map(|s| s.success()).unwrap_or(false) {
+                    let _ = std::fs::remove_file(&p);
+                    tracing::info!("compressed old log {}", p.display());
+                }
             }
         }
+        // remove logs beyond retention
+        if age_hours > retain_hours {
+            let target = if std::path::Path::new(&format!("{}.gz", p.display())).exists() {
+                std::path::PathBuf::from(format!("{}.gz", p.display()))
+            } else {
+                p.clone()
+            };
+            let _ = std::fs::remove_file(&target);
+        }
     }
+}
+
+/// Periodic log cleanup + compression (every 6h).
+pub fn spawn_log_cleanup(log_dir: std::path::PathBuf) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(6 * 3600)).await;
+            cleanup_old_logs(&log_dir);
+        }
+    });
 }
 
 fn get_local_lan_ip() -> String {

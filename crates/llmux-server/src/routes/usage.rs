@@ -140,8 +140,16 @@ pub async fn get_activity_detail(
 
     // 分段模式：只回一个片段，外加 total/next_offset 供前端续拉。
     if let Some(part) = params.part.as_deref() {        let full = match part {
-            "request" => request_body,
-            "response" => response_body,
+            "request" => crate::routes::v1::helpers::read_body_from_local_logs(
+                row.try_get::<i64, _>("timestamp").unwrap_or_default(),
+                &row.try_get::<String, _>("model").unwrap_or_default(),
+                "request",
+            ),
+            "response" => crate::routes::v1::helpers::read_body_from_local_logs(
+                row.try_get::<i64, _>("timestamp").unwrap_or_default(),
+                &row.try_get::<String, _>("model").unwrap_or_default(),
+                "response",
+            ),
             other => {
                 return crate::error::simple_error(
                     format!("unknown part: {other}"),

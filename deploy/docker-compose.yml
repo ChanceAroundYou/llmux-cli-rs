@@ -23,7 +23,8 @@ services:
       - BASE_PATH=${BASE_PATH:-llmux}
       - TZ=Asia/Shanghai
       - RUST_LOG=llmux=info
-      - LOG_RETAIN_DAYS=${LOG_RETAIN_DAYS:-30}
+      - LLMUX_BODY_DUMP=1
+      - LOG_RETAIN_DAYS=${LOG_RETAIN_DAYS:-3}
       - BODY_RETAIN_DAYS=${BODY_RETAIN_DAYS:-1}
       - LOG_ROW_RETAIN_DAYS=${LOG_ROW_RETAIN_DAYS:-30}
       - ADMIN_USERNAME=${ADMIN_USERNAME}

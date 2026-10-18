@@ -752,6 +752,9 @@ pub fn anthropic_resp_to_responses_resp(anth: &Value, model: &str) -> Value {
         "usage": {
             "input_tokens": usage["input_tokens"].as_i64().unwrap_or(0),
             "output_tokens": usage["output_tokens"].as_i64().unwrap_or(0),
+            "input_tokens_details": {
+                "cached_tokens": usage["cache_read_input_tokens"].as_i64().unwrap_or(0)
+            },
         },
     });
     if incomplete {
@@ -1211,7 +1214,18 @@ impl ResponsesToAnthropicConverter {
         calls.sort_by_key(|call| call.index);
         for call in calls { out.push(sse_event("content_block_stop", json!({"type":"content_block_stop","index":call.index}))); }
         let stop_reason = if self.incomplete_max_tokens { "max_tokens" } else if self.function_calls.is_empty() { "end_turn" } else { "tool_use" };
-        out.push(sse_event("message_delta", json!({"type":"message_delta","delta":{"stop_reason":stop_reason,"stop_sequence":null},"usage":self.last_usage.clone().unwrap_or(json!({}))})));
+        let usage = self.last_usage.as_ref();
+        let raw_input = usage.and_then(|u| u.get("input_tokens").or_else(|| u.get("prompt_tokens"))).and_then(Value::as_i64).unwrap_or(0).max(0);
+        let output = usage.and_then(|u| u.get("output_tokens").or_else(|| u.get("completion_tokens"))).and_then(Value::as_i64).unwrap_or(0).max(0);
+        let (cache_read, cache_create) = self.usage_cache();
+        let fresh_input = (raw_input - cache_read).max(0);
+        let canonical_usage = json!({
+            "input_tokens": fresh_input,
+            "output_tokens": output,
+            "cache_read_input_tokens": cache_read,
+            "cache_creation_input_tokens": cache_create,
+        });
+        out.push(sse_event("message_delta", json!({"type":"message_delta","delta":{"stop_reason":stop_reason,"stop_sequence":null},"usage":canonical_usage})));
         out.push(sse_event("message_stop", json!({"type":"message_stop"})));
         out
     }

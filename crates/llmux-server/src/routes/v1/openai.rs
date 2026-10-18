@@ -2447,8 +2447,16 @@ async fn openai_streaming_passthrough(
         // TRACE, not DEBUG: a full body is tens-to-hundreds of KB and at DEBUG
         // it dominated the log (129.5 of 132.6 MB on 2026-10-05). Investigation
         // needs it; the steady state does not.
-        if tracing::enabled!(tracing::Level::TRACE) {
-            tracing::trace!(
+        if tracing::enabled!(tracing::Level::TRACE) || std::env::var("LLMUX_BODY_DUMP").as_deref() == Ok("1") {
+            if let Some(rb) = &request_body {
+                tracing::info!(
+                    "[openai:{model}] full request body ({} bytes, account={}): {}",
+                    rb.len(),
+                    account.alias,
+                    rb
+                );
+            }
+            tracing::info!(
                 "[openai:{model}] full upstream body ({} bytes, account={}): {}",
                 received.len(),
                 account.alias,

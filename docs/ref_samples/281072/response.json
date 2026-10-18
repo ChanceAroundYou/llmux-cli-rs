@@ -1,0 +1,25 @@
+data: {"id":"gen_01M569NAK1JTHXZ05HK4NH7E48","object":"chat.completion.chunk","created":1792286567,"model":"stealth/cat-jam","choices":[{"index":0,"delta":{"role":"assistant"},"logprobs":null,"finish_reason":null}],"system_fingerprint":"fp_slejkmpqxq"}
+
+data: {"id":"gen_01M569NAK1JTHXZ05HK4NH7E48","object":"chat.completion.chunk","created":1792286567,"model":"stealth/cat-jam","choices":[{"index":0,"delta":{"reasoning":"Let","reasoning_details":[{"type":"reasoning.text","text":"Let","format":"unknown","index":0}]},"logprobs":null,"finish_reason":null}],"system_fingerprint":"fp_slejkmpqxq"}
+
+data: {"id":"gen_01M569NAK1JTHXZ05HK4NH7E48","object":"chat.completion.chunk","created":1792286567,"model":"stealth/cat-jam","choices":[{"index":0,"delta":{"reasoning":" me look at the diff to review.","reasoning_details":[{"type":"reasoning.text","text":" me look at the diff to review.","format":"unknown","index":0}]},"logprobs":null,"finish_reason":null}],"system_fingerprint":"fp_slejkmpqxq"}
+
+data: {"id":"gen_01M569NAK1JTHXZ05HK4NH7E48","object":"chat.completion.chunk","created":1792286567,"model":"stealth/cat-jam","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_bf18c48420014d1999680eb73db6517f","type":"function","function":{"name":"Bash","arguments":""}}]},"logprobs":null,"finish_reason":null}],"system_fingerprint":"fp_slejkmpqxq"}
+
+data: {"id":"gen_01M569NAK1JTHXZ05HK4NH7E48","object":"chat.completion.chunk","created":1792286567,"model":"stealth/cat-jam","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"command\": \""}}]},"logprobs":null,"finish_reason":null}],"system_fingerprint":"fp_slejkmpqxq"}
+
+data: {"id":"gen_01M569NAK1JTHXZ05HK4NH7E48","object":"chat.completion.chunk","created":1792286567,"model":"stealth/cat-jam","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"cd /home/xiaokubao/projects/llmux"}}]},"logprobs":null,"finish_reason":null}],"system_fingerprint":"fp_slejkmpqxq"}
+
+data: {"id":"gen_01M569NAK1JTHXZ05HK4NH7E48","object":"chat.completion.chunk","created":1792286567,"model":"stealth/cat-jam","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":" && git diff -- crates"}}]},"logprobs":null,"finish_reason":null}],"system_fingerprint":"fp_slejkmpqxq"}
+
+data: {"id":"gen_01M569NAK1JTHXZ05HK4NH7E48","object":"chat.completion.chunk","created":1792286567,"model":"stealth/cat-jam","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"/llmux-core/src/proxy/"}}]},"logprobs":null,"finish_reason":null}],"system_fingerprint":"fp_slejkmpqxq"}
+
+data: {"id":"gen_01M569NAK1JTHXZ05HK4NH7E48","object":"chat.completion.chunk","created":1792286567,"model":"stealth/cat-jam","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"anthropic_openai.rs crates/ll"}}]},"logprobs":null,"finish_reason":null}],"system_fingerprint":"fp_slejkmpqxq"}
+
+data: {"id":"gen_01M569NAK1JTHXZ05HK4NH7E48","object":"chat.completion.chunk","created":1792286567,"model":"stealth/cat-jam","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"mux-core/tests/anthropic_openai"}}]},"logprobs":null,"finish_reason":null}],"system_fingerprint":"fp_slejkmpqxq"}
+
+data: {"id":"gen_01M569NAK1JTHXZ05HK4NH7E48","object":"chat.completion.chunk","created":1792286567,"model":"stealth/cat-jam","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"_contract.rs\"}"}}]},"logprobs":null,"finish_reason":null}],"system_fingerprint":"fp_slejkmpqxq"}
+
+data: {"id":"gen_01M569NAK1JTHXZ05HK4NH7E48","object":"chat.completion.chunk","created":1792286567,"model":"stealth/cat-jam:free","choices":[{"index":0,"delta":{},"logprobs":null,"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":20769,"completion_tokens":72,"total_tokens":20841,"prompt_tokens_details":{"cached_tokens":20736,"audio_tokens":0,"video_tokens":0},"completion_tokens_details":{"reasoning_tokens":18,"image_tokens":0},"cache_creation_input_tokens":0},"system_fingerprint":"fp_slejkmpqxq"}
+
+data: [DONE]
