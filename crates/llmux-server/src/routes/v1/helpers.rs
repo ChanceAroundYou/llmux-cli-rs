@@ -1946,3 +1946,11 @@ pub fn read_body_from_local_logs(timestamp_ms: i64, model: &str, part: &str) -> 
     }
     best
 }
+
+pub fn extract_latest_user_message_pub(body: &str) -> Option<String> {
+    extract_latest_user_message(body)
+}
+
+pub fn extract_response_text_pub(body: &str) -> Option<String> {
+    extract_response_text(body)
+}

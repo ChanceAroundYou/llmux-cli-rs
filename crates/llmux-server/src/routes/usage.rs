@@ -139,7 +139,8 @@ pub async fn get_activity_detail(
     let response_body = row.try_get::<Option<String>, _>("response_body").unwrap_or_default();
 
     // 分段模式：只回一个片段，外加 total/next_offset 供前端续拉。
-    if let Some(part) = params.part.as_deref() {        let full = match part {
+    if let Some(part) = params.part.as_deref() {
+        let raw = match part {
             "request" => crate::routes::v1::helpers::read_body_from_local_logs(
                 row.try_get::<i64, _>("timestamp").unwrap_or_default(),
                 &row.try_get::<String, _>("model").unwrap_or_default(),
@@ -156,6 +157,18 @@ pub async fn get_activity_detail(
                     StatusCode::BAD_REQUEST,
                 )
             }
+        };
+        // 从日志读出的 body 是原始报文（SSE delta 或 JSON），需按协议组装成
+        // 完整响应：SSE 逐 delta 拼接成 thinking/tool_calls/content，请求取最后一条 user message。
+        // 若组装失败（如非标准格式），回退到原始 body，避免详情页空白。
+        let full = match part {
+            "request" => raw.as_deref().and_then(|b| {
+                crate::routes::v1::helpers::extract_latest_user_message_pub(b).or_else(|| Some(b.to_string()))
+            }),
+            "response" => raw.as_deref().and_then(|b| {
+                crate::routes::v1::helpers::extract_response_text_pub(b).or_else(|| Some(b.to_string()))
+            }),
+            _ => None,
         };
         let text = full.unwrap_or_default();
         // `offset` / `next_offset` 以**字节**计（对外可与 total 直接比较），
