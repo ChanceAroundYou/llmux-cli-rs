@@ -2051,17 +2051,22 @@ async fn dispatch_aggregate_openai(
         if switched {
             tracing::info!("🔀 [agg:{}] V migrated -> {} (after 3-confirm)", alias, hit);
             llmux_core::aggregate::persist_active(&state.pool, &alias, hit).await;
-        } else if hit != active && anchor_attempted {
-            // 锁着的别名根本不计数（record_request_outcome 遇到 locked 直接回 false）。
-            // 此前这里照样打「pending V migration (0/3)」——读日志的人会等一个永远
-            // 不会来的第 3 次。分开写也是为了让日志能当证据：看到 locked 就知道内存
-            // 里的锁是活的（重启后靠播种恢复）。
+        } else if hit != active {
+            // 三种「没迁移」在日志里此前长得一样而含义不同，分开写：
+            // - 锁着的别名根本不计数（record_request_outcome 遇 locked 直接回 false）
+            //   —— 以前照样打 pending (0/3)，读日志的人会等一个永远不会来的第 3 次。
+            // - 锚点被跳过的（退避 / 上下文装不下 / max_tokens）不是证据。以前这条
+            //   完全静默 —— 跳过时连 decision 行都不打，线上看不出规则有没有生效。
             let router = state.aggregate_router.lock().unwrap();
             let e = router.entries.get(&alias);
-            tracing::info!("🔀 [agg:{}] {}", alias, match e {
-                Some(e) if e.locked => format!("hit {} but locked (migration frozen)", hit),
-                _ => format!("hit {} pending V migration ({}/3)", hit, e.map(|e| e.confirm_count).unwrap_or(0)),
-            });
+            let why = if e.map(|e| e.locked).unwrap_or(false) {
+                format!("hit {hit} but locked (migration frozen)")
+            } else if !anchor_attempted {
+                format!("hit {hit} but the anchor was skipped (cooldown / request-side) — not evidence")
+            } else {
+                format!("hit {hit} pending V migration ({}/3)", e.map(|e| e.confirm_count).unwrap_or(0))
+            };
+            tracing::info!("🔀 [agg:{}] {}", alias, why);
         }
         if let Some(resp) = hit_stream_resp {
             // need cand model for stream
