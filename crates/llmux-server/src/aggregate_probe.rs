@@ -250,7 +250,7 @@ async fn probe_dual_phase(
     if !alive.is_empty() {
         alive.sort_unstable();
         let best = alive[0];
-        tracing::debug!("🔍 [agg:{}] probe best V={} (active={})", alias, best, active);
+        tracing::info!("🔍 [agg:{}] probe best V={} (active={})", alias, best, active);
         return Some(best);
     }
 
