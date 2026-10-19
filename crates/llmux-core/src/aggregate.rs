@@ -250,7 +250,7 @@ impl AggregateRouter {
             return false;
         }
         // 命中下游候选：按同一 target 连续 3 次（且在窗口内）才切
-        Self::advance_pending(e, hit, now)
+        Self::advance_pending(e, alias, hit, now)
     }
 
     /// Called when a request exhausts all candidates (502). Treat as pending V=0.
@@ -274,7 +274,7 @@ impl AggregateRouter {
         if e.active == 0 {
             // 已在 0：无迁移，但「连续全失败」仍要 3 次（窗口内）才触发退避翻倍。
             // 中断（锚点成功过一次）由 record_request_outcome 的 break_pending 负责。
-            if !Self::bump_pending(e, 0, now) {
+            if !Self::bump_pending(e, alias, 0, now) {
                 return false;
             }
             Self::break_pending(e);
@@ -282,7 +282,7 @@ impl AggregateRouter {
             return false;
         }
         // active != 0 且全失败：视为连续 3 次要求切回 0，中断则清零
-        let switched = Self::advance_pending(e, 0, now);
+        let switched = Self::advance_pending(e, alias, 0, now);
         if switched {
             e.probe_backoff_secs = (e.probe_backoff_secs * 2).min(PROBE_BACKOFF_MAX_SECS);
         }
@@ -316,7 +316,7 @@ impl AggregateRouter {
             }
             return false;
         }
-        let switched = Self::advance_pending(e, v_prime, now);
+        let switched = Self::advance_pending(e, alias, v_prime, now);
         e.last_probe = Instant::now();
         switched
     }
@@ -324,10 +324,18 @@ impl AggregateRouter {
     /// 推进一次确认：窗口内才继续攒，超窗口从头计数（是从 1 重新开始，不是清零）。
     /// 返回是否达到 3 次。窗口判据只在这一处 —— 请求侧和探活侧共用同一个 pending，
     /// 所以「3 次」是 3 次观察，证据来源可以混合。
-    fn bump_pending(e: &mut AggregateEntry, target: usize, now: Instant) -> bool {
+    fn bump_pending(e: &mut AggregateEntry, alias: &str, target: usize, now: Instant) -> bool {
         if e.pending_target == Some(target) {
             let started = e.pending_started.unwrap_or(now);
             if now.saturating_duration_since(started).as_secs() > PENDING_WINDOW_SECS {
+                // 窗口判据是这条规则唯一能被观察到的地方 —— 以前它静默重置，
+                // 线上看不出「3 次」到底是连着的还是跨了窗口。
+                tracing::info!(
+                    "🔀 [agg:{}] pending target {target} 跨过 {} 分钟窗口，之前攒的 {} 次作废，从 1 重新计数",
+                    alias,
+                    PENDING_WINDOW_SECS / 60,
+                    e.confirm_count
+                );
                 e.pending_started = Some(now);
                 e.confirm_count = 1;
                 return false;
@@ -341,8 +349,8 @@ impl AggregateRouter {
         e.confirm_count >= 3
     }
 
-    fn advance_pending(e: &mut AggregateEntry, target: usize, now: Instant) -> bool {
-        if !Self::bump_pending(e, target, now) {
+    fn advance_pending(e: &mut AggregateEntry, alias: &str, target: usize, now: Instant) -> bool {
+        if !Self::bump_pending(e, alias, target, now) {
             return false;
         }
         e.active = target;
@@ -559,6 +567,21 @@ mod tests {
         assert!(!r.record_request_outcome("a", 2, 3, t + Duration::from_secs(40), true));
         assert!(r.record_request_outcome("a", 2, 3, t + Duration::from_secs(50), true));
         assert_eq!(r.get_active("a"), 2);
+    }
+
+    /// 探活扫全表之后，best 比锚点更优就要把位置**往上**挪。此前探活范围是
+    /// `0..=active` 且 `record_probe_candidate` 有个「不得比手动起点更优」的地板，
+    /// 两处合起来把状态机钉成只能降。手动起点和自发迁移现在是同一回事；要钉住
+    /// 位置用 `locked`（C-B2），不是靠拒绝回升。
+    #[test]
+    fn a_probe_best_better_than_the_anchor_moves_position_up() {
+        let mut r = AggregateRouter::default();
+        let t = Instant::now();
+        r.set_active("a", 2, 3);
+        assert!(!r.record_probe_candidate("a", 0, 3, t));
+        assert!(!r.record_probe_candidate("a", 0, 3, t + Duration::from_secs(10)));
+        assert!(r.record_probe_candidate("a", 0, 3, t + Duration::from_secs(20)));
+        assert_eq!(r.get_active("a"), 0);
     }
 
     /// C-A3/A4：重启播种—— 库值在界内则恢复，越界归 0 并要求调用点回写。
