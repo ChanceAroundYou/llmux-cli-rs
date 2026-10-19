@@ -556,9 +556,15 @@ impl AppState {
         // resolve_aggregate 已回退到库里的 active_idx（C-A3），这里不得再用
         // get_active().unwrap_or(0) 覆盖回去 —— 否则重启后第一次请求永远从 0 开始。
         let res = if let Some(mut r) = res {
-            let has_entry = self.aggregate_router.lock().unwrap().entries.contains_key(&key);
-            if has_entry {
-                r.active = self.aggregate_router.lock().unwrap().get_active(&key).min(r.candidates.len().saturating_sub(1));
+            let mut router = self.aggregate_router.lock().unwrap();
+            if router.entries.contains_key(&key) {
+                r.active = router.get_active(&key).min(r.candidates.len().saturating_sub(1));
+            } else {
+                // C-A3 + C-B2：内存没有 entry（重启后第一次请求）时 active 和 locked
+                // 都要从库恢复。此前只恢复 active —— locked 要等探活跑到那一轮才写内存，
+                // 在那之前已锁定的别名在请求侧是裸的，会被照常迁移（实测 of 重启后
+                // 10:12 / 10:37 两次 V migrated，而它的 lock 是 10-15 设的）。
+                router.seed_active_if_absent(&key, r.active, r.candidates.len(), r.locked);
             }
             Some(r)
         } else { None };

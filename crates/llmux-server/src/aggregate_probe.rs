@@ -133,15 +133,9 @@ async fn run_probe_round(
     let now = Instant::now();
 
     for (alias, (interval_secs, db_locked)) in aliases {
-        // C-B2：锁定后整组探测暂停 —— continue 且不碰 last_probe（否则解锁
-        // 瞬间 is_due 立刻到期，连探三轮）。内存锁由 lock 接口同步，这里以
-        // 库值为准：重启后内存是空的，库才是真相。
-        if db_locked {
-            let len_hint = aggregate_router.lock().unwrap().entries.get(&alias).map(|e| e.last_status.len().max(1)).unwrap_or(1);
-            aggregate_router.lock().unwrap().set_locked(&alias, true, len_hint);
-            continue;
-        }
         // 按别名各自判到期 —— 快的别名按自己的节奏探，慢的/退避中的不受牵连。
+        // 判到期在播种之前：全新的别名第一轮就该探（播种会把 last_probe 设成
+        // 此刻，那样第一个 interval 就白等）。
         {
             let guard = aggregate_router.lock().unwrap();
             let since = guard.secs_since_probe(&alias, now);
@@ -175,14 +169,21 @@ async fn run_probe_round(
         }
         // C-A3：内存无 entry 时用库里的 active_idx 播种（重启恢复手动起点）；
         // 存量越界（stored >= len，候选列表被改短）回写 0（C-A4），否则下次
-        // 重启又读回越界值。
+        // 重启又读回越界值。锁**一起**恢复 —— 此前只播种 active，重启后
+        // locked 的别名在内存里是未锁定的，请求路径照样给它迁移位置。
         let stored = stored_active.unwrap_or(0).max(0) as usize;
-        let need_reset = aggregate_router.lock().unwrap().seed_active_if_absent(&alias, stored, len);
+        let need_reset = aggregate_router.lock().unwrap().seed_active_if_absent(&alias, stored, len, db_locked);
         if need_reset {
             let _ = sqlx::query("UPDATE aggregate_aliases SET active_idx = 0 WHERE alias = ?")
                 .bind(&alias)
                 .execute(pool)
                 .await;
+        }
+        // C-B2：锁定后整组探测暂停 —— continue 且不碰 last_probe（否则解锁
+        // 瞬间 is_due 立刻到期，连探三轮）。这里以库值为准：重启后内存是空的，
+        // 库才是真相（锁已随上面的播种落到内存）。
+        if db_locked {
+            continue;
         }
         let active = aggregate_router.lock().unwrap().get_active(&alias);
         let active = active.min(len.saturating_sub(1));
@@ -600,24 +601,25 @@ mod tests {
         assert_eq!(probe_range(3), 0..3);
     }
 
-    /// C-B2：锁定的别名整轮跳过 —— 不建内存 entry、不读候选、不发请求。
-    /// （锁检查在读 candidates 之前：账户 99 根本不存在，能走完即证明零请求。）
-    /// 也不碰 last_probe，否则解锁瞬间 is_due 立刻到期、连探三轮。
+    /// C-B2：锁定的别名整轮跳过 —— 不发请求、不碰 last_probe。
+    /// （锁和 active 一起从库播种；账户 99 不存在，能跑到断言就说明零请求。）
+    /// 不碰 last_probe，否则解锁瞬间 is_due 立刻到期、连探三轮。
     #[tokio::test]
     async fn locked_alias_is_skipped_for_the_whole_probe_round() {
         let pool = llmux_core::db::connect_sqlite("sqlite::memory:").await.unwrap();
         llmux_core::db::init_db(&pool).await.unwrap();
-        sqlx::query("INSERT INTO aggregate_aliases (alias, candidates, locked) VALUES ('l', '[{\"account_id\":99,\"model\":\"m\"}]', 1)")
+        sqlx::query("INSERT INTO aggregate_aliases (alias, candidates, locked, active_idx) VALUES ('l', '[{\"account_id\":99,\"model\":\"m\"},{\"account_id\":99,\"model\":\"m\"},{\"account_id\":99,\"model\":\"m\"}]', 1, 2)")
             .execute(&pool)
             .await
             .unwrap();
         let router = Arc::new(Mutex::new(AggregateRouter::default()));
         run_probe_round(&pool, "key", &router).await.unwrap();
-        // 锁从库同步到了内存；entry 若是探活建的会是未锁定 —— 锁定位证明
-        // 走的是跳过分支（该分支在读 candidates 之前 return，账户 99 根本
-        // 不存在也零请求）。last_probe 也没被碰，解锁后不会连探三轮。
+        // 锁和位置一起从库恢复到内存；entry 若是探活建的会是未锁定的 —— 锁定位
+        // 证明走的是跳过分支（账户 99 根本不存在，能跑到断言就说明零请求）。
+        // last_probe 也没被碰，解锁后不会连探三轮。
         let guard = router.lock().unwrap();
         assert!(guard.is_locked("l"));
+        assert_eq!(guard.get_active("l"), 2);
         assert!(guard.entries.get("l").unwrap().pending_target.is_none());
     }
 }

@@ -54,6 +54,10 @@ pub struct AggregateResolution {
     pub active: usize,
     pub upstream_api: crate::upstream_api::UpstreamApi,
     pub first_byte_timeout_secs: Option<u64>,
+    /// 库里的 `locked`。调用点据此把锁种进内存 entry（见 app.rs）—— 此前只有
+    /// 「调 lock 接口」和「探活跑到这一轮」两条路径会写内存，所以重启后、探活
+    /// 第一轮之前，已锁定的别名在请求侧是不锁定的，会被照常迁移。
+    pub locked: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -149,16 +153,18 @@ impl AggregateRouter {
     }
 
     /// C-A3：内存没有 entry 时用库里的 `active_idx` 播种（clamp：越界归 0，
-    /// 与 C-A4 的 reset 语义一致）。已存在 entry 不动 —— 内存是运行时的
-    /// 真实位置，库只是重启后的起点。返回 true 表示存量越界、调用点应把
-    /// 库回写为 0（ensure_entry 拿不到 pool，由调用点落库）。
-    pub fn seed_active_if_absent(&mut self, alias: &str, stored: usize, len: usize) -> bool {
+    /// 与 C-A4 的 reset 语义一致）。`stored_locked` 同样要种下去（C-B2 的「重启恢复」
+    /// 此前只恢复 active）—— 否则重启后到探活跑到那一轮之前，已锁定的别名在请求侧
+    /// 是裸的。已有内存 entry 不动 —— 内存是运行时的真实位置，库只是重启后的起点。
+    /// 返回 true 表示存量越界、调用点应把库回写为 0（ensure_entry 拿不到 pool，由调用点落库）。
+    pub fn seed_active_if_absent(&mut self, alias: &str, stored: usize, len: usize, stored_locked: bool) -> bool {
         if self.entries.contains_key(alias) || len == 0 {
             return false;
         }
         let (active, need_reset) = if stored < len { (stored, false) } else { (0, true) };
         let mut e = AggregateEntry::default();
         e.active = active;
+        e.locked = stored_locked;
         e.last_status = vec![None; len];
         self.entries.insert(alias.to_string(), e);
         need_reset
@@ -440,6 +446,7 @@ pub async fn resolve_aggregate(
         active,
         upstream_api,
         first_byte_timeout_secs: row.first_byte_timeout_secs.and_then(|v| u64::try_from(v).ok()),
+        locked: row.locked.unwrap_or(0) == 1,
     }))
 }
 
@@ -559,15 +566,37 @@ mod tests {
     #[test]
     fn seed_active_restores_stored_value_and_reports_out_of_range() {
         let mut r = AggregateRouter::default();
-        assert!(!r.seed_active_if_absent("a", 2, 3));
+        assert!(!r.seed_active_if_absent("a", 2, 3, false));
         assert_eq!(r.get_active("a"), 2);
         // 已有 entry：库里哪怕是别的值也不覆盖
-        assert!(!r.seed_active_if_absent("a", 0, 3));
+        assert!(!r.seed_active_if_absent("a", 0, 3, false));
         assert_eq!(r.get_active("a"), 2);
 
         let mut r = AggregateRouter::default();
-        assert!(r.seed_active_if_absent("b", 5, 3));
+        assert!(r.seed_active_if_absent("b", 5, 3, false));
         assert_eq!(r.get_active("b"), 0);
+    }
+
+    /// 重启播种必须连 `locked` 一起恢复。此前只恢复 active：`locked` 只有两条路径
+    /// 会写内存 —— 调 lock 接口，或探活跑到那一轮时从库同步。所以重启后到探活第一轮
+    /// 之前，库里 `locked=1` 的别名在请求侧是裸的，会被照常迁移。
+    /// 线上实测：`of` 的 lock 是 2026-10-15 设的，10-19 重启后 10:12 / 10:37 两次
+    /// `V migrated` 都发生了。
+    #[test]
+    fn seeding_from_db_restores_the_lock_too() {
+        let mut r = AggregateRouter::default();
+        assert!(!r.seed_active_if_absent("a", 2, 3, true));
+        assert_eq!(r.get_active("a"), 2);
+        assert!(r.is_locked("a"), "库里锁着，播种就要把锁一起种上");
+        // 锁着的别名即使被连中 3 次也不切
+        let t = Instant::now();
+        for k in 1..=3 {
+            assert!(!r.record_request_outcome("a", 1, 3, t + Duration::from_secs(k * 10), true));
+        }
+
+        let mut r = AggregateRouter::default();
+        assert!(!r.seed_active_if_absent("b", 0, 3, false));
+        assert!(!r.is_locked("b"), "没锁的别名不能被凭空锁上");
     }
 
     /// C-B2：锁定时请求侧的升降级全部冻结 —— 下游连中 3 次也不切，

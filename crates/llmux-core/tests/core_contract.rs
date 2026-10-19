@@ -1534,7 +1534,43 @@ async fn migration_0036_adds_active_idx_and_locked() {
     assert_eq!(active2, 2);
 }
 
-/// 自动迁移也要落库。此前只有手动 `set` 落库，请求侧/探活侧的迁移只改内存 ——
+/// 重启后第一次请求也要把库里的 `locked` 认下来。此前 `resolve_aggregate` 只恢复
+/// `active_idx`，`locked` 只在「调 lock 接口」或「探活跑到这一轮」时才进内存 ——
+/// 于是重启后、探活第一轮之前，一个已锁定的别名在请求侧是不锁定的，照样会被迁移。
+/// 线上撞上了：`of` 的 locked=1 是 10-15 设的，今天 10:12 / 10:37 两次 V migrated 都发生了。
+#[tokio::test]
+async fn resolve_aggregate_restores_the_lock_not_only_active() {
+    let pool = memory_db().await;
+    let mut router = llmux_core::aggregate::AggregateRouter::default();
+
+    sqlx::query("INSERT INTO aggregate_aliases (alias, candidates, locked) VALUES ('aggL', '[{\"account_id\":1,\"model\":\"m\"}]', 1)")
+        .execute(&pool)
+        .await
+        .expect("insert locked aggregate");
+
+    let agg = llmux_core::aggregate::resolve_aggregate(&pool, "aggL", &router)
+        .await
+        .expect("resolve")
+        .expect("aggregate should resolve");
+    assert_eq!(agg.locked, true, "resolution 必须带上库里的锁");
+
+    // 调用点（app.rs 的 resolve 后）用 seed_active_if_absent 把 active 和锁一起
+    // 种进 entry（这里直接 set_locked 断言锁本身）；没锁的别名不能被凭空锁上。
+    router.set_locked("aggL", agg.locked, agg.candidates.len());
+    assert!(router.is_locked("aggL"));
+    // 锁着的别名请求侧不得迁移 —— 这正是重启后那条被漏掉的判定
+    assert!(!router.record_request_outcome("aggL", 0, 1, std::time::Instant::now(), true));
+
+    sqlx::query("INSERT INTO aggregate_aliases (alias, candidates, locked) VALUES ('aggU', '[{\"account_id\":1,\"model\":\"m\"}]', 0)")
+        .execute(&pool)
+        .await
+        .expect("insert unlocked aggregate");
+    let agg = llmux_core::aggregate::resolve_aggregate(&pool, "aggU", &router)
+        .await
+        .expect("resolve")
+        .expect("aggregate should resolve");
+    assert_eq!(agg.locked, false);
+}
 /// 于是「重启后回到 0」，而内存位置正是重启后恢复的起点。落库失败只打日志：
 /// 内存已经切成功，库写失败不该把一次成功的迁移变成错误。
 #[tokio::test]
