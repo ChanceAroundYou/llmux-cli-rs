@@ -34,6 +34,47 @@
 
 ### Fixed
 
+- **聚合别名：什么才算「该换候选」的证据**。三处判据此前都算证据，实际只有
+  「真的试过锚点、真的失败」才是：被跳过的候选（退避中 / 上下文装不下 /
+  `max_tokens` 超限 / 账户不存在）是**没试过**，不是失败。此前靠
+  `request_side_skips` 计数挡（下面 2026-10-05 那条描述的机制），那个门已删，
+  换成 `anchor_attempted` 标志 —— 三个聚合循环共用同一个判据。
+
+  同时：3 次确认必须在**同一个窗口内连续**（`PENDING_WINDOW_SECS = 1800`；最长
+  退避 600s、3 轮探活约 20 分钟，所以 30 分钟是量出来的下限），窗口判据只在
+  `bump_pending` 一处（请求侧和探活侧共用同一个 pending，证据来源可以混合）；
+  锚点上任何一次成功立刻打断计数。
+
+- **手动设定的起点不再是地板，位置可以双向走**（C-A1 作废，见
+  `docs/aggregate-active-lock-reasoning-sig-spec.md`）。探活改为扫全表 `0..len`
+  （此前 `0..=active`）。要钉住某个位置用「锁定」，不是靠拒绝回升。
+  合约测试 `a_probe_best_better_than_the_anchor_moves_position_up`。
+
+- **迁移落库**。此前只有手动 `set` 落库，请求侧/探活侧的迁移只改内存 —— 于是
+  「重启后回到 0」，而内存位置正是重启后恢复的起点。现在 `persist_active` 三处共用。
+
+- **重启后 `locked` 和 `active` 一起从库恢复**。此前只恢复 active：内存里的锁只有
+  两条路径会被写（调 lock 接口、或探活跑到那一轮时从库同步），所以重启后到探活
+  第一轮之前，库里 `locked=1` 的别名在请求侧是裸的，会被照常迁移。生产撞上了：
+  `of` 的锁是 10-15 设的，10-19 重启后 78 秒就 `V migrated -> 1`。三个调用点共用
+  `seed_active_if_absent`（现在收 `stored_locked`）。
+
+- **decision 日志分开写 —— 三条规则此前在线上不可分辨**。
+  - 锁着的别名根本不计数，却照样打 `pending V migration (0/3)`：读日志的人会等一个
+    永远不会来的第 3 次。
+  - 锚点被跳过（退避 / 请求侧装不下）不是证据，此前**完全静默** —— 跳过时连 decision
+    行都不打，规则有没有生效看不见。现在打 `hit N but the anchor was skipped — not evidence`。
+  - 窗口过期时从头计数也是静默的，现在打一行（之前攒的次数作废）。
+
+  正向证据（10-19 生产）：重启后 29 秒出现 `hit 4 but locked (migration frozen)`，
+  而探活第一轮至少 `sleep(tick)`（≥30s）还没跑 —— 锁只能来自请求路径的播种。
+
+- **日志 body 读取以 JSON 边界为准**。`read_body_from_local_logs` 原先凭「下一行以
+  `[` + 数字 开头」判定新日志条目，于是美化过的 JSON body 里一行以 `[12,` 开头的
+  数组元素会被当成条目边界，body 被截断、解析失败、回退到原文片段。现在先试当前
+  body 是否已是合法 JSON；非 JSON 时最多收 100 行（安全阀，防止把整个文件吞掉）。
+  测试 `log_body_reader_stops_at_json_boundaries_and_at_the_safety_valve`。
+
 - **zen_free 退役 → `category=zen` 原生直连（推翻 0034 的钉死决定）**。
   与 codex 同一类问题、但结论相反：`opencode.ai/zen/v1` 免费档的门是两个纯
   HTTP 头（不是 TLS 指纹），llmux 原生能过 —— sidecar 下线，`ZEN_FREE_BASE`
@@ -141,10 +182,14 @@
 
   三条豁免日志齐全、一条「failed」都没有，迁移照旧发生。
 
-  现在：聚合循环里新增 `request_side_skips` 计数。本次请求若含有请求侧跳过，
+  当时：聚合循环里新增 `request_side_skips` 计数。本次请求若含有请求侧跳过，
   成功落在下游时只调 `note_candidate_success`（记成功、**不推进** 3-confirm），
   不走 `record_request_outcome`。「下游更好」的证据必须来自候选本身的健康度，
   不能来自「主候选装不下这一个请求」。
+
+  ⚠️ **2026-10-19 这条被更干净的判据取代**：那个门要数「本次请求里有没有跳过」，
+  而真正需要知道的只有一件事 —— 锚点有没有被真的试过。改成 `anchor_attempted` 标志后
+  门删了（三个聚合循环各自一个标志，判据在 decision 块一处）。见上面第一条。
 
 - **「上下文装不下」不再被当成候选故障**。上游回「输入比上下文窗口长」时，
   原先和真正的故障一样调 `note_candidate_failure` → 连续 3 次触发 3-confirm
