@@ -737,9 +737,9 @@ async fn dispatch_aggregate_anthropic(
     // 耗尽成因分类：全因配额冷却 vs 掺了别的原因（见 helpers::exhausted_status）
     let mut cooled_skips = 0usize;
     let mut failed_candidates = 0usize;
-    // 本次请求里有多少个候选是因**请求侧**原因被跳过的（见 is_request_side_rejection）。
-    // 这类跳过不能算「下游候选更好」的证据，否则几个大请求就能把别名切到付费兜底。
-    let mut request_side_skips = 0usize;
+    // 推进 3-confirm 的唯一证据形态：这一轮**真的尝试了锚点**（active）且它真的失败了。
+    // 被跳过不算证据 —— 冷却 / 装不下 / max_tokens 不合规都是「没试过」，不是「坏了」。
+    let mut anchor_attempted = false;
     let mut hit: Option<usize> = None;
 
     // Pre-build a flag for streaming hit response (need account/model for passthrough)
@@ -751,11 +751,12 @@ async fn dispatch_aggregate_anthropic(
         let cand = &agg.candidates[i];
         // 配额/限流冷却中的候选直接跳过 —— 配额类错误当天不会自愈，
         // 重打只是再吃一次 429，还把整条链拖成 502。
+        // 这里**不记失败**：冷却 30 分钟后自己会回来，把它当 3-confirm 证据会把
+        // 本来健康的主候选永久挤下线。
         if crate::routes::v1::helpers::rate_limit_suspended(&state.pool, cand.account_id, &cand.model).await {
             tracing::debug!("⏸️  [agg:{}] 跳过 {} | 账户 {}：冷却中", alias, cand.model, cand.account_id);
             crate::routes::v1::helpers::note_skip_reason(&mut last_error, format!("Candidate {} ({}) rate limited, cooling down", i, cand.model));
             cooled_skips += 1;
-            state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len);
             continue;
         }
         let account = match get_account_by_id(&state.pool, cand.account_id, &state.master_key).await {
@@ -842,6 +843,9 @@ async fn dispatch_aggregate_anthropic(
         tracing::info!("🔀 [agg:{} V={}] {} → {} → {} {}", alias, active, account.alias, cand.model, provider_request.url, if is_conversion { "[anthropic→openai]" } else { "" });
         if let Some(tx) = &state.tui_tx { let _ = tx.send(TuiEvent::Dispatch { timestamp: time::OffsetDateTime::now_utc().format(&DISPATCH_TIME_FMT).unwrap_or_default(), account: account.alias.clone(), model: cand.model.clone(), url: provider_request.url.clone(), tag: Some(format!("agg:{alias}")) }); }
 
+        // 走到这里说明前面那些「没试过」的分支都没触发 —— 锚点被真的尝试了。
+        if i == active { anchor_attempted = true; }
+
         let response = match execute_provider_request(&provider_request).await {
             Ok(r) => r,
             Err(e) => { tracing::error!("📡 [agg:{}] provider request failed: {e}", alias); last_error = Some(format!("Provider request failed: {e}")); state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); failed_candidates += 1; continue; }
@@ -874,7 +878,8 @@ async fn dispatch_aggregate_anthropic(
                     alias,
                     account.alias
                 );
-                request_side_skips += 1;
+                // 请求侧的拒绝不是「这个候选坏了」→ 撤掉刚才那一笔尝试记录。
+                if i == active { anchor_attempted = false; }
                 failed_candidates += 1;
                 continue;
             }
@@ -931,16 +936,15 @@ async fn dispatch_aggregate_anthropic(
     }
 
     if let Some(idx) = hit {
-        // 若本次落到下游只是因为请求侧原因（主候选装不下 / max_tokens 不合规），
-        // 那不是「下游更好」的证据 —— 记成功但不推进 3-confirm，否则几个大请求
-        // 就能把别名永久切到付费兜底，而主候选对其它请求完全健康。
-        let switched = if request_side_skips > 0 {
-            state.aggregate_router.lock().unwrap().note_candidate_success(&alias, idx, len);
-            false
-        } else {
-            state.aggregate_router.lock().unwrap().record_request_outcome(&alias, idx, len)
-        };
-        if switched { tracing::info!("🔀 [agg:{}] V migrated -> {} (after 3-confirm)", alias, idx); }
+        let now = Instant::now();
+        let switched = state.aggregate_router
+            .lock()
+            .unwrap()
+            .record_request_outcome(&alias, idx, len, now, anchor_attempted);
+        if switched {
+            tracing::info!("🔀 [agg:{}] V migrated -> {} (after 3-confirm)", alias, idx);
+            llmux_core::aggregate::persist_active(&state.pool, &alias, idx).await;
+        }
         let cand_model = agg.candidates[idx].model.clone();
         if let Some((resp, model, account, provider_id, is_conv)) = hit_stream {
             send_tui_request(&state.tui_tx, "/v1/messages", 200, start, &cand_model);
@@ -955,8 +959,14 @@ async fn dispatch_aggregate_anthropic(
         }
     }
 
-    let switched = state.aggregate_router.lock().unwrap().record_request_all_failed(&alias, len);
-    if switched { tracing::info!("🔀 [agg:{}] all failed — V reset to 0 (after 3-confirm)", alias); }
+    let switched = state.aggregate_router
+        .lock()
+        .unwrap()
+        .record_request_all_failed(&alias, len, Instant::now(), anchor_attempted);
+    if switched {
+        tracing::info!("🔀 [agg:{}] all failed — V reset to 0 (after 3-confirm)", alias);
+        llmux_core::aggregate::persist_active(&state.pool, &alias, 0).await;
+    }
     let latency_ms = start.elapsed().as_millis() as i64;
     let error_msg = last_error.unwrap_or_else(|| "All aggregate candidates exhausted".to_string());
     if let Some(acc) = hit_account {

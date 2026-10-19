@@ -36,6 +36,10 @@
 - **C-A1.** `probe_dual_phase` 的 stage1 只探 `active..len`，不探 `0..active`。
   V' 只可能是 `active` 自身（确认存活）或更高下标（死了往下走）。
   手动设定的起点不会再被探活往低拽。
+  **已作废（2026-10-19）**：探活改扫全表 `0..len`（`aggregate_probe::probe_range`）。
+  active 只是起点，不是地板也不是上限 —— 手动值与自动降级后语义相同，位置应能双向走；
+  要钉住某个位置用「锁定」（C-B2），不是靠拒绝回升。留地板会让别名永久停在付费兜底上，
+  而 `/v1/models` 报的仍是 `candidates[0]` 的窗口（`routes/v1/models.rs`），两处语义打架。
 - **C-A2.** `set_active` 落库：`aggregate_aliases` 新增 `active_idx INTEGER NOT NULL DEFAULT 0`
   列；手动设置成功后 UPDATE 该列。
 - **C-A3.** 启动 / `ensure_entry` 首次建 entry 时从库读 `active_idx`（clamp 到 `len`），

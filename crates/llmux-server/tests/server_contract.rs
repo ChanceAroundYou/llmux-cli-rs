@@ -483,15 +483,27 @@ async fn activity_detail_serves_body_in_char_safe_chunks() {
     let long = "中文abc".repeat(2000);
     let id: i64 = sqlx::query_scalar(
         "INSERT INTO usage_logs (timestamp, account_id, provider_id, model, input_tokens, output_tokens, latency_ms, success, error_message, request_body, response_body, is_test) \
-         VALUES (?, NULL, ?, ?, 0, 0, 1, 1, NULL, ?, NULL, 0) RETURNING id",
+         VALUES (?, NULL, ?, ?, 0, 0, 1, 1, NULL, NULL, NULL, 0) RETURNING id",
     )
     .bind(1_700_000_000_000i64)
     .bind("openai")
     .bind("gpt-4o")
-    .bind(&long)
     .fetch_one(&state.pool)
     .await
     .unwrap();
+
+    // 8098c61 起库里不再存 body，`?part=` 走本地日志（helpers::read_body_from_local_logs）。
+    // 所以要钉的性质是「从日志取出的 body 按 char 边界切分」，喂给路由的必须是一行日志。
+    // LOG_DIR 是进程级 env，这里照 admin_env_credentials 的做法单独隔离，用完还原。
+    let prev_log_dir = std::env::var("LOG_DIR").ok();
+    let log_dir = std::env::temp_dir().join("llmux-char-chunk-test");
+    std::fs::create_dir_all(&log_dir).unwrap();
+    std::fs::write(
+        log_dir.join("llmux.log.70-01-01"),
+        format!("[01-01 00:00:00] full request body (gpt-4o): {long}\n"),
+    )
+    .unwrap();
+    std::env::set_var("LOG_DIR", &log_dir);
 
     let login_req = Request::builder()
         .method(Method::POST)
@@ -576,6 +588,12 @@ async fn activity_detail_serves_body_in_char_safe_chunks() {
     let (st, bad) = get(format!("/api/activity/{id}?part=nope"), app, cookie).await;
     assert_eq!(st, StatusCode::BAD_REQUEST);
     assert_eq!(bad["error"].as_str().unwrap(), "unknown part: nope");
+
+    match prev_log_dir {
+        Some(v) => std::env::set_var("LOG_DIR", v),
+        None => std::env::remove_var("LOG_DIR"),
+    }
+    let _ = std::fs::remove_dir_all(&log_dir);
 }
 
 #[tokio::test]

@@ -115,11 +115,13 @@ fn is_due(since_last_probe_secs: u64, interval_secs: i64, backoff_secs: u64) -> 
     since_last_probe_secs >= backoff
 }
 
-/// C-A1：stage1 只探 `active..len`，不往 active 之前看。
-/// 手动 active 是起点（floor）—— 往低看会把手动设置拽回去（2026-10-14
-/// os 别名生产复现）。抽成纯函数，照抄 `is_due` 的测试风格。
-fn stage1_range(active: usize, len: usize) -> std::ops::Range<usize> {
-    active.min(len)..len
+/// 探活扫全表 `0..len`：位置可以上下走，`set_active` 只是起点，不是地板。
+/// 此前只探 `active..len`（C-A1），等于探活永远看不见更优的候选 —— 一次降级
+/// 就回不来，只能靠「全链失败复位到 0」这条硬路径，而那条要求连付费兜底也一起挂。
+/// 代价：位置之前的候选不再接真实流量，被动采信覆盖不到它们，所以每轮要为它们
+/// 真发一次 ping。只发生在「已经停在后面」的别名上，也就是正是需要救援的那些。
+fn probe_range(len: usize) -> std::ops::Range<usize> {
+    0..len
 }
 
 async fn run_probe_round(
@@ -191,33 +193,26 @@ async fn run_probe_round(
 
         // Dual-phase probe
         let v_prime = probe_dual_phase(&alias, &candidates, active, mode, pool, master_key).await;
-
         let switched = if let Some(vp) = v_prime {
-            let mut guard = aggregate_router.lock().unwrap();
-            // Update per-candidate last_status from the probe round. 各候选的成败
-            // 由 `probe_candidate` 内部处理，这里只需要把选出的 V' 交给状态机。
-            guard.record_probe_candidate(&alias, vp, len)
+            // 全表扫完后取到的就是「活着的最优候选」，可以比 active 更优（往上走）。
+            aggregate_router.lock().unwrap().record_probe_candidate(&alias, vp, len, now)
         } else {
-            // all failed => treat as pending V=0 with 3-confirm.
-            // active == 0 时走 record_probe_candidate(0) 即 v_prime == active 的
-            // 确认分支（旧行为：清 pending、退避回基准）；active > 0 时 0 在
-            // floor 之下，record_probe_candidate 会按 C-A1 拒绝，改走
-            // record_request_all_failed（同样是 advance_pending(e, 0) 的 3-confirm，
-            // 还顺手把刚全死的 last_status 全标 false）。
-            let mut guard = aggregate_router.lock().unwrap();
-            let switched = if guard.get_active(&alias) == 0 {
-                guard.record_probe_candidate(&alias, 0, len)
-            } else {
-                guard.record_request_all_failed(&alias, len)
-            };
-            if switched {
-                guard.record_probe_all_failed_confirmed(&alias, len);
-            }
-            switched
+            // 全挂：以 0（复位到默认）为目标走同一个确认器，3 次（窗口内）才切。
+            // 退避翻倍也在 record_request_all_failed 里同处完成 —— 此前这里另有一个
+            // record_probe_all_failed_confirmed，对 active==0 的轮次反而走的是
+            // 「确认健康」分支（清 pending、退避回基准），方向正好相反。
+            aggregate_router.lock().unwrap().record_request_all_failed(&alias, len, now, true)
         };
+        let target = v_prime.unwrap_or(0);
 
         if switched {
-            tracing::info!("🔍 [agg:{}] probe V migrated -> {:?}", alias, v_prime);
+            tracing::info!(
+                "🔍 [agg:{}] probe V migrated -> {} ({})",
+                alias,
+                target,
+                if v_prime.is_some() { "best alive" } else { "all failed, reset" }
+            );
+            llmux_core::aggregate::persist_active(pool, &alias, target).await;
         }
     }
     Ok(())
@@ -231,13 +226,12 @@ async fn probe_dual_phase(
     pool: &sqlx::SqlitePool,
     master_key: &str,
 ) -> Option<usize> {
-    // Stage 1: active..len concurrent (C-A1) — 手动 active 是起点，不往低看。
-    let stage1_indices: Vec<usize> = stage1_range(active, candidates.len()).collect();
-    let mut stage1_alive: Vec<usize> = Vec::new();
+    // 全表并发（见 probe_range）：取活着的最小 index（优先级最高）。
+    let probe_indices: Vec<usize> = probe_range(candidates.len()).collect();
+    let mut alive: Vec<usize> = Vec::new();
 
-    // Concurrent probe for stage1
     let mut futs = Vec::new();
-    for &idx in &stage1_indices {
+    for &idx in &probe_indices {
         let cand = candidates[idx].clone();
         let pool = pool.clone();
         let master_key = master_key.to_string();
@@ -247,21 +241,19 @@ async fn probe_dual_phase(
         });
     }
     let results = futures_util::future::join_all(futs).await;
-    for (idx, alive) in results {
-        if alive {
-            stage1_alive.push(idx);
+    for (idx, ok) in results {
+        if ok {
+            alive.push(idx);
         }
     }
 
-    if !stage1_alive.is_empty() {
-        stage1_alive.sort_unstable();
-        let best = stage1_alive[0];
-        tracing::debug!("🔍 [agg:{}] stage1 best V={}", alias, best);
+    if !alive.is_empty() {
+        alive.sort_unstable();
+        let best = alive[0];
+        tracing::debug!("🔍 [agg:{}] probe best V={} (active={})", alias, best, active);
         return Some(best);
     }
 
-    // Stage1 已覆盖 active..len 的全部候选 —— 一个都没活就是全死。
-    // （旧 stage2 在这里重探 active+1..，与 stage1 完全重复，全死时发两倍请求。）
     tracing::warn!("🔍 [agg:{}] all candidates failed", alias);
     None
 }
@@ -562,6 +554,7 @@ mod tests {
                 active: 0,
                 pending_target: None,
                 confirm_count: 0,
+                pending_started: None,
                 probe_backoff_secs: 300,
                 last_probe: Instant::now(),
                 last_status: vec![Some(true)],
@@ -574,6 +567,7 @@ mod tests {
                 active: 0,
                 pending_target: None,
                 confirm_count: 0,
+                pending_started: None,
                 probe_backoff_secs: 600,
                 last_probe: Instant::now(),
                 last_status: vec![Some(false)],
@@ -598,12 +592,12 @@ mod tests {
         assert!(!is_due(since, 300, base), "慢配的别名不该被快配的拖着一起探");
     }
 
-    /// C-A1 探活侧：stage1 只探 active..len，不往 active 之前看。
-    /// 范围计算抽成纯函数（照抄 is_due 的测试风格），先红。
+    /// 回归：探活扫全表，能看见位置之前的候选（一次降级后还能回来）。
+    /// 此前只探 `active..len`，位置只能往下走。
     #[test]
-    fn probe_stage1_never_looks_below_active() {
-        assert_eq!(stage1_range(2, 4), 2..4);
-        assert_eq!(stage1_range(0, 3), 0..3);
+    fn probe_scans_the_whole_list() {
+        assert_eq!(probe_range(4), 0..4);
+        assert_eq!(probe_range(3), 0..3);
     }
 
     /// C-B2：锁定的别名整轮跳过 —— 不建内存 entry、不读候选、不发请求。

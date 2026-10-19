@@ -1533,3 +1533,23 @@ async fn migration_0036_adds_active_idx_and_locked() {
             .expect("preserved");
     assert_eq!(active2, 2);
 }
+
+/// 自动迁移也要落库。此前只有手动 `set` 落库，请求侧/探活侧的迁移只改内存 ——
+/// 于是「重启后回到 0」，而内存位置正是重启后恢复的起点。落库失败只打日志：
+/// 内存已经切成功，库写失败不该把一次成功的迁移变成错误。
+#[tokio::test]
+async fn persist_active_writes_migrated_position_back_to_db() {
+    let pool = memory_db().await;
+    sqlx::query("INSERT INTO aggregate_aliases (alias, candidates) VALUES ('aggP', '[{\"account_id\":1,\"model\":\"m\"}]')")
+        .execute(&pool)
+        .await
+        .expect("insert");
+
+    llmux_core::aggregate::persist_active(&pool, "aggP", 2).await;
+
+    let stored: i64 = sqlx::query_scalar("SELECT active_idx FROM aggregate_aliases WHERE alias = 'aggP'")
+        .fetch_one(&pool)
+        .await
+        .expect("read back");
+    assert_eq!(stored, 2, "迁移必须落库，否则重启回到 0");
+}

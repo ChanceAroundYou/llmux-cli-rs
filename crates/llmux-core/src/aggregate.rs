@@ -66,12 +66,19 @@ pub struct AggregateResolution {
 pub const PROBE_BACKOFF_BASE_SECS: u64 = 300;
 /// 退避翻倍的上限。
 pub const PROBE_BACKOFF_MAX_SECS: u64 = 600;
+/// 3 次确认必须落在的这个窗口内（从第一次确认起算）。
+///
+/// 取 30 分钟不是随手拍的：最长退避 600s，探活侧跑满 3 轮正好 20 分钟。窗口
+/// 再小就会和退避互相卡死（永远攒不满 3 次），再大就允许跨小时的漂移。
+pub const PENDING_WINDOW_SECS: u64 = 1800;
 
 #[derive(Debug, Clone)]
 pub struct AggregateEntry {
     pub active: usize,
     pub pending_target: Option<usize>,
     pub confirm_count: u8,
+    /// 本轮 pending 的第一次确认时刻，供窗口判定。
+    pub pending_started: Option<Instant>,
     pub probe_backoff_secs: u64,
     pub last_probe: Instant,
     pub last_status: Vec<Option<bool>>,
@@ -86,6 +93,7 @@ impl Default for AggregateEntry {
             active: 0,
             pending_target: None,
             confirm_count: 0,
+            pending_started: None,
             probe_backoff_secs: PROBE_BACKOFF_BASE_SECS,
             last_probe: Instant::now(),
             last_status: Vec::new(),
@@ -132,6 +140,7 @@ impl AggregateRouter {
         if locked {
             e.pending_target = None;
             e.confirm_count = 0;
+            e.pending_started = None;
         }
     }
 
@@ -166,6 +175,7 @@ impl AggregateRouter {
         e.active = target;
         e.pending_target = None;
         e.confirm_count = 0;
+        e.pending_started = None;
         e.probe_backoff_secs = PROBE_BACKOFF_BASE_SECS;
         e.last_probe = Instant::now();
         if target < e.last_status.len() {
@@ -209,10 +219,13 @@ impl AggregateRouter {
 
     /// Called when a request succeeds at `hit` (hit may equal active or downstream).
     /// 连续 3 次命中同一非 active 候选才迁移；命中 active 则连续计数清零。
+    /// `anchor_attempted` = 这一轮**真的尝试了锚点且它真的失败了**。被跳过不算
+    /// （冷却 / 装不下 / max_tokens 不合规 / 账户不存在都是「没试过」，不是「坏了」）
+    /// —— 否则一次 30 分钟的限流休息就能把主候选永久挤下线。见 dispatch 路径。
     /// C-B2：锁定后 no-op（只观察、不迁移）—— 命中 active 的清零/退避恢复
     /// 也一起冻结，否则锁定时请求仍在改状态机，"暂停"名存实亡。
     /// Returns true if V actually migrated.
-    pub fn record_request_outcome(&mut self, alias: &str, hit: usize, len: usize) -> bool {
+    pub fn record_request_outcome(&mut self, alias: &str, hit: usize, len: usize, now: Instant, anchor_attempted: bool) -> bool {
         let e = self.ensure_entry(alias, len);
         if e.locked {
             return false;
@@ -221,59 +234,65 @@ impl AggregateRouter {
             e.last_status[hit] = Some(true);
         }
         if hit == e.active {
-            // 命中当前活跃：视为中断，降级连续计数清零（例：失败2次后成功1次 -> 重新计数）
-            if e.pending_target.is_some() || e.confirm_count != 0 {
-                e.pending_target = None;
-                e.confirm_count = 0;
-            }
+            // 命中当前活跃：视为中断，连续计数清零（例：失败2次后成功1次 -> 重新计数）
+            Self::break_pending(e);
             e.probe_backoff_secs = PROBE_BACKOFF_BASE_SECS;
             return false;
         }
-        // 命中下游候选：按同一 target 连续 3 次才切，不连续则重新计数
-        Self::advance_pending(e, hit)
+        if !anchor_attempted {
+            // 锚点这一轮没被试过：记成功、不推进。
+            return false;
+        }
+        // 命中下游候选：按同一 target 连续 3 次（且在窗口内）才切
+        Self::advance_pending(e, hit, now)
     }
 
     /// Called when a request exhausts all candidates (502). Treat as pending V=0.
     /// 同样要求连续 3 次才生效，不连续清零。
     /// C-B2：锁定后 no-op。
     /// Returns true if V migrated.
-    pub fn record_request_all_failed(&mut self, alias: &str, len: usize) -> bool {
+    pub fn record_request_all_failed(&mut self, alias: &str, len: usize, now: Instant, anchor_attempted: bool) -> bool {
         let e = self.ensure_entry(alias, len);
         if e.locked {
             return false;
         }
+        if !anchor_attempted {
+            // 锚点没被试过（例如正在冷却）→ 这一轮没有「全链失败」可言。
+            return false;
+        }
+        // ponytail: 这里把没尝试过的候选（例如正在冷却）也标 false。只影响 UI 角标，
+        // 不参与任何决策。要精确就得按本轮尝试集合逐个标，不值得。
         for v in e.last_status.iter_mut() {
             *v = Some(false);
         }
         if e.active == 0 {
-            // 已在 0：无迁移，但对 pending 0 的“连续全失败”计数仍需 3 次连续才触发 backoff 翻倍
-            // 若中间有成功（record_request_outcome 已清零），此处从头计数
-            if e.pending_target == Some(0) {
-                e.confirm_count = e.confirm_count.saturating_add(1);
-                if e.confirm_count >= 3 {
-                    e.pending_target = None;
-                    e.confirm_count = 0;
-                    e.probe_backoff_secs = (e.probe_backoff_secs * 2).min(PROBE_BACKOFF_MAX_SECS);
-                }
+            // 已在 0：无迁移，但「连续全失败」仍要 3 次（窗口内）才触发退避翻倍。
+            // 中断（锚点成功过一次）由 record_request_outcome 的 break_pending 负责。
+            if !Self::bump_pending(e, 0, now) {
                 return false;
             }
-            if e.pending_target.is_some() {
-                // 之前在等切到别的 V，遇到全失败则视为中断，重置为等待 0 的第 1 次
-                e.pending_target = Some(0);
-                e.confirm_count = 1;
-            }
-            // pending 为 None 时不累计（0 本就是 active，无需切）
+            Self::break_pending(e);
+            e.probe_backoff_secs = (e.probe_backoff_secs * 2).min(PROBE_BACKOFF_MAX_SECS);
             return false;
         }
         // active != 0 且全失败：视为连续 3 次要求切回 0，中断则清零
-        Self::advance_pending(e, 0)
+        let switched = Self::advance_pending(e, 0, now);
+        if switched {
+            e.probe_backoff_secs = (e.probe_backoff_secs * 2).min(PROBE_BACKOFF_MAX_SECS);
+        }
+        switched
     }
 
-    /// Probe gives candidate V' — 升级同样连续 3 次才切，不连续清零。
+    /// Probe gives candidate V'.
+    /// 位置可以上下走：`set_active` 的值只是**起点**，不是地板也不是上限。
+    /// 此前（C-A1）这里拒绝 `v_prime < active`，等于把一次性的降级结果当成永久位置
+    /// —— 探活看不见更优的候选，别名会永久停在付费兜底上，而 `/v1/models` 报的窗口
+    /// 仍是 candidates[0] 的（两处语义打架）。要钉住某个位置用「锁定」（C-B2），
+    /// 不是靠拒绝回升。
     /// C-B2：锁定后 no-op（后台探活也会跳过，这是请求侧探活都绕过内存直调
     /// 状态机时的兜底）。
     /// Returns true if switched.
-    pub fn record_probe_candidate(&mut self, alias: &str, v_prime: usize, len: usize) -> bool {
+    pub fn record_probe_candidate(&mut self, alias: &str, v_prime: usize, len: usize, now: Instant) -> bool {
         let e = self.ensure_entry(alias, len);
         if e.locked {
             return false;
@@ -281,22 +300,9 @@ impl AggregateRouter {
         if v_prime >= len && len > 0 {
             return false;
         }
-        // C-A1: 手动 active 是起点（floor）—— 低于 active 的 V' 不得启动
-        // pending，否则探活把手动设置拽回去（2026-10-14 os 别名生产复现：
-        // 手动设 0→? 被 3-confirm 弹走）。只记录观察到的存活状态，不迁移。
-        if v_prime < e.active {
-            e.last_probe = Instant::now();
-            if v_prime < e.last_status.len() {
-                e.last_status[v_prime] = Some(true);
-            }
-            return false;
-        }
         if v_prime == e.active {
-            // 探测确认当前 V 健康：升级/降级等待均视为中断，清零
-            if e.pending_target.is_some() || e.confirm_count != 0 {
-                e.pending_target = None;
-                e.confirm_count = 0;
-            }
+            // 探测确认当前 V 健康：升降级等待均视为中断，清零
+            Self::break_pending(e);
             e.last_probe = Instant::now();
             e.probe_backoff_secs = PROBE_BACKOFF_BASE_SECS;
             if v_prime < e.last_status.len() {
@@ -304,40 +310,49 @@ impl AggregateRouter {
             }
             return false;
         }
-        let switched = Self::advance_pending(e, v_prime);
+        let switched = Self::advance_pending(e, v_prime, now);
         e.last_probe = Instant::now();
         switched
     }
 
-    /// Record that this probe round was an all-failed 3rd confirmation — double backoff.
-    pub fn record_probe_all_failed_confirmed(&mut self, alias: &str, len: usize) {
-        let e = self.ensure_entry(alias, len);
-        e.probe_backoff_secs = (e.probe_backoff_secs * 2).min(PROBE_BACKOFF_MAX_SECS);
-        e.last_probe = Instant::now();
-        for v in e.last_status.iter_mut() {
-            *v = Some(false);
-        }
-    }
-
-    fn advance_pending(e: &mut AggregateEntry, target: usize) -> bool {
+    /// 推进一次确认：窗口内才继续攒，超窗口从头计数（是从 1 重新开始，不是清零）。
+    /// 返回是否达到 3 次。窗口判据只在这一处 —— 请求侧和探活侧共用同一个 pending，
+    /// 所以「3 次」是 3 次观察，证据来源可以混合。
+    fn bump_pending(e: &mut AggregateEntry, target: usize, now: Instant) -> bool {
         if e.pending_target == Some(target) {
+            let started = e.pending_started.unwrap_or(now);
+            if now.saturating_duration_since(started).as_secs() > PENDING_WINDOW_SECS {
+                e.pending_started = Some(now);
+                e.confirm_count = 1;
+                return false;
+            }
             e.confirm_count = e.confirm_count.saturating_add(1);
         } else {
             e.pending_target = Some(target);
+            e.pending_started = Some(now);
             e.confirm_count = 1;
         }
-        if e.confirm_count >= 3 {
-            e.active = target;
-            e.pending_target = None;
-            e.confirm_count = 0;
-            e.probe_backoff_secs = PROBE_BACKOFF_BASE_SECS;
-            if target < e.last_status.len() {
-                e.last_status[target] = Some(true);
-            }
-            true
-        } else {
-            false
+        e.confirm_count >= 3
+    }
+
+    fn advance_pending(e: &mut AggregateEntry, target: usize, now: Instant) -> bool {
+        if !Self::bump_pending(e, target, now) {
+            return false;
         }
+        e.active = target;
+        Self::break_pending(e);
+        e.probe_backoff_secs = PROBE_BACKOFF_BASE_SECS;
+        if target < e.last_status.len() {
+            e.last_status[target] = Some(true);
+        }
+        true
+    }
+
+    /// 中断：任何一次 active 成功（或被探活确认存活）就清零。
+    fn break_pending(e: &mut AggregateEntry) {
+        e.pending_target = None;
+        e.confirm_count = 0;
+        e.pending_started = None;
     }
 
     /// Snapshot for background loop (clone active map without holding lock long).
@@ -352,6 +367,20 @@ impl AggregateRouter {
 // ---------------------------------------------------------------------------
 // DB helpers
 // ---------------------------------------------------------------------------
+
+/// 状态机真正迁移后落库（此前只有手动 `set_active` 落库，所以重启会把运行时位置
+/// 丢掉、回到手动起点）。只在 3 次确认成立时调用，频率很低。
+/// 写失败只打日志：内存已经切过去了，落库失败不能把一次成功的迁移变成错误。
+pub async fn persist_active(pool: &SqlitePool, alias: &str, idx: usize) {
+    if let Err(e) = sqlx::query("UPDATE aggregate_aliases SET active_idx = ? WHERE alias = ?")
+        .bind(idx as i64)
+        .bind(alias)
+        .execute(pool)
+        .await
+    {
+        tracing::warn!("🔀 [agg:{}] active_idx persist failed: {e}", alias);
+    }
+}
 
 async fn find_aggregate_row(
     pool: &SqlitePool,
@@ -461,20 +490,68 @@ pub async fn get_account_by_id(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
-    /// C-A1 状态机侧：手动 active 是起点（floor），不是上限。
-    /// set_active(a, 2, 3) 后，探活说 0 存活也不得启动向 0 的 pending。
+    /// 手动 set_active 只是起点，不是地板也不是上限：探活连续 3 次确认更优的
+    /// 候选就该把位置挪回去。（此前 C-A1 拒绝 `v_prime < active`，等于把一次性
+    /// 的降级结果当成永久位置 —— 别名会永久停在付费兜底上。）
     #[test]
-    fn manual_active_is_a_floor_not_a_ceiling() {
+    fn the_anchor_can_move_back_above_a_manually_set_start() {
         let mut r = AggregateRouter::default();
+        let t = Instant::now();
         assert!(r.set_active("a", 2, 3));
-        r.record_probe_candidate("a", 0, 3);
-        let e = r.entries.get("a").unwrap();
-        assert!(
-            e.pending_target.is_none(),
-            "manual active=2 must not be dragged back to 0, got {:?}",
-            e.pending_target
-        );
+        assert!(!r.record_probe_candidate("a", 0, 3, t));
+        assert!(!r.record_probe_candidate("a", 0, 3, t + Duration::from_secs(300)));
+        assert!(r.record_probe_candidate("a", 0, 3, t + Duration::from_secs(600)));
+        assert_eq!(r.get_active("a"), 0);
+    }
+
+    /// 3 次确认必须落在窗口内（从第一次确认起算）。超窗口从头计数。
+    #[test]
+    fn pending_confirmations_expire_after_the_window() {
+        let mut r = AggregateRouter::default();
+        let t = Instant::now();
+        assert!(!r.record_request_outcome("a", 2, 3, t, true));
+        assert!(!r.record_request_outcome("a", 2, 3, t + Duration::from_secs(60), true));
+        assert_eq!(r.entries.get("a").unwrap().confirm_count, 2);
+        // 第 31 分钟：窗口已过 → 从头计数，不切
+        assert!(!r.record_request_outcome("a", 2, 3, t + Duration::from_secs(31 * 60), true));
+        assert_eq!(r.get_active("a"), 0);
+        assert_eq!(r.entries.get("a").unwrap().confirm_count, 1);
+        // 窗口内接着攒满 3 次才切
+        assert!(!r.record_request_outcome("a", 2, 3, t + Duration::from_secs(31 * 60 + 30), true));
+        assert!(r.record_request_outcome("a", 2, 3, t + Duration::from_secs(31 * 60 + 60), true));
+        assert_eq!(r.get_active("a"), 2);
+    }
+
+    /// 被跳过不是「坏了」：锚点在冷却时三个请求落到下游，不能推进计数。
+    /// 真死的候选照样靠探活连续 3 轮确认切过去。
+    #[test]
+    fn a_skipped_anchor_is_not_migration_evidence() {
+        let mut r = AggregateRouter::default();
+        let t = Instant::now();
+        for k in 0..3 {
+            assert!(!r.record_request_outcome("a", 2, 3, t + Duration::from_secs(k * 10), false));
+        }
+        assert_eq!(r.get_active("a"), 0);
+        assert!(r.entries.get("a").unwrap().pending_target.is_none());
+    }
+
+    /// 锚点成功一次就打断计数（失败 2 次 → 成功 → 重新从 1 开始）。
+    #[test]
+    fn a_success_at_the_anchor_breaks_the_count() {
+        let mut r = AggregateRouter::default();
+        let t = Instant::now();
+        assert!(!r.record_request_outcome("a", 2, 3, t, true));
+        assert!(!r.record_request_outcome("a", 2, 3, t + Duration::from_secs(10), true));
+        assert!(!r.record_request_outcome("a", 0, 3, t + Duration::from_secs(20), true));
+        assert_eq!(r.entries.get("a").unwrap().confirm_count, 0);
+        assert_eq!(r.get_active("a"), 0);
+        // 重新从 1 开始
+        assert!(!r.record_request_outcome("a", 2, 3, t + Duration::from_secs(30), true));
+        assert!(!r.record_request_outcome("a", 2, 3, t + Duration::from_secs(40), true));
+        assert!(r.record_request_outcome("a", 2, 3, t + Duration::from_secs(50), true));
+        assert_eq!(r.get_active("a"), 2);
     }
 
     /// C-A3/A4：重启播种—— 库值在界内则恢复，越界归 0 并要求调用点回写。
@@ -498,26 +575,27 @@ mod tests {
     #[test]
     fn locked_alias_freezes_migration() {
         let mut r = AggregateRouter::default();
+        let t = Instant::now();
         r.set_locked("a", true, 3);
         assert!(r.is_locked("a"));
         // 下游连中 3 次：不迁移
-        assert!(!r.record_request_outcome("a", 2, 3));
-        assert!(!r.record_request_outcome("a", 2, 3));
-        assert!(!r.record_request_outcome("a", 2, 3));
+        assert!(!r.record_request_outcome("a", 2, 3, t, true));
+        assert!(!r.record_request_outcome("a", 2, 3, t, true));
+        assert!(!r.record_request_outcome("a", 2, 3, t, true));
         assert_eq!(r.get_active("a"), 0);
         // 全失败：不回 0、不翻倍
-        assert!(!r.record_request_all_failed("a", 3));
+        assert!(!r.record_request_all_failed("a", 3, t, true));
         assert_eq!(r.get_active("a"), 0);
         // 探活 V'：不启动 pending
-        assert!(!r.record_probe_candidate("a", 1, 3));
+        assert!(!r.record_probe_candidate("a", 1, 3, t));
         assert!(r.entries.get("a").unwrap().pending_target.is_none());
 
         // 解锁后恢复：下游 3 次切过去
         r.set_locked("a", false, 3);
         assert!(!r.is_locked("a"));
-        assert!(!r.record_request_outcome("a", 2, 3));
-        assert!(!r.record_request_outcome("a", 2, 3));
-        assert!(r.record_request_outcome("a", 2, 3));
+        assert!(!r.record_request_outcome("a", 2, 3, t, true));
+        assert!(!r.record_request_outcome("a", 2, 3, t, true));
+        assert!(r.record_request_outcome("a", 2, 3, t, true));
         assert_eq!(r.get_active("a"), 2);
     }
 }

@@ -391,15 +391,9 @@ pub async fn set_aggregate_active(
     let changed = state.aggregate_router.lock().unwrap().set_active(&alias, target, len);
     state.invalidate_aggregate_cache(&alias);
     // C-A2：落库，否则重启回到 0。失败只打日志 —— 内存已切成功，
-    // 库写失败不能把一次成功的手动操作变成 500。
-    if let Err(e) = sqlx::query("UPDATE aggregate_aliases SET active_idx = ? WHERE alias = ?")
-        .bind(target as i64)
-        .bind(&alias)
-        .execute(&state.pool)
-        .await
-    {
-        tracing::warn!("🔀 [agg:{}] active_idx persist failed: {e}", alias);
-    }
+    // 库写失败不能把一次成功的手动操作变成 500。（同一个 helper 也被请求侧
+    // 和探活侧的迁移用 —— 以前只有手动设置落库，自动迁移不落库，重启就丢。）
+    llmux_core::aggregate::persist_active(&state.pool, &alias, target).await;
     if let Ok(mut cache) = state.models_cache.lock() {
         *cache = None;
     }
