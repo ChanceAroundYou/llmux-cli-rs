@@ -1926,16 +1926,24 @@ pub fn read_body_from_local_logs(timestamp_ms: i64, model: &str, part: &str) -> 
                 if let Some(start) = body_start {
                     let mut body = String::from(&line[start..]);
                     let mut j = i + 1;
+                    // 优先尝试把已收集的内容解析成 JSON：body 本身可能含换行
+                    //（上游请求/响应里字符串值带 \\n），不能仅凭「下一行以 [ 数字 开头」
+                    // 就判定为新日志条目，否则会截断 body 导致 JSON 解析失败、回退到原文。
                     while j < lines.len() {
+                        // 先试当前 body 是否已成合法 JSON
+                        if serde_json::from_str::<serde_json::Value>(&body).is_ok() {
+                            break;
+                        }
                         let next = lines[j];
-                        // next log entry starts with "[MM-DD" pattern
-                        if next.len() > 6 && next.starts_with('[') && next.chars().nth(1).map(|c| c.is_ascii_digit()).unwrap_or(false) {
+                        // 安全阀：最多收集 100 行，防止非 JSON body 把整个文件吞掉
+                        if j - i > 100 {
                             break;
                         }
                         body.push('\n');
                         body.push_str(next);
                         j += 1;
                     }
+                    // 最后再试一次（body 可能本身就是单行合法 JSON）
                     best = Some(body);
                     i = j;
                     continue;

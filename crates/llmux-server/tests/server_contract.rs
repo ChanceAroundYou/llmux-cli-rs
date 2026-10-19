@@ -1429,3 +1429,51 @@ async fn stats_without_key_id_keeps_returning_every_row() {
     assert_eq!(body["summary"]["total_requests"], json!(2), "{body}");
     assert_eq!(body["summary"]["total_input"], json!(1009), "{body}");
 }
+
+/// `read_body_from_local_logs` 的截断判据：真正的边界是「已收集的部分能解析成
+/// JSON」，不是「下一行以 `[` + 数字 开头」—— 美化过的 JSON body 里一行以 `[12,`
+/// 开头是数组元素，按旧判据会截断成非法 JSON（详情页回退到原文片段）。
+/// 第二条钉的是安全阀：非 JSON 的 body 最多收 100 行，不能把整个文件吞掉。
+#[test]
+fn log_body_reader_stops_at_json_boundaries_and_at_the_safety_valve() {
+    let prev_log_dir = std::env::var("LOG_DIR").ok();
+
+    // 1) JSON 边界
+    let json_dir = std::env::temp_dir().join("llmux-json-boundary-test");
+    std::fs::create_dir_all(&json_dir).unwrap();
+    std::fs::write(
+        json_dir.join("llmux.log.70-01-01"),
+        "[70-01-01 00:00:00] full request body (gpt-4o): {\"messages\": [\n[12,34]\n]}\n",
+    )
+    .unwrap();
+    std::env::set_var("LOG_DIR", &json_dir);
+    let body = llmux_server::routes::v1::helpers::read_body_from_local_logs(1_700_000_000_000, "gpt-4o", "request")
+        .expect("body should be found");
+    let parsed: Value = serde_json::from_str(&body).expect("body 必须是完整 JSON，不是被截断的片段");
+    assert_eq!(parsed["messages"].as_array().unwrap().len(), 1, "{body}");
+
+    // 2) 安全阀（单独目录：函数扫 LOG_DIR 下所有文件，同目录会互相污染）
+    let junk_dir = std::env::temp_dir().join("llmux-safety-valve-test");
+    std::fs::create_dir_all(&junk_dir).unwrap();
+    let junk = (0..300).map(|i| format!("junk line {i}")).collect::<Vec<_>>().join("\n");
+    std::fs::write(
+        junk_dir.join("llmux.log.70-01-02"),
+        format!("[70-01-02 00:00:00] full request body (gpt-4o): {junk}\n"),
+    )
+    .unwrap();
+    std::env::set_var("LOG_DIR", &junk_dir);
+    let capped = llmux_server::routes::v1::helpers::read_body_from_local_logs(1_700_000_000_000, "gpt-4o", "request")
+        .expect("body should be found");
+    assert!(
+        capped.lines().count() <= 101,
+        "安全阀应封顶 100 行，实际收了 {} 行",
+        capped.lines().count()
+    );
+
+    match prev_log_dir {
+        Some(v) => std::env::set_var("LOG_DIR", v),
+        None => std::env::remove_var("LOG_DIR"),
+    }
+    let _ = std::fs::remove_dir_all(&json_dir);
+    let _ = std::fs::remove_dir_all(&junk_dir);
+}
