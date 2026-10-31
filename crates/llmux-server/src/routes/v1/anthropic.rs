@@ -747,7 +747,10 @@ async fn dispatch_aggregate_anthropic(
     let mut hit_json: Option<Value> = None;
     let mut hit_account: Option<adapters::Account> = None;
 
-    for i in active..len {
+    // 锁定 = 硬钉：只发锁定的那个候选，失败就如实报错（2026-10-31 明确要求
+    // 「失败也不切换」）。锁只冻结自动迁移时，单次请求仍会故障转移到别的模型。
+    let last = if agg.locked { (active + 1).min(len) } else { len };
+    for i in active..last {
         let cand = &agg.candidates[i];
         // 配额/限流冷却中的候选直接跳过 —— 配额类错误当天不会自愈，
         // 重打只是再吃一次 429，还把整条链拖成 502。

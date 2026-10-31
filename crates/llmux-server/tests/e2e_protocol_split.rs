@@ -863,3 +863,250 @@ async fn aggregate_lock_route_round_trip() {
     assert_eq!(locked, 0);
     assert!(!state.aggregate_router.lock().unwrap().is_locked(&row.1));
 }
+
+async fn api_get(app: axum::Router, cookie: &str, uri: &str) -> (StatusCode, Value) {
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(uri)
+        .header(header::COOKIE, cookie)
+        .body(Body::empty())
+        .unwrap();
+    let resp = llmux_server::test_request(app, req).await;
+    let status = resp.status();
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+}
+
+/// 锁定 = 硬钉：锁定的候选失败时直接报错，不再故障转移到下一个候选。
+/// 以前锁只冻结自动迁移，单次请求仍会顺着列表往下走 —— 下游看到的模型
+/// 照样换来换去（2026-10-31 用户明确要求「失败也不切换」）。
+#[tokio::test]
+async fn locked_aggregate_candidate_does_not_fail_over() {
+    let (upstream_a, _upstream_b) = spawn_mock_upstreams().await;
+    let state = llmux_server::test_state().await;
+    let app = llmux_server::app(state.clone());
+
+    sqlx::query("INSERT INTO api_keys (name, key, allowed_models) VALUES (?, ?, ?)")
+        .bind("e2e-pin")
+        .bind("sk-pin")
+        .bind("*")
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    let cookie = login(app.clone()).await;
+
+    // 候选 0：连不上；候选 1：mock A 正常应答。
+    let (st, body) = api_post(
+        app.clone(),
+        &cookie,
+        "/api/accounts",
+        json!({
+            "alias": "deadpin",
+            "provider_id": "openai",
+            "api_key": "sk-mock",
+            "base_url": "http://127.0.0.1:9",
+            "chat_endpoint": "http://127.0.0.1:9",
+            "default_protocol": "chat",
+            "skip_validation": true,
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body:?}");
+    let dead_id = body["id"].as_i64().expect("dead account id");
+
+    let (st, body) = api_post(
+        app.clone(),
+        &cookie,
+        "/api/accounts",
+        json!({
+            "alias": "alivepin",
+            "provider_id": "openai",
+            "api_key": "sk-mock",
+            "base_url": upstream_a,
+            "chat_endpoint": upstream_a,
+            "default_protocol": "chat",
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body:?}");
+    let alive_id = body["id"].as_i64().expect("alive account id");
+
+    let (st, body) = api_post(
+        app.clone(),
+        &cookie,
+        "/api/aggregate-aliases",
+        json!({
+            "alias": "agg-pin",
+            "candidates": [
+                {"account_id": dead_id, "model": "m-dead"},
+                {"account_id": alive_id, "model": "m-alive"},
+            ],
+            "upstream_api": "chat",
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body:?}");
+    let id: i64 = sqlx::query_scalar("SELECT id FROM aggregate_aliases WHERE alias = 'agg-pin'")
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+
+    // 锁在 #1（= 候选 0，连不上的那个）
+    let (st, body) = api_post(
+        app.clone(),
+        &cookie,
+        &format!("/api/aggregate-aliases/{id}/lock"),
+        json!({"locked": true}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body:?}");
+
+    let chat_body = json!({
+        "model": "agg-pin",
+        "max_tokens": 16,
+        "messages": [{"role": "user", "content": "hi"}],
+    });
+    let (st, _resp, raw) = v1_post(app.clone(), "sk-pin", "/v1/chat/completions", chat_body.clone()).await;
+    assert_eq!(
+        st,
+        StatusCode::BAD_GATEWAY,
+        "锁定后不得转移到活候选，实际: {st:?} {raw}"
+    );
+
+    // 解锁后恢复故障转移
+    let (st, body) = api_post(
+        app.clone(),
+        &cookie,
+        &format!("/api/aggregate-aliases/{id}/lock"),
+        json!({"locked": false}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body:?}");
+    let (st, _resp, raw) = v1_post(app.clone(), "sk-pin", "/v1/chat/completions", chat_body).await;
+    assert_eq!(st, StatusCode::OK, "解锁后应能故障转移: {raw}");
+    assert!(raw.contains("A-chat"), "应落在 mock A 上，实际: {raw}");
+}
+
+/// 保存别名不得悄悄改掉锁定的位置：此前 ON CONFLICT 无条件写回 `active_idx=0`，
+/// 锁着的别名被保存一次（改间隔/超时/增删候选）锁就跳到 #1。
+#[tokio::test]
+async fn saving_a_locked_alias_keeps_the_pin() {
+    let state = llmux_server::test_state().await;
+    let app = llmux_server::app(state.clone());
+    let cookie = login(app.clone()).await;
+
+    let mut account_ids = Vec::new();
+    for alias in ["pinsrc", "pindst"] {
+        let (st, body) = api_post(
+            app.clone(),
+            &cookie,
+            "/api/accounts",
+            json!({
+                "alias": alias,
+                "provider_id": "openai",
+                "api_key": "sk-mock",
+                "base_url": "http://127.0.0.1:9",
+                "chat_endpoint": "http://127.0.0.1:9",
+                "default_protocol": "chat",
+                "skip_validation": true,
+            }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{body:?}");
+        account_ids.push(body["id"].as_i64().expect("account id"));
+    }
+    let (a, b) = (account_ids[0], account_ids[1]);
+
+    let (st, body) = api_post(
+        app.clone(),
+        &cookie,
+        "/api/aggregate-aliases",
+        json!({
+            "alias": "agg-save-pin",
+            "candidates": [{"account_id": a, "model": "ma"}, {"account_id": b, "model": "mb"}],
+            "upstream_api": "chat",
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body:?}");
+    let id: i64 =
+        sqlx::query_scalar("SELECT id FROM aggregate_aliases WHERE alias = 'agg-save-pin'")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+
+    // 锁在 #2（候选 b/mb）
+    let (st, body) = api_post(
+        app.clone(),
+        &cookie,
+        &format!("/api/aggregate-aliases/{id}/active"),
+        json!({"active": 1}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body:?}");
+    let (st, body) = api_post(
+        app.clone(),
+        &cookie,
+        &format!("/api/aggregate-aliases/{id}/lock"),
+        json!({"locked": true}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body:?}");
+
+    // 原样重存一次：位置与锁都必须原样保留
+    let (st, body) = api_post(
+        app.clone(),
+        &cookie,
+        "/api/aggregate-aliases",
+        json!({
+            "alias": "agg-save-pin",
+            "candidates": [{"account_id": a, "model": "ma"}, {"account_id": b, "model": "mb"}],
+            "upstream_api": "chat",
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body:?}");
+    let (active, locked): (Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT active_idx, locked FROM aggregate_aliases WHERE alias = 'agg-save-pin'",
+    )
+    .fetch_one(&state.pool)
+    .await
+    .unwrap();
+    assert_eq!(active, Some(1), "保存不该把 active 打回 0");
+    assert_eq!(locked, Some(1), "保存不该解锁");
+
+    // 列表口径：保存会清掉内存 entry，这里正是走「库里 active_idx」的回退，
+    // UI 的锁标记（locked && active==idx）才不会刷新后跑到 #1。
+    let (st, list) = api_get(app.clone(), &cookie, "/api/aggregate-aliases").await;
+    assert_eq!(st, StatusCode::OK, "{list:?}");
+    let entry = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["alias"] == "agg-save-pin")
+        .expect("alias in list");
+    assert_eq!(entry["active"], json!(1));
+    assert_eq!(entry["locked"], json!(1));
+
+    // 把锁定的候选删掉：必须明确解锁（锁一个不存在的候选没有意义）
+    let (st, body) = api_post(
+        app.clone(),
+        &cookie,
+        "/api/aggregate-aliases",
+        json!({
+            "alias": "agg-save-pin",
+            "candidates": [{"account_id": a, "model": "ma"}],
+            "upstream_api": "chat",
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body:?}");
+    let (active, locked): (Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT active_idx, locked FROM aggregate_aliases WHERE alias = 'agg-save-pin'",
+    )
+    .fetch_one(&state.pool)
+    .await
+    .unwrap();
+    assert_eq!(active, Some(0));
+    assert_eq!(locked, Some(0), "锁定的候选没了就该解锁");
+}

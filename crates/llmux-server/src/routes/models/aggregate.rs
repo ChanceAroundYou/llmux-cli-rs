@@ -32,7 +32,16 @@ pub async fn list_aggregate_aliases(Extension(state): Extension<AppState>) -> Re
         let candidates: Value =
             serde_json::from_str(&row.candidates).unwrap_or(Value::Array(vec![]));
         let entry = router.entries.get(&row.alias);
-        let active = entry.map(|e| e.active).unwrap_or(0);
+        // 与 `resolve_aggregate` 的 C-A3 同一口径：内存还没有 entry（重启后还没
+        // 请求过、刚保存过 —— 保存会 remove 内存 entry）时回退到库里的 active_idx。
+        // 这里此前固定回 0，而 UI 的锁标记绑在 active 上（`locked && active==idx`），
+        // 于是刷新后锁看起来跑到了 #1、原来锁着的候选显示成「锁定」—— 用户眼里
+        // 就是「一刷新就自动解锁」。
+        let active = entry.map(|e| e.active).unwrap_or_else(|| {
+            row.active_idx.unwrap_or(0).max(0) as usize
+        });
+        let candidate_len = candidates.as_array().map(|a| a.len()).unwrap_or(0);
+        let active = if active < candidate_len { active } else { 0 };
         let last_status = entry
             .map(|e| serde_json::to_value(&e.last_status).unwrap_or(Value::Array(vec![])))
             .unwrap_or(Value::Array(vec![]));
@@ -235,14 +244,56 @@ pub async fn set_aggregate_alias(
         );
     }
 
+    // 保存别名不能悄悄改掉锁定的位置。此前 ON CONFLICT 无条件把 active_idx 写回 0：
+    // 锁着的别名只要被保存一次（改探测间隔、改超时、增删候选），锁就跳到 #1 ——
+    // 用户看到的是「锁定没用」「自己解锁了」。这里按候选身份（account_id+model）
+    // 把旧 active 映射到新列表：还在就保留位置和锁；真的没了才归零，且明确解锁
+    // （锁一个已经不存在的候选毫无意义，静默钉在 #1 更糟）。
+    let (keep_active, keep_locked) = match sqlx::query_as::<_, (String, Option<i64>, Option<i64>)>(
+        "SELECT candidates, active_idx, locked FROM aggregate_aliases WHERE alias = ?",
+    )
+    .bind(&alias)
+    .fetch_optional(&state.pool)
+    .await
+    .ok()
+    .flatten()
+    {
+        Some((old_json, old_active, old_locked)) => {
+            let locked = old_locked.unwrap_or(0) == 1;
+            let old_list = parse_candidates(&old_json).unwrap_or_default();
+            let pinned = old_list.get(old_active.unwrap_or(0).max(0) as usize);
+            let moved = pinned.and_then(|old| {
+                parsed.iter().position(|candidate| {
+                    candidate.get("account_id").and_then(Value::as_i64) == Some(old.account_id)
+                        && candidate.get("model").and_then(Value::as_str) == Some(old.model.as_str())
+                })
+            });
+            match moved {
+                Some(idx) => (idx as i64, i64::from(locked)),
+                None => {
+                    if locked {
+                        tracing::warn!(
+                            "🔓 [agg:{}] 锁定的候选不在新列表里了 —— 解锁并回到 #1",
+                            alias
+                        );
+                    }
+                    (0, 0)
+                }
+            }
+        }
+        None => (0, 0),
+    };
+
     match sqlx::query(
-        "INSERT INTO aggregate_aliases (alias, candidates, interval_secs, upstream_api, first_byte_timeout_secs, active_idx, updated_at) VALUES (?, ?, ?, ?, ?, 0, CURRENT_TIMESTAMP) ON CONFLICT(alias) DO UPDATE SET candidates=excluded.candidates, interval_secs=excluded.interval_secs, upstream_api=excluded.upstream_api, first_byte_timeout_secs=excluded.first_byte_timeout_secs, active_idx=0, updated_at=CURRENT_TIMESTAMP",
+        "INSERT INTO aggregate_aliases (alias, candidates, interval_secs, upstream_api, first_byte_timeout_secs, active_idx, locked, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP) ON CONFLICT(alias) DO UPDATE SET candidates=excluded.candidates, interval_secs=excluded.interval_secs, upstream_api=excluded.upstream_api, first_byte_timeout_secs=excluded.first_byte_timeout_secs, active_idx=excluded.active_idx, locked=excluded.locked, updated_at=CURRENT_TIMESTAMP",
     )
     .bind(&alias)
     .bind(&candidates_json)
     .bind(interval_secs)
     .bind(&upstream_api)
     .bind(first_byte_timeout_secs)
+    .bind(keep_active)
+    .bind(keep_locked)
     .execute(&state.pool)
     .await
     {

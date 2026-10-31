@@ -923,7 +923,11 @@ pub(crate) async fn dispatch_aggregate_with_conversion(
     let mut hit_stream_resp: Option<reqwest::Response> = None;
     let mut hit_data: Option<Value> = None;
     let mut hit_account: Option<adapters::Account> = None;
-    for i in active..len {
+    // 锁定 = 硬钉：只发锁定的那个候选，失败就如实报错。以前锁只冻结「迁移」，
+    // 单次请求失败仍会顺着列表往下故障转移 —— 下游看到的模型照样换来换去，
+    // 锁形同虚设（2026-10-31 用户明确要求「失败也不切换」）。
+    let last = if agg.locked { (active + 1).min(len) } else { len };
+    for i in active..last {
         let cand = &agg.candidates[i];
         // 配额/限流冷却中的候选跳过，见 670 行同处注释。
         if crate::routes::v1::helpers::rate_limit_suspended(&state.pool, cand.account_id, &cand.model).await {
@@ -1881,7 +1885,9 @@ async fn dispatch_aggregate_openai(
     let mut hit_data: Option<Value> = None;
     let mut hit_stream_resp: Option<reqwest::Response> = None;
 
-    for i in active..len {
+    // 锁定 = 硬钉，与上面 dispatch_aggregate 同一条规则。
+    let last = if agg.locked { (active + 1).min(len) } else { len };
+    for i in active..last {
         let cand = &agg.candidates[i];
         // 真配额耗尽冷却中的候选跳过。缺这一步会让本函数每轮都重试一个已
         // 知没配额的账户：同族的 dispatch_aggregate_with_conversion(545 行)、

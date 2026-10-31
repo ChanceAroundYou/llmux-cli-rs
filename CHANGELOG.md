@@ -34,6 +34,27 @@
 
 ### Fixed
 
+- **聚合别名锁定改为硬钉，且保存别名不再丢锁**。此前锁只冻结「自动迁移」，
+  单次请求失败仍会顺着候选列表往下故障转移 —— 下游看到的模型照样换，
+  用户视角就是「锁没用」。现在锁定的别名只发锁定的那个候选，失败直接报错。
+  另外两处会悄悄挪锁：保存别名无条件把 `active_idx` 写回 0（改间隔/超时都会
+  触发），以及列表接口在内存无 entry 时把 `active` 固定回 0（UI 用
+  `locked && active==idx` 画锁标，于是刷新后锁看起来跑到 #1）。保存改为按
+  候选身份（account_id+model）映射旧位置，映射不到才归零并明确解锁；列表
+  回退到库里的 `active_idx`，与 `resolve_aggregate` 的 C-A3 同一口径。
+
+- **`stealth/cat-jam:free` / `reflection/beam:free` 预置 `reasoning_content`，
+  修复 Claude Code 自动压缩的 502**。这两个模型要求「每个历史 assistant 消息都带回
+  `reasoning_content`」，而 llmux 只在入站消息带 `thinking` 块时才输出该字段；
+  Claude Code 压缩时用 `context_management.clear_thinking` 清掉历史 thinking，
+  出站于是缺字段、整轮 400（NAS 归档截至 2026-10-20 的日志里该报文 205 次，
+  `Missing required parameter: 'messages[62].reasoning_content'`），
+  聚合里其它候选也失败时对外表现为 502。
+  新增 `llmux_core::reasoning_replay`：**按模型**（不按账户，同一别名还会路由到别处）
+  给每条缺字段的 assistant 消息补占位串，已有原值不动；接入
+  `anthropic_to_openai_request_with` 与 Chat 目标的 `build_passthrough_with_beta`。
+  其他模型的出站 JSON 逐字节不变。
+
 - **聚合别名：什么才算「该换候选」的证据**。三处判据此前都算证据，实际只有
   「真的试过锚点、真的失败」才是：被跳过的候选（退避中 / 上下文装不下 /
   `max_tokens` 超限 / 账户不存在）是**没试过**，不是失败。此前靠
