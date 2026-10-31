@@ -203,7 +203,14 @@ pub fn anthropic_to_openai_request_with(
         );
     }
 
-    Ok(Value::Object(out))
+    let mut out = Value::Object(out);
+    // 少数上游（cat-jam / beam）要求每个历史 assistant 消息都带回
+    // `reasoning_content`，而客户端的 clear_thinking 会把 thinking 块清掉，
+    // 出站于是缺字段、整轮 400。详见 `crate::reasoning_replay`。
+    if crate::reasoning_replay::requires(resolved_model) {
+        crate::reasoning_replay::backfill(&mut out);
+    }
+    Ok(out)
 }
 
 /// Expand one Anthropic message into OpenAI messages. `tool_result` blocks

@@ -1,6 +1,6 @@
 use llmux_core::adapters::{
-    build_custom_request, build_openai_request, build_passthrough, join_upstream_url, Account,
-    ChatMessage, ChatRequest,
+    build_custom_request, build_openai_request, build_passthrough, build_passthrough_with_beta,
+    join_upstream_url, Account, ChatMessage, ChatRequest,
 };
 use llmux_core::protocol::Protocol;
 use llmux_core::dispatcher::{
@@ -228,4 +228,36 @@ fn dispatcher_helpers_resolve_and_order_failover_attempts() {
     assert_eq!(meta.preferred_id, 1);
     // Preferred account (id=1) should be first
     assert_eq!(ordered[0].id, 1);
+}
+
+#[test]
+fn chat_passthrough_backfills_reasoning_for_replay_models() {
+    // OpenAI 格式客户端直接打这两个模型时同样会 400 —— 与 Messages 转换器共用
+    // 同一份名单（`llmux_core::reasoning_replay`）。
+    let body = json!({
+        "model": "reflection/beam:free",
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"}
+        ]
+    });
+    let req = build_passthrough_with_beta(&account("command"), Protocol::Chat, &body, None);
+    assert_eq!(
+        req.body["messages"][1]["reasoning_content"],
+        llmux_core::reasoning_replay::PLACEHOLDER
+    );
+
+    // 非 Chat 目标没有这个字段的语义
+    for proto in [Protocol::Messages, Protocol::Responses] {
+        let req = build_passthrough_with_beta(&account("command"), proto, &body, None);
+        assert!(req.body["messages"][1].get("reasoning_content").is_none());
+    }
+
+    // 名单之外的模型一个字节都不动
+    let other = json!({
+        "model": "qwen3.8-27b",
+        "messages": [{"role": "assistant", "content": "x"}]
+    });
+    let req = build_passthrough_with_beta(&account("command"), Protocol::Chat, &other, None);
+    assert!(req.body["messages"][0].get("reasoning_content").is_none());
 }

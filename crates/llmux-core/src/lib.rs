@@ -14,6 +14,7 @@ pub mod models;
 pub mod probe;
 pub mod proxy;
 pub mod reasoning_effort;
+pub mod reasoning_replay;
 pub mod settings;
 pub mod streaming;
 pub mod protocol;

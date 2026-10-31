@@ -454,6 +454,68 @@ fn request_maps_thinking_block_to_reasoning_fields() {
 }
 
 #[test]
+fn request_backfills_reasoning_for_models_that_demand_its_replay() {
+    // 2026-10-29 生产：Claude Code 压缩时 clear_thinking 把历史 thinking 清空，
+    // 出站 assistant 消息就没有 reasoning_content，cat-jam/beam 整轮 400
+    // （`Missing required parameter: 'messages[62].reasoning_content'`）。
+    let req = anthropic_to_openai_request(
+        &json!({
+            "model": "os",
+            "messages": [
+                {"role": "user", "content": "go"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "real chain", "signature": "sig"},
+                    {"type": "text", "text": "step 1"},
+                    {"type": "tool_use", "id": "t1", "name": "read", "input": {}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "ok"}
+                ]},
+                {"role": "assistant", "content": [{"type": "text", "text": "step 2"}]}
+            ]
+        }),
+        "stealth/cat-jam:free",
+    )
+    .unwrap();
+
+    let messages = req["messages"].as_array().unwrap();
+    let assistants: Vec<&Value> = messages
+        .iter()
+        .filter(|m| m["role"] == "assistant")
+        .collect();
+    assert_eq!(assistants.len(), 2);
+    // 原文在的，原样保留
+    assert_eq!(assistants[0]["reasoning_content"], "real chain");
+    // 原文被客户端丢掉的，补占位
+    assert!(assistants[1]["reasoning_content"]
+        .as_str()
+        .is_some_and(|text| !text.trim().is_empty()));
+
+    let tool = messages.iter().find(|m| m["role"] == "tool").unwrap();
+    assert!(tool.get("reasoning_content").is_none());
+}
+
+#[test]
+fn request_backfill_leaves_other_models_untouched() {
+    // 同一份历史、普通模型：出站一个 reasoning_content 都不该多出来。
+    let req = anthropic_to_openai_request(
+        &json!({
+            "model": "oq",
+            "messages": [
+                {"role": "user", "content": "go"},
+                {"role": "assistant", "content": [{"type": "text", "text": "step 1"}]},
+                {"role": "user", "content": "again"}
+            ]
+        }),
+        "qwen3.8-27b",
+    )
+    .unwrap();
+
+    let text = serde_json::to_string(&req).unwrap();
+    assert!(!text.contains("reasoning_content"));
+}
+
+#[test]
 fn request_drops_cache_control_from_a_text_block() {
     // 曾叫 request_keeps_cache_control_on_text_block。2026-10-14 生产实测后改契约：
     // 严格 chat 上游（Console Go 的 cat-jam-free）对带 cache_control 的 text 块回 400

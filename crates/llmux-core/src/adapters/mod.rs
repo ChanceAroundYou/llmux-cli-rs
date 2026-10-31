@@ -652,6 +652,12 @@ pub fn build_passthrough_with_beta(
         .and_then(Value::as_str)
         .unwrap_or_default();
     let mut body = body.clone();
+    // 强制回放 reasoning 的上游：Chat 目标缺 `reasoning_content` 会整轮 400。
+    // 只对 Chat 生效 —— Messages/Responses 没有这个字段的语义。见
+    // `crate::reasoning_replay`。转换路径已经补过时这里是空操作。
+    if proto == crate::protocol::Protocol::Chat && crate::reasoning_replay::requires(model) {
+        crate::reasoning_replay::backfill(&mut body);
+    }
     // 按上游**实际接受的上限**收敛 max_tokens。客户端发 65536、而上游只收 32768
     // 时，整轮请求会 400 —— 免费模型就是这样一次都没接住的（见 max_tokens 模块
     // 注释）。顺序放在 effort 之前无所谓，两者互不影响。
