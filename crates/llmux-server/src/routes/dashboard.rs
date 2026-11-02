@@ -100,35 +100,7 @@ async fn fetch_aliases(state: &AppState) -> anyhow::Result<Value> {
 }
 
 async fn fetch_aggregate_aliases(state: &AppState) -> anyhow::Result<Value> {
-    let rows = sqlx::query_as::<_, llmux_core::aggregate::AggregateAliasRow>(
-        "SELECT id, alias, candidates, interval_secs, upstream_api, active_idx, locked, created_at, updated_at FROM aggregate_aliases ORDER BY id",
-    )
-    .fetch_all(&state.pool)
-    .await?;
-    let router = state.aggregate_router.lock().unwrap();
-    let mut out = Vec::with_capacity(rows.len());
-    for row in rows {
-        let candidates: Value = serde_json::from_str(&row.candidates).unwrap_or(Value::Array(vec![]));
-        let entry = router.entries.get(&row.alias);
-        let active = entry.map(|e| e.active).unwrap_or(0);
-        let last_status = entry
-            .map(|e| serde_json::to_value(&e.last_status).unwrap_or(Value::Array(vec![])))
-            .unwrap_or(Value::Array(vec![]));
-        let pending_target = entry.and_then(|e| e.pending_target.map(|v| json!(v))).unwrap_or(Value::Null);
-        let confirm_count = entry.map(|e| json!(e.confirm_count)).unwrap_or(json!(0));
-        out.push(json!({
-            "id": row.id,
-            "alias": row.alias,
-            "candidates": candidates,
-            "interval_secs": row.interval_secs.unwrap_or(300),
-            "upstream_api": row.upstream_api.clone().unwrap_or_else(|| "chat".to_string()),
-            "active": active,
-            "last_status": last_status,
-            "pending_target": pending_target,
-            "confirm_count": confirm_count,
-        }));
-    }
-    Ok(Value::Array(out))
+    crate::routes::models::aggregate::aggregate_alias_payloads(state).await
 }
 
 async fn fetch_health(state: &AppState) -> anyhow::Result<Value> {

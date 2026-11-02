@@ -10,21 +10,20 @@ use llmux_core::aggregate::{parse_candidates, AggregateAliasRow};
 
 use crate::app::AppState;
 
-pub async fn list_aggregate_aliases(Extension(state): Extension<AppState>) -> Response {
-    let rows = match sqlx::query_as::<_, AggregateAliasRow>(
+/// 聚合别名的对外形态。**三个端点共用这一份**：`/api/aggregate-aliases`、
+/// `/api/models/summary`、`/api/dashboard`。
+///
+/// 此前这里是三份拷贝，其中 summary 与 dashboard 两份**根本不发 `locked`**
+/// （也少发 `first_byte_timeout_secs`，且 `active` 在内存无 entry 时硬回 0）。
+/// 前端页面加载走的是 summary，于是刷新后 `locked === undefined`、`!!agg.locked`
+/// 为 false，锁按钮一律变回「锁定」—— 库里 `locked=1` 一直好好躺着。改一处
+/// 而漏掉另两处就是「别名锁定修了两次都没修好」的实际成因。
+pub async fn aggregate_alias_payloads(state: &AppState) -> anyhow::Result<Value> {
+    let rows = sqlx::query_as::<_, AggregateAliasRow>(
         "SELECT id, alias, candidates, interval_secs, upstream_api, first_byte_timeout_secs, active_idx, locked, created_at, updated_at FROM aggregate_aliases ORDER BY id",
     )
     .fetch_all(&state.pool)
-    .await
-    {
-        Ok(v) => v,
-        Err(e) => {
-            return crate::error::simple_error(
-                format!("Failed to list aggregate aliases: {e}"),
-                StatusCode::INTERNAL_SERVER_ERROR,
-            )
-        }
-    };
+    .await?;
 
     let router = state.aggregate_router.lock().unwrap();
     let mut out = Vec::with_capacity(rows.len());
@@ -35,8 +34,7 @@ pub async fn list_aggregate_aliases(Extension(state): Extension<AppState>) -> Re
         // 与 `resolve_aggregate` 的 C-A3 同一口径：内存还没有 entry（重启后还没
         // 请求过、刚保存过 —— 保存会 remove 内存 entry）时回退到库里的 active_idx。
         // 这里此前固定回 0，而 UI 的锁标记绑在 active 上（`locked && active==idx`），
-        // 于是刷新后锁看起来跑到了 #1、原来锁着的候选显示成「锁定」—— 用户眼里
-        // 就是「一刷新就自动解锁」。
+        // 于是刷新后锁看起来跑到了 #1、原来锁着的候选显示成「锁定」。
         let active = entry.map(|e| e.active).unwrap_or_else(|| {
             row.active_idx.unwrap_or(0).max(0) as usize
         });
@@ -61,7 +59,17 @@ pub async fn list_aggregate_aliases(Extension(state): Extension<AppState>) -> Re
             "confirm_count": confirm_count,
         }));
     }
-    Json(json!(out)).into_response()
+    Ok(Value::Array(out))
+}
+
+pub async fn list_aggregate_aliases(Extension(state): Extension<AppState>) -> Response {
+    match aggregate_alias_payloads(&state).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => crate::error::simple_error(
+            format!("Failed to list aggregate aliases: {e}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
 }
 
 pub async fn set_aggregate_alias(

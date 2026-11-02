@@ -1110,3 +1110,128 @@ async fn saving_a_locked_alias_keeps_the_pin() {
     assert_eq!(active, Some(0));
     assert_eq!(locked, Some(0), "锁定的候选没了就该解锁");
 }
+
+/// 前端加载走 `/api/models/summary`，不是 `/api/aggregate-aliases`。
+/// 这两个聚合列表此前是**三份拷贝**，其中 summary 与 dashboard 两份**根本不发
+/// `locked`**：刷新后前端拿到 `locked === undefined`，`!!agg.locked` 为 false，
+/// 锁按钮一律变回「锁定」—— 用户视角就是「一刷新就自动解锁」，而库里 locked=1
+/// 一直好好躺着。
+#[tokio::test]
+async fn summary_and_dashboard_also_report_lock_state() {
+    let state = llmux_server::test_state().await;
+    let app = llmux_server::app(state.clone());
+    let cookie = login(app.clone()).await;
+
+    let mut account_ids = Vec::new();
+    for alias in ["locksrc", "lockdst"] {
+        let (st, body) = api_post(
+            app.clone(),
+            &cookie,
+            "/api/accounts",
+            json!({
+                "alias": alias,
+                "provider_id": "openai",
+                "api_key": "sk-mock",
+                "base_url": "http://127.0.0.1:9",
+                "chat_endpoint": "http://127.0.0.1:9",
+                "default_protocol": "chat",
+                "skip_validation": true,
+            }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{body:?}");
+        account_ids.push(body["id"].as_i64().expect("account id"));
+    }
+    let (a, b) = (account_ids[0], account_ids[1]);
+
+    let (st, body) = api_post(
+        app.clone(),
+        &cookie,
+        "/api/aggregate-aliases",
+        json!({
+            "alias": "agg-refresh-lock",
+            "candidates": [{"account_id": a, "model": "ma"}, {"account_id": b, "model": "mb"}],
+            "upstream_api": "chat",
+            "interval_secs": 120,
+            "first_byte_timeout_secs": 45,
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body:?}");
+    let id: i64 =
+        sqlx::query_scalar("SELECT id FROM aggregate_aliases WHERE alias = 'agg-refresh-lock'")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+    let (st, body) = api_post(
+        app.clone(),
+        &cookie,
+        &format!("/api/aggregate-aliases/{id}/active"),
+        json!({"active": 1}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body:?}");
+    let (st, body) = api_post(
+        app.clone(),
+        &cookie,
+        &format!("/api/aggregate-aliases/{id}/lock"),
+        json!({"locked": true}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body:?}");
+
+    // 重存一次：保存会清掉内存 entry，此后三个端点只能靠库里的值（= 重启后的视角）
+    let (st, body) = api_post(
+        app.clone(),
+        &cookie,
+        "/api/aggregate-aliases",
+        json!({
+            "alias": "agg-refresh-lock",
+            "candidates": [{"account_id": a, "model": "ma"}, {"account_id": b, "model": "mb"}],
+            "upstream_api": "chat",
+            "interval_secs": 120,
+            "first_byte_timeout_secs": 45,
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body:?}");
+
+    // 新进程视角：内存没有 entry（模拟重启后还没请求过这个别名），
+    // 三个端点都必须从库里把 locked 与 active 读出来。
+    for uri in ["/api/aggregate-aliases", "/api/models/summary", "/api/dashboard"] {
+        let (st, payload) = api_get(app.clone(), &cookie, uri).await;
+        assert_eq!(st, StatusCode::OK, "{payload:?}");
+        // /api/aggregate-aliases 返回裸数组，另两个是 `{ aggregateAliases: [...] }`
+        let rows = if payload.is_array() {
+            payload.as_array().unwrap()
+        } else {
+            payload["aggregateAliases"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{uri} 的 aggregateAliases 不是数组: {payload:?}"))
+        };
+        let entry = rows
+            .iter()
+            .find(|e| e["alias"] == "agg-refresh-lock")
+            .unwrap_or_else(|| panic!("{uri} 里没有 agg-refresh-lock"));
+        assert_eq!(
+            entry.get("locked").and_then(Value::as_i64),
+            Some(1),
+            "{uri} 必须报 locked —— 前端 !!locked 决定锁按钮显示「锁定」还是「解锁」"
+        );
+        assert_eq!(
+            entry.get("active").and_then(Value::as_i64),
+            Some(1),
+            "{uri} 必须报库里的 active_idx —— 锁标记绑在 active 上"
+        );
+        assert_eq!(
+            entry.get("interval_secs").and_then(Value::as_i64),
+            Some(120),
+            "{uri}"
+        );
+        assert_eq!(
+            entry.get("first_byte_timeout_secs").and_then(Value::as_i64),
+            Some(45),
+            "{uri} 必须报 first_byte_timeout_secs —— 否则编辑表单回填成默认值"
+        );
+    }
+}

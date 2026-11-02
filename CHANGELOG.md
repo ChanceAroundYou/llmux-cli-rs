@@ -34,14 +34,21 @@
 
 ### Fixed
 
-- **聚合别名锁定改为硬钉，且保存别名不再丢锁**。此前锁只冻结「自动迁移」，
-  单次请求失败仍会顺着候选列表往下故障转移 —— 下游看到的模型照样换，
-  用户视角就是「锁没用」。现在锁定的别名只发锁定的那个候选，失败直接报错。
-  另外两处会悄悄挪锁：保存别名无条件把 `active_idx` 写回 0（改间隔/超时都会
-  触发），以及列表接口在内存无 entry 时把 `active` 固定回 0（UI 用
-  `locked && active==idx` 画锁标，于是刷新后锁看起来跑到 #1）。保存改为按
-  候选身份（account_id+model）映射旧位置，映射不到才归零并明确解锁；列表
-  回退到库里的 `active_idx`，与 `resolve_aggregate` 的 C-A3 同一口径。
+- **聚合别名锁定：硬钉 + 「一刷新就解锁」的真根因**。三处缺陷，前两轮只修了前两处：
+  1. 锁只冻结「自动迁移」，单次请求失败仍会顺着候选列表往下故障转移 —— 下游看到的
+     模型照样换，用户视角就是「锁没用」。现在锁定的别名只发锁定的那个候选，失败
+     直接报错（`anthropic.rs` 一处 + `openai.rs` 两处）。
+  2. 保存别名无条件把 `active_idx` 写回 0（改间隔/超时都会触发）、内存 entry 被清掉，
+     却保留 `locked=1` —— 锁被悄悄挪到 #1。改为按候选身份（account_id+model）映射旧
+     位置，映射不到才归零并明确解锁 + warn。
+  3. **真正让「一刷新就解锁」的是聚合列表的三份拷贝**：`/api/aggregate-aliases`、
+     `/api/models/summary`、`/api/dashboard` 各自手写了一遍 row→JSON 映射，后两份
+     **根本不发 `locked`**（也少发 `first_byte_timeout_secs`，`active` 在内存无 entry
+     时硬回 0）。前端页面加载走的是 summary，`!!agg.locked` 于是恒为 false，锁按钮
+     一律变回「锁定」—— 库里 `locked=1` 一直好好躺着。上一轮只改了
+     `/api/aggregate-aliases`，而刷新路径不经过它，所以「修了却没修好」。
+     现在三份合并成 `aggregate::aggregate_alias_payloads` 一处（含库里 `active_idx`
+     的回退，与 `resolve_aggregate` 的 C-A3 同一口径）。
 
 - **`stealth/cat-jam:free` / `reflection/beam:free` 预置 `reasoning_content`，
   修复 Claude Code 自动压缩的 502**。这两个模型要求「每个历史 assistant 消息都带回
