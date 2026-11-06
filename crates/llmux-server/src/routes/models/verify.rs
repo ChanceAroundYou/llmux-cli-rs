@@ -53,6 +53,9 @@ pub async fn verify_targets(
 
     let mut results = Vec::new();
     for account in accounts {
+        // codex 原生账户：过期就先刷（与真实流量路径同一判据）。别名保存校验此前
+        // 只 load_creds，空闲账户 token 到期后「保存别名」会一直报探测失败。
+        let account = llmux_core::codex_auth::ensure_fresh(&state.pool, &account).await;
         let provider_type = {
             let pt =
                 sqlx::query_scalar::<_, Option<String>>("SELECT type FROM providers WHERE id = ?")

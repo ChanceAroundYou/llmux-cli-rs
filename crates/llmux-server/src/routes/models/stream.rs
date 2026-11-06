@@ -86,7 +86,8 @@ pub async fn stream_available_models(
             pending.push(async move {
                 let _permit = sem_c.acquire().await.unwrap();
                 let provider_type = resolve_provider_type(None, &account.provider_id);
-                let (mut models, fetch_error) = fetch_provider_models(&account, &provider_type).await;
+                let (mut models, fetch_error) =
+                    fetch_provider_models(&state_c.pool, &account, &provider_type).await;
                 let now = now_secs();
                 // ensure owned_by and handle empty -> placeholder
                 let payload_models: Vec<Value>;

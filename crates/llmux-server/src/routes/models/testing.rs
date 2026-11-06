@@ -124,11 +124,15 @@ pub(crate) async fn persist_test_result(
         )
         .await;
         if newly {
+            // 报真实时长：冷却随连败递增（5/15/30/60 分钟），写死 SUSPEND_SECS
+            // 会让「为什么这一轮没探它」在日志里查不出来。
+            let (streak, remaining) = probe::failure_streak(pool, account.id, model).await;
             tracing::warn!(
-                "⏸️  {} | {} 连续失败，暂停自动拨测 {} 分钟",
+                "⏸️  {} | {} 已连续失败 {} 次，暂停自动拨测 {} 分钟",
                 model,
                 account.alias,
-                probe::SUSPEND_SECS / 60
+                streak,
+                remaining / 60
             );
         }
     }
@@ -768,6 +772,8 @@ pub async fn start_test_queue(
                             queue.progress = if queue.total > 0 { ((i + 1) * 100) / queue.total } else { 0 };
                             continue;
                         }
+                        let refreshed = llmux_core::codex_auth::ensure_fresh(&pool, account).await;
+                        let account = &refreshed;
                         let provider_type = {
                             let pt = sqlx::query_scalar::<_, Option<String>>(
                                 "SELECT type FROM providers WHERE id = ?",
@@ -973,6 +979,11 @@ pub async fn test_model(
         }))
         .into_response();
     };
+
+    // codex 原生账户：过期先刷。手动拨测此前只 load_creds，空闲账户 token 到期后
+    // 每次点「拨测」都 401 —— 而真实流量路径会自刷，看起来就像「面板坏了」。
+    let refreshed = llmux_core::codex_auth::ensure_fresh(&state.pool, account).await;
+    let account = &refreshed;
 
     let provider_type = {
         let pt =

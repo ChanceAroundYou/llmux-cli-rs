@@ -297,7 +297,8 @@ async fn do_fetch_models(state: &AppState) -> Vec<Value> {
             let account = account.clone();
             async move {
                 let provider_type = resolve_provider_type(None, &account.provider_id);
-                let (mut models, fetch_error) = fetch_provider_models(&account, &provider_type).await;
+                let (mut models, fetch_error) =
+                    fetch_provider_models(&state.pool, &account, &provider_type).await;
                 if !models.is_empty() {
                     // 保留禁用模型进缓存（前端灰卡显示），但打标；探测层不再过滤
                     mark_disabled(&mut models, account.id as i64, &state.pool).await;
@@ -386,10 +387,20 @@ async fn do_fetch_models(state: &AppState) -> Vec<Value> {
     all_models
 }
 
+/// 拉取一个账户的模型清单。
+///
+/// `pool` 不是顺手传进去的装饰：codex 原生账户的 access_token 约 10 天到期，
+/// 这一条路径（加载模型）此前只 `load_creds`、不查过期也不刷新，于是**空闲账户**
+/// 到期后必然 401 → 面板只剩 `*-models-unavailable` 占位卡 → 更没有流量 →
+/// 只有真实请求那条路径会自刷，而它已经没有流量了。刷新判据统一收在
+/// [`llmux_core::codex_auth::ensure_fresh`]（非 codex 账户直接原样返回）。
 pub async fn fetch_provider_models(
+    pool: &sqlx::SqlitePool,
     account: &llmux_core::adapters::Account,
     provider_type: &str,
 ) -> (Vec<Value>, Option<String>) {
+    let account = llmux_core::codex_auth::ensure_fresh(pool, account).await;
+
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
@@ -427,7 +438,9 @@ pub async fn fetch_provider_models(
                 version
             );
             let mut headers = std::collections::BTreeMap::new();
-            let (token, account_id) = llmux_core::codex_auth::load_creds(account)
+            // 凭据在这里必然已刷新（函数开头 `ensure_fresh`）；缺失时不断言 ——
+            // 让请求带空 Bearer 去上游拿 401，错得清楚（与真实流量路径一致）。
+            let (token, account_id) = llmux_core::codex_auth::load_creds(&account)
                 .map(|c| (c.access_token, c.account_id))
                 .unwrap_or_default();
             headers.insert("authorization".to_string(), format!("Bearer {}", token));

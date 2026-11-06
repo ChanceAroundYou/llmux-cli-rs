@@ -555,7 +555,7 @@ pub async fn create_account(
         resolve_provider_type(pt.as_deref(), &provider_id)
     };
 
-    let (models, _) = fetch_provider_models(&test_account, &provider_type).await;
+    let (models, _) = fetch_provider_models(&state.pool, &test_account, &provider_type).await;
     if models.is_empty() && !skip_validation {
         return crate::error::simple_error(
             "accounts.validationFailed",
@@ -889,7 +889,8 @@ pub async fn update_account(
                 resolve_provider_type(pt.as_deref(), &test_account.provider_id)
             };
 
-            let (models, _) = fetch_provider_models(&test_account, &provider_type).await;
+            let (models, _) =
+                fetch_provider_models(&state.pool, &test_account, &provider_type).await;
             if models.is_empty() && !skip_validation {
                 return crate::error::simple_error(
                     "accounts.validationFailed",

@@ -10,7 +10,9 @@ use serde_json::Value;
 use sqlx::SqlitePool;
 
 /// sidecar 的 OAuth client_id（ChatGPT 网页登录的公共 client，固定值）。
-const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+/// `codex_device`（界面里的设备码登录）与刷新共用同一个 client —— 换掉就等于换会话。
+pub(crate) const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+pub(crate) const AUTH_ISSUER: &str = "https://auth.openai.com";
 const REFRESH_URL: &str = "https://auth.openai.com/oauth/token";
 /// 提前 30 秒判定过期（与 sidecar `tokenFresh` 一致）。
 const EXPIRY_BUFFER_SECS: i64 = 30;
@@ -179,25 +181,70 @@ pub async fn refresh_and_save(
     Ok(new_json)
 }
 
-/// 从 JWT payload 解出 `exp`（秒级 Unix 时间戳）。
-fn jwt_exp(token: &str) -> Option<i64> {
+/// 该账户是否需要「用前先刷新」：codex 原生账户 + 存着能解析的凭据 + access_token 已过期。
+///
+/// 判据与 `routes/v1/openai.rs` 的请求前刷新完全一致（`is_codex_native` 同一入口 +
+/// `is_expired` 提前 30s），区别只在这里发生在**没有流量**的路径上：加载模型、拨测、
+/// 聚合探活。那些路径此前只 `load_creds`，于是空闲账户会卡成
+/// 「token 到期 → 拨测 401 → 暂停 30 分钟 → 加载模型 401 → 更没流量 → 永远没人刷新」。
+/// 凭据缺失或解析失败返回 false —— 让请求带空 Bearer 去上游拿 401，错得清楚。
+pub fn needs_refresh(account: &crate::adapters::Account) -> bool {
+    if !crate::adapters::is_codex_native(account) {
+        return false;
+    }
+    match load_creds(account) {
+        Some(creds) => creds.is_expired(),
+        None => false,
+    }
+}
+
+/// 需要就刷新并写回 DB，返回可直接用于本次请求的账户（不需要则原样克隆）。
+///
+/// 刷新失败**不吞**：返回原账户并打 WARN，调用方的请求会拿到真实 401 正文 ——
+/// 比在网关里把它改写成「刷新失败」更可诊断（与上游超时那同理：诊断正文比改写有用）。
+pub async fn ensure_fresh(pool: &SqlitePool, account: &crate::adapters::Account) -> crate::adapters::Account {
+    if !needs_refresh(account) {
+        return account.clone();
+    }
+    match refresh_and_save(pool, account.id, &account.codex_auth_json).await {
+        Ok(new_json) => {
+            tracing::info!(
+                "🔑 codex token refreshed pre-probe/list for account {} (id={})",
+                account.alias,
+                account.id
+            );
+            crate::adapters::Account { codex_auth_json: new_json, ..account.clone() }
+        }
+        Err(e) => {
+            tracing::warn!(
+                "🔑 codex pre-probe/list refresh failed for account {} (id={}): {e}",
+                account.alias,
+                account.id
+            );
+            account.clone()
+        }
+    }
+}
+
+/// 解出 JWT payload（第二段，base64url）。签名**不校验** —— 这些字段只用来
+/// 记账（过期时间、account_id、邮箱/套餐），真正认账的是上游。
+pub(crate) fn jwt_claims(token: &str) -> Option<Value> {
     let payload = token.split('.').nth(1)?;
     let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(payload.trim_end_matches('='))
         .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload))
         .ok()?;
-    let v: Value = serde_json::from_slice(&decoded).ok()?;
-    v.get("exp")?.as_i64()
+    serde_json::from_slice(&decoded).ok()
+}
+
+/// 从 JWT payload 解出 `exp`（秒级 Unix 时间戳）。
+fn jwt_exp(token: &str) -> Option<i64> {
+    jwt_claims(token)?.get("exp")?.as_i64()
 }
 
 /// 从 JWT 解出 `chatgpt_account_id`。复用 `balance.rs` 的逻辑（同一段 payload 结构）。
 fn jwt_chatgpt_account_id(token: &str) -> Option<String> {
-    let payload = token.split('.').nth(1)?;
-    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload.trim_end_matches('='))
-        .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload))
-        .ok()?;
-    let v: Value = serde_json::from_slice(&decoded).ok()?;
+    let v = jwt_claims(token)?;
     // 两个位置都查：顶层 `chatgpt_account_id` 和嵌套 `https://api.openai.com/auth`
     v.get("chatgpt_account_id")
         .and_then(Value::as_str)
@@ -329,5 +376,68 @@ mod tests {
             category: "codex".into(),
         };
         assert!(load_creds(&account).is_none());
+    }
+
+    fn account_with(category: &str, auth_json: &str) -> crate::adapters::Account {
+        crate::adapters::Account {
+            id: 60,
+            alias: "codex".into(),
+            provider_id: "codex".into(),
+            api_key: String::new(),
+            base_url: None,
+            anthropic_base_url: None,
+            is_active: 1,
+            weight: 1,
+            openai_compatible: 0,
+            chat_endpoint: None,
+            responses_endpoint: None,
+            messages_endpoint: None,
+            default_protocol: None,
+            balance_provider: "codex".into(),
+            balance_auth: String::new(),
+            codex_auth_json: auth_json.into(),
+            category: category.into(),
+        }
+    }
+
+    fn auth_json_with_exp(exp: i64) -> String {
+        let token = make_jwt(&format!(r#"{{"exp": {exp}}}"#));
+        format!(
+            r#"{{"auth_mode":"chatgpt","tokens":{{"access_token":"{token}","refresh_token":"rt"}}}}"#
+        )
+    }
+
+    /// 缺口回归：空闲 codex 账户的 access_token 过期后，加载模型 / 拨测那两条路径
+    /// 必须先刷新。判据为假就等于缺口回来（401 → 暂停拨测 → 更没流量 → 没人刷新）。
+    #[test]
+    fn needs_refresh_true_for_expired_codex_creds() {
+        let account = account_with("codex", &auth_json_with_exp(0));
+        assert!(needs_refresh(&account));
+    }
+
+    #[test]
+    fn needs_refresh_false_for_fresh_codex_creds() {
+        let future = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+            + 3600;
+        let account = account_with("codex", &auth_json_with_exp(future));
+        assert!(!needs_refresh(&account));
+    }
+
+    /// `provider_id=codex` 但 `category=custom` 时整条原生路径是关掉的（2026-11-06 的
+    /// 生产根因）—— 这里也不该去刷新：那条路径用的是 api_key，不是 codex_auth_json。
+    #[test]
+    fn needs_refresh_false_when_category_is_not_codex() {
+        let account = account_with("custom", &auth_json_with_exp(0));
+        assert!(!needs_refresh(&account));
+    }
+
+    /// 凭据缺失 / 脏 JSON：不刷新，让请求带空 Bearer 去上游拿真 401。
+    #[test]
+    fn needs_refresh_false_without_credentials() {
+        assert!(!needs_refresh(&account_with("codex", "")));
+        assert!(!needs_refresh(&account_with("codex", "{not json")));
     }
 }
