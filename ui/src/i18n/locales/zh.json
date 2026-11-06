@@ -281,6 +281,8 @@
       "codex": "Codex",
       "zen": "Zen"
     },
+    "codexConfigured": "已登录",
+    "codexNotConfigured": "Codex 还没登录",
     "apiKey": "API Key",
     "baseUrl": "Base URL",
     "noAccounts": "暂无账户配置",
@@ -520,5 +522,28 @@
     "cacheTokens": "缓存",
     "probe": "拨测",
     "elapsed": "耗时"
+  },
+  "codex": {
+    "login": {
+      "title": "Codex 登录",
+      "description": "点「发起登录」拿一次性码，在浏览器里确认，llmux 自己把凭据接住存进这个账户 —— 不用开命令行。",
+      "start": "发起登录",
+      "restart": "重新发起",
+      "cancel": "取消",
+      "close": "关闭",
+      "code": "一次性码",
+      "copyCode": "复制一次性码",
+      "openPage": "打开授权页",
+      "stepHint": "① 打开授权页并登录 ChatGPT ② 输入下面的一次性码 ③ 留在这个窗口等结果",
+      "waiting": "等你在浏览器里确认…已查 {{poll}} 次",
+      "authorizing": "已授权，正在换取令牌…",
+      "starting": "正在向 ChatGPT 申请一次性码…",
+      "expiresIn": "码剩余 {{seconds}} 秒",
+      "completed": "登录完成",
+      "identity": "邮箱 {{email}} · 套餐 {{plan}} · ChatGPT 工作区 {{workspace}}",
+      "models": "可加载模型 {{count}} 个",
+      "failed": "登录没完成",
+      "caution": "只授权你自己刚发起的这次登录：如果这个码是别人或某个网页给你的，取消。"
+    }
   }
 }

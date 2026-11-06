@@ -24,9 +24,11 @@ import {
   Filter,
   RefreshCw,
   Info,
+  LogIn,
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { Dialog, ConfirmDialog } from '../components/Modal';
+import { CodexLoginDialog } from '../components/CodexLoginDialog';
 import { CopyButton } from '../components/CopyButton';
 import { cn } from '../lib/utils';
 import { Button } from '@/components/ui/button';
@@ -481,6 +483,8 @@ export default function Accounts() {
   const [editEnabled, setEditEnabled] = useState<Record<Protocol, boolean>>({ chat: false, responses: false, messages: false });
   const [editShowKey, setEditShowKey] = useState(false);
   const [accountToDelete, setAccountToDelete] = useState<{ id: number; name: string } | null>(null);
+  // Codex 设备码登录：非 null 即对话框打开，值是目标账户。
+  const [codexLoginAccount, setCodexLoginAccount] = useState<{ id: number; alias: string } | null>(null);
   const [isValidating, setIsValidating] = useState(false);
   const [validationError, setValidationError] = useState<string | null>(null);
   const [visibleKeyId, setVisibleKeyId] = useState<number | null>(null);
@@ -795,6 +799,17 @@ export default function Accounts() {
                   <StatusDot status={acc.is_active === 1 ? 'online' : 'offline'} />
                 </div>
                 <div className="flex items-center gap-2 shrink-0">
+                  {acc.category === 'codex' && (
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      onClick={() => setCodexLoginAccount({ id: acc.id, alias: acc.alias })}
+                      className={acc.codex_configured ? "text-success hover:text-success hover:bg-success/10" : "text-warning hover:text-warning hover:bg-warning/10"}
+                      title={acc.codex_configured ? `${t('codex.login.title')}（${t('accounts.codexConfigured')})` : t('accounts.codexNotConfigured')}
+                    >
+                      <LogIn size={16} />
+                    </Button>
+                  )}
                   <Button variant="ghost" size="icon" onClick={() => openEdit(acc)} className="text-warning hover:text-warning hover:bg-warning/10" title="Edit account"><Pencil size={16} /></Button>
                   <Button variant="ghost" size="icon" onClick={() => toggleActive(acc.id, acc.is_active)} className={acc.is_active === 1 ? "text-success hover:text-success hover:bg-success/10" : "text-muted-foreground/40 hover:text-muted-foreground hover:bg-muted"} title={acc.is_active === 1 ? t('common.online') : t('accounts.offline')}><Power size={16} /></Button>
                   <Button variant="ghost" size="icon" onClick={() => setAccountToDelete({ id: acc.id, name: acc.alias })} className="text-destructive hover:text-destructive hover:bg-destructive/10"><Trash2 size={16} /></Button>
@@ -1212,6 +1227,17 @@ export default function Accounts() {
            </p>
         </div>
       </Dialog>
+
+      <CodexLoginDialog
+        isOpen={codexLoginAccount !== null}
+        onClose={() => setCodexLoginAccount(null)}
+        account={codexLoginAccount}
+        onSignedIn={() => {
+          // 新凭据进了库，账户卡和模型列表都要重读，否则界面还按「未配置凭据」说话。
+          void fetchAccounts();
+          void fetchModels(true);
+        }}
+      />
     </div>
   );
 }

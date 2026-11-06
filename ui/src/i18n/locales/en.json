@@ -279,6 +279,8 @@
       "codex": "Codex",
       "zen": "Zen"
     },
+    "codexConfigured": "signed in",
+    "codexNotConfigured": "Codex sign-in required",
     "apiKey": "API Key",
     "baseUrl": "Base URL",
     "noAccounts": "No accounts configured",
@@ -519,5 +521,28 @@
     "cacheTokens": "Cache",
     "probe": "Probe",
     "elapsed": "Elapsed"
+  },
+  "codex": {
+    "login": {
+      "title": "Codex sign-in",
+      "description": "Start a login, confirm the one-time code in your browser, and llmux catches the credentials and stores them on this account — no terminal needed.",
+      "start": "Start login",
+      "restart": "Start again",
+      "cancel": "Cancel",
+      "close": "Close",
+      "code": "One-time code",
+      "copyCode": "Copy one-time code",
+      "openPage": "Open the sign-in page",
+      "stepHint": "① Open the page and sign in to ChatGPT ② Enter the code below ③ Stay here while llmux waits",
+      "waiting": "Waiting for you to confirm in the browser… checked {{poll}} times",
+      "authorizing": "Approved — exchanging the code for tokens…",
+      "starting": "Requesting a one-time code from ChatGPT…",
+      "expiresIn": "Code expires in {{seconds}}s",
+      "completed": "Signed in",
+      "identity": "{{email}} · plan {{plan}} · ChatGPT workspace {{workspace}}",
+      "models": "{{count}} models loadable",
+      "failed": "Sign-in did not complete",
+      "caution": "Only approve a login you just started yourself. If someone else or a web page gave you this code, cancel."
+    }
   }
 }

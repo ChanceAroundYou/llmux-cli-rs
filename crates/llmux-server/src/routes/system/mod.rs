@@ -1,5 +1,6 @@
 pub mod claude;
 pub mod codex;
+pub mod codex_device;
 pub mod gemini;
 pub mod helpers;
 
@@ -15,6 +16,9 @@ pub use claude::{
 pub use codex::{
     apply_codex_settings, delete_codex_backup, get_codex_settings, import_codex_auth,
     list_codex_backups, restore_codex_backup,
+};
+pub use codex_device::{
+    cancel_codex_device_login, get_codex_device_login, start_codex_device_login, DeviceLoginSession,
 };
 pub use gemini::{
     apply_gemini_settings, delete_gemini_backup, get_gemini_settings, list_gemini_backups,

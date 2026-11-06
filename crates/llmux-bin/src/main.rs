@@ -170,6 +170,7 @@ async fn start(port_override: Option<u16>, use_tui: bool) -> anyhow::Result<()> 
         model_cache,
         aggregate_cache,
         sessions,
+        codex_device_logins: Arc::new(Mutex::new(std::collections::HashMap::new())),
         cache_breakpoint_unsupported: Arc::new(Mutex::new(std::collections::HashSet::new())),
         tui_tx,
     };

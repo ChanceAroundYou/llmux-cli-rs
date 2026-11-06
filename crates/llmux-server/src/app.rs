@@ -101,6 +101,10 @@ pub struct AppState {
     pub model_cache: Arc<Mutex<HashMap<String, CachedModel>>>,
     pub aggregate_cache: Arc<Mutex<HashMap<String, CachedAggregate>>>,
     pub sessions: Arc<Mutex<HashMap<String, Instant>>>,
+    /// 进行中的 Codex 设备码登录（界面点「Codex 登录」发起）。只活 15 分钟，
+    /// 所以刻意不落盘 —— 重启等于重新发起登录，本来就得重来。
+    pub codex_device_logins:
+        Arc<Mutex<HashMap<String, crate::routes::system::DeviceLoginSession>>>,
     /// Providers whose upstream rejected the `prompt_cache_breakpoint` marker.
     /// Requests routed to them are converted without it.
     pub cache_breakpoint_unsupported: Arc<Mutex<HashSet<String>>>,
@@ -407,6 +411,15 @@ fn core_router() -> AppRouter {
             post(system::import_codex_auth),
         )
         .route(
+            // 设备码登录：POST 发起 / GET 看进度（不带 session_id 时列全部，刷新页面接得回去）。
+            "/api/system/codex-device",
+            post(system::start_codex_device_login).get(system::get_codex_device_login),
+        )
+        .route(
+            "/api/system/codex-device-cancel",
+            post(system::cancel_codex_device_login),
+        )
+        .route(
             "/api/system/gemini-settings",
             get(system::get_gemini_settings).post(system::apply_gemini_settings),
         )
@@ -512,6 +525,7 @@ pub async fn test_state() -> AppState {
         model_cache: Arc::new(Mutex::new(HashMap::new())),
         aggregate_cache: Arc::new(Mutex::new(HashMap::new())),
         sessions: Arc::new(Mutex::new(HashMap::new())),
+        codex_device_logins: Arc::new(Mutex::new(HashMap::new())),
         cache_breakpoint_unsupported: Arc::new(Mutex::new(HashSet::new())),
     }
 }

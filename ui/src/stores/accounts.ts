@@ -27,6 +27,9 @@ export interface Account {
   activity_bucket?: number | null;
   balance_ok?: boolean | null;
   balance_tier?: number | null;
+  // codex 账户是否已存 OAuth 凭据（codex_auth_json 非空）。界面用它决定
+  // 「Codex 登录」按钮是「已登录，可重登」还是「待登录」。
+  codex_configured?: boolean;
 }
 
 interface AccountsState {
