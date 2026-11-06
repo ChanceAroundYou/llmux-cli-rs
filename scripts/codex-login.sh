@@ -9,7 +9,7 @@
 # 用法:
 #   ./scripts/codex-login.sh --account-id 60                 # 登录+导入（默认 llmux 本地 25976）
 #   ./scripts/codex-login.sh --account-id 60 --reuse          # 跳过登录，直接复用上次的 auth.json
-#   ./scripts/codex-login.sh --account-id 60 --from-router    # 从路由器 sidecar 取现成凭据（免登录）
+#   ./scripts/codex-login.sh --account-id 60 --from-router    # 从路由器取旧凭据（⚠️ 见下方警告）
 #   LLMux_BASE=http://127.0.0.1:25977 ./scripts/codex-login.sh --account-id 60 ...
 #   ADMIN_USER=admin ADMIN_PASS=xxx ./scripts/codex-login.sh --account-id 60 ...
 #
@@ -77,6 +77,8 @@ EOF
 if [ "$FROM_ROUTER" = 1 ]; then
   need ssh
   echo "→ 从路由器取 sidecar 凭据 ($ROUTER:$ROUTER_AUTH)…"
+  echo "  ⚠️ 那份文件冻结在 sidecar 时代（实测 last_refresh=2026-10-12）；llmux 每次自刷都会轮换" >&2
+  echo "     refresh_token，路由器那份的 refresh_token 已作废。真要用凭据请走 --reuse 或重新登录。" >&2
   mkdir -p "$WORK_HOME"
   scp -q "$ROUTER:$ROUTER_AUTH" "$AUTH_JSON.tmp" \
     || { echo "取回失败：确认 ssh $ROUTER 可达且文件存在" >&2; exit 1; }
@@ -130,5 +132,6 @@ import json, sys
 d = json.load(sys.stdin)
 print('✓ 账户 {} 已切 codex 原生路径（account_hint={}，token_expired={}）'.format(
     d.get('account_id'), d.get('account_id_hint'), d.get('token_expired')))
-print('  sidecar 可停：ssh router \"cd /root/docker/llmux && docker compose stop codex-api\"')
+print('  下一步：账户的 category 必须是 codex（PUT /api/accounts/{} {{"category":"codex"}}），'.format(d.get('account_id')))
+print('  否则私有头 / store=false 预处理 / 令牌刷新三样都不生效。详见 docs/codex-subscription-account-guide.md')
 "
