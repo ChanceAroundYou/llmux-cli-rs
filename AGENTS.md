@@ -235,8 +235,18 @@ ChatGPT Plus 的 Codex 额度直连 `chatgpt.com/backend-api/codex`，llmux 原�
 
 - llmux 账户：`provider_id=codex`，`codex_auth_json` 存完整 auth.json，
   `balance_provider=codex`（余额走 access_token 打 `wham/usage`）。
-- 登录：`./scripts/codex-login.sh --account-id 60`（device-auth，隔离 CODEX_HOME）；
-  或 `--from-router` 复用路由器 `./codex-auth/auth.json`（免登录）。
+- 登录（**首选，界面上点**，2026-11-07 起）：账户页 codex 账户的登录按钮 → 对话框给一次性码
+  + 「打开授权页」（`https://auth.openai.com/codex/device`）→ 人在浏览器确认 → 凭据自动写库、
+  回显邮箱/套餐/可加载模型数。实现 `llmux_core::codex_device` + `routes/system/codex_device.rs`
+  （会话只在内存、15 分钟窗口、`device_auth_id` 不出服务端、日志里的码打掩码），
+  细节见 `docs/codex-subscription-account-guide.md` §7。**换 token 那一步必须人确认，界面上做完才算验证过。**
+- 登录（命令行，仍可用）：`./scripts/codex-login.sh --account-id 60`（device-auth，隔离 CODEX_HOME）。
+  ⚠️ `--from-router` 已不可用：路由器 `./codex-auth/auth.json` 那份 2026-10-12 之后没动过，
+  refresh_token 大概率已被 llmux 自己的每次自刷轮换作废。
+- 令牌生命周期**三条**刷新路径（判据同为 `is_expired`，提前 30s）：真实流量请求前、
+  真实流量 401 后重试一次、以及**加载模型 / 拨测 / 保存别名校验前**
+  （`codex_auth::ensure_fresh`，2026-11-07 加 —— 修的是「空闲账户到期后自我锁死」：
+  拨测 401 → 冷却 → 加载模型 401 → 更没流量 → 没人去刷新）。
 - ⚠️ 走的是 codex **未公开私有后端**，随时可能被上游改掉而失效；**可能违背 OpenAI ToS、有账号风控风险**。
 - 归档：sidecar 方案见 `docs/codex-absorption-plan.md`；旧 compose 备份在路由器
   `docker-compose.yml.bak-before-codex-remove-20261013`。
@@ -321,6 +331,15 @@ ChatGPT Plus 的 Codex 额度直连 `chatgpt.com/backend-api/codex`，llmux 原�
 模型名必须经"别名绑定账户"（如 `d4`→DeepSeek、`gl`→Copilot），裸模型名直传 503。
 每个别名绑定一个上游账户（Copilot、DeepSeek、sense、agnes 等），请求按别名路由到对应 API。
 context_length 字段：先查 models_cache（上游提供）→ 再查内置表（`crates/llmux-core/src/context.rs`）。
+
+## 探活与冷却（2026-11-07 改）
+
+只对**失败/降级**的候选发探活请求；判据在 `llmux_core::probe`，轮次编排在 `aggregate_probe.rs`。
+三个别踩的点：三态结论 `Alive/Dead/Deferred`（冷却中的候选此前被算成「死」，会让**零请求的一轮**
+攒满 3 次确认并挪走活跃位置）；探活侧冷却递增 `5/15/30/60 min`（连败 2 次起）但**流量侧保持平坦**
+（`Retry-After` 不能因本机探活不顺被拉长）；信任窗口 `clamp(4×别名周期, 15min, 2h)` 会被更新的
+真实流量**失败**推翻。完整判据与日志行见 `docs/probe-cooldown-policy.md`。
+单个手工拨测不受冷却约束；批量拨测队列算自动拨测，冷却中的会被跳过。
 
 ## 开发约定
 

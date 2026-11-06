@@ -32,7 +32,58 @@
   - 幽灵调用（注入的 dummy 被模型真调）透传不做过滤，客户端报错后以
     tool_result 送回，模型自己消化。
 
+- **Codex 订阅登录改到界面里点：设备码全流程，不用开命令行**。
+  账户页 codex 账户上的登录按钮 → 一次性码直接显示在对话框（可复制）+「打开授权页」
+  跳 `https://auth.openai.com/codex/device` → 人在浏览器确认后界面自动变「登录完成」，
+  回显邮箱 / 套餐 / 工作区 / 可加载模型数，并刷新账户与模型列表。
+
+  - 协议实现 `crates/llmux-core/src/codex_device.rs`：`usercode` → 轮询 `deviceauth/token`
+    → `oauth/token`（form）。两条硬规矩：PKCE 的 `code_verifier` 由服务端在第 2 步给出
+    （我们不自己生成），**第 3 步绝不重试**（超时也可能已把一次性码消费掉）。
+    实测 interval=5s、窗口 +15 分钟。
+  - 会话管理 `routes/system/codex_device.rs`：只在内存（重启等于重新发起）、15 分钟窗口、
+    最多 3 个待授权会话、按上游 interval 轮询（撞 429 加 5s、上限 60s）、
+    连续 5 次传输失败结束、关对话框即取消。
+  - 凭据边界：`device_auth_id` 只给轮询任务，API/界面只回 `user_code`；
+    日志里的码只打前两位（`mask_code`，两个变异都验过会让测试变红）；
+    只有 `category=codex` 的账户能登（防止把 codex 凭据写进 custom 账户）；
+    缺 `refresh_token` 的凭据拒绝入库；落库后立刻用新凭据拉一次模型清单并置空缓存。
+  - 生产实测（2026-11-07，账户 60）：POST → 200 + 真码 10 位 + `remaining=899s`；
+    后台轮询自己把 `poll_count` 推到 2/3（403 pending 记为 Pending 而非 Failed）；
+    取消 → `failed / 已取消` 且 `poll_count` 不再变；响应字段无 `device_auth_id`；
+    日志那行是 `一次性码 3D********`。
+    **换 token 那一步没代做** —— 必须人在浏览器输码确认，凭据真正落库那段只有测试覆盖。
+
+### Changed
+
+- **探活策略大改：只对失败/降级的候选发请求，越失败间隔越长**。
+  原来每轮把候选表里每一个都真打一遍：已被判死的候选（下架模型、账户没配额、
+  网络路径坏了）会被无限重探，结论不变，配额/日志/UI 一直在付。
+
+  - 三态结论 `Alive / Dead / Deferred`（`aggregate_probe.rs`）：冷却没走完的候选是
+    `Deferred` —— 此前它被算成「死」，喂进 `record_request_all_failed`，
+    于是**一轮零请求也能攒满 3 次确认**、挪走活跃位置、把退避翻倍。
+  - 评估范围改 `0..len`（原来 `active..len`）：探活终于能往回走到更优的候选，
+    不再只靠「全链失败复位到 0」那条硬路径。
+  - 递增冷却 `PROBE_COOLDOWN_STEPS_SECS = 5/15/30/60 min`（连败 2 次起算），
+    只作用于探活侧；流量侧冷却保持平坦，`Retry-After` 不因「本机探活不顺」被拉长。
+  - 信任窗口 `clamp(4 × 别名周期, 15 min, 2 h)`：已知活的候选窗口内不再 ping；
+    但更新的真实流量**失败**会推翻它（最近的证据是失败，它比旧的成功更该被采信）。
+  - 一轮内对 `0/408/429/5xx` 原地重试 1 次（间隔 2s）；`400/401/403/404/422` 不重试
+    —— 结论一模一样，只会多花一次配额。
+  - 零请求的一轮（全 Deferred 且无可信结论）不改状态机，只打 DEBUG。
+  细节与判据见 `docs/probe-cooldown-policy.md`。
+
 ### Fixed
+
+- **Codex 空闲账户：access_token 到期后没人去刷新**。加载模型、聚合拨测、保存别名前的
+  校验、手工拨测四条路径此前只 `load_creds`，不查过期也不刷新；只有真实流量那条会自刷。
+  于是空闲账户到期后自我锁死：拨测 401 → 冷却 30 分钟 → 加载模型 401 → 别名不健康
+  → 更没有流量 → 没有一条路径会去刷新。判据与刷新收进
+  `codex_auth::ensure_fresh(pool, &account) -> Account`（到期先 `refresh_and_save`，
+  返回刷新后的账户；失败原样返回，让上游 401 错得清楚），接在
+  `available.rs:402`（`fetch_provider_models`）/ `aggregate_probe.rs:393` /
+  `verify.rs:58` / `testing.rs:775,985`。非 codex 账户是零开销直返。
 
 - **聚合别名锁定：硬钉 + 「一刷新就解锁」的真根因**。三处缺陷，前两轮只修了前两处：
   1. 锁只冻结「自动迁移」，单次请求失败仍会顺着候选列表往下故障转移 —— 下游看到的
