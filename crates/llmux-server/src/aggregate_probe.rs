@@ -115,13 +115,40 @@ fn is_due(since_last_probe_secs: u64, interval_secs: i64, backoff_secs: u64) -> 
     since_last_probe_secs >= backoff
 }
 
-/// 探活扫全表 `0..len`：位置可以上下走，`set_active` 只是起点，不是地板。
-/// 此前只探 `active..len`（C-A1），等于探活永远看不见更优的候选 —— 一次降级
+/// 每一轮**评估**全表 `0..len`：位置可以上下走，`set_active` 只是起点，不是地板。
+/// 此前只评估 `active..len`（C-A1），等于探活永远看不见更优的候选 —— 一次降级
 /// 就回不来，只能靠「全链失败复位到 0」这条硬路径，而那条要求连付费兜底也一起挂。
-/// 代价：位置之前的候选不再接真实流量，被动采信覆盖不到它们，所以每轮要为它们
-/// 真发一次 ping。只发生在「已经停在后面」的别名上，也就是正是需要救援的那些。
-fn probe_range(len: usize) -> std::ops::Range<usize> {
+///
+/// 注意「评估全表」≠「为全表付一次请求」：真正发请求的只有冷却到期或从没被
+/// 确认过的候选，见 [`Verdict`] 与 [`probe_candidate`]。
+fn evaluation_range(len: usize) -> std::ops::Range<usize> {
     0..len
+}
+
+/// 一个候选在这一轮评估之后的结论。
+///
+/// 三态是这次改动的核心。此前只有「活 / 死」两态，于是：
+/// * 健康的候选每轮都要付一次真实请求（`probe_range` 全表 + 只有活跃候选能被
+///   真实流量被动采信）；
+/// * **冷却中**的候选被算成「死」，`run_probe_round` 再把它当成「本轮全部失败」
+///   喂给 `record_request_all_failed(anchor_attempted = true)` —— 而核心状态机
+///   的整条纪律是「没试过 ≠ 坏了」（`record_request_outcome` 的 `anchor_attempted`），
+///   一轮零请求却可以攒满 3 次确认、把位置挪走、还把退避翻倍。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    /// 不花一个请求的判活：近期成功流量，或近期成功探活仍在信任窗口内。
+    Alive,
+    /// 本轮真发过请求（含重试）且仍失败。
+    Dead,
+    /// 本轮不发请求：冷却没走完（越失败间隔越长那一档），既不算活也不算死。
+    Deferred,
+}
+
+/// 一轮的结果。`probed` 是**真发过请求**的候选数 —— 它是「这一轮到底有没有证据」
+/// 的判据，零请求的一轮不许改动状态机。
+struct RoundOutcome {
+    alive: Vec<usize>,
+    probed: usize,
 }
 
 async fn run_probe_round(
@@ -192,13 +219,28 @@ async fn run_probe_round(
         // 别名（如 op）会拿 Chat 去比对，误报「配置可能写错了」。
         let mode = llmux_core::protocol::DownstreamMode::from_str(upstream_api.as_deref().unwrap_or("chat"));
 
-        // Dual-phase probe
-        let v_prime = probe_dual_phase(&alias, &candidates, active, mode, pool, master_key).await;
+        // 只在这个别名**真有候选到期**时才动状态机 —— 见 `RoundOutcome::probed`。
+        let trust_ms = llmux_core::probe::probe_trust_secs(interval_secs) * 1000;
+        let outcome = probe_round(&alias, &candidates, active, mode, pool, master_key, trust_ms).await;
+
+        if outcome.probed == 0 && outcome.alive.is_empty() {
+            // 这一轮一个请求都没发（全部在冷却里），也没有可信的存活结论：
+            // 什么都不记。`record_request_all_failed` 需要的是「试过了、全挂」，
+            // 这里连试都没试。
+            tracing::debug!(
+                "⏭️  [agg:{}] 本轮 {} 个候选都在冷却里，零请求 —— 不改状态机",
+                alias,
+                len
+            );
+            continue;
+        }
+
+        let v_prime = outcome.alive.first().copied();
         let switched = if let Some(vp) = v_prime {
-            // 全表扫完后取到的就是「活着的最优候选」，可以比 active 更优（往上走）。
+            // 评估完后取到的就是「活着的最优候选」，可以比 active 更优（往上走）。
             aggregate_router.lock().unwrap().record_probe_candidate(&alias, vp, len, now)
         } else {
-            // 全挂：以 0（复位到默认）为目标走同一个确认器，3 次（窗口内）才切。
+            // 真发过请求且全挂：以 0（复位到默认）为目标走同一个确认器，3 次（窗口内）才切。
             // 退避翻倍也在 record_request_all_failed 里同处完成 —— 此前这里另有一个
             // record_probe_all_failed_confirmed，对 active==0 的轮次反而走的是
             // 「确认健康」分支（清 pending、退避回基准），方向正好相反。
@@ -208,10 +250,11 @@ async fn run_probe_round(
 
         if switched {
             tracing::info!(
-                "🔍 [agg:{}] probe V migrated -> {} ({})",
+                "🔍 [agg:{}] probe V migrated -> {} ({}，本轮发了 {} 次请求)",
                 alias,
                 target,
-                if v_prime.is_some() { "best alive" } else { "all failed, reset" }
+                if v_prime.is_some() { "best alive" } else { "all failed, reset" },
+                outcome.probed
             );
             llmux_core::aggregate::persist_active(pool, &alias, target).await;
         }
@@ -219,44 +262,62 @@ async fn run_probe_round(
     Ok(())
 }
 
-async fn probe_dual_phase(
+async fn probe_round(
     alias: &str,
     candidates: &[AggregateCandidate],
     active: usize,
     mode: llmux_core::protocol::DownstreamMode,
     pool: &sqlx::SqlitePool,
     master_key: &str,
-) -> Option<usize> {
-    // 全表并发（见 probe_range）：取活着的最小 index（优先级最高）。
-    let probe_indices: Vec<usize> = probe_range(candidates.len()).collect();
+    trust_ms: i64,
+) -> RoundOutcome {
+    // 全表并发评估（见 evaluation_range）：取活着的最小 index（优先级最高）。
     let mut alive: Vec<usize> = Vec::new();
+    let mut probed = 0usize;
+    let mut deferred = 0usize;
 
     let mut futs = Vec::new();
-    for &idx in &probe_indices {
+    for idx in evaluation_range(candidates.len()) {
         let cand = candidates[idx].clone();
         let pool = pool.clone();
         let master_key = master_key.to_string();
         futs.push(async move {
-            let alive = probe_candidate(&cand, mode, &pool, &master_key).await;
-            (idx, alive)
+            let verdict = probe_candidate(&cand, mode, &pool, &master_key, trust_ms).await;
+            (idx, verdict)
         });
     }
     let results = futures_util::future::join_all(futs).await;
-    for (idx, ok) in results {
-        if ok {
-            alive.push(idx);
+    for (idx, verdict) in results {
+        match verdict {
+            Verdict::Alive => alive.push(idx),
+            Verdict::Dead => probed += 1,
+            Verdict::Deferred => deferred += 1,
         }
     }
+    alive.sort_unstable();
 
     if !alive.is_empty() {
-        alive.sort_unstable();
-        let best = alive[0];
-        tracing::info!("🔍 [agg:{}] probe best V={} (active={})", alias, best, active);
-        return Some(best);
+        tracing::info!(
+            "🔍 [agg:{}] probe best V={} (active={}，发请求 {} 次，采信 {} 次，冷却跳过 {} 次)",
+            alias,
+            alive[0],
+            active,
+            probed,
+            alive.len(),
+            deferred
+        );
+        return RoundOutcome { alive, probed };
     }
 
-    tracing::warn!("🔍 [agg:{}] all candidates failed", alias);
-    None
+    if probed > 0 {
+        tracing::warn!(
+            "🔍 [agg:{}] 本轮真探了 {} 个候选，全挂（另有 {} 个在冷却里）",
+            alias,
+            probed,
+            deferred
+        );
+    }
+    RoundOutcome { alive, probed }
 }
 
 async fn probe_candidate(
@@ -264,12 +325,21 @@ async fn probe_candidate(
     mode: llmux_core::protocol::DownstreamMode,
     pool: &sqlx::SqlitePool,
     master_key: &str,
-) -> bool {
-    // 冷却中的候选直接判死，不发请求 —— 这是「定时触发的自动拨测」，
-    // 正是暂停机制要拦的那类。手工拨测与真实调用不走这里，不受影响。
+    trust_ms: i64,
+) -> Verdict {
+    // 冷却中的候选本轮直接跳过 —— 冷却时长随连败递增（5/15/30/60 分钟，
+    // 见 `probe::probe_cooldown_secs`），这正是「只对失败/降级的探活」里
+    // 「失败的那批越探越稀」那一半。手工拨测与真实调用不走这里，不受影响。
+    let (streak, remaining) = llmux_core::probe::failure_streak(pool, cand.account_id, &cand.model).await;
     if llmux_core::probe::is_suspended(pool, cand.account_id, &cand.model).await {
-        tracing::debug!("⏸️  [agg] 跳过 {} | 账户 {}：冷却中", cand.model, cand.account_id);
-        return false;
+        tracing::debug!(
+            "⏸️  [agg] 跳过 {} | 账户 {}：已连续失败 {} 次，冷却还剩 {} 分钟",
+            cand.model,
+            cand.account_id,
+            streak,
+            remaining / 60
+        );
+        return Verdict::Deferred;
     }
 
     // 被动优先：近 TRAFFIC_FRESHNESS_MS 内有**成功**的真实流量 → 直接采信，
@@ -279,39 +349,48 @@ async fn probe_candidate(
     // health 接口已把真实流量合并进展示（`models/health.rs`），不落库不丢信息。
     //
     // 流量刚**失败**不采信 —— 可能是瞬时 429/抖动，直接判死会让 3-confirm 误迁移，
-    // 落到下面的主动探测做二次确认。
-    match llmux_core::probe::recent_traffic(
-        pool,
-        cand.account_id,
-        &cand.model,
-        TRAFFIC_FRESHNESS_MS,
-    )
-    .await
-    {
-        Some(t) if t.usable_as_alive() => {
+    // 也**不能**再拿更旧的探活结论兜底（最近一次证据是失败，它比旧的成功更该被采信）：
+    // 直接落到下面的主动探测做二次确认。
+    let traffic = llmux_core::probe::recent_traffic(pool, cand.account_id, &cand.model, TRAFFIC_FRESHNESS_MS).await;
+    let traffic_failed = matches!(&traffic, Some(t) if !t.usable_as_alive());
+    if let Some(t) = &traffic {
+        if t.usable_as_alive() {
             tracing::debug!(
                 "🌿 [agg] {} | 账户 {}：采信 {}ms 前的成功流量，不发请求",
                 cand.model,
                 cand.account_id,
                 now_ms().saturating_sub(t.at_ms) / 1000
             );
-            return true;
+            return Verdict::Alive;
         }
-        Some(t) => {
-            tracing::debug!(
-                "🩺 [agg] {} | 账户 {}：{}ms 前流量失败，补一次主动探测确认",
-                cand.model,
-                cand.account_id,
-                now_ms().saturating_sub(t.at_ms) / 1000
-            );
-        }
-        None => {}
+        tracing::debug!(
+            "🩺 [agg] {} | 账户 {}：{}ms 前流量失败，补一次主动探测确认",
+            cand.model,
+            cand.account_id,
+            now_ms().saturating_sub(t.at_ms) / 1000
+        );
+    }
+
+    // 兜底候选没有流量，只靠上一次探活结论活着：信任窗口内不再重探。
+    // 窗口 = 4× 别名周期，夹在 [15 分钟, 2 小时]（`probe::probe_trust_secs`）。
+    if !traffic_failed
+        && llmux_core::probe::recent_probe_success_within(pool, cand.account_id, &cand.model, trust_ms).await
+    {
+        tracing::debug!(
+            "🌿 [agg] {} | 账户 {}：上次探活成功还在信任窗口内，不发请求",
+            cand.model,
+            cand.account_id
+        );
+        return Verdict::Alive;
     }
 
     let account = match get_account_by_id(pool, cand.account_id, master_key).await {
         Ok(Some(a)) => a,
-        _ => return false,
+        _ => return Verdict::Dead,
     };
+    // codex 原生账户：access_token 过期就先刷。这条路径此前只 load_creds，
+    // 空闲账户到期后会卡成「拨测 401 → 冷却 → 加载模型 401 → 更没流量 → 没人刷新」。
+    let account = llmux_core::codex_auth::ensure_fresh(pool, &account).await;
 
     let provider_type = {
         let pt = sqlx::query_scalar::<_, Option<String>>("SELECT type FROM providers WHERE id = ?")
@@ -336,23 +415,46 @@ async fn probe_candidate(
         .build()
     {
         Ok(c) => c,
-        Err(_) => return false,
+        Err(_) => return Verdict::Dead,
     };
-    let outcome = match tokio::time::timeout(
+
+    let mut outcome = match tokio::time::timeout(
         Duration::from_secs(15),
-        llmux_core::probe::run_probe(
-            &client,
-            &account,
-            &cand.model,
-            &provider_type,
-            mode,
-        ),
+        llmux_core::probe::run_probe(&client, &account, &cand.model, &provider_type, mode),
     )
     .await
     {
         Ok(o) => o,
-        _ => return false,
+        _ => return Verdict::Dead,
     };
+    let mut attempts = 1;
+
+    // 一次失败不等于失败：网络类（连不上 / 超时 / 429 / 5xx）原地再试一次才计死。
+    // 判据见 `probe::probe_retry_worthwhile` —— 400/401/404 这类重试只是同一条
+    // 请求再发一遍，白烧配额；而一次抖动把候选推进入冷却、进而推满 3-confirm
+    // 迁移，代价比多等 2 秒大得多。
+    while !outcome.success() && attempts <= llmux_core::probe::PROBE_RETRY_PER_ROUND
+        && llmux_core::probe::probe_retry_worthwhile(outcome.status())
+    {
+        tracing::debug!(
+            "↻ [agg] {} | {} 第一次探测失败（{}），{}s 后重试",
+            cand.model,
+            account.alias,
+            outcome.status(),
+            llmux_core::probe::PROBE_RETRY_SECS
+        );
+        tokio::time::sleep(Duration::from_secs(llmux_core::probe::PROBE_RETRY_SECS)).await;
+        outcome = match tokio::time::timeout(
+            Duration::from_secs(15),
+            llmux_core::probe::run_probe(&client, &account, &cand.model, &provider_type, mode),
+        )
+        .await
+        {
+            Ok(o) => o,
+            _ => return Verdict::Dead,
+        };
+        attempts += 1;
+    }
 
     // 落库标 aggregate：角标会用这次探测的协议集合，但 health 的「最近一次
     // 状态」不采信 —— 否则这个每 300s 一轮的后台探活会把用户手工拨测的结果
@@ -381,19 +483,24 @@ async fn probe_candidate(
             );
         }
         tracing::debug!(
-            "🧪 [agg] {} | {} | {}ms | OK [{}]",
-            cand.model, account.alias, outcome.latency_ms(), outcome.via_label()
-        );
-    } else {
-        // 探活失败此前只在 UI 里可见，日志无从 grep。补一行。
-        tracing::warn!(
-            "🧪 [agg] {} | {} | FAILED: {}",
+            "🧪 [agg] {} | {} | {}ms | OK [{}]{}",
             cand.model,
             account.alias,
-            outcome.error_summary()
+            outcome.latency_ms(),
+            outcome.via_label(),
+            if attempts > 1 { "（重试后）" } else { "" }
         );
+        return Verdict::Alive;
     }
-    outcome.success()
+    // 探活失败此前只在 UI 里可见，日志无从 grep。补一行。
+    tracing::warn!(
+        "🧪 [agg] {} | {} | FAILED（第 {} 次）: {}",
+        cand.model,
+        account.alias,
+        attempts,
+        outcome.error_summary()
+    );
+    Verdict::Dead
 }
 
 #[cfg(test)]
@@ -432,7 +539,7 @@ mod tests {
     ///
     /// 真的跑一遍 `probe_candidate`，但让它在**构造 HTTP client 之前**就返回 ——
     /// 若被动采信没生效，函数会继续往下走去 `get_account_by_id`（账户 99 不存在）
-    /// 然后连本地测试 socket，返回 false。断言 true 因此真的锁住了「0 请求」。
+    /// 然后连本地测试 socket，返回 Dead。断言 Alive 因此真的锁住了「0 请求」。
     #[tokio::test]
     async fn fresh_successful_traffic_makes_the_candidate_silent() {
         let pool = llmux_core::db::connect_sqlite("sqlite::memory:").await.unwrap();
@@ -453,8 +560,8 @@ mod tests {
             model: "m".into(),
         };
         // 账户 99 在库里不存在：若走到主动探测分支，get_account_by_id 会返回
-        // None → 函数返回 false。返回 true 证明确实在发请求之前就短路了。
-        assert!(probe_candidate(&cand, chat_mode(), &pool, "key").await);
+        // None → 函数返回 Dead。返回 Alive 证明确实在发请求之前就短路了。
+        assert_eq!(probe_candidate(&cand, chat_mode(), &pool, "key", trust_ms()).await, Verdict::Alive);
     }
 
     /// 反向对照：只有**失败**的近期流量不足以判活，仍要发一次主动探测。
@@ -476,14 +583,17 @@ mod tests {
             account_id: 99,
             model: "m".into(),
         };
-        // 落到主动探测 → 账户 99 不存在 → false。
-        assert!(!probe_candidate(&cand, chat_mode(), &pool, "key").await);
+        // 落到主动探测 → 账户 99 不存在 → Dead。
+        assert_eq!(probe_candidate(&cand, chat_mode(), &pool, "key", trust_ms()).await, Verdict::Dead);
     }
 
-    /// 冷却优先于被动采信：冷却中的候选连流量都不查，直接判死。
-    /// 否则「刚被流量打成功但仍在冷却」的矛盾状态会让 30min 冷却形同虚设。
+    /// 冷却优先于被动采信：冷却中的候选连流量都不查，本轮直接跳过。
+    /// 否则「刚被流量打成功但仍在冷却」的矛盾状态会让冷却形同虚设。
+    ///
+    /// 结论是 `Deferred` 而不是 `Dead`（这次改动的关键一步）：冷却意味着
+    /// 「本轮没试」，不是「试了且失败」。
     #[tokio::test]
-    async fn a_suspended_candidate_is_judged_dead_even_with_fresh_traffic() {
+    async fn a_suspended_candidate_is_deferred_even_with_fresh_traffic() {
         let pool = llmux_core::db::connect_sqlite("sqlite::memory:").await.unwrap();
         llmux_core::db::init_db(&pool).await.unwrap();
         llmux_core::probe::note_failure(
@@ -516,7 +626,145 @@ mod tests {
             account_id: 99,
             model: "m".into(),
         };
-        assert!(!probe_candidate(&cand, chat_mode(), &pool, "key").await);
+        assert_eq!(probe_candidate(&cand, chat_mode(), &pool, "key", trust_ms()).await, Verdict::Deferred);
+    }
+
+    /// 默认别名周期下的信任窗口，测试里统一取它，免得各写一个数。
+    fn trust_ms() -> i64 {
+        llmux_core::probe::probe_trust_secs(DEFAULT_INTERVAL_SECS) * 1000
+    }
+
+    /// 「只对失败/降级的探活」的另一半：兜底候选没有真实流量，只靠上一次探活
+    /// 成功的结论活着 —— 信任窗口内不再为它付请求。
+    ///
+    /// 同样用「账户 99 不存在」当探针：真去探测必然返回 Dead（拿不到账户），
+    /// 返回 Alive 只可能是走了不发请求的那条路。
+    #[tokio::test]
+    async fn a_fallback_candidate_inside_the_trust_window_costs_no_request() {
+        let pool = llmux_core::db::connect_sqlite("sqlite::memory:").await.unwrap();
+        llmux_core::db::init_db(&pool).await.unwrap();
+
+        sqlx::query(
+            "INSERT INTO model_test_results (account_id, model, success, latency_ms, checked_at, source) \
+             VALUES (99, 'm', 1, 100, ?, 'aggregate')",
+        )
+        .bind(now_ms() - 60_000)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let cand = AggregateCandidate { account_id: 99, model: "m".into() };
+        assert_eq!(probe_candidate(&cand, chat_mode(), &pool, "key", trust_ms()).await, Verdict::Alive);
+    }
+
+    /// 信任窗口过期后必须回到「探」，否则一次成功就把候选永久免探 ——
+    /// 悄悄坏掉的兜底候选会在需要它的那一刻才被发现。
+    #[tokio::test]
+    async fn an_expired_trust_window_brings_the_candidate_back_to_probing() {
+        let pool = llmux_core::db::connect_sqlite("sqlite::memory:").await.unwrap();
+        llmux_core::db::init_db(&pool).await.unwrap();
+
+        let stale = now_ms() - (llmux_core::probe::PROBE_TRUST_MAX_SECS + 600) * 1000;
+        sqlx::query(
+            "INSERT INTO model_test_results (account_id, model, success, latency_ms, checked_at, source) \
+             VALUES (99, 'm', 1, 100, ?, 'aggregate')",
+        )
+        .bind(stale)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let cand = AggregateCandidate { account_id: 99, model: "m".into() };
+        // 过期 → 去探 → 账户 99 不存在 → Dead。
+        assert_eq!(probe_candidate(&cand, chat_mode(), &pool, "key", trust_ms()).await, Verdict::Dead);
+    }
+
+    /// 最近一次证据是**真实流量失败**时，不能拿更旧的探活成功兜底 —— 降级
+    /// 正是要探的对象，不是免探的理由。
+    #[tokio::test]
+    async fn a_fresh_traffic_failure_overrides_an_older_probe_success() {
+        let pool = llmux_core::db::connect_sqlite("sqlite::memory:").await.unwrap();
+        llmux_core::db::init_db(&pool).await.unwrap();
+
+        sqlx::query(
+            "INSERT INTO model_test_results (account_id, model, success, latency_ms, checked_at, source) \
+             VALUES (99, 'm', 1, 100, ?, 'aggregate')",
+        )
+        .bind(now_ms() - 120_000)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO usage_logs (timestamp, account_id, provider_id, model, latency_ms, success, is_test) \
+             VALUES (?, 99, 'p', 'm', 100, 0, 0)",
+        )
+        .bind(now_ms())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let cand = AggregateCandidate { account_id: 99, model: "m".into() };
+        assert_eq!(probe_candidate(&cand, chat_mode(), &pool, "key", trust_ms()).await, Verdict::Dead);
+    }
+
+    /// 整轮都在冷却里 → 一个请求都没发 → **不许**改动状态机。
+    ///
+    /// 这是三态存在的理由。旧代码把「冷却」算成「死」，于是零请求的一轮也会
+    /// 走 `record_request_all_failed(anchor_attempted = true)`：攒确认、挪位置、
+    /// 退避翻倍 —— 而核心状态机整条纪律是「没试过 ≠ 坏了」。
+    #[tokio::test]
+    async fn a_round_where_everything_is_cooling_down_changes_nothing() {
+        let pool = llmux_core::db::connect_sqlite("sqlite::memory:").await.unwrap();
+        llmux_core::db::init_db(&pool).await.unwrap();
+        sqlx::query("INSERT INTO aggregate_aliases (alias, candidates, locked, active_idx) VALUES ('c', '[{\"account_id\":99,\"model\":\"m\"},{\"account_id\":99,\"model\":\"m2\"}]', 0, 0)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        for m in ["m", "m2"] {
+            for _ in 0..2 {
+                llmux_core::probe::note_failure(&pool, 99, m, Some("e"), llmux_core::probe::FailureKind::Probe)
+                    .await;
+            }
+        }
+
+        let router = Arc::new(Mutex::new(AggregateRouter::default()));
+        run_probe_round(&pool, "key", &router).await.unwrap();
+
+        let guard = router.lock().unwrap();
+        let entry = guard.entries.get("c").expect("播种应建 entry");
+        assert_eq!(entry.active, 0, "零请求的一轮不该迁移位置");
+        assert!(entry.pending_target.is_none(), "零请求的一轮不该攒确认");
+        assert_eq!(entry.last_status, vec![None, None], "零请求的一轮不该把候选标成失败");
+        assert_eq!(entry.probe_backoff_secs, llmux_core::aggregate::PROBE_BACKOFF_BASE_SECS, "零请求的一轮不该退避翻倍");
+    }
+
+    /// 反向对照：真的探了、真的全挂，才允许走「全链失败」那条路。
+    #[tokio::test]
+    async fn a_probe_that_actually_ran_and_failed_does_move_the_state_machine() {
+        let pool = llmux_core::db::connect_sqlite("sqlite::memory:").await.unwrap();
+        llmux_core::db::init_db(&pool).await.unwrap();
+        sqlx::query("INSERT INTO aggregate_aliases (alias, candidates, locked, active_idx) VALUES ('c', '[{\"account_id\":99,\"model\":\"m\"},{\"account_id\":99,\"model\":\"m2\"}]', 0, 0)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // 账户 99 不存在 → 每个候选都探不出去（真发过请求 = 有证据）→ 记为失败。
+        let router = Arc::new(Mutex::new(AggregateRouter::default()));
+        for round in 0..3 {
+            // 每轮之间把别名退避复位到「已到期」，模拟后台按周期反复跑到这一轮。
+            {
+                let mut g = router.lock().unwrap();
+                if let Some(e) = g.entries.get_mut("c") {
+                    e.last_probe = Instant::now() - Duration::from_secs(DEFAULT_INTERVAL_SECS as u64 + 1);
+                }
+            }
+            run_probe_round(&pool, "key", &router).await.unwrap();
+            let guard = router.lock().unwrap();
+            let entry = guard.entries.get("c").unwrap();
+            assert_eq!(entry.last_status, vec![Some(false), Some(false)], "第 {round} 轮应记为失败");
+        }
+        let guard = router.lock().unwrap();
+        assert_eq!(guard.entries.get("c").unwrap().active, 0);
     }
 
     /// 排期：先看 `interval_secs` 到没到点，再看退避是否否决。
@@ -593,12 +841,15 @@ mod tests {
         assert!(!is_due(since, 300, base), "慢配的别名不该被快配的拖着一起探");
     }
 
-    /// 回归：探活扫全表，能看见位置之前的候选（一次降级后还能回来）。
+    /// 回归：每一轮**评估**全表，能看见位置之前的候选（一次降级后还能回来）。
     /// 此前只探 `active..len`，位置只能往下走。
+    ///
+    /// 「评估全表」不等于「为全表付请求」—— 发不发由候选自己的冷却与信任窗口决定
+    /// （见 `Verdict`），这里钉的只是「不要把更优的候选排除在视野外」。
     #[test]
-    fn probe_scans_the_whole_list() {
-        assert_eq!(probe_range(4), 0..4);
-        assert_eq!(probe_range(3), 0..3);
+    fn every_round_evaluates_the_whole_list() {
+        assert_eq!(evaluation_range(4), 0..4);
+        assert_eq!(evaluation_range(3), 0..3);
     }
 
     /// C-B2：锁定的别名整轮跳过 —— 不发请求、不碰 last_probe。

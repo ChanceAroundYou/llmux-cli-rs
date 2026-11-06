@@ -566,7 +566,9 @@ fn sort_by_priority(iter: impl Iterator<Item = Protocol>) -> Vec<Protocol> {
 // * **成功即退出暂停**：只要有一次成功（无论来源），计数和暂停一起清零。
 //   所以模型恢复后不需要等冷却到期，手工拨一次就能救回来。
 //
-// 冷却按 30 分钟逐次递增：失败 → 暂停到 now+30m；到期后再试再失败 → +30m。
+// 冷却按连败次数递增（阶梯见 `PROBE_COOLDOWN_STEPS_SECS`）：第 2 次失败 → 暂停 5 分钟；
+// 第 3 次 → 15 分钟；第 4 次 → 30 分钟；第 5 次及以后 → 60 分钟封顶。
+// 每次都是「从现在重新起算」，不是叠加旧到期。
 // `consecutive_failures` 不断累积，UI 据此显示「已连续失败 N 次」。
 //
 // **两列冷却，两个门（0023 拆分的由来）**：
@@ -590,8 +592,63 @@ fn sort_by_priority(iter: impl Iterator<Item = Protocol>) -> Vec<Protocol> {
 /// 连续失败多少次后进入暂停。2 次：单次失败可能只是上游抖动，不值得停。
 pub const SUSPEND_AFTER_FAILURES: i64 = 2;
 
-/// 每次暂停的时长（30 分钟，逐次递增）。
+/// 冷却基准（第一次进入暂停时的时长，30 分钟）。也是真实配额 429 的流量侧冷却。
 pub const SUSPEND_SECS: i64 = 30 * 60;
+
+/// 探活侧冷却阶梯：索引 = `连续失败次数 - SUSPEND_AFTER_FAILURES`，超出取最后一档。
+///
+/// 5 → 15 → 30 → 60 分钟。**越失败间隔越长**是这条的存在理由：一个已被判死的
+/// 候选（下架模型 / 账户没配额 / 网络路径坏了）每 300s 被重探一次，既不改变结论
+/// 又继续烧上游配额、还把日志和 UI 淹成红海。首次进入暂停只用 5 分钟 ——
+/// 单次抖动最常见，探活侧要能在一轮内自己确认恢复；之后每多一次连败就把间隔翻倍。
+///
+/// 首档刻意小于 [`SUSPEND_SECS`]：那个 30 分钟是给「真实配额 429」用的
+/// （错误正文里写着 resets at），探活侧不需要那么长。
+pub const PROBE_COOLDOWN_STEPS_SECS: [i64; 4] = [300, 900, 1800, 3600];
+
+/// 连败多少次后落到阶梯的最后一档（60 分钟封顶）。
+pub const PROBE_COOLDOWN_MAX_AFTER: i64 =
+    SUSPEND_AFTER_FAILURES + PROBE_COOLDOWN_STEPS_SECS.len() as i64 - 1;
+
+/// 该 (账户, 模型) 当前的探活冷却该多长（秒）。`failures < 阈值` 时为 0（还没进暂停）。
+pub fn probe_cooldown_secs(failures: i64) -> i64 {
+    if failures < SUSPEND_AFTER_FAILURES {
+        return 0;
+    }
+    let step = (failures - SUSPEND_AFTER_FAILURES) as usize;
+    PROBE_COOLDOWN_STEPS_SECS[step.min(PROBE_COOLDOWN_STEPS_SECS.len() - 1)]
+}
+
+/// 一次成功（探活或真实流量）之后，多久内**不再为该候选发探活请求**。
+///
+/// 「只对失败/降级的探活」的正半句：已知活的候选不该每轮再付一次 ping。
+/// 活跃候选由 [`TRAFFIC_FRESHNESS_MS`] 的真实流量覆盖，这条覆盖的是**不接流量的
+/// 兜底候选** —— 它们没有流量，只靠上次探活成功的结论活着。
+///
+/// 取 4× 别名周期、夹在 [15 分钟, 2 小时]：太短省不下请求，太长会让一个
+/// 悄悄坏掉的兜底候选在需要它之前一直没被复查。
+pub const PROBE_TRUST_FACTOR: i64 = 4;
+pub const PROBE_TRUST_MIN_SECS: i64 = 15 * 60;
+pub const PROBE_TRUST_MAX_SECS: i64 = 2 * 3600;
+
+pub fn probe_trust_secs(interval_secs: i64) -> i64 {
+    (interval_secs.max(1) * PROBE_TRUST_FACTOR).clamp(PROBE_TRUST_MIN_SECS, PROBE_TRUST_MAX_SECS)
+}
+
+/// 一轮探活里第一次失败后**原地再试几次**才计死。
+///
+/// 判据是 HTTP 状态：0（连不上/超时）、408、429、5xx 是「这次没走通」，
+/// 重试有意义；400/401/403/404/422 是「配置或凭据不对」，同一条请求再发一遍
+/// 只会多花一次配额、结论一模一样。不重试也让 `consecutive_failures` 不被
+/// 一次抖动推到暂停阈值。
+pub const PROBE_RETRY_PER_ROUND: u32 = 1;
+
+/// 重试前等多久。
+pub const PROBE_RETRY_SECS: u64 = 2;
+
+pub fn probe_retry_worthwhile(status: u16) -> bool {
+    matches!(status, 0 | 408 | 429 | 500 | 502 | 503 | 504)
+}
 
 /// 「余额不足 / 账单被拒」这类需要人工充值的失败，挂起多久。
 ///
@@ -601,6 +658,9 @@ pub const SUSPEND_SECS: i64 = 30 * 60;
 pub const PAYMENT_SUSPEND_SECS: i64 = 24 * 3600;
 
 /// 这个失败类型该挂起多久（秒）。
+///
+/// `Probe` 走的是**流量侧无关**的入口，时长由连败次数决定（见
+/// [`probe_cooldown_secs`]）；这里只回答「基准值」，给日志与调用点当默认。
 pub fn suspend_secs_for(kind: FailureKind) -> i64 {
     match kind {
         FailureKind::PaymentRequired => PAYMENT_SUSPEND_SECS,
@@ -754,11 +814,15 @@ pub async fn is_traffic_suspended(
 /// 各自到 `SUSPEND_AFTER_FAILURES` 才武装自己那一侧 —— 计数器共用的话
 /// 「1 次探活失败 + 1 次配额 429」就能凑够阈值，单次配额 429 照样开挡。
 ///
-/// 配额的 UPSERT 用 `MAX(existing, excluded)` 而不是直接覆盖：探活与真实流量
-/// 都会调它，两者可以交错。冷却只会「延长」语义，用 MAX 免得先写的一方
-/// 把后写一方的更长冷却截短（后写的 `now` 更晚，MAX 也自然偏向它）。
-/// 探活侧沿用原有的「从现在重新起算」语义 —— 那条路径历史上是单来源的，
-/// 改成 MAX 会让「冷却中又失败」不再顺延，与 0021 起的既有测试相悖。
+/// 冷却时长由**连败次数**决定（[`probe_cooldown_secs`]：5 → 15 → 30 → 60 分钟），
+/// 所以下面必须先拿到「自增之后」的计数才能算时长。用 `RETURNING` 拿，而不是
+/// SELECT-改-写：自增本身仍必须在同一条 UPSERT 里原子完成（真实流量下同一
+/// (账户,模型) 的并发 429 很常见，读-改-写会丢计数，冷却迟迟不开挡 —— 而这正是
+/// 本函数要挡的东西），`RETURNING` 只是把自增后的值带回来，不引入第二次读竞态。
+///
+/// 冷却一律 `MAX(原值, 新值)`：只会延长，绝不截短。阶梯单调递增 + `now` 前进，
+/// 所以 MAX 不改变「从现在重新起算」的观感，但让两个并发写者（后台探活与手动
+/// 拨测队列会重叠）不能互相把对方更长的冷却改短。
 pub async fn note_failure(
     pool: &sqlx::SqlitePool,
     account_id: i64,
@@ -767,120 +831,121 @@ pub async fn note_failure(
     kind: FailureKind,
 ) -> bool {
     let now = now_ms();
-    let until = now + suspend_secs_for(kind) * 1000;
-    // 两侧分开报：配额 429 会同时动两侧（探活侧也该停探），只报一个布尔值
-    // 会让调用方漏打一半日志。
-    let (mut probe_changed, mut traffic_changed) = (false, false);
 
-    match kind {
-        FailureKind::Probe => {
-            // 同样用 SQL 原子自增。探活并不总是单来源：`probe_candidate` 对一个
-            // 别名的候选是并发跑的，手动拨测队列也会与后台轮次重叠，读-改-写
-            // 丢一次计数就等于让「已下架模型」多挨一轮 300s 的真实请求 ——
-            // 而多探一轮不只是慢，是继续烧上游配额。
-            //
-            // 到期与首次暂停时间都用 CASE 就地算，不读出来在 Rust 里判断：
-            // 读-改-写必须先 SELECT 才能算 first_at，而那一步本身就有竞态。
-            //
-            // 两列流量侧的字面量 0 只出现在 INSERT 分支（无历史行，计数从 1
-            // 起，不到阈值）；`DO UPDATE SET` 里**完全不出现**流量侧两列，
-            // 所以探活失败既不能武装也不能覆盖真实配额冷却 —— 这是 0023
-            // 拆列的全部意义所在。
-            let _ = sqlx::query(
-                "INSERT INTO model_probe_suspensions \
-                 (account_id, model, consecutive_failures, suspended_until, traffic_suspended_until, consecutive_quota_failures, first_suspended_at, last_error) \
-                 VALUES (?, ?, 1, 0, 0, 0, 0, ?) \
-                 ON CONFLICT(account_id, model) DO UPDATE SET \
-                   consecutive_failures = consecutive_failures + 1, \
-                   suspended_until = CASE \
-                     WHEN consecutive_failures + 1 >= ? THEN ? \
-                     ELSE suspended_until END, \
-                   first_suspended_at = CASE \
-                     WHEN consecutive_failures + 1 >= ? AND (suspended_until <= ? OR first_suspended_at <= 0) \
-                     THEN ? ELSE MAX(first_suspended_at, ?) END, \
-                   last_error = excluded.last_error",
-            )
-            .bind(account_id)
-            .bind(model)
-            .bind(error)
-            .bind(SUSPEND_AFTER_FAILURES)
-            .bind(until)
-            .bind(SUSPEND_AFTER_FAILURES)
-            .bind(now)
-            .bind(now)
-            .bind(now)
-            .execute(pool)
-            .await;
-            // 自增后的值读回来，只为决定要不要打日志。
-            let after: Option<i64> = sqlx::query_scalar(
-                "SELECT consecutive_failures FROM model_probe_suspensions \
-                 WHERE account_id = ? AND model = ?",
-            )
-            .bind(account_id)
-            .bind(model)
-            .fetch_optional(pool)
-            .await
-            .ok()
-            .flatten();
-            probe_changed = after.is_some_and(|n| n >= SUSPEND_AFTER_FAILURES);
-        }
-        FailureKind::Quota | FailureKind::PaymentRequired => {
-            // 计数用 SQL 原子自增（`col = col + 1`），不在 Rust 里读出来加一。
-            // 真实流量下同一 (账户,模型) 的并发 429 很常见：读-改-写会让两个
-            // 请求都读到 n、都写 n+1，丢一次失败，配额冷却迟迟不开挡 —— 而这
-            // 正是本函数要挡的东西。SQLite 单条 UPSERT 本身是原子的。
-            //
-            // 冷却到期时间用 CASE 表达式就地算：自增后 >= 阈值才写新到期，
-            // 否则保留原值（可能正冷着，不该被一次未到阈值的失败清掉）。
-            // INSERT 分支（无历史行）计数从 1 起，1 < 阈值，所以三列都写 0；
-            // 真的开挡发生在第二次的 CONFLICT 分支。
-            let _ = sqlx::query(
-                "INSERT INTO model_probe_suspensions \
-                 (account_id, model, consecutive_failures, suspended_until, traffic_suspended_until, consecutive_quota_failures, first_suspended_at, last_error) \
-                 VALUES (?, ?, 1, 0, 0, 1, 0, ?) \
-                 ON CONFLICT(account_id, model) DO UPDATE SET \
-                   consecutive_failures = consecutive_failures + 1, \
-                   consecutive_quota_failures = consecutive_quota_failures + 1, \
-                   suspended_until = CASE \
-                     WHEN consecutive_failures + 1 >= ? THEN ? \
-                     ELSE suspended_until END, \
-                   first_suspended_at = CASE \
-                     WHEN consecutive_failures + 1 >= ? AND (suspended_until <= ? OR first_suspended_at <= 0) \
-                     THEN ? ELSE first_suspended_at END, \
-                   traffic_suspended_until = MAX(traffic_suspended_until, \
-                     CASE WHEN consecutive_quota_failures + 1 >= ? THEN ? ELSE 0 END), \
-                   last_error = excluded.last_error",
-            )
-            .bind(account_id)
-            .bind(model)
-            .bind(error)
-            .bind(SUSPEND_AFTER_FAILURES)
-            .bind(until)
-            .bind(SUSPEND_AFTER_FAILURES)
-            .bind(now)
-            .bind(now)
-            .bind(SUSPEND_AFTER_FAILURES)
-            .bind(until)
-            .execute(pool)
-            .await;
-            // 自增后的值读回来，只为决定要不要打日志。
-            let after: Option<(i64, i64)> = sqlx::query_as(
-                "SELECT consecutive_failures, consecutive_quota_failures \
-                 FROM model_probe_suspensions WHERE account_id = ? AND model = ?",
-            )
-            .bind(account_id)
-            .bind(model)
-            .fetch_optional(pool)
-            .await
-            .ok()
-            .flatten();
-            if let Some((pf, qf)) = after {
-                probe_changed = pf >= SUSPEND_AFTER_FAILURES;
-                traffic_changed = qf >= SUSPEND_AFTER_FAILURES;
+    // 第一次失败（无历史行）计数从 1 起、不到阈值，冷却列全写 0；真的开挡发生在
+    // 第二次的 CONFLICT 分支。流量侧两列在 Probe 分支的 DO UPDATE 里**完全不出现**
+    // —— 探活失败既不能武装也不能覆盖真实配额冷却，这是 0023 拆列的全部意义。
+    let counts: Option<(i64, i64)> = if matches!(kind, FailureKind::Probe) {
+        sqlx::query_as(
+            "INSERT INTO model_probe_suspensions \
+             (account_id, model, consecutive_failures, suspended_until, traffic_suspended_until, consecutive_quota_failures, first_suspended_at, last_error) \
+             VALUES (?, ?, 1, 0, 0, 0, 0, ?) \
+             ON CONFLICT(account_id, model) DO UPDATE SET \
+               consecutive_failures = consecutive_failures + 1, \
+               last_error = excluded.last_error \
+             RETURNING consecutive_failures, consecutive_quota_failures",
+        )
+        .bind(account_id)
+        .bind(model)
+        .bind(error)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+    } else {
+        sqlx::query_as(
+            "INSERT INTO model_probe_suspensions \
+             (account_id, model, consecutive_failures, suspended_until, traffic_suspended_until, consecutive_quota_failures, first_suspended_at, last_error) \
+             VALUES (?, ?, 1, 0, 0, 1, 0, ?) \
+             ON CONFLICT(account_id, model) DO UPDATE SET \
+               consecutive_failures = consecutive_failures + 1, \
+               consecutive_quota_failures = consecutive_quota_failures + 1, \
+               last_error = excluded.last_error \
+             RETURNING consecutive_failures, consecutive_quota_failures",
+        )
+        .bind(account_id)
+        .bind(model)
+        .bind(error)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+    };
+
+    let Some((probe_streak, quota_streak)) = counts else {
+        return false;
+    };
+
+    // 到期时间：探活侧按阶梯，流量侧对配额类用基准 30 分钟、充值类用 24 小时。
+    let probe_until = if probe_streak >= SUSPEND_AFTER_FAILURES {
+        match kind {
+            FailureKind::Probe | FailureKind::Quota => {
+                Some(now + probe_cooldown_secs(probe_streak) * 1000)
             }
+            FailureKind::PaymentRequired => Some(now + PAYMENT_SUSPEND_SECS * 1000),
         }
+    } else {
+        None
+    };
+    // 流量侧只看配额类计数：充值类与配额类共用这一列（两者都要挡真实流量，
+    // 区别只在时长），取更长的那个。
+    let traffic_secs = match kind {
+        FailureKind::Quota => Some(SUSPEND_SECS),
+        FailureKind::PaymentRequired => Some(PAYMENT_SUSPEND_SECS),
+        FailureKind::Probe => None,
+    };
+    let traffic_until = traffic_secs
+        .filter(|_| quota_streak >= SUSPEND_AFTER_FAILURES)
+        .map(|s| now + s * 1000);
+
+    if probe_until.is_some() || traffic_until.is_some() {
+        // `first_suspended_at` 的判据读的是**更新前**的 `suspended_until`（同一条
+        // UPDATE 里所有 SET 都看到旧值）：已过期或从没挂起过 → 首次时间重置为本次，
+        // 否则保留最早的那次。这是「连续失败从第一次算起」的锚点，不能被后续的
+        // 续期一路推后。
+        let _ = sqlx::query(
+            "UPDATE model_probe_suspensions SET \
+               suspended_until = MAX(suspended_until, ?), \
+               traffic_suspended_until = MAX(traffic_suspended_until, ?), \
+               first_suspended_at = CASE \
+                 WHEN (suspended_until <= ? OR first_suspended_at <= 0) THEN ? \
+                 ELSE first_suspended_at END \
+             WHERE account_id = ? AND model = ?",
+        )
+        .bind(probe_until.unwrap_or(0))
+        .bind(traffic_until.unwrap_or(0))
+        .bind(now)
+        .bind(now)
+        .bind(account_id)
+        .bind(model)
+        .execute(pool)
+        .await;
     }
-    probe_changed || traffic_changed
+
+    // 返回值 = 「这一笔失败是否让某一侧开始挡」，调用方靠它决定要不要打暂停日志。
+    // 配额类会同时动两侧（探活侧也停探），所以这里用「或」而不是只看探活侧。
+    probe_streak >= SUSPEND_AFTER_FAILURES
+        || (matches!(kind, FailureKind::Quota | FailureKind::PaymentRequired)
+            && quota_streak >= SUSPEND_AFTER_FAILURES)
+}
+
+/// 该 (账户, 模型) 当前的连败次数与剩余冷却秒数，只为日志与 UI。
+/// 没有记录返回 (0, 0)。
+pub async fn failure_streak(pool: &sqlx::SqlitePool, account_id: i64, model: &str) -> (i64, i64) {
+    let row: Option<(i64, i64)> = sqlx::query_as(
+        "SELECT consecutive_failures, suspended_until FROM model_probe_suspensions \
+         WHERE account_id = ? AND model = ?",
+    )
+    .bind(account_id)
+    .bind(model)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    match row {
+        Some((failures, until)) => (failures, ((until - now_ms()).max(0)) / 1000),
+        None => (0, 0),
+    }
 }
 
 /// 记一次成功：清掉计数与暂停。
@@ -965,6 +1030,37 @@ pub async fn recent_traffic(
         error,
         at_ms,
     })
+}
+
+// ---------------------------------------------------------------------------
+
+/// 最近一次**探活**（后台聚合或手动拨测）成功是否还在信任窗口内。
+///
+/// 与 [`recent_traffic`] 是互补的两条「不花请求也知道它还活着」证据：那条看
+/// 真实流量，只能覆盖**接流量的活跃候选**；这条看拨测结论，覆盖**不接流量的
+/// 兜底候选** —— 后者没有流量，只靠上一次探活成功的结论活着，没有这条就得每轮重探。
+///
+/// 判据与 UI 角标同源（都读 `model_test_results.checked_at`），所以「面板说它好」
+/// 和「探活因此不打它」不会各说各话。只认 `success = 1`。
+pub async fn recent_probe_success_within(
+    pool: &sqlx::SqlitePool,
+    account_id: i64,
+    model: &str,
+    window_ms: i64,
+) -> bool {
+    let cutoff = now_ms() - window_ms;
+    sqlx::query_scalar::<_, i64>(
+        "SELECT 1 FROM model_test_results \
+         WHERE account_id = ? AND model = ? AND success = 1 AND checked_at >= ? LIMIT 1",
+    )
+    .bind(account_id)
+    .bind(model)
+    .bind(cutoff)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()
+    .is_some()
 }
 
 // ---------------------------------------------------------------------------
@@ -1583,6 +1679,165 @@ mod tests {
             mismatched_config: None,
         };
         assert_eq!(out.total_usage(), (5, 2));
+    }
+
+    // ---- 探活排期策略（只对失败/降级的探活 + 越失败间隔越长） ----
+
+    /// 阶梯必须单调递增且有上限：这是「越失败间隔越长」的全部实现，
+    /// 也是它不会退化成「无限延长、再也不探」的保证。
+    #[test]
+    fn probe_cooldown_grows_with_consecutive_failures_and_caps() {
+        assert_eq!(probe_cooldown_secs(0), 0, "没进暂停就没有冷却");
+        assert_eq!(probe_cooldown_secs(1), 0, "单次失败不停（上游抖动很常见）");
+        assert_eq!(probe_cooldown_secs(2), 300);
+        assert_eq!(probe_cooldown_secs(3), 900);
+        assert_eq!(probe_cooldown_secs(4), 1800);
+        assert_eq!(probe_cooldown_secs(5), 3600);
+        // 封顶：第 6、100 次都停在 60 分钟，不能再长（否则死候选永不复查）。
+        assert_eq!(probe_cooldown_secs(6), 3600);
+        assert_eq!(probe_cooldown_secs(100), 3600);
+        assert_eq!(PROBE_COOLDOWN_MAX_AFTER, 5);
+    }
+
+    /// 冷却必须**严格递增**（阶梯内部），否则「越长」只是口号。
+    #[test]
+    fn probe_cooldown_is_strictly_increasing_before_the_cap() {
+        let mut prev = 0;
+        for n in SUSPEND_AFTER_FAILURES..=PROBE_COOLDOWN_MAX_AFTER {
+            let cur = probe_cooldown_secs(n);
+            assert!(cur > prev, "第 {n} 次失败的冷却 {cur}s 必须比上一次 {prev}s 长");
+            prev = cur;
+        }
+        assert_eq!(prev, 3600, "最后一档就是上限");
+    }
+
+    /// 信任窗口随别名周期放大，但夹在 [15 分钟, 2 小时]：
+    /// 太短省不下请求，太长会让悄悄坏掉的兜底候选一直没被复查。
+    #[test]
+    fn trust_window_scales_with_interval_but_is_clamped() {
+        assert_eq!(probe_trust_secs(60), 15 * 60, "4×60=240s 抬到 15 分钟地板");
+        assert_eq!(probe_trust_secs(300), 4 * 300, "默认周期落在 4×");
+        assert_eq!(probe_trust_secs(3600), 2 * 3600, "封顶 2 小时");
+        assert_eq!(probe_trust_secs(0), 15 * 60, "非法周期也要给个可用值");
+    }
+
+    /// 重试判据：网络类才重试；配置/凭据类重试是同一条请求再发一遍，白花钱。
+    #[test]
+    fn only_transient_probe_failures_are_worth_a_retry() {
+        assert!(probe_retry_worthwhile(0), "连不上/超时");
+        assert!(probe_retry_worthwhile(408));
+        assert!(probe_retry_worthwhile(429), "配额窗口内的 429 可能立刻过去");
+        assert!(probe_retry_worthwhile(502));
+        assert!(!probe_retry_worthwhile(400), "形状/参数错：再发一遍结论相同");
+        assert!(!probe_retry_worthwhile(401), "凭据问题：该走刷新，不该重探");
+        assert!(!probe_retry_worthwhile(403));
+        assert!(!probe_retry_worthwhile(404), "模型已下架：重试只是多烧一次");
+        assert!(!probe_retry_worthwhile(422));
+    }
+
+    /// 冷却时长真的由连败次数决定（不是常数、也不是叠加）。
+    #[tokio::test]
+    async fn cooldown_ladder_is_what_gets_written_to_the_db() {
+        let pool = crate::db::connect_sqlite("sqlite::memory:").await.unwrap();
+        crate::db::init_db(&pool).await.unwrap();
+
+        for expected in [0i64, 300, 900, 1800, 3600] {
+            note_failure(&pool, 7, "m", Some("boom"), FailureKind::Probe).await;
+            let (streak, remaining) = failure_streak(&pool, 7, "m").await;
+            if expected == 0 {
+                assert_eq!(streak, 1, "首次失败只计数，不进暂停");
+                assert_eq!(remaining, 0, "未到阈值不该有冷却");
+                continue;
+            }
+            // 允许 5 秒抖动：写入用的 now 与这里读到的 now 之间隔了一次往返。
+            assert!(
+                (remaining - expected).abs() <= 5,
+                "连败 {} 次应有 {} 秒冷却，实测 {}",
+                streak,
+                expected,
+                remaining
+            );
+        }
+        let (streak, _) = failure_streak(&pool, 7, "m").await;
+        assert_eq!(streak, 5);
+    }
+
+    /// 成功一次必须把连败与冷却一起清零 —— 否则「恢复后仍被长期冷却」会
+    /// 让兜底候选在需要它的时候恰好躺在冷却里。
+    #[tokio::test]
+    async fn a_success_clears_the_streak_so_the_next_failure_starts_short_again() {
+        let pool = crate::db::connect_sqlite("sqlite::memory:").await.unwrap();
+        crate::db::init_db(&pool).await.unwrap();
+        for _ in 0..4 {
+            note_failure(&pool, 7, "m", Some("boom"), FailureKind::Probe).await;
+        }
+        let (_, remaining) = failure_streak(&pool, 7, "m").await;
+        assert!(remaining > 1700, "第 4 次连败应在 30 分钟档");
+
+        clear_suspension(&pool, 7, "m").await;
+        let (streak, remaining) = failure_streak(&pool, 7, "m").await;
+        assert_eq!((streak, remaining), (0, 0), "成功后连败与冷却都要归零");
+
+        note_failure(&pool, 7, "m", Some("boom"), FailureKind::Probe).await;
+        note_failure(&pool, 7, "m", Some("boom"), FailureKind::Probe).await;
+        let (_, remaining) = failure_streak(&pool, 7, "m").await;
+        assert!(remaining <= 305, "归零后重新进入暂停要回到最短那一档");
+    }
+
+    /// 探活连败只冷却探活侧，绝不冷却生产流量（0023 拆列的意义）。
+    #[tokio::test]
+    async fn escalating_probe_cooldown_never_blocks_real_traffic() {
+        let pool = crate::db::connect_sqlite("sqlite::memory:").await.unwrap();
+        crate::db::init_db(&pool).await.unwrap();
+        for n in 0..6 {
+            note_failure(&pool, 7, "m", Some("boom"), FailureKind::Probe).await;
+            if n + 1 >= SUSPEND_AFTER_FAILURES {
+                assert!(is_suspended(&pool, 7, "m").await, "第 {} 次连败后探活侧应停", n + 1);
+            } else {
+                assert!(!is_suspended(&pool, 7, "m").await, "单次失败不停");
+            }
+            assert!(
+                !is_traffic_suspended(&pool, 7, "m").await,
+                "探活连败不得挡真实请求（账户配额可能完好）"
+            );
+        }
+    }
+
+    /// 配额类 429 两侧都挡，且流量侧固定 30 分钟基准（不受探活阶梯影响）：
+    /// 客户端拿到的 Retry-After 不该因为「这个模型之前被探活探挂过」而变长。
+    #[tokio::test]
+    async fn quota_failures_cooldown_both_sides_with_the_flat_traffic_window() {
+        let pool = crate::db::connect_sqlite("sqlite::memory:").await.unwrap();
+        crate::db::init_db(&pool).await.unwrap();
+        for _ in 0..3 {
+            note_failure(&pool, 7, "m", Some("429 quota"), FailureKind::Quota).await;
+        }
+        assert!(is_suspended(&pool, 7, "m").await);
+        assert!(is_traffic_suspended(&pool, 7, "m").await);
+        let row: (i64, i64) = sqlx::query_as(
+            "SELECT consecutive_failures, (traffic_suspended_until - suspended_until) / 1000 \
+             FROM model_probe_suspensions WHERE account_id = 7",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, 3);
+        // 探活侧第 3 档 900s，流量侧 1800s —— 这一档已经能区分两边。
+        assert!(row.1 >= 895 && row.1 <= 905, "流量侧应比探活侧长一档，实测差 {} 秒", row.1);
+        note_failure(&pool, 7, "m", Some("429 quota"), FailureKind::Quota).await;
+        let (probe_left, traffic_left): (i64, i64) = sqlx::query_as(
+            "SELECT (suspended_until - ?) / 1000, (traffic_suspended_until - ?) / 1000 FROM model_probe_suspensions WHERE account_id = 7",
+        )
+        .bind(now_ms())
+        .bind(now_ms())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(probe_left >= 1795 && probe_left <= 1805, "探活侧走阶梯 1800s，实测 {probe_left}");
+        assert!(
+            traffic_left >= 1795 && traffic_left <= 1805,
+            "流量侧恒 30 分钟基准、不被阶梯拉长，实测 {traffic_left}"
+        );
     }
 }
 
