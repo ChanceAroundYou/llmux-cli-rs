@@ -48,6 +48,7 @@ crossterm = "0.28"
 url = "2"
 uuid = { version = "1", features = ["v4"] }
 zeroize = "1"
+toml_edit = "0.22"
 
 [profile.dev]
 # 关掉调试信息。cargo 默认是 debug=2（全量），实测那 39% 的体积都是它 ——

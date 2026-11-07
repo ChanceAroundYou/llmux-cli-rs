@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 
 use crate::app::AppState;
 
+use super::codex_toml::patch_codex_toml;
 use super::helpers::{format_local_time, local_now_str, prune_backups, BackupQuery};
 
 fn codex_dir() -> Option<std::path::PathBuf> {
@@ -97,14 +98,35 @@ pub async fn apply_codex_settings(
     let auth_path = dir.join("auth.json");
     let auth_content = json!({ "OPENAI_API_KEY": &api_key });
 
-    // config.toml — 基于现有配置合并，只替换我们负责的字段
+    // config.toml — 基于现有配置合并，只替换我们负责的字段。
+    // 读不到 / 解析失败都必须停下来，不能拿「空内容」继续往下写：那等于把用户
+    // 自己写的配置覆盖掉。中止点在 auth.json 与 config.toml 真正落盘之前，
+    // 所以这条路径上一个字节都不会被改。
     let config_path = dir.join("config.toml");
     let existing_toml = if config_path.exists() {
-        fs::read_to_string(&config_path).unwrap_or_default()
+        match fs::read_to_string(&config_path) {
+            Ok(s) => s,
+            Err(e) => {
+                return crate::error::simple_error(
+                    format!("读 config.toml 失败，已中止（没有改动任何文件）：{e}"),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                );
+            }
+        }
     } else {
         String::new()
     };
-    let config_toml = patch_codex_toml(&existing_toml, model, review_model, &api_base_url, wire_api, context_window, auto_compact_limit);
+    let config_toml = match patch_codex_toml(
+        &existing_toml, model, review_model, &api_base_url, wire_api, context_window, auto_compact_limit,
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            return crate::error::simple_error(
+                format!("config.toml 无法安全编辑，已中止（没有改动任何文件）：{e}"),
+                StatusCode::BAD_REQUEST,
+            );
+        }
+    };
 
     // Backup - single combined file
     let backup_dir = codex_backups_dir(&state.data_dir);
@@ -155,67 +177,6 @@ pub async fn apply_codex_settings(
             "configToml": config_toml,
         },
     })).into_response()
-}
-
-fn set_toml_key(toml: &str, key: &str, value: &str) -> String {
-    let prefix = format!("{key} = \"");
-    if let Some(line_start) = toml.find(&prefix) {
-        let line_end = toml[line_start..].find('\n').map(|i| line_start + i).unwrap_or(toml.len());
-        let mut result = String::with_capacity(toml.len() + value.len());
-        result.push_str(&toml[..line_start]);
-        result.push_str(&format!("{key} = \"{value}\""));
-        result.push_str(&toml[line_end..]);
-        return result;
-    }
-    format!("{}\n{key} = \"{value}\"\n", toml.trim_end())
-}
-
-fn set_toml_bool_key(toml: &str, key: &str, value: &str) -> String {
-    let prefix = format!("{key} = ");
-    if let Some(line_start) = toml.find(&prefix) {
-        let line_end = toml[line_start..].find('\n').map(|i| line_start + i).unwrap_or(toml.len());
-        let mut result = String::with_capacity(toml.len() + 10);
-        result.push_str(&toml[..line_start]);
-        result.push_str(&format!("{key} = {value}"));
-        result.push_str(&toml[line_end..]);
-        return result;
-    }
-    format!("{}\n{key} = {value}\n", toml.trim_end())
-}
-
-fn set_toml_int_key(toml: &str, key: &str, value: u64) -> String {
-    let prefix = format!("{key} = ");
-    if let Some(line_start) = toml.find(&prefix) {
-        let line_end = toml[line_start..].find('\n').map(|i| line_start + i).unwrap_or(toml.len());
-        let mut result = String::with_capacity(toml.len() + 20);
-        result.push_str(&toml[..line_start]);
-        result.push_str(&format!("{key} = {value}"));
-        result.push_str(&toml[line_end..]);
-        return result;
-    }
-    format!("{}\n{key} = {value}\n", toml.trim_end())
-}
-
-fn patch_codex_toml(
-    existing: &str, model: &str, review_model: &str, api_base_url: &str, wire_api: &str,
-    context_window: Option<u64>, auto_compact_limit: Option<u64>,
-) -> String {
-    let mut result = existing.to_string();
-    // 确保 provider section 存在
-    if !result.contains("[model_providers.llmux]") {
-        result = format!("{}\n\n[model_providers.llmux]\n", result.trim_end());
-    }
-    result = set_toml_key(&result, "model_provider", "llmux");
-    result = set_toml_key(&result, "model", model);
-    result = set_toml_key(&result, "review_model", review_model);
-    if let Some(v) = context_window { result = set_toml_int_key(&result, "model_context_window", v); }
-    if let Some(v) = auto_compact_limit { result = set_toml_int_key(&result, "model_auto_compact_token_limit", v); }
-    // provider section 内逐 key 更新
-    result = set_toml_key(&result, "name", "llmux");
-    result = set_toml_key(&result, "base_url", api_base_url);
-    result = set_toml_key(&result, "wire_api", wire_api);
-    result = set_toml_bool_key(&result, "requires_openai_auth", "true");
-    result
 }
 
 fn is_valid_codex_backup_name(name: &str) -> bool {
