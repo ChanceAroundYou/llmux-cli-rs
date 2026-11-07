@@ -50,9 +50,12 @@ llmux/                  ← git 仓库根（origin = fork）
 | `target` 体积、「清一次能拿回多少」 | `du -sh target` + `./scripts/clean.sh`（默认 dry-run） | 「稳态」= 陈旧产物与增量缓存被清掉之后的读数；dry-run 报的「可释放」就是本轮上限 |
 | 当前账户 / 别名 / 聚合别名 id 与绑定 | 登录 Web 界面看；或带**会话 cookie**（不是 `/v1` 的 API key）打 `GET /api/models/aliases`、`GET /api/aggregate-aliases`、`GET /api/accounts` | **不要把 id 写进本文、脚本常量或提交** —— 按 id 操作前先查当前值 |
 | 别名 / 聚合实际生效的首字节超时 | `GET /api/aggregate-aliases` 的 `first_byte_timeout_secs`，以及候选上的同名字段 | 候选值优先于聚合值；两个都空 → `FIRST_BYTE_TIMEOUT_SECS`（`grep -n FIRST_BYTE_TIMEOUT_SECS crates/llmux-core/src/adapters/mod.rs`） |
-| 测试是否**真的**全绿 | `cargo test > /tmp/t.log 2>&1`，然后 `grep '^test result' /tmp/t.log` | ⚠️ 别用 `cargo test \| tail`：管道的退出码是 `tail` 的，**编译失败也会被报成 exit 0**（2026-11-07 踩过）。判据是各套件的 passed/failed 计数 + `grep -c '^error'` |
+| 测试是否**真的**全绿 | `cargo test > /tmp/t.log 2>&1`，然后 `grep '^test result' /tmp/t.log` | ⚠️ 别用 `cargo test \| tail`：管道的退出码是 `tail` 的，**编译失败也会被报成 exit 0**（2026-11-07 踩过）。判据是各套件的 passed/failed 计数 + `grep -c '^error'`。⚠️ **退出码 0 不代表跑完了**：同日一次后台 `cargo test` 只留下 5 个 `test result` 行却回 exit 0 —— 数一下套件数（`grep -c '^test result'`）对不对得上已知的量（2026-11-07 是 21 套 / 583 通过），对不上就是没跑完，别据此声称全绿 |
 | 上游某别名今天的形态（端点、模型清单、免费档门） | 直接打上游，如 `GET https://opencode.ai/zen/v1/models` | 上游随时会变；本文关于上游的记述都是「某日实测」，用前先打一次 |
+| 改了保存侧校验后，**现有配置**会不会被拒 | 本地重放：只读快照生产 `accounts/model_aliases/aggregate_aliases` 的**非密钥列** → 灌进本地新建库 → 用同一份 binary 跑保存路由，出站地址指 `127.0.0.1:9` | 零外呼、零密钥副本 —— 日志里 `failed to decrypt API key for account id=…` 是**预期**的（本地没有生产 master.key），保存路由校验阶段用不到明文 key。**别为了重跑去取生产 cookie / master.key** |
 | 部署是否**真的**把新代码放上去了 | `md5sum target/release/llmux deploy/llmux` + `ssh router 'md5sum /root/docker/llmux/llmux; docker exec llmux md5sum /usr/local/bin/llmux'` 四处比 | 四个 md5 全等才算「新代码在线上」；`docker ps` 显示 `Up` 只说明容器活着，不说明跑的是哪份 binary。健康检查报失败时**先跑这一条**再谈回滚 |
+| 回滚锚点还在不在、是不是**上一轮**那份 | `ls -l deploy/llmux.rollback` + `ssh router 'ls -l /root/docker/llmux/llmux.rollback; md5sum /root/docker/llmux/llmux.rollback'` | 锚点 md5 应 **≠** 当前运行的那份（相同=本轮没换 binary，或锚点被覆盖过）；清理只认 `llmux.bak-*` / `llmux.shadow-*`，所以它一直在 |
+| 新容器**多久才开始监听** | `ssh router 'docker inspect --format "{{.State.StartedAt}}" llmux'` + `ssh router 'docker logs --since 25m llmux 2>&1 | grep -m1 "Server running"'`（`StartedAt` 是 UTC，日志行是本地时区，比之前换算） | 差值应在**秒级**；`compressed old log` 那几行必须落在 `Server running` **之后**（压缩已移出启动路径）。差到分钟级 = 又有东西挡在监听前面，不是「部署失败」 |
 
 ### §schema replay（不碰生产库，也能看到终态 schema）
 
@@ -174,18 +177,21 @@ build 独有的一批 `.rmeta`，把它们误判成陈旧。
 BASE_PATH=llmux ./deploy/deploy.sh -y           # 带基路径前缀（build 时注入 Vite base + 后端前缀）
 ```
 
-脚本流程：UI 增量构建（`VITE_BASE_PATH` 非空时注入 `base=/llmux/` + Router basename）→ cargo build --release → 本地+远程 binary 备份（`llmux.bak-<ts>`）→ scp → `docker compose build && up -d` → `/llmux/api/health` 健康检查（`BASE_PATH` 非空时走带前缀路径）。
+脚本流程：UI 增量构建（`VITE_BASE_PATH` 非空时注入 `base=/llmux/` + Router basename）→ cargo build --release → **回滚锚点 `llmux.rollback`（本地+远程，存执行前正在跑的那份）** → 本地+远程 binary 备份（`llmux.bak-<ts>`）→ scp → `docker compose build && up -d` → `/llmux/api/health` 健康检查（`BASE_PATH` 非空时走带前缀路径）。
+⚠️ 锚点名字故意不用 `llmux.bak-*`：第 8 步清理（>7 天删 + 只留最新 3 份）只认 `llmux.bak-*` / `llmux.shadow-*`，碰不到它。回滚 = `ssh router 'cd /root/docker/llmux && cp llmux.rollback llmux && docker compose build && docker compose up -d'`。
 
 健康检查是**轮询**（每 2s 一轮、最多 `HEALTH_WAIT_SECS=180`，任一 URL 首次 2xx 即通过），
 不是「sleep 3 后 curl 一次」。后者实测把成功部署误报成失败：`up -d` 返回时进程还没监听。
 ⚠️ **窗口必须盖过应用启动时间**：2026-11-07 一次部署轮询 60s 全灭，但部署本身是成功的
-（四处 md5 一致、三个 URL 随后都 200）—— 实测容器 `StartedAt=14:43:33` 而
-`🚀 Server running` 打在 **14:44:53**，**约 80s 才开始监听**。判据（别引用这个数，重测）：
+（四处 md5 一致、三个 URL 随后都 200）—— 那次实测容器 `StartedAt=14:43:33` 而
+`🚀 Server running` 打在 **14:44:53**，**约 80s 才开始监听**，全在启动路径上压缩旧日志（见 §日志）。
+判据（别引用这两个数，重测）：
 `ssh router 'docker inspect --format "{{.State.StartedAt}} restarts={{.RestartCount}}" llmux'`
 + `ssh router 'docker logs --since 25m llmux 2>&1 | grep -m1 "Server running"'` ——
 两个时间差大于窗口就是「启动慢」，不是「部署失败」。
-⚠️ **含义**：每次部署生产有 **约 80–90s 不可用**（旧容器被替换、新容器还没监听），
-别在流量高峰部署，也别把这段时间的下游报错当成新版本的回归。
+✅ **2026-11-07 17:04 起重测：差值已到秒级**（`StartedAt=09:04:06Z` 与 `Server running 17:04:06`
+同一秒，压缩挪到后台后）—— 那 **约 80–90s 不可用**是「压缩挂在启动路径上」那阵子的读数，
+现在的空档只剩容器替换本身。仍然别在流量高峰部署，也别把部署前后的下游报错当成新版本的回归。
 失败分支**不再提前 `exit 1`**（2026-11-07 改）：以前它会连带跳过日志目录校验（7b）与
 镜像 prune / 旧备份清理（8），既留悬空镜像又把「日志写不到 NAS」这种真问题藏起来；
 现在收尾照常跑，退出码在脚本末尾按健康结论决定。
@@ -200,15 +206,19 @@ BASE_PATH=llmux ./deploy/deploy.sh -y           # 带基路径前缀（build 时
 - 镜像 tag：统一 `llmux:latest`（不做版本管理，build 即覆盖）
 - 端口：容器内 25976 固定，宿主机当前为 25977（曾为 25976，基路径迁移时改；公网经 nginx 443 统一入口，内部 `localhost:25977`）
   ⚠️ 端口与 compose 形状会变，**别照本文抄**：取当前值 `ssh router 'grep -nE "2597[0-9]|ports:|BASE_PATH" /root/docker/llmux/docker-compose.yml'`
-- 日志：滚动文件 `llmux.log.<日期>-<两位后缀>`（**不是按天**；启动时自动清理超期旧日志，`LOG_RETAIN_DAYS` 可覆盖，**compose 里默认 30**）；`docker logs` 另有 `json-file 50m*2`。
+- 日志：滚动文件 `llmux.log.<日期>-<两位后缀>`（**不是按天**；启动时只**删**超期旧日志，压缩在后台循环里，`LOG_RETAIN_DAYS` 可覆盖，**compose 里默认 30**）；`docker logs` 另有 `json-file 50m*2`。
   ⚠️ **别按文件名猜内容所在小时**：2026-11-07 13:10 读到最新的是 `llmux.log.2026-11-07-05`、mtime 13:00 —— 后缀与小时不同步。
   ⚠️ **旧小时会被 gzip**（`.gz`）→ `rg` 搜不出东西，用 `zgrep` / `zcat … | rg`；只有最近几份是明文。
-  ⚠️ **压缩是在启动路径上跑的**：2026-11-07 实测新容器 `StartedAt=14:43:33`，14:43:39→14:44:52
-  连压 5 份当日小时日志（每份 8–27s，都在 NAS/CIFS 上），**14:44:53 才 `Server running`** ——
-  部署那 80–90s 空档主要是它烧掉的。判据：
-  `rg -N -a 'compressed old log|Server running' ~/HD/openwrt/log-archive/llmux/llmux.log.$(date +%Y-%m-%d)*`。
-  这也解释了上一条：压缩只在容器启动时跑一轮，不是持续在压。
-  ⚠️ **归档窗口不是 30 天**：2026-11-07 读到 78 个文件、跨度 `11-04-01 → 11-07-05`（约 3.5 天）。要更早的历史别在这里找。
+  ✅ **压缩已移出启动路径**（2026-11-07 改，`llmux-bin/src/main.rs` 的 `cleanup_at_startup` 只删不压；
+  压缩在 `spawn_log_cleanup` 的后台循环：启动后 20s 第一轮、之后每 6h，跑在 `spawn_blocking`）。
+  改之前的实测因果：新容器 `StartedAt=14:43:33`，14:43:39→14:44:52 连压 5 份当日小时日志
+  （每份 8–27s，都在 NAS/CIFS 上），**14:44:53 才 `Server running`** —— 部署那 80–90s 空档主要是它烧掉的。
+  改之后同一天的重测（17:04 那轮）：`StartedAt=09:04:06Z` 与 `Server running 17:04:06` **同一秒**，
+  `compressed old log` 打在 17:04:40 / 17:04:52 / 17:05:02，**夹在真实流量之间**。判据：
+  `rg -N -a 'compressed old log|Server running' ~/HD/openwrt/log-archive/llmux/llmux.log.$(date +%Y-%m-%d)*`
+  —— 差值应在秒级、压缩行在 `Server running` **之后**。
+  ⚠️ **归档窗口不是 30 天**（≈3 天滚动，实测值会变）：2026-11-07 读到 78 个文件、跨度
+  `11-04-01 → 11-07-05`；同日 17:10 再读 **73 个、`11-04-09 → 11-07-09`**。要更早的历史别在这里找。
   取当前清单 `ls -1t ~/HD/openwrt/log-archive/llmux/ | head`，找当天一律用通配 `llmux.log.$(date +%Y-%m-%d)*`
   - **日志不在容器里**，走 fnos NAS（`LOG_DIR=/data/llmux-logs`，6.4T 大盘，**不占路由器的 3.9G overlay**）。
   - **本机读取路径**：`~/HD/openwrt/log-archive/llmux/`（fnos 挂载点，`~/HD` = fnos 共享）。容器内 `/data/llmux-logs` 是**空的**（只有挂载点，日志直写 NAS），别去容器里找。同目录还有 `request-captures/next.json`（一次性捕获开关，见上）。

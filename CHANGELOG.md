@@ -7,6 +7,26 @@
 
 ### Added
 
+- **聚合候选的纯逻辑有了 core 层契约测试**（新文件
+  `crates/llmux-core/tests/aggregate_candidate_contract.rs`，13 条）。此前这些判据只被
+  server 层的 HTTP 契约测试**间接**覆盖，间接覆盖挡不住两类回归：库里**已有的**旧
+  `candidates` JSON（建于 `via_alias` 之前）被改坏 —— 那是线上真实数据；以及排序 / 保位规则被改
+  —— 它决定「哪个候选是 active、锁没锁」，错了不会报错，只会静默换线路。
+  覆盖：旧 JSON 解析 + 重序列化逐字节同形、`stale_source` 绝不从库里读、引用名去重保序、
+  active/locked 按候选身份（`account_id + model`）搬运（身份消失连锁一起清）、脏 old JSON /
+  越界 idx / `locked=2` 都退回 `(0,0)` 不 panic、展开的 preferred 优先与 `weight DESC, id ASC`、
+  `dropped` 报告、协议与超时转发、别名链解析到具体模型、三类不可路由形状、脏聚合行不崩反查。
+  配套 `scripts/mutate_aggregate_helpers.py`（10 条变异，**10/10 变红**）。
+  ⚠️ 变异要设计成「真会红」：ordering 那两条把插入顺序刻意排成与 weight 顺序不同，
+  否则「按 weight 排」与「按建表顺序排」在测试里长得一样，去掉 `ORDER BY` 也不会红。
+
+- **`deploy.sh` 加了永久回滚锚点 `llmux.rollback`**（新步骤 ⓪，本地 + 远程各一份）。
+  存的是**执行前那一刻正在跑的**那份 binary。名字故意不用 `llmux.bak-*` —— 第 8 步的清理
+  （>7 天删 + 只留最新 3 份）只认 `llmux.bak-*` / `llmux.shadow-*` 两个前缀，碰不到它；
+  否则回滚窗口只有「最近 3 次部署」，出事先想到就已经过了。两处回滚提示与收尾打印都改指它。
+  2026-11-07 部署实测：锚点 13,009,456 B / md5 `5b6eba18…`，与本轮上线的
+  `7d46c994…` 是两个不同 binary（四处 md5 一致取证见 AGENTS §部署是否真的把新代码放上去了）。
+
 - **聚合别名可以引用普通别名（完整转发，只允许一层）**。`POST /api/aggregate-aliases`
   的候选现在两种写法：原有的 `{"account_id":5,"model":"x"}`，以及 `{"alias":"d4"}` ——
   后者在**保存时**由 `llmux_core::aggregate::expand_alias_candidate` 展开成那条普通别名
@@ -32,10 +52,21 @@
     「保存成功但永远走不通」不是配置而是坑。运行时跳过保留（改普通别名的协议会经
     `resync_alias_candidates` 重展开进已存的聚合，不经过保存路由）；普通别名绑定账户
     仍不在保存时拒（2026-08 那条决定未推翻）。前端在候选行上预先拦同一种冲突。
-  - 契约测试 `crates/llmux-server/tests/aggregate_alias_candidate_contract.rs`（7 条，端到端走
+    ✅ **不会把线上现有配置打挂**（2026-11-07 取证，方式：把生产 `accounts / model_aliases /
+    aggregate_aliases` 只读快照灌进本地新建库、用同一份 release binary 真跑保存路由，出站地址
+    指到 `127.0.0.1:9` —— 零外呼、零密钥副本）：生产的 7 条聚合别名（`op/of/qwv/local/ag/ok/os`）
+    逐条重放保存**全部 200**，`deepseek-yf` 带 id 编辑自己也是 200 并带动聚合 `of` 重展开。
+    原因是现存候选 JSON 里一个 `via_alias` / `upstream_api` 都没有（都建于本特性之前），
+    而判据只看候选自己的 `upstream_api`，`None` 不参与冲突判定。
+    同一轮里两条**故意造出来的**负例也照预期红：聚合强制 `chat` 而引用一条 `responses` 别名 →
+    400 且点名 `candidate from alias 'respalias' forces responses`；同名别名不带 `self_id` 重放 →
+    409 `名字已被别名 #291 占用`（这正是新同名规则要的创建语义，也是前端编辑态必须带上自身主键的原因）。
+  - 契约测试 `crates/llmux-server/tests/aggregate_alias_candidate_contract.rs`（8 条，端到端走
     `/v1/chat/completions` + 真 mock 上游的 `/fast`、`/slow` 两条路径），
-    并用 `scripts/mutate_alias_candidate.py` 做 7 条变异验证（7/7 变红，含
-    「stale 跳过改成记失败」「超时优先级反过来」「删别名不作废解析缓存」）。
+    并用 `scripts/mutate_alias_candidate.py` 做 8 条变异验证（8/8 变红，含
+    「stale 跳过改成记失败」「超时优先级反过来」「删别名不作废解析缓存」「丢掉协议冲突判据」）。
+    （条数取法：`grep -c '^#\[tokio::test\]\|^#\[test\]' <该文件>`；变异条数取
+    `python3 -c` 读 `MUTATIONS` 长度。）
 
 - **Codex 原生请求默认使用稳定的提示缓存 session**。此前只有请求自带
   `prompt_cache_key` 时才发送 Codex 私有头 `session_id`；Anthropic 转换请求通常没有该字段，
@@ -105,6 +136,26 @@
   细节与判据见 `docs/probe-cooldown-policy.md`。
 
 ### Fixed
+
+- **旧日志压缩不再挂在启动路径上 —— 每次部署约 80–90s 的生产空档消掉了**
+  （`crates/llmux-bin/src/main.rs`）。启动时只 `cleanup_at_startup()` 删超期的（不压缩）；
+  压缩改由 `spawn_log_cleanup` 的后台循环干（启动后 20s 第一轮、之后每 6h，
+  跑在 `spawn_blocking` 上）。压缩本身是 8–27s/份 的 gzip（NAS/CIFS），此前它挡在监听之前。
+  - ✅ 2026-11-07 17:04 部署后重测：容器 `StartedAt=2026-11-07T09:04:06Z`，日志里
+    `🚀 Server running` 打在 **17:04:06**（本地）—— **同一秒**；`compressed old log`
+    那三行落在 **17:04:40 / 17:04:52 / 17:05:02**，中间还夹着真实流量（17:04:45、17:04:57 各有请求）。
+    对照 14:43 那轮：`StartedAt=14:43:33` → `Server running=14:44:53`（80s）。
+    判据（别引用这两个数，重测）：
+    `ssh router 'docker inspect --format "{{.State.StartedAt}}" llmux'` +
+    `ssh router 'docker logs --since 25m llmux 2>&1 | grep -m1 "Server running"'`，
+    差值应在秒级，且 `compressed old log` 在 `Server running` **之后**。
+  - 拆分后各自的判据：`remove_expired_logs(dir, retain_hours)`（`retain <= 0` 一律不删 ——
+    拼错 env 不该静默删光日志）、认不出日期的文件名**跳过**而不是当「很旧」、
+    删除时 `.gz` 优先但没有 `.gz` 也要删掉明文那份、压缩只看 `age_hours > 1` 且不重压已有 `.gz` 双胞胎的。
+  - 测试 `main.rs` 内 `log_rotation_tests`（6 条）+ `scripts/mutate_log_rotation.py`
+    （6 条变异，**6/6 变红**，含「启动路径又开始压缩」「保留期非正也照删」「认不出日期当成很旧」）。
+    ⚠️ 造文件名时间戳要从 **UTC 整点**往回推（测试里把名字里的时间按 UTC 解析、`now` 取本地）：
+    用本地整点造名字会让「年龄」凭空多出一个时区偏移，测试换台机器就红。
 
 - **`deploy.sh` 的健康检查窗口 60s → 180s，且失败不再提前 `exit 1`**。2026-11-07 一次部署
   被误报成失败：轮询 60s 内三个 URL 全无 2xx，而部署本身是成功的（本地/`deploy/`/路由器/容器内
