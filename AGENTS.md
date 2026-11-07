@@ -34,6 +34,48 @@ llmux/                  ← git 仓库根（origin = fork）
                         记忆统一走全局 ~/.claude/projects/-home-xiaokubao-projects-llmux/memory/）
 ```
 
+## 事实的取法（本文其它地方的数字都是**快照**）
+
+本文出现的具体数字（迁移条数、索引个数、库大小、`target` 体积、账户 id、耗时分布）
+都是**某个日期读到的值**，不是当前值 —— 改一次代码、部署一轮、上游换一批模型就漂。
+所以每条判据配一条自证命令：**要引用一个数，先重跑它**。新增事实必须带日期 + 取法，
+没有取法的数字一律当「待验证」读。
+
+| 要知道什么 | 自证命令（仓库根） | 判据 / 坑 |
+|---|---|---|
+| 迁移条数与**新库终态 schema**（表、索引） | 下方 §schema replay | 必须像 `init_db` 那样逐条执行并吞掉 `already exists` / `duplicate column`：直接 `executescript` 会在 0002 停住（0001 已含那列）—— 停住的那份不是终态 |
+| 某个索引是否真被用上 | replay 出 schema 后 `EXPLAIN QUERY PLAN` | 不出现在任何计划里的索引 = 纯负担（写放大 + 库变大，收益 0）；改动前后各测一次，**且先 `ANALYZE`** |
+| 库大小 / 回收是否生效 | `rg -N '回收 [0-9.]+ MiB 空闲页' ~/HD/openwrt/log-archive/llmux/llmux.log.$(date +%Y-%m-%d)* \| grep -v 'full request body'` | 判据是 `freelist_count`，不是 `ls -la`；**没有这行 = 本轮没到阈值，正常**（闲时零开销）。⚠️ `full request body` 行会把 AGENTS.md 自身内容回显进日志，不排掉就会「匹配到自己」（本文就是这么被骗过一次） |
+| `target` 体积、「清一次能拿回多少」 | `du -sh target` + `./scripts/clean.sh`（默认 dry-run） | 「稳态」= 陈旧产物与增量缓存被清掉之后的读数；dry-run 报的「可释放」就是本轮上限 |
+| 当前账户 / 别名 / 聚合别名 id 与绑定 | 登录 Web 界面看；或带**会话 cookie**（不是 `/v1` 的 API key）打 `GET /api/models/aliases`、`GET /api/aggregate-aliases`、`GET /api/accounts` | **不要把 id 写进本文、脚本常量或提交** —— 按 id 操作前先查当前值 |
+| 别名 / 聚合实际生效的首字节超时 | `GET /api/aggregate-aliases` 的 `first_byte_timeout_secs`，以及候选上的同名字段 | 候选值优先于聚合值；两个都空 → `FIRST_BYTE_TIMEOUT_SECS`（`grep -n FIRST_BYTE_TIMEOUT_SECS crates/llmux-core/src/adapters/mod.rs`） |
+| 测试是否**真的**全绿 | `cargo test > /tmp/t.log 2>&1`，然后 `grep '^test result' /tmp/t.log` | ⚠️ 别用 `cargo test \| tail`：管道的退出码是 `tail` 的，**编译失败也会被报成 exit 0**（2026-11-07 踩过）。判据是各套件的 passed/failed 计数 + `grep -c '^error'` |
+| 上游某别名今天的形态（端点、模型清单、免费档门） | 直接打上游，如 `GET https://opencode.ai/zen/v1/models` | 上游随时会变；本文关于上游的记述都是「某日实测」，用前先打一次 |
+
+### §schema replay（不碰生产库，也能看到终态 schema）
+
+`init_db` 没有迁移记录表，36 个迁移（2026-11-07 读到：`ls crates/llmux-core/src/migrations/*.sql | wc -l`）
+每次启动全量重跑、靠吞错误假装幂等。所以「库里现在到底有哪些索引」的取法是把这套迁移
+按同样的语义重放一遍：
+
+```bash
+python3 - <<'PY'
+import sqlite3, pathlib, glob
+con = sqlite3.connect(':memory:')
+files = sorted(glob.glob('crates/llmux-core/src/migrations/*.sql'))
+for f in files:
+    for stmt in filter(None, (s.strip() for s in pathlib.Path(f).read_text().split(';'))):
+        try: con.execute(stmt)                       # 与 init_db 一样吞掉 already-exists
+        except sqlite3.Error: pass
+print('迁移文件数:', len(files))
+for t in ('usage_logs', 'aggregate_aliases', 'model_aliases', 'accounts'):
+    print(t, [r[1] for r in con.execute(f"PRAGMA index_list('{t}')")])
+PY
+```
+
+2026-11-07 读到：36 个迁移、吞掉 2 条语句错误、`usage_logs` 5 个索引。
+（重放只覆盖 `CREATE`/`ALTER`，不含运行时数据 —— 判**形状**够用，判**大小**要用上一行的日志行。）
+
 ## 构建与测试
 
 ```bash
@@ -62,22 +104,28 @@ cd /home/xiaokubao/projects/llmux/ui && npm run build
 ⚠️ **别把 `ui/dist` 删了**：`static_ui.rs` 的 `#[folder = "../../ui/dist"]` 在编译期读它，删了 `cargo build` 直接失败。
 脚本默认 dry-run、拒绝删 git 跟踪的文件、拒绝删项目根之外的路径、cargo/rustc 在跑时直接退出。
 
-### `target` 稳态约 2.3G —— 靠 `[profile.dev] debug = 0`
+### `target` 会涨，稳态取决于清没清 —— 靠 `[profile.dev] debug = 0`
 
 `Cargo.toml` 里设了 `debug = 0`。cargo 默认是 `debug = 2`（全量调试信息），
 实测那 39% 的体积都是它 —— 集成测试可执行文件单个 160-207M，其中最大的那个
-139M 是 `.debug_str` + `.debug_info`。14 个测试二进制 + 数百个 rlib 各带一份。
+139M 是 `.debug_str` + `.debug_info`。十几个测试二进制 + 数百个 rlib 各带一份。
 
 | | debug=2（cargo 默认） | debug=0（当前） |
 |---|---|---|
-| 项目总大小 | 4.6G | **2.3G** |
+| 项目总大小 | 4.6G | 2.3G |
 | 最大的测试二进制 | 207 MiB | 47 MiB |
 | 全量重编 | 3分24秒 | 2分39秒 |
 | 增量构建 | 0.28s | 0.27s |
 
+⚠️ **上表是 A/B 实验那一次的读数，不是当前体积**。「2.3G」是**刚清完**的稳态读数；
+2026-11-07 未清理时读到 8.9G（`target/debug` 8.0G + `target/release` 857M），
+同一时刻 `./scripts/clean.sh` 预演报「可释放」：陈旧产物 2.0GiB + 增量缓存 4.6GiB +
+release 测试产物 168MiB。**当前值走 §事实的取法 那一行，别引用这里的数。**
+
 ⚠️ **代价**：测试 panic 时只有函数名，没有「文件:行号」。需要调试时临时加
 `CARGO_PROFILE_DEV_DEBUG=2 cargo test` —— 会触发全量重编，别常开。
-⚠️ **别动 `[profile.release]`**：它已有 `strip = true`，binary 11 MiB，与 `debug=0` 无关。
+⚠️ **别动 `[profile.release]`**：它已有 `strip = true`，binary 11 MiB（2026-10 读数，
+重测：`ls -l target/release/llmux`），与 `debug=0` 无关。
 ⚠️ **这不代表 `target` 里没有陈旧产物了** —— `debug=0` 只是让每一份变小，
 陈旧累积的机制照样在跑，隔一段时间仍要 `./scripts/clean.sh --apply`。
 
@@ -86,9 +134,14 @@ cd /home/xiaokubao/projects/llmux/ui && npm run build
 `target/{debug,release}/deps` 里改一次代码就多一份产物，旧的 cargo 早已不认却不会删。
 集成测试可执行文件（静态链进整个 axum 栈）单个 37-47M，`.rlib`/`.rmeta` 里
 llmux-server 一个 150M+。同一测试能积到 3-5 份。
+⚠️ **这些具体字节是某轮清理时的读数**（2026-09/10）；当前值跑 `./scripts/clean.sh`
+预演，它直接报「可释放 X / N 个陈旧产物」。下面几条**判据**不随体积变，照做就行。
 
 `clean.sh` 从 `--message-format=json` 的 `executable`（测试二进制）和 `filenames`
 （rlib/rmeta）两个字段取白名单，只删不在清单里的。
+⚠️ 上面这段里的具体字节（37-47M、150M+、3-5 份、678 MiB、38M）都是**清理那轮的读数**
+（2026-10）。判据照用；当前值跑 `./scripts/clean.sh`（默认预演，会直接报「可释放 X GiB /
+N 个陈旧产物」）和 `du -sh target/debug/deps target/release/deps`。
 ⚠️ **白名单必须跑两次 cargo**（`test --no-run` + `build`）—— 只跑其一会漏掉
 build 独有的一批 `.rmeta`，把它们误判成陈旧。
 ⚠️ **别用 `cargo build --release --tests` 枚举 release 产物** —— `--tests`
@@ -134,9 +187,12 @@ BASE_PATH=llmux ./deploy/deploy.sh -y           # 带基路径前缀（build 时
 - Docker：`/root/docker/llmux/`，`docker-compose.yml` 为单服务 `llmux`（`25977:25976`，`BASE_PATH=llmux`），挂载 `./data` → `/data/llmux`；nginx `llmux.locations` 直通 `25977` 且已无 `sub_filter`（基路径由后端 `BASE_PATH` + 前端 `Vite base` 原生支持）
 - 镜像 tag：统一 `llmux:latest`（不做版本管理，build 即覆盖）
 - 端口：容器内 25976 固定，宿主机当前为 25977（曾为 25976，基路径迁移时改；公网经 nginx 443 统一入口，内部 `localhost:25977`）
-- 日志：按天滚动 `llmux.log.YYYY-MM-DD`，启动时自动清理超期旧日志（`LOG_RETAIN_DAYS` 可覆盖，**compose 里默认 30**）；`docker logs` 另有 `json-file 50m*2`。
+  ⚠️ 端口与 compose 形状会变，**别照本文抄**：取当前值 `ssh router 'grep -nE "2597[0-9]|ports:|BASE_PATH" /root/docker/llmux/docker-compose.yml'`
+- 日志：滚动文件 `llmux.log.<日期>[.<小时>]`，启动时自动清理超期旧日志（`LOG_RETAIN_DAYS` 可覆盖，**compose 里默认 30**）；`docker logs` 另有 `json-file 50m*2`。
+  ⚠️ **文件名格式会变**（当前读到的是按小时：`llmux.log.2026-11-07-04`；早期是按天）——
+  取当前清单 `ls -t ~/HD/openwrt/log-archive/llmux/ | head`，找当天一律用通配 `llmux.log.$(date +%Y-%m-%d)*`
   - **日志不在容器里**，走 fnos NAS（`LOG_DIR=/data/llmux-logs`，6.4T 大盘，**不占路由器的 3.9G overlay**）。
-  - **本机读取路径**：`~/HD/openwrt/log-archive/llmux/llmux.log.YYYY-MM-DD`（fnos 挂载点，`~/HD` = fnos 共享）。容器内 `/data/llmux-logs` 是**空的**（只有挂载点，日志直写 NAS），别去容器里找。
+  - **本机读取路径**：`~/HD/openwrt/log-archive/llmux/`（fnos 挂载点，`~/HD` = fnos 共享）。容器内 `/data/llmux-logs` 是**空的**（只有挂载点，日志直写 NAS），别去容器里找。同目录还有 `request-captures/next.json`（一次性捕获开关，见上）。
   - 文件很大（单日几十~几百 MB），**别直接 `cat`**；用 `grep`/`rg` 或 `tail` 定位。
 - 数据铁律：**绝不 `docker run -v /opt/llmux/data`**（2026-08-06 误用初始化空库）
 - binary 是 glibc 动态链接（在 Proxmox VM / Ubuntu 26.04 构建，**不是 WSL**；最高符号 `GLIBC_2.39`），**不能跑 Alpine/musl**
@@ -199,7 +255,9 @@ BASE_PATH=llmux ./deploy/deploy.sh -y           # 带基路径前缀（build 时
   才落盘。**判断回收是否成功要看 `PRAGMA freelist_count`，不是 `ls -la`。**
 - 历史实测：2026-09-15 手动 901.9 MB → 159.3 MB；2026-10-02 自动路径 599.8 MB → 103.5 MB
   （freelist 377 MiB → 0），期间无停机、无数据丢失。
-- **稳态库大小约 39 MiB**（2026-10-02 实测推算：删掉 30 天前的 37,118 行后 VACUUM
+- **稳态库大小的量级约 39 MiB**（**快照：2026-10-02 实测推算**，不是当前值 ——
+  取当前值：先看上一条的 `freelist_count` 日志行，再 `ls -l` 路由器上的
+  `/root/docker/llmux/data/llmux_db.db`。推算过程：删掉 30 天前的 37,118 行后 VACUUM
   得 157.7 MiB，其中 129 MiB 是 1 天保留期内的 body；清空后 21.2 MiB，
   加上每天新写入约 10.4 MiB 的 body ≈ 39 MiB）。
   首次触发那轮 6h 循环会 `DELETE` 37,118 行 —— 实测 DELETE 0.34s + VACUUM 1.10s，
@@ -219,13 +277,15 @@ BASE_PATH=llmux ./deploy/deploy.sh -y           # 带基路径前缀（build 时
   B 树。逐条 `EXPLAIN QUERY PLAN` 核下来 6 个**从未出现在任何计划里**，已删
   （迁移 0024），并把 `idx_usage_logs_is_test` 换成 `(is_test, timestamp DESC)` ——
   首页那条 `WHERE is_test=0 ORDER BY timestamp DESC LIMIT 100` 因此从
-  **79.87ms 降到 0.15ms**（每次打开首页都付）。现在只剩 5 个，都有真实计划在用。
+  **79.87ms 降到 0.15ms**（每次打开首页都付）。
+  **当前有几个索引：跑 §schema replay，别信这里的数**（2026-11-07 重放读到 5 个，都有真实计划在用）。
   **加索引前先 `EXPLAIN QUERY PLAN` 看它会不会被选中**，不会被选中的索引是纯负担：
-  写放大 + 库文件变大，而收益是 0。留下的 5 个及各自理由写在迁移文件的注释里。
+  写放大 + 库文件变大，而收益是 0。留下的每个索引及各自理由写在迁移文件的注释里。
 - ⚠️ **改过索引后做性能对比，必须先 `ANALYZE`**：`sqlite_stat1` 里还是旧的统计，
   优化器会挑错索引。实测这会让人把 accounts 页误判成「37.5ms → 74.3ms 的回归」，
   `ANALYZE` 之后两边同为 44.43ms —— 那个「回归」根本不存在。
-- ⚠️ **`init_db` 没有迁移记录表**：23 个迁移每次启动全部重跑，靠吞掉「already exists」
+- ⚠️ **`init_db` 没有迁移记录表**：**全部迁移**（数量会长，当前读数与取法见 §schema replay）
+  每次启动全部重跑，靠吞掉「already exists」
   错误假装幂等。所以 0024 删掉的索引会在每次启动时被 0001/0006/0013 重新建出来、
   再被 0024 删掉（实测每次启动白花 0.33s）。终态正确，**不要为此重构迁移机制，
   也绝不要回头改已发布的历史迁移**。
@@ -244,7 +304,9 @@ ChatGPT Plus 的 Codex 额度直连 `chatgpt.com/backend-api/codex`，llmux 原�
   回显邮箱/套餐/可加载模型数。实现 `llmux_core::codex_device` + `routes/system/codex_device.rs`
   （会话只在内存、15 分钟窗口、`device_auth_id` 不出服务端、日志里的码打掩码），
   细节见 `docs/codex-subscription-account-guide.md` §7。**换 token 那一步必须人确认，界面上做完才算验证过。**
-- 登录（命令行，仍可用）：`./scripts/codex-login.sh --account-id 60`（device-auth，隔离 CODEX_HOME）。
+- 登录（命令行，仍可用）：`./scripts/codex-login.sh --account-id <id>`（device-auth，隔离 CODEX_HOME）。
+  ⚠️ **`<id>` 要先查**（`GET /api/accounts` 里 `provider_id=codex` 那条，或界面账户页）——
+  本文曾经写死过 `60`（2026-10 的 id），换过账户就是错的。
   ⚠️ `--from-router` 已不可用：路由器 `./codex-auth/auth.json` 那份 2026-10-12 之后没动过，
   refresh_token 大概率已被 llmux 自己的每次自刷轮换作废。
 - 令牌生命周期**三条**刷新路径（判据同为 `is_expired`，提前 30s）：真实流量请求前、
@@ -252,6 +314,14 @@ ChatGPT Plus 的 Codex 额度直连 `chatgpt.com/backend-api/codex`，llmux 原�
   （`codex_auth::ensure_fresh`，2026-11-07 加 —— 修的是「空闲账户到期后自我锁死」：
   拨测 401 → 冷却 → 加载模型 401 → 更没流量 → 没人去刷新）。
 - ⚠️ 走的是 codex **未公开私有后端**，随时可能被上游改掉而失效；**可能违背 OpenAI ToS、有账号风控风险**。
+- **`config.toml` 的原地编辑走 `toml_edit`**（`crates/llmux-server/src/routes/system/codex_toml.rs`，
+  2026-11-07 移植自上游 `fbf6713`）：按 section 精确定位，只改 llmux 负责的字段，其余原样保留。
+  替掉的是 `toml.find("model = \"")` 那一套字符串打补丁，它的三条坏行为各有一条契约测试钉着
+  （`model` 查找先命中 `review_model`；用户自己其它 `[model_providers.*]` 段的同名键被改；
+  缺失的顶层键盲追加到文件末尾、而末尾正是新加的 `[model_providers.llmux]` 段）。
+  ⚠️ 别退回 `doc["model_providers"]["llmux"]["base_url"] = value(..)` 那种链式写法 ——
+  toml_edit 那样建出来的是 **inline table**，语义对但形状不是 Codex 期待的段落。
+  解析失败（用户手写的 TOML 有语法错）一律回 `Err` 让调用方报错，**绝不吞错后拿空文档覆盖原文件**。
 - 归档：sidecar 方案见 `docs/codex-absorption-plan.md`；旧 compose 备份在路由器
   `docker-compose.yml.bak-before-codex-remove-20261013`。
 
@@ -302,14 +372,17 @@ ChatGPT Plus 的 Codex 额度直连 `chatgpt.com/backend-api/codex`，llmux 原�
   `ClientBuilder` 上，没有按请求设置的入口**，而 client 是全局单例且要跑 SSE。
   全局设它会把正常的流式「思考」间隔掐断（成功流式 TTFT p90 就 39.5s > 30s）。
 - 判据是**发出去的 body 里 `stream` 是不是 true**，不是调用点的 `streaming` 变量
-  （那是「下游要不要流」，两者可以不同），所以 14 个调用点一个都没改。
+  （那是「下游要不要流」，两者可以不同）。所以这个判据**不挂在调用点上** ——
+  当初核对的 14 个调用点一个都没改，将来加调用点也不需要改它们，
+  但要确认新调用点走的仍是同一处判定（`grep -n 'FIRST_BYTE_TIMEOUT_SECS' crates/llmux-core/src/adapters/mod.rs`）。
   认不出的 `stream` 一律当非流式 —— 反过来会让这个特性**静默失效**，而失效看不见：
   请求只是继续挂着，不报错。
 - 30s 这个值别随手调。7 天非流式数据：成功 p50 5.2s / p90 19.2s / p99 51.9s，
   挂死 p50 28.8s / p90 95.1s。30s 抓到 48% 的挂死、误杀 3.4% 的成功。
   要调到 45s 就必须同时接受抓取率降到约 35% —— 想清楚再动。
-- ⚠️ **但上面那组 p99 是全网关的，套在大 prompt 上不成立**。2026-10-10 实测 account 58
-  （ninfer `qwen3.8-27b`）**421KB 冷前缀非流式请求需要 109–139s** 才能出首字节
+- ⚠️ **但上面那组 p99 是全网关的，套在大 prompt 上不成立**。2026-10-10 实测
+  当时 id 58 的那个 ninfer `qwen3.8-27b` 账户（**id 会变**，取法见 §事实的取法）
+  **421KB 冷前缀非流式请求需要 109–139s** 才能出首字节
   （连续 4 次实测：109.4s / 133.2s / 139.2s），远超 30s。后果不是"慢"而是**死循环**：
   ```
   冷前缀 + 大 prompt → ninfer prefill 109~139s
@@ -348,6 +421,43 @@ ChatGPT Plus 的 Codex 额度直连 `chatgpt.com/backend-api/codex`，llmux 原�
 模型名必须经"别名绑定账户"（如 `d4`→DeepSeek、`gl`→Copilot），裸模型名直传 503。
 每个别名绑定一个上游账户（Copilot、DeepSeek、sense、agnes 等），请求按别名路由到对应 API。
 context_length 字段：先查 models_cache（上游提供）→ 再查内置表（`crates/llmux-core/src/context.rs`）。
+
+## 聚合别名引用普通别名（2026-11-07 加）
+
+聚合别名的候选两种写法：`{"account_id":5,"model":"x"}`（原有）或 `{"alias":"d4"}`
+（引用一条**普通别名**）。引用在**保存时**展开成那条别名当前的绑定
+（`llmux_core::aggregate::expand_alias_candidate`：preferred 账户在前，其余按
+`weight DESC, id ASC`），`upstream_api` / `first_byte_timeout_secs` 一并带过来，
+候选上只留 `via_alias` 记来源。
+
+- **只允许一层**：候选引用聚合别名 → 400（含引用自己）；引用不存在的普通别名 → 400。
+- **运行时不解析别名**：库里存的一直是具体 (账户, 模型)，`aggregate_probe`、路由、
+  索引语义（`active_idx` / `locked` / 3-confirm）都不用改。`AggregateCandidate::stale_source`
+  是运行时判定，`serde(skip)` 不落库。
+- **来源别名被删/改名 = 配置失效，不是上游坏了**：dispatch 跳过该候选，且**不记**
+  `note_candidate_failure`、不设 `anchor_attempted` —— 否则「删掉一条普通别名」就能在几轮里
+  把聚合的主候选挤下线。跳过只进 `exhausted_status` 的**分母不进分子**：掺着配置失效时回
+  502 + 诊断串，而不是 429 让客户端按 `Retry-After` 干等一个不会自愈的配置问题。
+  判据 `routes::v1::helpers::stale_candidate_reason`。
+- **改普通别名会带动引用它的聚合**：保存普通别名时 `resync_alias_candidates` 重展开；
+  删除普通别名时 `aggregates_referencing` 作废那些聚合的解析缓存（不作废就要最长
+  `HOT_CACHE_TTL` 才生效，取当前值 `grep -n HOT_CACHE_TTL crates/llmux-server/src/app.rs`）。
+  候选本身**不删** —— 别名可能只是改名，或还会被建回来。
+- **超时优先级：候选自带的 > 聚合自己的**（`cand.first_byte_timeout_secs.or(agg.first_byte_timeout_secs)`），
+  「完整转发」就是这个意思。
+- **协议不一致不 400**（别名强制 responses、聚合强制 chat 之类）：保存回 `notes` 警告 +
+  运行时跳过 —— 与 2026-08 那次「强制协议不在保存时拒」的决定一致
+  （`docs/superpowers/plans/2026-08-23-upstream-downstream-split.md`）。前端在编辑时就显示同一条冲突。
+- 契约测试 `crates/llmux-server/tests/aggregate_alias_candidate_contract.rs`（条数取法：
+  `cargo test --test aggregate_alias_candidate_contract 2>&1 | grep '^test result'`）。
+
+## 别名同名冲突（2026-11-07 改）
+
+保存普通别名时，同名属于**另一条**别名（且不是自己）→ **409 `alias_name_taken`** +
+`existing_id`，不再静默改掉那一条的 target / 绑定。判据：请求带 `id` = 编辑自己，
+不带 = 创建语义。前端 `addAlias` 在编辑态必须把自身主键带上，否则「改自己的绑定」会被判成冲突。
+**普通 ↔ 聚合之间的覆盖仍走 confirm 流程**（`conflict: ordinary | aggregate`），与这条不是一回事。
+测试 `crates/llmux-server/tests/alias_conflict_contract.rs`。
 
 ## 探活与冷却（2026-11-07 改）
 

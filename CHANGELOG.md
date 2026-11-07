@@ -7,6 +7,32 @@
 
 ### Added
 
+- **聚合别名可以引用普通别名（完整转发，只允许一层）**。`POST /api/aggregate-aliases`
+  的候选现在两种写法：原有的 `{"account_id":5,"model":"x"}`，以及 `{"alias":"d4"}` ——
+  后者在**保存时**由 `llmux_core::aggregate::expand_alias_candidate` 展开成那条普通别名
+  当前的绑定（preferred 账户在前、其余 `weight DESC, id ASC`），并把它的 `upstream_api`
+  与 `first_byte_timeout_secs` 一并带到候选上，候选只多一个 `via_alias` 记来源。
+
+  - **展开只在保存侧**：库里存的永远是具体 (账户, 模型)。`aggregate_probe`、路由、
+    `active_idx` / `locked` / 3-confirm 的索引语义一个都没改 —— 选这条路的理由。
+  - **只允许一层**：候选引用聚合别名（含引用自己）→ 400；引用不存在的普通别名 → 400。
+  - **来源别名被删/改名 = 配置失效，不是上游坏了**：`resolve_aggregate` 里一次 `IN` 查询
+    打上 `stale_source`（`serde(skip)`，不落库），dispatch 跳过该候选且**不记**
+    `note_candidate_failure`、不设 `anchor_attempted` —— 否则「删一条普通别名」就能在
+    几轮 3-confirm 里把聚合的主候选挤下线。跳过只进 `exhausted_status` 的**分母不进分子**：
+    掺着配置失效时回 502 + 诊断串，而不是 429 让客户端按 `Retry-After` 干等一个不会自愈的配置问题。
+  - **改普通别名会带动引用它的聚合**：保存时 `resync_alias_candidates` 重展开；
+    删除时 `aggregates_referencing` 作废那些聚合的解析缓存（否则最长等 `HOT_CACHE_TTL`）。
+    候选本身不删 —— 别名可能只是改名，或还会被建回来。
+  - **超时优先级：候选自带的 > 聚合自己的**（`cand.first_byte_timeout_secs.or(agg...)`），
+    「完整转发」就是这个意思。
+  - **协议不一致不 400**：保存回 `notes` 警告 + 运行时跳过，与 2026-08「强制协议不在保存时拒」
+    一致；前端在候选行上预先显示同一条冲突。
+  - 契约测试 `crates/llmux-server/tests/aggregate_alias_candidate_contract.rs`（7 条，端到端走
+    `/v1/chat/completions` + 真 mock 上游的 `/fast`、`/slow` 两条路径），
+    并用 `scripts/mutate_alias_candidate.py` 做 7 条变异验证（7/7 变红，含
+    「stale 跳过改成记失败」「超时优先级反过来」「删别名不作废解析缓存」）。
+
 - **Codex 原生请求默认使用稳定的提示缓存 session**。此前只有请求自带
   `prompt_cache_key` 时才发送 Codex 私有头 `session_id`；Anthropic 转换请求通常没有该字段，
   使重复的规则前缀无法稳定复用同一缓存分区。现在缺省按账户生成稳定 session，显式
@@ -75,6 +101,26 @@
   细节与判据见 `docs/probe-cooldown-policy.md`。
 
 ### Fixed
+
+- **Codex `config.toml` 的编辑改用 `toml_edit` 按 section 定位**（移植上游 `fbf6713`，
+  新文件 `crates/llmux-server/src/routes/system/codex_toml.rs`）。此前是
+  `toml.find("model = \"")` 那一套字符串打补丁，三条都会写坏用户自己的 Codex 配置，
+  每条一条契约测试（`tests/codex_toml_contract.rs`，12 条）：
+  - `model` 的查找先命中 `review_model = "…"`（后者含 `model = "` 子串）；
+  - 用户自己写的其它 `[model_providers.*]` 段里的同名键被改成 llmux 的值；
+  - 缺失的顶层键被盲追加到文件末尾，而末尾正好是新加的 `[model_providers.llmux]` 段 ——
+    `model` / `model_provider` 落进 provider 段里，Codex 读顶层读不到。
+  两个刻意的取舍：解析失败（用户手写的 TOML 有语法错）一律回 `Err` 让调用方报错，
+  **绝不吞错后拿空文档覆盖原文件**；段落**形状跟着用户走**（inline table 就沿用 inline table）。
+  ⚠️ 别退回 `doc["model_providers"]["llmux"]["base_url"] = value(..)` 那种链式写法 ——
+  实测 toml_edit 那样建出来的是 inline table，`Item::as_table()` 会是 None。
+
+- **保存普通别名时，同名属于另一条别名会被静默改掉那一条的 target / 绑定**。
+  现在回 **409 `alias_name_taken`** + `existing_id`（前端据此显示「名字已被另一条别名占用（#id）」）。
+  判据：请求带 `id` = 编辑自己，不带 = 创建语义 —— 前端 `addAlias` 在编辑态必须把自身主键带上，
+  否则「改自己的绑定」会被判成冲突。**普通 ↔ 聚合之间的覆盖仍走 confirm 流程**
+  （`conflict: ordinary | aggregate`），与这条不是一回事。
+  契约测试 `crates/llmux-server/tests/alias_conflict_contract.rs`（5 条）。
 
 - **别名的首字节超时设置一直没显示出来**。`/api/models/aliases` 返回的字段是
   snake_case `first_byte_timeout_secs`（后端 `ModelAlias` 没有 `rename_all`），
