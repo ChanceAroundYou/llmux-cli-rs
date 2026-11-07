@@ -52,6 +52,7 @@ llmux/                  ← git 仓库根（origin = fork）
 | 别名 / 聚合实际生效的首字节超时 | `GET /api/aggregate-aliases` 的 `first_byte_timeout_secs`，以及候选上的同名字段 | 候选值优先于聚合值；两个都空 → `FIRST_BYTE_TIMEOUT_SECS`（`grep -n FIRST_BYTE_TIMEOUT_SECS crates/llmux-core/src/adapters/mod.rs`） |
 | 测试是否**真的**全绿 | `cargo test > /tmp/t.log 2>&1`，然后 `grep '^test result' /tmp/t.log` | ⚠️ 别用 `cargo test \| tail`：管道的退出码是 `tail` 的，**编译失败也会被报成 exit 0**（2026-11-07 踩过）。判据是各套件的 passed/failed 计数 + `grep -c '^error'` |
 | 上游某别名今天的形态（端点、模型清单、免费档门） | 直接打上游，如 `GET https://opencode.ai/zen/v1/models` | 上游随时会变；本文关于上游的记述都是「某日实测」，用前先打一次 |
+| 部署是否**真的**把新代码放上去了 | `md5sum target/release/llmux deploy/llmux` + `ssh router 'md5sum /root/docker/llmux/llmux; docker exec llmux md5sum /usr/local/bin/llmux'` 四处比 | 四个 md5 全等才算「新代码在线上」；`docker ps` 显示 `Up` 只说明容器活着，不说明跑的是哪份 binary。健康检查报失败时**先跑这一条**再谈回滚 |
 
 ### §schema replay（不碰生产库，也能看到终态 schema）
 
@@ -175,9 +176,19 @@ BASE_PATH=llmux ./deploy/deploy.sh -y           # 带基路径前缀（build 时
 
 脚本流程：UI 增量构建（`VITE_BASE_PATH` 非空时注入 `base=/llmux/` + Router basename）→ cargo build --release → 本地+远程 binary 备份（`llmux.bak-<ts>`）→ scp → `docker compose build && up -d` → `/llmux/api/health` 健康检查（`BASE_PATH` 非空时走带前缀路径）。
 
-健康检查是**轮询**（每 2s 一轮、最多 `HEALTH_WAIT_SECS=60`，任一 URL 首次 2xx 即通过），
-不是「sleep 3 后 curl 一次」。后者实测把成功部署误报成失败：`up -d` 返回时进程还没监听；
-而失败分支的 `exit 1` 会跳过收尾的镜像 prune 与旧备份清理。
+健康检查是**轮询**（每 2s 一轮、最多 `HEALTH_WAIT_SECS=180`，任一 URL 首次 2xx 即通过），
+不是「sleep 3 后 curl 一次」。后者实测把成功部署误报成失败：`up -d` 返回时进程还没监听。
+⚠️ **窗口必须盖过应用启动时间**：2026-11-07 一次部署轮询 60s 全灭，但部署本身是成功的
+（四处 md5 一致、三个 URL 随后都 200）—— 实测容器 `StartedAt=14:43:33` 而
+`🚀 Server running` 打在 **14:44:53**，**约 80s 才开始监听**。判据（别引用这个数，重测）：
+`ssh router 'docker inspect --format "{{.State.StartedAt}} restarts={{.RestartCount}}" llmux'`
++ `ssh router 'docker logs --since 25m llmux 2>&1 | grep -m1 "Server running"'` ——
+两个时间差大于窗口就是「启动慢」，不是「部署失败」。
+⚠️ **含义**：每次部署生产有 **约 80–90s 不可用**（旧容器被替换、新容器还没监听），
+别在流量高峰部署，也别把这段时间的下游报错当成新版本的回归。
+失败分支**不再提前 `exit 1`**（2026-11-07 改）：以前它会连带跳过日志目录校验（7b）与
+镜像 prune / 旧备份清理（8），既留悬空镜像又把「日志写不到 NAS」这种真问题藏起来；
+现在收尾照常跑，退出码在脚本末尾按健康结论决定。
 遇孤儿容器（无 compose label）自动安全删除接管（数据在挂载卷，容器只含进程）。
 **不做镜像版本管理**，tag 统一 `llmux:latest`，build 即覆盖。
 影子模式（已归档）：曾用 `llmux_new:25977` + `data_shadow` 隔离验证，现已合并为单容器 `llmux:25977`。

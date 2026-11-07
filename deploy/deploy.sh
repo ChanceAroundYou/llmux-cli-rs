@@ -152,13 +152,22 @@ fi
 #
 # 不能「sleep 3 后一次性 curl」：`docker compose up -d` 返回时容器刚创建，
 # 进程还没开始监听，实测把一次成功部署报成「✗ 健康检查失败」（镜像已 build、
-# binary 已 scp、容器 Up，几秒后同一 URL 就 200）。更糟的是下面失败分支的
-# `exit 1` 会跳过收尾的镜像 prune 与旧备份清理，留下一堆悬空镜像。
-# 超时可用 HEALTH_WAIT_SECS 覆盖（默认 60s）。
-HEALTH_WAIT_SECS="${HEALTH_WAIT_SECS:-60}"
+# binary 已 scp、容器 Up，几秒后同一 URL 就 200）。
+#
+# 但**窗口要盖过应用启动时间**，60s 不够：2026-11-07 实测容器
+# `StartedAt=14:43:33` 而日志里 `🚀 Server running` 是 **14:44:53** —— 80s 才开始监听，
+# 60s 的窗口对一次完全成功的部署照样报失败。判据（不是这里的数，用命令重测）：
+#   ssh router 'docker inspect --format "{{.State.StartedAt}}" llmux'
+#   ssh router 'docker logs --since 25m llmux 2>&1 | grep -m1 "Server running"'
+#
+# 失败**不再提前 exit**：以前 `exit 1` 会连带跳过第 7b 步的日志目录校验和第 8 步的
+# 镜像 prune / 旧备份清理，留下一堆悬空镜像，而且把「日志写不到 NAS」这种真问题
+# 一起藏掉。现在照常走完，最后再按健康结论决定退出码。
+HEALTH_WAIT_SECS="${HEALTH_WAIT_SECS:-180}"
 echo "▶ 等待容器就绪（最多 ${HEALTH_WAIT_SECS}s）..."
 run ssh "$ROUTER" "docker ps --filter name=^llmux\$ --format '{{.Names}} {{.Status}}'"
 health_ok=0
+health_failed=0
 health_url_ok=""
 deadline=$((SECONDS + HEALTH_WAIT_SECS))
 while [ "$SECONDS" -lt "$deadline" ]; do
@@ -178,7 +187,7 @@ else
   echo "  尝试: ${HEALTH_URLS[*]}" >&2
   echo "  诊断: ssh $ROUTER 'docker ps; docker logs --tail 50 llmux; curl -v http://127.0.0.1:${PROD_PORT}${HEALTH_PATH}'" >&2
   echo "  回滚: ssh $ROUTER 'cd $REMOTE_DIR && cp llmux.bak-$TS llmux && docker compose build && docker compose up -d'" >&2
-  exit 1
+  health_failed=1
 fi
 
 # 7b. 日志目录校验 — LOG_DIR 指向 NAS(CIFS bind mount)。挂载掉线时 docker 会把
@@ -218,3 +227,14 @@ run ssh "$ROUTER" "find $REMOTE_DIR -maxdepth 1 \( -name 'llmux.bak-*' -o -name 
 echo "  ℹ 限量备份仅留最新 3 份（本地+远程）"
 if [ "$DRY_RUN" -eq 0 ]; then ls -t "$DEPLOY_DIR"/llmux.bak-* 2>/dev/null | tail -n +4 | xargs -r rm -v 2>&1 | head -n 20 || true; fi
 run ssh "$ROUTER" "ls -t $REMOTE_DIR/llmux.bak-* 2>/dev/null | tail -n +4 | xargs -r rm -v 2>&1 | head -n 20 || true"
+
+# 9. 退出码 — 清理与校验都跑完了，最后才按健康结论决定
+if [ "${health_failed:-0}" -eq 1 ]; then
+  echo "✗ 健康检查在 ${HEALTH_WAIT_SECS}s 内没通过（收尾清理已照常执行）" >&2
+  echo "  先分清是「应用还没起来」还是「起来了但探不到」：" >&2
+  echo "  ssh $ROUTER 'docker inspect --format \"{{.State.StartedAt}} restarts={{.RestartCount}}\" llmux; docker logs --since 25m llmux 2>&1 | grep -m1 \"Server running\"'" >&2
+  echo "  两个时间差 > 窗口 → 是启动慢（HEALTH_WAIT_SECS 调大），不是部署失败" >&2
+  echo "  回滚: ssh $ROUTER 'cd $REMOTE_DIR && cp llmux.bak-$TS llmux && docker compose build && docker compose up -d'" >&2
+  exit 1
+fi
+echo "✓ 部署完成"

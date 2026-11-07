@@ -106,6 +106,15 @@
 
 ### Fixed
 
+- **`deploy.sh` 的健康检查窗口 60s → 180s，且失败不再提前 `exit 1`**。2026-11-07 一次部署
+  被误报成失败：轮询 60s 内三个 URL 全无 2xx，而部署本身是成功的（本地/`deploy/`/路由器/容器内
+  四处 md5 全等，随后三个 URL 都回 200）。实测容器 `StartedAt=14:43:33`、日志里
+  `🚀 Server running` 打在 **14:44:53** —— 应用**约 80s 才开始监听**，窗口够不到。
+  副作用不止误报：失败分支的 `exit 1` 连带跳过第 7b 步的日志目录（NAS/CIFS）校验与
+  第 8 步的镜像 prune / 旧备份清理。现在收尾照常执行，退出码在脚本末尾按健康结论决定，
+  并在失败时直接给出「启动慢 vs 真失败」的判据命令（`docker inspect StartedAt` vs
+  `docker logs | grep -m1 "Server running"`）。顺带确认的新事实：每次部署生产约 80–90s 不可用。
+
 - **Codex `config.toml` 的编辑改用 `toml_edit` 按 section 定位**（移植上游 `fbf6713`，
   新文件 `crates/llmux-server/src/routes/system/codex_toml.rs`）。此前是
   `toml.find("model = \"")` 那一套字符串打补丁，三条都会写坏用户自己的 Codex 配置，
