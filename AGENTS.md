@@ -203,6 +203,11 @@ BASE_PATH=llmux ./deploy/deploy.sh -y           # 带基路径前缀（build 时
 - 日志：滚动文件 `llmux.log.<日期>-<两位后缀>`（**不是按天**；启动时自动清理超期旧日志，`LOG_RETAIN_DAYS` 可覆盖，**compose 里默认 30**）；`docker logs` 另有 `json-file 50m*2`。
   ⚠️ **别按文件名猜内容所在小时**：2026-11-07 13:10 读到最新的是 `llmux.log.2026-11-07-05`、mtime 13:00 —— 后缀与小时不同步。
   ⚠️ **旧小时会被 gzip**（`.gz`）→ `rg` 搜不出东西，用 `zgrep` / `zcat … | rg`；只有最近几份是明文。
+  ⚠️ **压缩是在启动路径上跑的**：2026-11-07 实测新容器 `StartedAt=14:43:33`，14:43:39→14:44:52
+  连压 5 份当日小时日志（每份 8–27s，都在 NAS/CIFS 上），**14:44:53 才 `Server running`** ——
+  部署那 80–90s 空档主要是它烧掉的。判据：
+  `rg -N -a 'compressed old log|Server running' ~/HD/openwrt/log-archive/llmux/llmux.log.$(date +%Y-%m-%d)*`。
+  这也解释了上一条：压缩只在容器启动时跑一轮，不是持续在压。
   ⚠️ **归档窗口不是 30 天**：2026-11-07 读到 78 个文件、跨度 `11-04-01 → 11-07-05`（约 3.5 天）。要更早的历史别在这里找。
   取当前清单 `ls -1t ~/HD/openwrt/log-archive/llmux/ | head`，找当天一律用通配 `llmux.log.$(date +%Y-%m-%d)*`
   - **日志不在容器里**，走 fnos NAS（`LOG_DIR=/data/llmux-logs`，6.4T 大盘，**不占路由器的 3.9G overlay**）。
