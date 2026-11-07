@@ -46,6 +46,7 @@ llmux/                  ← git 仓库根（origin = fork）
 | 迁移条数与**新库终态 schema**（表、索引） | 下方 §schema replay | 必须像 `init_db` 那样逐条执行并吞掉 `already exists` / `duplicate column`：直接 `executescript` 会在 0002 停住（0001 已含那列）—— 停住的那份不是终态 |
 | 某个索引是否真被用上 | replay 出 schema 后 `EXPLAIN QUERY PLAN` | 不出现在任何计划里的索引 = 纯负担（写放大 + 库变大，收益 0）；改动前后各测一次，**且先 `ANALYZE`** |
 | 库大小 / 回收是否生效 | `rg -N '回收 [0-9.]+ MiB 空闲页' ~/HD/openwrt/log-archive/llmux/llmux.log.$(date +%Y-%m-%d)* \| grep -v 'full request body'` | 判据是 `freelist_count`，不是 `ls -la`；**没有这行 = 本轮没到阈值，正常**（闲时零开销）。⚠️ `full request body` 行会把 AGENTS.md 自身内容回显进日志，不排掉就会「匹配到自己」（本文就是这么被骗过一次） |
+| 日志归档还在不在、覆盖到哪天 | `ls -1t ~/HD/openwrt/log-archive/llmux/ \| head -3`；跨度 `ls -1 ~/HD/openwrt/log-archive/llmux/llmux.log.* \| sed -n '1p;$p'` | ⚠️ 文件名是 `llmux.log.<日期>-<两位后缀>`（**不是按天**），且后缀**不等于内容所在小时**（2026-11-07 13:10 读到最新是 `-05`、mtime 13:00）。旧小时会被 gzip → `rg` 搜不到，用 `zgrep` / `zcat … \| rg`。窗口是快照：2026-11-07 读到 78 个文件、跨 `11-04-01 → 11-07-05`（约 3.5 天）—— **别按 `LOG_RETAIN_DAYS=30` 以为能翻 30 天** |
 | `target` 体积、「清一次能拿回多少」 | `du -sh target` + `./scripts/clean.sh`（默认 dry-run） | 「稳态」= 陈旧产物与增量缓存被清掉之后的读数；dry-run 报的「可释放」就是本轮上限 |
 | 当前账户 / 别名 / 聚合别名 id 与绑定 | 登录 Web 界面看；或带**会话 cookie**（不是 `/v1` 的 API key）打 `GET /api/models/aliases`、`GET /api/aggregate-aliases`、`GET /api/accounts` | **不要把 id 写进本文、脚本常量或提交** —— 按 id 操作前先查当前值 |
 | 别名 / 聚合实际生效的首字节超时 | `GET /api/aggregate-aliases` 的 `first_byte_timeout_secs`，以及候选上的同名字段 | 候选值优先于聚合值；两个都空 → `FIRST_BYTE_TIMEOUT_SECS`（`grep -n FIRST_BYTE_TIMEOUT_SECS crates/llmux-core/src/adapters/mod.rs`） |
@@ -188,12 +189,14 @@ BASE_PATH=llmux ./deploy/deploy.sh -y           # 带基路径前缀（build 时
 - 镜像 tag：统一 `llmux:latest`（不做版本管理，build 即覆盖）
 - 端口：容器内 25976 固定，宿主机当前为 25977（曾为 25976，基路径迁移时改；公网经 nginx 443 统一入口，内部 `localhost:25977`）
   ⚠️ 端口与 compose 形状会变，**别照本文抄**：取当前值 `ssh router 'grep -nE "2597[0-9]|ports:|BASE_PATH" /root/docker/llmux/docker-compose.yml'`
-- 日志：滚动文件 `llmux.log.<日期>[.<小时>]`，启动时自动清理超期旧日志（`LOG_RETAIN_DAYS` 可覆盖，**compose 里默认 30**）；`docker logs` 另有 `json-file 50m*2`。
-  ⚠️ **文件名格式会变**（当前读到的是按小时：`llmux.log.2026-11-07-04`；早期是按天）——
-  取当前清单 `ls -t ~/HD/openwrt/log-archive/llmux/ | head`，找当天一律用通配 `llmux.log.$(date +%Y-%m-%d)*`
+- 日志：滚动文件 `llmux.log.<日期>-<两位后缀>`（**不是按天**；启动时自动清理超期旧日志，`LOG_RETAIN_DAYS` 可覆盖，**compose 里默认 30**）；`docker logs` 另有 `json-file 50m*2`。
+  ⚠️ **别按文件名猜内容所在小时**：2026-11-07 13:10 读到最新的是 `llmux.log.2026-11-07-05`、mtime 13:00 —— 后缀与小时不同步。
+  ⚠️ **旧小时会被 gzip**（`.gz`）→ `rg` 搜不出东西，用 `zgrep` / `zcat … | rg`；只有最近几份是明文。
+  ⚠️ **归档窗口不是 30 天**：2026-11-07 读到 78 个文件、跨度 `11-04-01 → 11-07-05`（约 3.5 天）。要更早的历史别在这里找。
+  取当前清单 `ls -1t ~/HD/openwrt/log-archive/llmux/ | head`，找当天一律用通配 `llmux.log.$(date +%Y-%m-%d)*`
   - **日志不在容器里**，走 fnos NAS（`LOG_DIR=/data/llmux-logs`，6.4T 大盘，**不占路由器的 3.9G overlay**）。
   - **本机读取路径**：`~/HD/openwrt/log-archive/llmux/`（fnos 挂载点，`~/HD` = fnos 共享）。容器内 `/data/llmux-logs` 是**空的**（只有挂载点，日志直写 NAS），别去容器里找。同目录还有 `request-captures/next.json`（一次性捕获开关，见上）。
-  - 文件很大（单日几十~几百 MB），**别直接 `cat`**；用 `grep`/`rg` 或 `tail` 定位。
+  - 文件很大（**单个小时** 90–930 MB，2026-11-07 读到），**别直接 `cat`**；用 `grep`/`rg`（明文）或 `zgrep`（已压缩）定位。
 - 数据铁律：**绝不 `docker run -v /opt/llmux/data`**（2026-08-06 误用初始化空库）
 - binary 是 glibc 动态链接（在 Proxmox VM / Ubuntu 26.04 构建，**不是 WSL**；最高符号 `GLIBC_2.39`），**不能跑 Alpine/musl**
 - 容器实测内存 **~386MiB**（路由器 2GB）。⚠️ 早先记的「~18MiB」已过时——那是
@@ -211,7 +214,7 @@ BASE_PATH=llmux ./deploy/deploy.sh -y           # 带基路径前缀（build 时
   `ZEN_KEY`（OpenCode Zen，原先单独放 `.zenkey`，2026-10-19 已并入）。仍然不得写进
   本文件、代码、提交、命令输出或排障记录；脚本请求一律 `set -a; . ./.env.local; set +a`
   从文件读，别硬编码，并及时清理临时文件。
-- 生产请求日志在本机挂载的 `~/HD/openwrt/log-archive/llmux/llmux.log.YYYY-MM-DD`，不是 router 容器内；日志文件可能很大，只用 `rg`/`tail` 定位必要片段，避免整文件读取。
+- 生产请求日志在本机挂载的 `~/HD/openwrt/log-archive/llmux/`，文件名 `llmux.log.<日期>-<后缀>`（旧小时已 gzip → 用 `zgrep`），不是 router 容器内；文件按小时就有几百 MB，只用 `rg`/`zgrep`/`tail` 定位必要片段，避免整文件读取。
 - 完整请求只通过一次性捕获：在 `~/HD/openwrt/log-archive/llmux/request-captures/next.json` 写入 `{"alias":"of","model":"muse-spark-1.3-contributor"}`，下一个匹配的 Messages 请求会保存原始入站 JSON、实际出站 JSON 和上游响应。NAS 挂载可能忽略文件权限，因此 artifact 用 llmux `master.key` 加密；`REQUEST_CAPTURE_RETAIN_DAYS` 默认 7 天，到期自动清理。不要启用全量 TRACE body dump。
 - **2026-10-13 已定位并修复 `of` 的生产 400 根因**：完整捕获请求有 222 个 Responses `input` 项，其中 83 个 `function_call` + 83 个对应 `function_call_output`。Anthropic 历史里并行工具调用尚未全部返回时夹有普通消息；原转换按原序把消息插进未完成的工具调用批次，OpenCode Zen Go 的 Muse Spark Responses endpoint 对该形状回泛化 400。生产对照已复现：3 个调用后连续返回结果为 200；在 3 个调用和结果之间插入普通 user 项为 400；把完整原请求的普通消息延后到对应调用结果齐全后，生产返回 200（141,174 输入 token，输出上限 16）。部署后，原始 525,136-byte Messages body 保持逐字节不变（含 `max_tokens=32000`）经生产 `/v1/messages` 返回 HTTP 200；模型返回 `tool_use`，诊断脚本未执行工具。
 - `crates/llmux-core/src/proxy/responses.rs` 的 `group_responses_tool_history` 会保留工具调用/结果，并暂存未完成调用批次期间的普通消息，待该批次结果齐全后再发出。回归测试 `anthropic_parallel_tool_results_precede_intervening_messages` 覆盖此顺序。完整历史只把 max_output_tokens 降至 16 时仍回 400；单独短请求 `max_output_tokens=32000` 返回 200，故 32k 上限不是根因。`strict:false` 和降低输出上限都不是根因修复；不要通过删除工具历史或截断 prompt 绕过。
