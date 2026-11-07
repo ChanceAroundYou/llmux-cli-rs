@@ -86,52 +86,82 @@ async fn execute_provider_request_with(
 ) -> anyhow::Result<reqwest::Response> {
     let client = get_client();
     let method = reqwest::Method::from_bytes(request.method.as_bytes())?;
-    let mut builder = client.request(method, &request.url);
     let bound_first_byte = bound_first_byte_timeout(&request.body);
-    // ponytail: force identity encoding. Upstream SSE streams that get truncated
-    // mid-gzip make reqwest abort the whole stream ("error decoding response
-    // body"); with identity we receive plaintext and emit partial events instead.
-    builder = builder.header("accept-encoding", "identity");
     let mut headers = request.headers.clone();
     apply_upstream_identity_headers(&request.method, &request.url, &mut headers);
-    for (key, value) in &headers {
-        builder = builder.header(key.as_str(), value.as_str());
-    }
-    // GET with a literal "null" body gets rejected by strict upstreams (GitHub
-    // API); only attach the JSON body when there is one.
-    let send = if request.body.is_null() {
-        builder.send()
-    } else {
-        builder.json(&request.body).send()
-    };
-    let response = if bound_first_byte {
-        // 超时只包住 `send()` —— 它在响应头到达时就 resolve，body 不在其内。
-        match tokio::time::timeout(first_byte_timeout, send).await {
-            Ok(r) => r,
-            Err(_) => {
-                tracing::error!(
-                    "🚀❌ Upstream 首字节超时（{}s）: {} {}",
-                    first_byte_timeout.as_secs(),
+    // 连接层失败重试一次。
+    //
+    // 生产实测（2026-11-07，New API 中继 192.168.10.106:3000）：同一分钟内请求
+    // **交错**成功与失败，失败都是 dispatch 当秒就返回 `error sending request`，
+    // 说明不是上游慢，而是 TCP/TLS 这次没连上（keep-alive 连接被对端先关是最常见
+    // 的一类）。这种失败请求根本没发出去，重试不会重复计费；而调用方往往被这一下
+    // 直接打成 502（锁定的聚合别名没有下一个候选可退）。
+    //
+    // 只重试 `is_connect()`：超时（首字节/发送）和「已连上但中途出错」都不重试 ——
+    // 前者重试只是再等一轮，后者可能已经在上游计费，重试就是双花。
+    let mut attempts = 0u8;
+    let response = loop {
+        attempts += 1;
+        let mut builder = client.request(method.clone(), &request.url);
+        // ponytail: force identity encoding. Upstream SSE streams that get truncated
+        // mid-gzip make reqwest abort the whole stream ("error decoding response
+        // body"); with identity we receive plaintext and emit partial events instead.
+        builder = builder.header("accept-encoding", "identity");
+        for (key, value) in &headers {
+            builder = builder.header(key.as_str(), value.as_str());
+        }
+        // GET with a literal "null" body gets rejected by strict upstreams (GitHub
+        // API); only attach the JSON body when there is one.
+        let send = if request.body.is_null() {
+            builder.send()
+        } else {
+            builder.json(&request.body).send()
+        };
+        let response = if bound_first_byte {
+            // 超时只包住 `send()` —— 它在响应头到达时就 resolve，body 不在其内。
+            match tokio::time::timeout(first_byte_timeout, send).await {
+                Ok(r) => r,
+                Err(_) => {
+                    tracing::error!(
+                        "🚀❌ Upstream 首字节超时（{}s）: {} {}",
+                        first_byte_timeout.as_secs(),
+                        request.method,
+                        request.url
+                    );
+                    return Err(anyhow::anyhow!(
+                        "Upstream sent no response headers within {}s",
+                        first_byte_timeout.as_secs()
+                    ));
+                }
+            }
+        } else {
+            send.await
+        };
+
+        match response {
+            Ok(r) => break r,
+            Err(e) if attempts == 1 && e.is_connect() => {
+                tracing::warn!(
+                    "🔁 Upstream 连接失败，重试 1 次: {} {} - {e}",
                     request.method,
                     request.url
                 );
-                return Err(anyhow::anyhow!(
-                    "Upstream sent no response headers within {}s",
-                    first_byte_timeout.as_secs()
-                ));
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+            // 保留底层 reqwest::Error 作 source（Display 不变），后续日志用 `{:#}`
+            // 才能打出真正的成因链 —— 此前 `{e}` 只有 "error sending request for url
+            // (...)"，看不出是 DNS / 连接被拒 / 证书问题。
+            Err(e) => {
+                tracing::error!(
+                    "🚀❌ Upstream request failed: {} {} - {e}",
+                    request.method,
+                    request.url
+                );
+                return Err(anyhow::Error::new(e));
             }
         }
-    } else {
-        send.await
     };
-    response.map_err(|e| {
-        tracing::error!(
-            "🚀❌ Upstream request failed: {} {} - {e}",
-            request.method,
-            request.url
-        );
-        anyhow::anyhow!("{e}")
-    })
+    Ok(response)
 }
 
 /// Console Go (opencode.ai/zen/go/*) rejects inference requests that lack a
@@ -1193,6 +1223,40 @@ mod first_byte_timeout_tests {
             body,
             r#"{"choices":[{"message":{"content":"OK"}}]}"#,
             "body 必须完整读完（不中途截断）"
+        );
+    }
+
+    /// 连接层失败重试一次 —— 见 `execute_provider_request_with` 里的注释。
+    ///
+    /// 用一个绑定后立刻释放的端口制造「连接被拒」：两次尝试都会失败，但第一次
+    /// 失败后要等 300ms 再试。断言两件事：
+    ///   1. 错误保留 `reqwest::Error`（否则 `is_connect()` 无从判断，日志也只剩
+    ///      "error sending request for url" 这一句，看不出成因）；
+    ///   2. 总耗时 ≥ 重试间隔 —— 不重试时整个调用只要几毫秒，这条会红。
+    #[tokio::test]
+    async fn a_refused_connection_is_retried_once() {
+        let addr = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap()
+        }; // listener 在这里被 drop → 端口拒绝连接
+        let started = std::time::Instant::now();
+        let err = execute_provider_request_with(
+            &post(
+                &format!("http://{addr}/v1/chat/completions"),
+                json!({"model": "m", "stream": true}),
+            ),
+            TEST_TIMEOUT,
+        )
+        .await
+        .expect_err("连接被拒时必须返回错误");
+        let elapsed = started.elapsed();
+        let re = err
+            .downcast_ref::<reqwest::Error>()
+            .expect("错误必须保留 reqwest::Error，否则 is_connect() 分类与成因链都丢了");
+        assert!(re.is_connect(), "连接被拒应被识别为 connect 错误：{err:#}");
+        assert!(
+            elapsed >= Duration::from_millis(250),
+            "连接失败没有重试（耗时只有 {elapsed:?}，小于 300ms 的重试间隔）"
         );
     }
 

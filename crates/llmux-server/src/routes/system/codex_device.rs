@@ -817,8 +817,14 @@ mod tests {
     #[test]
     fn expiry_uses_the_servers_timestamp_when_it_is_there() {
         let base = now_ms();
-        let with = expiry_ms(Some("2026-11-07T00:20:00+00:00"), base);
-        assert!(with > base, "服务端给的时刻该被采用");
+        // 别写死日期：曾经写的是 "2026-11-07T00:20:00+00:00"，到了那一天这个
+        // 「未来时刻」就成了过去，断言 `with > base` 从那天起永远失败。
+        let server_says = base + 20 * 60 * 1000;
+        let formatted = time::OffsetDateTime::from_unix_timestamp_nanos(server_says as i128 * 1_000_000)
+            .expect("时间戳合法")
+            .format(&time::format_description::well_known::Rfc3339)
+            .expect("格式化不该失败");
+        assert_eq!(expiry_ms(Some(&formatted), base), server_says, "服务端给的时刻该被采用");
         let without = expiry_ms(None, base);
         assert_eq!(without, base + DEVICE_CODE_TTL_SECS * 1000);
         // 解析不出来的字符串不能把会话变成永久有效。

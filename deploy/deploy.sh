@@ -148,24 +148,33 @@ else
 fi
 fi
 
-# 7. 健康检查 — 依次尝试 HEALTH_URLS，任一成功即通过
-echo "▶ 等待容器就绪..."
-sleep 3
+# 7. 健康检查 — 轮询到就绪为止，任一 URL 首次 2xx 即通过
+#
+# 不能「sleep 3 后一次性 curl」：`docker compose up -d` 返回时容器刚创建，
+# 进程还没开始监听，实测把一次成功部署报成「✗ 健康检查失败」（镜像已 build、
+# binary 已 scp、容器 Up，几秒后同一 URL 就 200）。更糟的是下面失败分支的
+# `exit 1` 会跳过收尾的镜像 prune 与旧备份清理，留下一堆悬空镜像。
+# 超时可用 HEALTH_WAIT_SECS 覆盖（默认 60s）。
+HEALTH_WAIT_SECS="${HEALTH_WAIT_SECS:-60}"
+echo "▶ 等待容器就绪（最多 ${HEALTH_WAIT_SECS}s）..."
 run ssh "$ROUTER" "docker ps --filter name=^llmux\$ --format '{{.Names}} {{.Status}}'"
 health_ok=0
-for url in "${HEALTH_URLS[@]}"; do
-  if curl -fsS --max-time 10 "$url" >/dev/null 2>&1; then
-    echo "✓ $url OK — 部署成功"
-    health_ok=1
-    break
-  else
-    echo "  ✗ $url 不通，尝试下一个..."
-  fi
+health_url_ok=""
+deadline=$((SECONDS + HEALTH_WAIT_SECS))
+while [ "$SECONDS" -lt "$deadline" ]; do
+  for url in "${HEALTH_URLS[@]}"; do
+    if curl -fsS --max-time 5 "$url" >/dev/null 2>&1; then
+      health_ok=1
+      health_url_ok="$url"
+      break 2
+    fi
+  done
+  sleep 2
 done
 if [ "$health_ok" -eq 1 ]; then
-  :
+  echo "✓ $health_url_ok OK — 部署成功"
 else
-  echo "✗ 健康检查失败（已尝试 ${#HEALTH_URLS[@]} 个 URL）!" >&2
+  echo "✗ 健康检查失败（${HEALTH_WAIT_SECS}s 内 ${#HEALTH_URLS[@]} 个 URL 均未就绪）!" >&2
   echo "  尝试: ${HEALTH_URLS[*]}" >&2
   echo "  诊断: ssh $ROUTER 'docker ps; docker logs --tail 50 llmux; curl -v http://127.0.0.1:${PROD_PORT}${HEALTH_PATH}'" >&2
   echo "  回滚: ssh $ROUTER 'cd $REMOTE_DIR && cp llmux.bak-$TS llmux && docker compose build && docker compose up -d'" >&2

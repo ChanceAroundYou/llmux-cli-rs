@@ -120,6 +120,10 @@ BASE_PATH=llmux ./deploy/deploy.sh -y           # 带基路径前缀（build 时
 ```
 
 脚本流程：UI 增量构建（`VITE_BASE_PATH` 非空时注入 `base=/llmux/` + Router basename）→ cargo build --release → 本地+远程 binary 备份（`llmux.bak-<ts>`）→ scp → `docker compose build && up -d` → `/llmux/api/health` 健康检查（`BASE_PATH` 非空时走带前缀路径）。
+
+健康检查是**轮询**（每 2s 一轮、最多 `HEALTH_WAIT_SECS=60`，任一 URL 首次 2xx 即通过），
+不是「sleep 3 后 curl 一次」。后者实测把成功部署误报成失败：`up -d` 返回时进程还没监听；
+而失败分支的 `exit 1` 会跳过收尾的镜像 prune 与旧备份清理。
 遇孤儿容器（无 compose label）自动安全删除接管（数据在挂载卷，容器只含进程）。
 **不做镜像版本管理**，tag 统一 `llmux:latest`，build 即覆盖。
 影子模式（已归档）：曾用 `llmux_new:25977` + `data_shadow` 隔离验证，现已合并为单容器 `llmux:25977`。
@@ -325,6 +329,19 @@ ChatGPT Plus 的 Codex 额度直连 `chatgpt.com/backend-api/codex`，llmux 原�
 - ⚠️ **`usage_logs.ttft_ms` 在非流式下等于 `latency_ms`**（实测无一例外，
   非流式路径直接传 `Some(latency_ms)`）。所以**库里没有字段能分开「首字节慢」和
   「生成慢」**。要按 token 量拆这两段，只能先加埋点，别拿 `latency_ms` 当首字节用。
+- ⚠️ **大 body 的失败先看错误串，别默认是首字节超时**（2026-11-07 实测）。`of`/`deepseek-yf`
+  经 New API 中继（`192.168.10.106:3000`）的 430–1000KB 请求，失败形态是**流式跑到一半**
+  `error decoding response body` + `stream truncated: chunks=297 overflow=false`，dispatch
+  到出错只有 4 秒 —— 而别名配的首字节超时是 60s / `of` 90s，**根本没到点**。上游自己把 SSE
+  截断了。判据三条一起看：① 失败点远小于别名超时 ② `chunks>0` 说明已经出过内容 ③
+  `overflow=false` 排除上下文超限。这类失败**不能靠调超时解决**，llmux 也重试不了（内容已经
+  发给客户端）；能做的只有换候选（锁定的聚合别名没有下一个候选，会直接 502）。
+- **连接层失败现在自动重试 1 次**（间隔 300ms，判据 `reqwest::Error::is_connect()`）。
+  同一次实测里还有一类失败：dispatch 当秒就 `error sending request`，且**紧挨着的下一笔请求
+  就成功** —— 不是上游慢，是 TCP/TLS 这次没连上（keep-alive 被对端先关最常见）。这种请求
+  根本没发出去，重试不重复计费；不重试就会被打成 502（锁定的别名没有退路）。
+  超时和「已连上但中途出错」都不重试（后者可能已经计费）。回归测试
+  `a_refused_connection_is_retried_once` 同时钉住分类与重试间隔。
 
 ## 路由模型机制
 

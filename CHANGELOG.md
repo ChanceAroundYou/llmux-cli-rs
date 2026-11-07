@@ -76,6 +76,23 @@
 
 ### Fixed
 
+- **别名的首字节超时设置一直没显示出来**。`/api/models/aliases` 返回的字段是
+  snake_case `first_byte_timeout_secs`（后端 `ModelAlias` 没有 `rename_all`），
+  前端却按 `firstByteTimeoutSecs` 读 —— 永远是 `undefined`，于是列表里的超时值和
+  编辑弹窗的回填都是空的。现在普通别名与聚合别名都显示**生效值**：没配显示
+  `30s（默认）`（后端 `FIRST_BYTE_TIMEOUT_SECS`），配了显示实际秒数。
+
+- **部署脚本的健康检查把成功误报成失败**。原来是 `sleep 3` 后一次性 curl，
+  而 `up -d` 返回时进程还没开始监听；失败分支的 `exit 1` 又会跳过收尾的
+  镜像 prune 与旧备份清理。改为轮询（每 2s 一轮、默认最多 60s，
+  `HEALTH_WAIT_SECS` 可覆盖）。
+
+- **上游连接层失败不再直接 502**。`execute_provider_request_with` 对
+  `is_connect()` 的失败重试 1 次（间隔 300ms）。生产实测这类失败是
+  dispatch 当秒返回 `error sending request`，紧挨着的下一笔请求就成功 ——
+  是连接没建立，不是上游慢；请求根本没发出去，重试不重复计费。
+  错误现在保留 `reqwest::Error` 作 source（`{:#}` 能打出成因链）。
+
 - **Codex 空闲账户：access_token 到期后没人去刷新**。加载模型、聚合拨测、保存别名前的
   校验、手工拨测四条路径此前只 `load_creds`，不查过期也不刷新；只有真实流量那条会自刷。
   于是空闲账户到期后自我锁死：拨测 401 → 冷却 30 分钟 → 加载模型 401 → 别名不健康
