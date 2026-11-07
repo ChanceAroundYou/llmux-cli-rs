@@ -3,12 +3,25 @@
 
 每条变异都必须**合法编译**（编译失败不算测试变红），且必须让对应测试变红。
 """
+import os
 import shutil
 import subprocess
 import sys
 
 ROOT = "/home/xiaokubao/projects/llmux"
 CARGO = "/home/xiaokubao/.cargo/bin/cargo"
+
+
+def restore(backup: str, path: str) -> None:
+    """还原源码，并把 mtime 推到当下。
+
+    ⚠️ 别用 `shutil.copy2` 还原：它连 mtime 一起还原成备份那一刻，而那一刻**早于**
+    刚才为这条变异编译出的测试二进制 —— cargo 判「源码没变」直接复用那个变异版产物，
+    于是下一条变异跑的其实是上一条的二进制，报出来的「✅ 变红 / ❌ 没变红」都不是
+    它声称的那条变异。备份那份保不保 mtime 无所谓，还原这一步必须 touch。
+    """
+    shutil.copyfile(backup, path)
+    os.utime(path, None)
 
 STALE_SKIP_OPENAI = """        // 来源普通别名已被删除 → 配置失效，跳过且不计失败（见 helpers::stale_candidate_reason）。
         if let Some(reason) = super::helpers::stale_candidate_reason(cand) {
@@ -99,13 +112,18 @@ def run_test(name: str) -> tuple[bool, str]:
 
 
 def main() -> int:
-    files = sorted({m["file"] for m in MUTATIONS})
+    # 可选参数：要重跑的变异序号（0 起）。默认全跑。
+    # 单条一般 2-3 分钟（重编 llmux-server + 测试二进制），全跑 7 条会超过
+    # 后台命令的 10 分钟上限 —— 被掐断时源码可能停在某条变异上，务必先 `git status` 确认还原。
+    picks = [int(a) for a in sys.argv[1:]] or list(range(len(MUTATIONS)))
+    mutations = [MUTATIONS[i] for i in picks]
+    files = sorted({m["file"] for m in mutations})
     backups = {}
     for f in files:
         shutil.copy2(f"{ROOT}/{f}", f"/tmp/mut3-{f.replace('/', '_')}")
     try:
         failures = 0
-        for m in MUTATIONS:
+        for m in mutations:
             path = f"{ROOT}/{m['file']}"
             src = open(path, encoding="utf-8").read()
             if src.count(m["find"]) != m["count"]:
@@ -123,12 +141,12 @@ def main() -> int:
                     if "test result" in line or "error[" in line or "panicked" in line or "assertion" in line.lower()
                 )
                 print(f"❌ 没变红：{m['name']}\n{tail}")
-            shutil.copy2(f"/tmp/mut3-{m['file'].replace('/', '_')}", path)
-        print(f"共 {len(MUTATIONS)} 条变异，失败 {failures}")
+            restore(f"/tmp/mut3-{m['file'].replace('/', '_')}", path)
+        print(f"共 {len(mutations)} 条变异，失败 {failures}")
         return 1 if failures else 0
     finally:
         for f in files:
-            shutil.copy2(f"/tmp/mut3-{f.replace('/', '_')}", f"{ROOT}/{f}")
+            restore(f"/tmp/mut3-{f.replace('/', '_')}", f"{ROOT}/{f}")
 
 
 if __name__ == "__main__":
