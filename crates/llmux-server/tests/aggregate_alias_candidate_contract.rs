@@ -617,13 +617,16 @@ async fn a_referenced_alias_keeps_its_own_first_byte_timeout() {
     );
 }
 
-// --- 7. 协议不一致：警告 + 运行时跳过，不 400 -----------------------------------
+// --- 7. 协议不一致：保存时 400（2026-11-07 改） --------------------------------
 
-/// 与 2026-08 的决定一致（强制协议不在保存侧拒绑定）：拒掉会把「别名后来改了
-/// 协议」变成保存不进去的聚合别名。但**必须说出来** —— 用户挑的是别名，看不到
-/// 底下的账户，不告诉他就只剩「为什么没走到这个候选」这种查不动的问题。
+/// 原先是「notes 警告 + 运行时跳过」。改判的原因：候选来自**别名**时用户看不见底下的
+/// 协议，「保存成功、但这条候选永远走不通」不是配置而是坑 —— 而 400 给出的两条出路
+/// 都在用户手里（换候选 / 改这个聚合强制的协议）。
+///
+/// 运行时跳过**保留**：改普通别名的协议会经 `resync_alias_candidates` 直接重展开进
+/// 已存的聚合别名，那条路不经过本保存路由。
 #[tokio::test]
-async fn a_protocol_mismatch_between_alias_and_aggregate_is_a_note_not_a_rejection() {
+async fn a_protocol_conflict_between_referenced_alias_and_aggregate_is_rejected_on_save() {
     let base = spawn_mock().await;
     let state = llmux_server::test_state().await;
     let app = llmux_server::app(state.clone());
@@ -644,16 +647,85 @@ async fn a_protocol_mismatch_between_alias_and_aggregate_is_a_note_not_a_rejecti
         }),
     )
     .await;
-    assert_eq!(st, StatusCode::OK, "协议不一致不该 400：{body:?}");
-    let notes = body["notes"].as_array().cloned().unwrap_or_default();
-    assert!(
-        !notes.is_empty(),
-        "不一致必须在响应里说出来（只有后端知道候选底下是什么）：{body:?}"
+    assert_eq!(
+        st,
+        StatusCode::BAD_REQUEST,
+        "候选强制 chat、聚合强制 responses —— 保存就该拒，不该留下永远走不通的候选：{body:?}"
     );
+    assert_eq!(
+        body["code"].as_str().unwrap_or_default(),
+        "candidate_protocol_conflict",
+        "前端要靠这个 code 定位到具体候选行：{body:?}"
+    );
+    let msg = body["error"].as_str().unwrap_or_default();
     assert!(
-        notes
+        msg.contains("d4proto") && msg.contains("chat") && msg.contains("responses"),
+        "要说清是哪条候选、两边各强制什么：{body:?}"
+    );
+
+    // 拒掉就是拒掉：库里不能有这条聚合别名。
+    let (st, body) = api(
+        &app,
+        &cookie,
+        Method::GET,
+        "/api/aggregate-aliases",
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body:?}");
+    assert!(
+        body.as_array()
+            .cloned()
+            .unwrap_or_default()
             .iter()
-            .any(|n| n.as_str().unwrap_or_default().contains("skipped at runtime")),
-        "要说清后果是运行时跳过：{body:?}"
+            .all(|a| a["alias"].as_str() != Some("agg-proto")),
+        "400 之后不该留下半成品聚合别名：{body:?}"
     );
+}
+
+/// 冲突判据不挂在「有没有 via_alias」上：手工挑的一对候选显式带了 `upstream_api`
+/// 且与聚合强制的协议不一致，同样 400。
+#[tokio::test]
+async fn a_hand_picked_candidate_with_conflicting_upstream_api_is_rejected_too() {
+    let base = spawn_mock().await;
+    let state = llmux_server::test_state().await;
+    let app = llmux_server::app(state.clone());
+    let cookie = login(&app).await;
+    let acct = create_account(&app, &cookie, "handproto", &format!("{base}/fast")).await;
+
+    let (st, body) = api_post(
+        &app,
+        &cookie,
+        "/api/aggregate-aliases",
+        json!({
+            "alias": "agg-hand-proto",
+            "candidates": [{"account_id": acct, "model": "m-hand", "upstream_api": "chat"}],
+            "upstream_api": "responses",
+        }),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::BAD_REQUEST,
+        "没有 via_alias 也照样是冲突：{body:?}"
+    );
+    assert_eq!(
+        body["code"].as_str().unwrap_or_default(),
+        "candidate_protocol_conflict",
+        "{body:?}"
+    );
+
+    // 同一对候选，不带 upstream_api（= 不强制）→ 正常保存（不强制就不是冲突）
+    let (st, body) = api_post(
+        &app,
+        &cookie,
+        "/api/aggregate-aliases",
+        json!({
+            "alias": "agg-hand-proto",
+            "candidates": [{"account_id": acct, "model": "m-hand"}],
+            "upstream_api": "responses",
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "候选不强制协议时不该拦：{body:?}");
 }

@@ -513,14 +513,14 @@ export default function Models() {
     setAggregateForm({ alias: '', downstreamMode: 'default', candidates: [{ account_id: '', model: '' }], firstByteTimeoutSecs: '' });
   };
 
-  /// 来源别名自己强制的协议与聚合强制的协议不一致 —— 后端**不会** 400（与 2026-08
-  /// 那条「强制协议不在保存时拒」的决定一致），但保存后这一候选会在运行时被跳过。
-  /// 所以在编辑器里先说出来，否则用户只会看到「怎么没走到这个候选」。
+  /// 候选自带的协议与聚合强制的协议不一致 —— **保存会被后端 400**（2026-11-07 改，
+  /// 此前只是 notes 警告 + 运行时跳过）。在编辑器里先说出来，并把两条出路写清楚，
+  /// 否则用户只会看到「怎么没走到这个候选」。
   const aliasModeConflict = (aliasMode?: string | null) => {
     const aggMode = aggregateForm.downstreamMode;
     if (aggMode === 'default' || !aliasMode || aliasMode === 'default') return null;
     return aliasMode === aggMode ? null
-      : `来源别名强制 ${aliasMode}，本聚合强制 ${aggMode} —— 保存后这一候选会在运行时被跳过`;
+      : `候选强制 ${aliasMode}，本聚合强制 ${aggMode} —— 保存会被拒：换掉这条候选，或改本聚合的上游协议`;
   };
 
   const handleSaveAggregate = async (e: React.FormEvent) => {
@@ -548,6 +548,16 @@ export default function Models() {
     const broken = rows.filter(c => !isAliasRefRow(c) && missingViaAlias(c, aliases));
     if (broken.length > 0) {
       setAggregateFormNotice(`候选来源已删除：${broken.map(c => `账户 #${c.account_id} ← 别名 ${c.via_alias}`).join('、')} —— 删掉这一行，或先建回同名别名再保存。`);
+      return;
+    }
+    // 协议冲突：后端保存时 400（2026-11-07 改）。这里先拦是因为同一句中文提示能落到
+    // 具体候选行上，比吃一条英文 400 有用。判据与后端一致：只看候选自己的
+    // upstream_api（引用行 = 那条别名记录的 upstream_api），default 不算冲突。
+    const clash = rows.filter(c => aliasModeConflict(
+      isAliasRefRow(c) ? aliases.find(a => a.alias === c.alias_ref)?.upstream_api : c.upstream_api,
+    ));
+    if (clash.length > 0) {
+      setAggregateFormNotice(`协议冲突：${clash.map(c => isAliasRefRow(c) ? `别名 ${c.alias_ref}` : `账户 #${c.account_id} ${c.model}`).join('、')} 与本聚合强制的上游协议不一致 —— 删掉这些候选，或把上面的「上游协议」改成 default（或与之相同的值）。`);
       return;
     }
     // If editing and alias changed, delete old first
@@ -1506,7 +1516,10 @@ export default function Models() {
         onConfirm={async () => {
           if (!overwriteConfirm) return;
           if (overwriteConfirm.kind === 'ordinary') {
-            await saveAggregateAlias(overwriteConfirm.alias, overwriteConfirm.pending, undefined, true, 'chat');
+            // 覆盖重存要带**表单里选的上游协议**，不是写死的 'chat'：写死会在
+            // 「聚合本来强制 responses」这种情形下当场造出一条协议冲突的候选，
+            // 而现在协议冲突是保存时 400（2026-11-07），这条路径会直接失败。
+            await saveAggregateAlias(overwriteConfirm.alias, overwriteConfirm.pending, undefined, true, aggregateForm.downstreamMode || 'default');
             closeAggregateModal();
           } else {
             const pd = overwriteConfirm.pending;

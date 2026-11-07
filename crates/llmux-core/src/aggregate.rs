@@ -249,13 +249,13 @@ pub fn preserve_active_state(
 ///
 /// 返回被改写的聚合别名名（调用方据此逐个失效它们的解析缓存）。
 pub async fn resync_alias_candidates(pool: &SqlitePool, alias: &str) -> anyhow::Result<Vec<String>> {
-    let rows = sqlx::query_as::<_, (String, String, Option<i64>, Option<i64>)>(
-        "SELECT alias, candidates, active_idx, locked FROM aggregate_aliases",
+    let rows = sqlx::query_as::<_, (String, String, Option<i64>, Option<i64>, Option<String>)>(
+        "SELECT alias, candidates, active_idx, locked, upstream_api FROM aggregate_aliases",
     )
     .fetch_all(pool)
     .await?;
     let mut touched: Vec<String> = Vec::new();
-    for (agg_alias, candidates_json, active_idx, locked) in rows {
+    for (agg_alias, candidates_json, active_idx, locked, agg_api) in rows {
         let stored = match parse_candidates(&candidates_json) {
             Ok(v) => v,
             Err(e) => {
@@ -292,6 +292,22 @@ pub async fn resync_alias_candidates(pool: &SqlitePool, alias: &str) -> anyhow::
         }
         let (keep_active, keep_locked) =
             preserve_active_state(&candidates_json, active_idx, locked, &refreshed);
+        // 改这条别名的**协议**会把「候选强制 X、聚合强制 Y」直接写进已存的聚合别名 ——
+        // 保存路由的 400 拦不到这条路（这里不经过它），只能靠运行时跳过兜住。
+        // 不记一行日志，现场就只剩「为什么没走到这个候选」这种查不动的问题。
+        let agg_mode = crate::protocol::DownstreamMode::from_str(agg_api.as_deref().unwrap_or("default"));
+        if agg_mode != crate::protocol::DownstreamMode::Default {
+            for c in &refreshed {
+                let Some(api) = c.upstream_api.as_deref() else { continue };
+                let cand_mode = crate::protocol::DownstreamMode::from_str(api);
+                if cand_mode != crate::protocol::DownstreamMode::Default && cand_mode != agg_mode {
+                    tracing::warn!(
+                        "[agg:{agg_alias}] 候选 {}（{}）强制 {}，本聚合强制 {} —— 保存侧的 400 管不到这条路，运行时会跳过它；请到别名页重新保存这个聚合别名",
+                        c.account_id, c.model, cand_mode.as_str(), agg_mode.as_str()
+                    );
+                }
+            }
+        }
         let json = serde_json::to_string(&refreshed)?;
         sqlx::query(
             "UPDATE aggregate_aliases SET candidates = ?, active_idx = ?, locked = ?, updated_at = CURRENT_TIMESTAMP WHERE alias = ?",

@@ -96,6 +96,20 @@ MUTATIONS = [
         "count": 1,
         "test": "an_aggregate_can_forward_an_ordinary_alias_end_to_end",
     },
+    {
+        "name": "去掉「协议冲突保存时 400」的判据（冲突候选照样存进去）",
+        "file": "crates/llmux-server/src/routes/models/aggregate.rs",
+        "find": """                    if cand_mode == llmux_core::protocol::DownstreamMode::Default
+                        || cand_mode == mode
+                    {
+                        return None;
+                    }""",
+        "replace": """                    if true {
+                        return None;
+                    }""",
+        "count": 1,
+        "test": "a_protocol_conflict_between_referenced_alias_and_aggregate_is_rejected_on_save",
+    },
 ]
 
 

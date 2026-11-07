@@ -314,30 +314,64 @@ pub async fn set_aggregate_alias(
     let confirm = body.get("confirm").and_then(Value::as_bool).unwrap_or(false);
     let upstream_api = llmux_core::protocol::DownstreamMode::from_str(body.get("upstream_api").and_then(Value::as_str).unwrap_or("default")).as_str().to_string();
 
-    // Forced protocols no longer reject unsupported candidates (2026-08): the UI
-    // shows a red warning per candidate and the runtime dispatch skips them
-    // (dispatch_aggregate_* guards with protocol::supports / endpoint checks).
+    // 候选自带的 `upstream_api` 与本聚合强制的 `upstream_api` 不一致 → **保存时 400**。
     //
-    // 别名候选同理，但这里能说得更清楚：来源别名自己强制的协议和本聚合强制的协议
-    // 不一致时，明确警告并写进响应（用户挑的是别名，看不到底下的账户，不告诉他就只剩
-    // 「为什么没走到这个候选」这种查不动的问题）。仍然不 400 —— 与 2026-08 那条决定一致，
-    // 拒绝会把「别名后来改了协议」变成保存不进去的聚合别名。
+    // 2026-11-07 改：此前只写 notes 警告 + 运行时跳过（与 2026-08「强制协议不在保存侧拒
+    // 绑定」那条决定一致）。改判的原因只有一条：候选来自**别名**时用户看不见底下的协议，
+    // 「保存成功、但这条候选永远走不通」不是配置而是坑，而 400 给的两条出路都在用户手里
+    // （换候选 / 改这个聚合强制的协议）。
+    //
+    // 运行时跳过**保留**（`dispatch_aggregate_*` 的 protocol::supports / endpoint 判定）：
+    // 改普通别名的协议会经 `resync_alias_candidates` 直接重展开进已存的聚合别名，
+    // 那条路不经过本路由，只能靠运行时兜住。
     {
         let mode = llmux_core::protocol::DownstreamMode::from_str(&upstream_api);
         if mode != llmux_core::protocol::DownstreamMode::Default {
-            for c in &parsed {
-                let (Some(via), Some(cand_api)) = (c.via_alias.as_deref(), c.upstream_api.as_deref()) else { continue };
-                let cand_mode = llmux_core::protocol::DownstreamMode::from_str(cand_api);
-                if cand_mode != llmux_core::protocol::DownstreamMode::Default && cand_mode != mode {
-                    tracing::warn!(
-                        "🔀 [agg:{alias}] 候选 {} 来自别名 '{via}'（别名强制 {}），聚合强制 {} —— 运行时会跳过这一候选",
-                        c.account_id, cand_mode.as_str(), mode.as_str()
-                    );
-                    notes.push(format!(
-                        "candidate from alias '{via}' forces {} but this aggregate forces {} — it will be skipped at runtime",
-                        cand_mode.as_str(), mode.as_str()
-                    ));
-                }
+            let conflicts: Vec<String> = parsed
+                .iter()
+                .filter_map(|c| {
+                    let cand_api = c.upstream_api.as_deref()?;
+                    let cand_mode = llmux_core::protocol::DownstreamMode::from_str(cand_api);
+                    if cand_mode == llmux_core::protocol::DownstreamMode::Default
+                        || cand_mode == mode
+                    {
+                        return None;
+                    }
+                    // 说清「哪一条、两边各强制什么」—— 前端要靠这个把警告落到具体行上。
+                    Some(match c.via_alias.as_deref() {
+                        Some(via) => format!(
+                            "candidate from alias '{via}' forces {}",
+                            cand_mode.as_str()
+                        ),
+                        None => format!(
+                            "candidate account {} model {} forces {}",
+                            c.account_id,
+                            c.model,
+                            cand_mode.as_str()
+                        ),
+                    })
+                })
+                .collect();
+            if !conflicts.is_empty() {
+                tracing::warn!(
+                    "🔀 拒绝保存聚合别名 {alias}：它强制 {}，但 {}",
+                    mode.as_str(),
+                    conflicts.join("; ")
+                );
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": format!(
+                            "Invalid alias candidate: protocol conflict — this aggregate forces {}, but {}",
+                            mode.as_str(),
+                            conflicts.join("; ")
+                        ),
+                        "code": "candidate_protocol_conflict",
+                        "aggregate_upstream_api": mode.as_str(),
+                        "conflicts": conflicts,
+                    })),
+                )
+                    .into_response();
             }
         }
     }
