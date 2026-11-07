@@ -427,6 +427,7 @@
     "accountUnsupportedMode": "Account does not support the \"{{mode}}\" routing mode. Pick another account or switch modes.",
     "downstreamUnsupportedBadge": "unsupported: {{mode}}",
     "firstByteTimeout": "First-byte timeout (seconds)",
+    "firstByteTimeoutDefaultValue": "{{secs}}s (default)",
     "firstByteTimeoutHint": "Optional; blank uses the 30-second default. Maximum 600 seconds.",
     "firstByteTimeoutPlaceholder": "Default (30 seconds)",
     "disableBtn": "Disable",

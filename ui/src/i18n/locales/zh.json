@@ -429,6 +429,7 @@
     "accountUnsupportedMode": "该账户不支持「{{mode}}」路由模式，请更换账户或切换模式。",
     "downstreamUnsupportedBadge": "不支持 {{mode}}",
     "firstByteTimeout": "首字节超时（秒）",
+    "firstByteTimeoutDefaultValue": "{{secs}}s（默认）",
     "firstByteTimeoutHint": "可选；留空使用 30 秒默认值，最大 600 秒。",
     "firstByteTimeoutPlaceholder": "默认（30 秒）",
     "disableBtn": "禁用",

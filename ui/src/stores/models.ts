@@ -19,7 +19,10 @@ export interface ModelAlias {
   provider_id: string | null;
   account_ids: string | null;
   preferred_account_id?: number | null;
-  firstByteTimeoutSecs: number | null;
+  /// 线上字段是 snake_case（后端 `ModelAlias` 没有 rename_all）——
+  /// 此前这里写成 `firstByteTimeoutSecs`，取到的永远是 undefined，
+  /// 于是列表里的超时值和编辑弹窗的回填都是空的。
+  first_byte_timeout_secs: number | null;
   upstream_api?: string | null;
 }
 
@@ -48,6 +51,8 @@ export interface AggregateAlias {
   candidates: AggregateCandidate[];
   interval_secs: number;
   upstream_api?: string | null;
+  /// 首字节超时（秒）。null = 走后端默认 30s（aggregate.rs 的 payload 用同一个字段名）。
+  first_byte_timeout_secs?: number | null;
   active: number;
   locked?: number | boolean | null;
   last_status: (boolean | null)[];

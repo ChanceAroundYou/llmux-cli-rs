@@ -65,6 +65,11 @@ type QueueStatus = { isRunning: boolean; current: number; total: number; progres
 const IDLE_QUEUE: QueueStatus = { isRunning: false, current: 0, total: 0, progress: 0 };
 const TEST_SCOPES: TestScope[] = ['aliases', 'aggregates', 'models'];
 
+/// 别名没配 first_byte_timeout_secs 时后端实际用的值。
+/// 与 `crates/llmux-core/src/adapters/mod.rs` 的 `FIRST_BYTE_TIMEOUT_SECS` 一致；
+/// 这里只用于「显示生效值」，不参与请求构造 —— 改了后端要同步改这里。
+const DEFAULT_FIRST_BYTE_TIMEOUT_SECS = 30;
+
 /// 拨测入口按钮。三个入口（别名 / 聚合 / 模型）视觉与交互完全一致，只有待测集合
 /// 不同；各自持有独立状态，所以点其中一个不会让另外两个也显示「测试中」。
 function ScopeTestButton({
@@ -575,7 +580,7 @@ export default function Models() {
                         selectedAccountIds: selectedIds,
                         preferredAccountId: a.preferred_account_id ?? null,
                         downstreamMode: normalizeMode((a as any).upstream_api),
-                        firstByteTimeoutSecs: a.firstByteTimeoutSecs ?? null,
+                        firstByteTimeoutSecs: a.first_byte_timeout_secs ?? null,
                       });
                       setEditingAliasId(a.id);
                       setIsModalOpen(true);
@@ -592,11 +597,20 @@ export default function Models() {
                         <ArrowRight size={10} className="text-muted-foreground opacity-30 shrink-0" />
                         <div className="flex items-center gap-2 min-w-0">
                           <div className="text-xs font-bold truncate text-muted-foreground">{a.target_model}</div>
-                          {a.firstByteTimeoutSecs != null && (
-                            <span className="text-[10px] font-bold text-muted-foreground/40 shrink-0" title="首字节超时">
-                              {a.firstByteTimeoutSecs}s
-                            </span>
-                          )}
+                          {/* 超时值一直显示：空值不是「没有限制」，而是走后端默认 30s
+                              （crates/llmux-core/src/adapters/mod.rs FIRST_BYTE_TIMEOUT_SECS）。
+                              只显示非空值会让默认值看起来像没设置、也看不出生效值是多少。 */}
+                          <span
+                            className={cn(
+                              "text-[10px] font-bold shrink-0",
+                              a.first_byte_timeout_secs == null ? "text-muted-foreground/30" : "text-muted-foreground/60"
+                            )}
+                            title={t('models.firstByteTimeout')}
+                          >
+                            {a.first_byte_timeout_secs == null
+                              ? t('models.firstByteTimeoutDefaultValue', { secs: DEFAULT_FIRST_BYTE_TIMEOUT_SECS })
+                              : `${a.first_byte_timeout_secs}s`}
+                          </span>
                           {result && (
                             <div className="flex items-center gap-1.5 shrink-0">
                               <div className={cn(
@@ -673,6 +687,19 @@ export default function Models() {
                       <div className="flex items-center gap-1.5 min-w-0">
                         <span className="px-2 py-0.5 bg-primary/10 text-primary rounded text-xs font-bold uppercase truncate shadow-sm border border-primary/5 shrink-0">{agg.alias}</span>
                         <CopyButton value={agg.alias} size={10} className="p-1 opacity-0 group-hover:opacity-100 transition-opacity shrink-0" />
+                        {/* 聚合别名的首字节超时此前完全没露出（只存在编辑弹窗里），
+                            和普通别名一样把生效值显示出来。 */}
+                        <span
+                          className={cn(
+                            "text-[10px] font-bold shrink-0",
+                            agg.first_byte_timeout_secs == null ? "text-muted-foreground/30" : "text-muted-foreground/60"
+                          )}
+                          title={t('models.firstByteTimeout')}
+                        >
+                          {agg.first_byte_timeout_secs == null
+                            ? t('models.firstByteTimeoutDefaultValue', { secs: DEFAULT_FIRST_BYTE_TIMEOUT_SECS })
+                            : `${agg.first_byte_timeout_secs}s`}
+                        </span>
                         {pendingNote && <span className="text-xs text-warning font-bold truncate">{pendingNote}</span>}
                       </div>
                       <Button variant="ghost" size="icon" onClick={(e) => { e.stopPropagation(); setAggregateToDelete({ id: agg.id, name: agg.alias }); }} className="h-6 w-6 shrink-0 text-muted-foreground hover:text-destructive transition-all"><Trash2 size={12} /></Button>
