@@ -50,7 +50,13 @@ Thumbs.db
 # deploy/ 产物（binary 与滚动备份，来自 target/release/llmux 的 cp）
 deploy/llmux
 deploy/llmux.bak-*
+# 回滚锚点：deploy.sh ⓪ 步存的「上一轮正在跑的」binary（约 13MB，同样不入仓）
+deploy/llmux.rollback
+deploy/llmux.shadow-*
 deploy/.claude/
+
+# 变异驱动脚本被 import 时的副产物
+scripts/__pycache__/
 
 # zen-free sidecar 运行时文件（容器本地，不入仓）
 deploy/zen-free/api-keys.json

@@ -11,6 +11,8 @@
 #   - 只写三类文件: 本地 deploy/llmux、路由器 llmux、compose 构建产物
 #   - 绝不触碰 data/（llmux_db.db + master.key）与 config.json
 #   - 每次覆盖前备份: 本地 llmux.bak-<ts> / 路由器 llmux.bak-<ts>
+#   - 覆盖前先留**永久回滚锚点** llmux.rollback（本地+远程，存执行前正在跑的那份，
+#     不参与第 8 步清理 —— 备份只留 7 天/3 份，锚点一直在）
 set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -97,6 +99,7 @@ if [ "$SHADOW" -eq 1 ]; then
   echo "  ⑤ 收尾: 清理悬空镜像 (docker image prune -f) + 本地/远程 >7天旧备份 (llmux.bak-*/llmux.shadow-*)"
 else
   echo "将要执行:"
+  echo "  ⓪ 先留回滚锚点 llmux.rollback（本地 + 远程各一份，存的是**现在正在跑的**那份）"
   echo "  ① cp target/release/llmux → $DEPLOY_DIR/llmux   (旧版备份 llmux.bak-$TS)"
   echo "  ② scp → $ROUTER:$REMOTE_DIR/llmux               (远程旧版备份 llmux.bak-$TS)"
   echo "  ③ $ROUTER: docker compose build && up -d (镜像 tag 统一 llmux:latest)"
@@ -126,6 +129,11 @@ if [ "$SHADOW" -eq 1 ]; then
   run ssh "$ROUTER" "mkdir -p $REMOTE_DIR/data_shadow && ( [ -f $REMOTE_DIR/data/llmux_db.db ] && cp -n $REMOTE_DIR/data/llmux_db.db $REMOTE_DIR/data_shadow/ 2>/dev/null || true )"
   run ssh "$ROUTER" "cd $REMOTE_DIR && docker compose -f docker-compose.shadow.yml build"
 else
+  # ⓪ 回滚锚点：存的是**此刻正在跑的**那份，且名字故意不用 llmux.bak-* ——
+  # 第 8 步的清理（>7 天删 + 只留最新 3 份）只认那两个前缀，碰不到它。
+  # 否则回滚窗口只有「最近 3 次部署」，出事先想到就已经过了。
+  [ -f "$DEPLOY_DIR/llmux" ] && run cp "$DEPLOY_DIR/llmux" "$DEPLOY_DIR/llmux.rollback"
+  run ssh "$ROUTER" "cp $REMOTE_DIR/llmux $REMOTE_DIR/llmux.rollback && ls -l $REMOTE_DIR/llmux.rollback"
   [ -f "$DEPLOY_DIR/llmux" ] && run cp "$DEPLOY_DIR/llmux" "$DEPLOY_DIR/llmux.bak-$TS"
   run cp target/release/llmux "$DEPLOY_DIR/llmux"
   run ssh "$ROUTER" "cp $REMOTE_DIR/llmux $REMOTE_DIR/llmux.bak-$TS && ls -l $REMOTE_DIR/llmux.bak-$TS"
@@ -186,7 +194,7 @@ else
   echo "✗ 健康检查失败（${HEALTH_WAIT_SECS}s 内 ${#HEALTH_URLS[@]} 个 URL 均未就绪）!" >&2
   echo "  尝试: ${HEALTH_URLS[*]}" >&2
   echo "  诊断: ssh $ROUTER 'docker ps; docker logs --tail 50 llmux; curl -v http://127.0.0.1:${PROD_PORT}${HEALTH_PATH}'" >&2
-  echo "  回滚: ssh $ROUTER 'cd $REMOTE_DIR && cp llmux.bak-$TS llmux && docker compose build && docker compose up -d'" >&2
+  echo "  回滚: ssh $ROUTER 'cd $REMOTE_DIR && cp llmux.rollback llmux && docker compose build && docker compose up -d'  （llmux.rollback 不参与清理；本轮的 llmux.bak-$TS 也在）" >&2
   health_failed=1
 fi
 
@@ -227,6 +235,10 @@ run ssh "$ROUTER" "find $REMOTE_DIR -maxdepth 1 \( -name 'llmux.bak-*' -o -name 
 echo "  ℹ 限量备份仅留最新 3 份（本地+远程）"
 if [ "$DRY_RUN" -eq 0 ]; then ls -t "$DEPLOY_DIR"/llmux.bak-* 2>/dev/null | tail -n +4 | xargs -r rm -v 2>&1 | head -n 20 || true; fi
 run ssh "$ROUTER" "ls -t $REMOTE_DIR/llmux.bak-* 2>/dev/null | tail -n +4 | xargs -r rm -v 2>&1 | head -n 20 || true"
+# 回滚锚点确认：清理只认 llmux.bak-*/llmux.shadow-*，这一份永远留（约 11 MiB）。
+echo "  ℹ 回滚锚点（不参与清理）:"
+[ "$DRY_RUN" -eq 1 ] || ls -l "$DEPLOY_DIR/llmux.rollback" 2>/dev/null || echo "    (本地缺 $DEPLOY_DIR/llmux.rollback)"
+run ssh "$ROUTER" "ls -l $REMOTE_DIR/llmux.rollback 2>/dev/null || echo '    (远程缺 $REMOTE_DIR/llmux.rollback)'"
 
 # 9. 退出码 — 清理与校验都跑完了，最后才按健康结论决定
 if [ "${health_failed:-0}" -eq 1 ]; then
@@ -234,7 +246,7 @@ if [ "${health_failed:-0}" -eq 1 ]; then
   echo "  先分清是「应用还没起来」还是「起来了但探不到」：" >&2
   echo "  ssh $ROUTER 'docker inspect --format \"{{.State.StartedAt}} restarts={{.RestartCount}}\" llmux; docker logs --since 25m llmux 2>&1 | grep -m1 \"Server running\"'" >&2
   echo "  两个时间差 > 窗口 → 是启动慢（HEALTH_WAIT_SECS 调大），不是部署失败" >&2
-  echo "  回滚: ssh $ROUTER 'cd $REMOTE_DIR && cp llmux.bak-$TS llmux && docker compose build && docker compose up -d'" >&2
+  echo "  回滚: ssh $ROUTER 'cd $REMOTE_DIR && cp llmux.rollback llmux && docker compose build && docker compose up -d'  （llmux.rollback 不参与清理；本轮的 llmux.bak-$TS 也在）" >&2
   exit 1
 fi
 echo "✓ 部署完成"
