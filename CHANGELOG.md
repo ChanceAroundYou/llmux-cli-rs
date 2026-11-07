@@ -26,8 +26,12 @@
     候选本身不删 —— 别名可能只是改名，或还会被建回来。
   - **超时优先级：候选自带的 > 聚合自己的**（`cand.first_byte_timeout_secs.or(agg...)`），
     「完整转发」就是这个意思。
-  - **协议不一致不 400**：保存回 `notes` 警告 + 运行时跳过，与 2026-08「强制协议不在保存时拒」
-    一致；前端在候选行上预先显示同一条冲突。
+  - **协议不一致在保存时 400**（`code=candidate_protocol_conflict`）：候选自带的 `upstream_api`
+    与本聚合强制的协议不一致就拒保存，`error` 点名是哪条候选、两边各强制什么。
+    此前是 `notes` 警告 + 运行时跳过；改判因为候选来自别名时用户看不见底下的协议，
+    「保存成功但永远走不通」不是配置而是坑。运行时跳过保留（改普通别名的协议会经
+    `resync_alias_candidates` 重展开进已存的聚合，不经过保存路由）；普通别名绑定账户
+    仍不在保存时拒（2026-08 那条决定未推翻）。前端在候选行上预先拦同一种冲突。
   - 契约测试 `crates/llmux-server/tests/aggregate_alias_candidate_contract.rs`（7 条，端到端走
     `/v1/chat/completions` + 真 mock 上游的 `/fast`、`/slow` 两条路径），
     并用 `scripts/mutate_alias_candidate.py` 做 7 条变异验证（7/7 变红，含

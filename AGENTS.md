@@ -448,9 +448,16 @@ context_length 字段：先查 models_cache（上游提供）→ 再查内置表
   候选本身**不删** —— 别名可能只是改名，或还会被建回来。
 - **超时优先级：候选自带的 > 聚合自己的**（`cand.first_byte_timeout_secs.or(agg.first_byte_timeout_secs)`），
   「完整转发」就是这个意思。
-- **协议不一致不 400**（别名强制 responses、聚合强制 chat 之类）：保存回 `notes` 警告 +
-  运行时跳过 —— 与 2026-08 那次「强制协议不在保存时拒」的决定一致
-  （`docs/superpowers/plans/2026-08-23-upstream-downstream-split.md`）。前端在编辑时就显示同一条冲突。
+- **协议不一致在保存聚合别名时 400**（2026-11-07 改，此前是 `notes` 警告 + 运行时跳过）：
+  候选自带的 `upstream_api`（来自被引用的别名，或候选显式带的）与本聚合强制的 `upstream_api`
+  不一致 → `400 code=candidate_protocol_conflict`，`error` 里点名是哪条候选、两边各强制什么。
+  改判的理由只有一条：候选来自**别名**时用户看不见底下的协议，「保存成功但这条候选永远走不通」
+  不是配置而是坑；而 400 给的两条出路（换候选 / 改这个聚合强制的协议）都在用户手里。
+  **两处不变**：① 运行时跳过保留 —— 改普通别名的协议会经 `resync_alias_candidates` 直接
+  重展开进已存的聚合别名，那条路不经过保存路由，只能靠运行时兜；② 普通别名绑定账户
+  仍不在保存时拒（2026-08 那条决定没被推翻，钉在 `tests/e2e_protocol_split.rs`）。
+  判据只看候选自己的 `upstream_api`（`default` 不算冲突），不挂在 `via_alias` 上。
+  前端在编辑时就拦同一种冲突并给同一句话（`aliasModeConflict`），不让你吃一条英文 400。
 - 契约测试 `crates/llmux-server/tests/aggregate_alias_candidate_contract.rs`（条数取法：
   `cargo test --test aggregate_alias_candidate_contract 2>&1 | grep '^test result'`）。
 
