@@ -7,10 +7,31 @@ use std::time::Instant;
 // Candidate & DB row
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AggregateCandidate {
     pub account_id: i64,
     pub model: String,
+    /// 这一候选是从哪个**普通别名**展开来的（`expand_alias_candidate` 写的）。
+    /// `None` = 手工挑的 (账户, 模型) 对，与旧数据完全一致。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via_alias: Option<String>,
+    /// 转发自来源别名的配置。
+    ///
+    /// ⚠️ 运行时的**线路形状仍由聚合别名自己的 `upstream_api` 决定** —— endpoint 在
+    /// 候选循环之前就已经定死了，一个候选不能中途换协议。这两个字段的作用是把来源
+    /// 别名的约束带到**保存侧和 UI**：不兼容在保存时就报出来，而不是等线上运行时
+    /// 被 `target_protocol` 静默跳过（那正是聚合别名最难查的一类「为什么没走到它」）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_api: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_byte_timeout_secs: Option<u64>,
+    /// 运行时判定，**不落库**（`serde(skip)`）：来源别名已经不在 `model_aliases` 里了。
+    ///
+    /// 这种候选是「配置失效」不是「上游坏了」：dispatch 跳过它且不记
+    /// `note_candidate_failure` —— 否则删掉一个普通别名就能在几轮里把聚合别名的
+    /// 主候选挤下线（3-confirm 迁移把它当成连续失败）。
+    #[serde(skip, default)]
+    pub stale_source: bool,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -41,6 +62,253 @@ pub fn parse_candidates(raw: &str) -> anyhow::Result<Vec<AggregateCandidate>> {
         }
     }
     Ok(v)
+}
+
+// ---------------------------------------------------------------------------
+// 候选引用普通别名（一层）
+// ---------------------------------------------------------------------------
+
+/// 候选里引用到的普通别名名（去重、保序）。保存校验、重展开、运行时陈旧判定共用。
+pub fn referenced_aliases(candidates: &[AggregateCandidate]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for c in candidates {
+        if let Some(name) = c.via_alias.as_deref() {
+            if !name.is_empty() && !out.iter().any(|n| n == name) {
+                out.push(name.to_string());
+            }
+        }
+    }
+    out
+}
+
+pub async fn is_aggregate_alias(pool: &SqlitePool, name: &str) -> anyhow::Result<bool> {
+    Ok(sqlx::query_scalar::<_, i64>("SELECT id FROM aggregate_aliases WHERE alias = ?")
+        .bind(name)
+        .fetch_optional(pool)
+        .await?
+        .is_some())
+}
+
+/// 哪些聚合别名的候选引用了这条普通别名。
+///
+/// 别名被**删除**时靠它立刻作废这些聚合的解析缓存（`HOT_CACHE_TTL` = 60s）——
+/// 不作废的话运行时最长一分钟还拿着「来源健在」的旧快照，跳过要等缓存过期才生效，
+/// 而这一分钟正是用户会拿来问「为什么没走到那个候选」的时间。
+pub async fn aggregates_referencing(pool: &SqlitePool, alias: &str) -> anyhow::Result<Vec<String>> {
+    let rows = sqlx::query_as::<_, (String, String)>("SELECT alias, candidates FROM aggregate_aliases")
+        .fetch_all(pool)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .filter(|(_, candidates)| {
+            parse_candidates(candidates)
+                .map(|c| referenced_aliases(&c).iter().any(|n| n == alias))
+                .unwrap_or(false)
+        })
+        .map(|(alias, _)| alias)
+        .collect())
+}
+
+/// 把一个普通别名**完整转发**成聚合候选：它的 target_model、它绑定的账户集、
+/// 它的 upstream_api 与首字节超时。
+///
+/// 解释与路由侧对普通别名一致（见 `dispatcher::resolve_model`）：
+///   - `account_ids` 为空 → 该 provider 下的全部启用账户
+///   - `target_model` 指向另一条别名 → 沿链解析到具体模型（候选里存的必须是具体模型，
+///     dispatch 直接把候选的 model 发给上游，不会再解析一次）
+///   - `preferred_account_id` 排在这批候选的最前 —— 别名自己的偏好带到聚合里
+///
+/// 返回 `(候选, 被丢掉的账户 id)`：来源别名里已停用的账户不进候选集，调用方要把
+/// 丢掉了哪些明确说出来（否则用户以为「跟着别名走」，实际少了两个账户）。
+///
+/// 报错的三种情况：名字是聚合别名（只允许一层）、名字不是任何别名、没有可用账户。
+pub async fn expand_alias_candidate(
+    pool: &SqlitePool,
+    alias: &str,
+) -> anyhow::Result<(Vec<AggregateCandidate>, Vec<i64>)> {
+    let name = alias.trim();
+    if name.is_empty() {
+        anyhow::bail!("alias candidate name must not be empty");
+    }
+    if is_aggregate_alias(pool, name).await? {
+        anyhow::bail!(
+            "alias candidate '{name}' is an aggregate alias — aggregate candidates may only reference an ordinary alias (one level)"
+        );
+    }
+    if crate::dispatcher::find_alias(pool, name).await?.is_none() {
+        anyhow::bail!("alias candidate '{name}' does not exist (no such ordinary alias)");
+    }
+    // 沿链解析：拿具体 target 模型、绑定账户集、协议、超时（和普通别名共用这条解析）
+    let resolution = crate::dispatcher::resolve_model(pool, name).await?;
+
+    let preferred = resolution.preferred_account_id;
+    let mut active_ids: Vec<i64> = Vec::new();
+    let mut declared: Vec<i64> = Vec::new();
+    if !resolution.account_ids.is_empty() {
+        let ids = &resolution.account_ids;
+        let placeholders: Vec<String> = ids.iter().map(|_| "?".to_string()).collect();
+        let sql = format!(
+            "SELECT id FROM accounts WHERE id IN ({}) AND is_active = 1 ORDER BY weight DESC, id ASC",
+            placeholders.join(",")
+        );
+        let mut query = sqlx::query(&sql);
+        for id in ids {
+            query = query.bind(id);
+        }
+        for row in query.fetch_all(pool).await? {
+            use sqlx::Row;
+            let id: i64 = row.try_get("id")?;
+            active_ids.push(id);
+        }
+        declared = ids.clone();
+    } else if !resolution.provider_id.is_empty() {
+        let rows = sqlx::query(
+            "SELECT id FROM accounts WHERE provider_id = ? AND is_active = 1 ORDER BY weight DESC, id ASC",
+        )
+        .bind(&resolution.provider_id)
+        .fetch_all(pool)
+        .await?;
+        for row in rows {
+            use sqlx::Row;
+            let id: i64 = row.try_get("id")?;
+            active_ids.push(id);
+        }
+    }
+    if active_ids.is_empty() {
+        anyhow::bail!(
+            "alias candidate '{name}' has no usable account (all bound accounts are missing or inactive)"
+        );
+    }
+
+    // 别名的偏好排在前面；其余按 weight/id 顺序（与 get_accounts_by_ids 一致）。
+    let mut ordered: Vec<i64> = Vec::with_capacity(active_ids.len());
+    if let Some(p) = preferred {
+        if active_ids.contains(&p) {
+            ordered.push(p);
+        }
+    }
+    ordered.extend(active_ids.iter().copied().filter(|id| Some(*id) != preferred));
+    // 声明顺序里有、但没进候选集的 = 已停用/已删除
+    let dropped: Vec<i64> = declared
+        .iter()
+        .copied()
+        .filter(|id| !ordered.contains(id))
+        .collect();
+
+    let candidates = ordered
+        .into_iter()
+        .map(|account_id| AggregateCandidate {
+            account_id,
+            model: resolution.target_model.clone(),
+            via_alias: Some(name.to_string()),
+            upstream_api: Some(resolution.upstream_api.as_str().to_string()),
+            first_byte_timeout_secs: resolution.first_byte_timeout_secs,
+            stale_source: false,
+        })
+        .collect();
+    Ok((candidates, dropped))
+}
+
+/// 保存聚合别名时保住「哪一格是 active、锁着没锁」的同一套判据（按候选身份
+/// account_id+model 把旧 active 映射到新列表）。
+///
+/// 保存路径和「普通别名变了 → 引用它的聚合别名重展开」都必须走这里 —— 此前这段
+/// 逻辑只有一份内联在保存路由里，重展开另写一份就会分叉（这个仓已经因「同一份
+/// 载荷写三处」踩过锁定修不好的坑）。
+pub fn preserve_active_state(
+    old_candidates_json: &str,
+    old_active_idx: Option<i64>,
+    old_locked: Option<i64>,
+    new_candidates: &[AggregateCandidate],
+) -> (i64, i64) {
+    if new_candidates.is_empty() {
+        return (0, 0);
+    }
+    let locked = old_locked.unwrap_or(0) == 1;
+    let old_list = parse_candidates(old_candidates_json).unwrap_or_default();
+    let pinned = old_list.get(old_active_idx.unwrap_or(0).max(0) as usize);
+    let moved = pinned.and_then(|old| {
+        new_candidates.iter().position(|c| {
+            c.account_id == old.account_id && c.model == old.model
+        })
+    });
+    match moved {
+        Some(idx) => (idx as i64, i64::from(locked)),
+        None => (0, 0),
+    }
+}
+
+/// 普通别名被保存 / 停用后，把引用它的聚合别名候选**重展开**成该别名当前的绑定。
+///
+/// 「跟着别名走」是这条机制的全部意义：别名改了绑定而聚合里留着旧快照，用户就会
+/// 在聚合里用到早就停用的账户。所以别名侧的每次保存都要回头刷新。
+///
+/// 别名被**删除**时不删候选：留着，由 `resolve_aggregate` 标成 `stale_source`
+/// 在运行时跳过（Deferred）。删掉会让「只剩这一个候选」的聚合别名变成空列表，
+/// 那是 `parse_candidates` 直接拒绝的非法状态，等于替用户删了别名。
+///
+/// 返回被改写的聚合别名名（调用方据此逐个失效它们的解析缓存）。
+pub async fn resync_alias_candidates(pool: &SqlitePool, alias: &str) -> anyhow::Result<Vec<String>> {
+    let rows = sqlx::query_as::<_, (String, String, Option<i64>, Option<i64>)>(
+        "SELECT alias, candidates, active_idx, locked FROM aggregate_aliases",
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut touched: Vec<String> = Vec::new();
+    for (agg_alias, candidates_json, active_idx, locked) in rows {
+        let stored = match parse_candidates(&candidates_json) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("[agg:{agg_alias}] 候选解析失败，跳过重展开: {e}");
+                continue;
+            }
+        };
+        if !referenced_aliases(&stored).iter().any(|n| n == alias) {
+            continue;
+        }
+        let expanded = match expand_alias_candidate(pool, alias).await {
+            Ok((c, dropped)) => {
+                if !dropped.is_empty() {
+                    tracing::info!(
+                        "[agg:{agg_alias}] 重展开别名 {alias}：丢掉 {} 个已不可用的账户 {dropped:?}",
+                        dropped.len()
+                    );
+                }
+                c
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "[agg:{agg_alias}] 引用的普通别名 {alias} 现在展不开（{e}）—— 候选保留，运行时按配置失效跳过，请到别名页重新保存这个聚合别名"
+                );
+                continue;
+            }
+        };
+        let mut refreshed: Vec<AggregateCandidate> = Vec::with_capacity(stored.len());
+        for stored_cand in &stored {
+            match stored_cand.via_alias.as_deref() {
+                Some(via) if via == alias => refreshed.extend(expanded.clone()),
+                _ => refreshed.push(stored_cand.clone()),
+            }
+        }
+        let (keep_active, keep_locked) =
+            preserve_active_state(&candidates_json, active_idx, locked, &refreshed);
+        let json = serde_json::to_string(&refreshed)?;
+        sqlx::query(
+            "UPDATE aggregate_aliases SET candidates = ?, active_idx = ?, locked = ?, updated_at = CURRENT_TIMESTAMP WHERE alias = ?",
+        )
+        .bind(&json)
+        .bind(keep_active)
+        .bind(keep_locked)
+        .bind(&agg_alias)
+        .execute(pool)
+        .await?;
+        touched.push(agg_alias.clone());
+        tracing::info!(
+            "[agg:{agg_alias}] 普通别名 {alias} 变了 → 候选跟着刷新（{} 个候选，active #{keep_active}）",
+            refreshed.len()
+        );
+    }
+    Ok(touched)
 }
 
 // ---------------------------------------------------------------------------
@@ -408,6 +676,46 @@ async fn find_aggregate_row(
     .await?)
 }
 
+/// 一次查询判掉所有 `via_alias` 来源还在不在。
+///
+/// 没有别名候选时**一条查询都不发** —— 现存的聚合别名全是手工候选，热路径
+/// （生产 ~43 req/s）不该为用不到的东西多付一次查询。
+///
+/// 查询失败时**不标**（宁可照常去试这个候选，也不要把一批好候选集体判成配置失效）：
+/// 试了失败会被现有的「account not found」分支接住，比静默跳过更容易查。
+async fn mark_stale_alias_sources(pool: &SqlitePool, candidates: &mut [AggregateCandidate]) {
+    let names = referenced_aliases(candidates);
+    if names.is_empty() {
+        return;
+    }
+    let placeholders: Vec<String> = names.iter().map(|_| "?".to_string()).collect();
+    let sql = format!(
+        "SELECT alias FROM model_aliases WHERE alias IN ({})",
+        placeholders.join(",")
+    );
+    let mut query = sqlx::query(&sql);
+    for name in &names {
+        query = query.bind(name);
+    }
+    let alive: std::collections::HashSet<String> = match query.fetch_all(pool).await {
+        Ok(rows) => {
+            use sqlx::Row;
+            rows.iter()
+                .filter_map(|r| r.try_get::<String, _>("alias").ok())
+                .collect()
+        }
+        Err(e) => {
+            tracing::warn!("检查聚合别名候选的来源失败（按原样继续）：{e}");
+            return;
+        }
+    };
+    for c in candidates.iter_mut() {
+        if let Some(via) = c.via_alias.as_deref() {
+            c.stale_source = !alive.contains(via);
+        }
+    }
+}
+
 pub async fn resolve_aggregate(
     pool: &SqlitePool,
     model_name: &str,
@@ -433,7 +741,8 @@ pub async fn resolve_aggregate(
             None => return Ok(None),
         },
     };
-    let candidates = parse_candidates(&row.candidates)?;
+    let mut candidates = parse_candidates(&row.candidates)?;
+    mark_stale_alias_sources(pool, &mut candidates).await;
     // C-A3：内存无 entry（重启刚起来、探活还没跑到这一轮）时回退到库里的
     // active_idx，而不是 0 —— 否则重启后第一次请求永远从 0 开始，手动起点
     // 要等探活跑一轮才恢复。有 entry 时内存是真实位置，库只是起点。

@@ -81,6 +81,47 @@ pub async fn set_model_alias(
         );
     };
     let confirm = body.get("confirm").and_then(Value::as_bool).unwrap_or(false);
+    // 编辑态携带的自身 id（可选）：用来区分「同名更新自己」和「名字被别的别名占着」。
+    let self_id = body.get("id").and_then(Value::as_i64);
+
+    // 同名冲突：alias 上有 UNIQUE，而 `INSERT … ON CONFLICT(alias) DO UPDATE` 永远不会
+    // 报冲突 —— 目标名已被**另一条**别名占用时，它会静默改掉那一条的 target/绑定/协议。
+    // 典型触发：编辑别名 A 时把名字改成已存在的 B（UI 改名走「先删 A 再建」，
+    // 建的时候 B 还活着 → 原本 B 被覆盖，A 却还在，两条别名变成一条都不对）。
+    // 判据只有「同名且不是自己」这一条；同名且是自己 → 正常更新。
+    //
+    // 这里排在聚合别名冲突检查之前：名字被普通别名占用时**没有 confirm 逃生口**
+    // （静默删掉别人的别名不是用户想要的），而前端对 409 的分支是看 `conflict` 字段，
+    // 先返回才不会把这种冲突渲染成「要覆盖聚合别名吗？」的确认框。
+    match sqlx::query_scalar::<_, i64>("SELECT id FROM model_aliases WHERE alias = ?")
+        .bind(&alias)
+        .fetch_optional(&state.pool)
+        .await
+    {
+        Ok(Some(existing_id)) if Some(existing_id) != self_id => {
+            tracing::warn!(
+                "🏷️ 拒绝保存别名 {alias}：名字已被别名 #{existing_id} 占用（请求携带 self_id={self_id:?}）"
+            );
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": format!("Alias name already taken: {alias}"),
+                    "code": "alias_name_taken",
+                    "conflict": "ordinary",
+                    "alias": alias,
+                    "existing_id": existing_id,
+                })),
+            )
+                .into_response();
+        }
+        Ok(_) => {}
+        Err(e) => {
+            return crate::error::simple_error(
+                format!("Failed to check alias name collision: {e}"),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            );
+        }
+    }
     // If an aggregate alias with same name exists, require confirm to overwrite
     let agg_exists: Option<i64> = match sqlx::query_scalar("SELECT id FROM aggregate_aliases WHERE alias = ?").bind(&alias).fetch_optional(&state.pool).await {
         Ok(v) => v,
@@ -148,8 +189,12 @@ pub async fn set_model_alias(
     // the UI warns and the runtime skips unsupported accounts (supports guard in
     // dispatch_with_conversion).
 
+    // 原地 UPSERT，不是 `INSERT OR REPLACE`。REPLACE 是「删旧行 + 插新行」，
+    // 在 `alias` UNIQUE 上每次保存都会换一个 rowid（AUTOINCREMENT 不会复用）——
+    // 而上面的冲突判据靠「库里同名行的 id == 请求携带的 self_id」，id 每次保存都漂，
+    // 同一条别名连着保存两次就会把自己判成冲突。ON CONFLICT DO UPDATE 保留原行、id 稳定。
     match sqlx::query(
-        "INSERT OR REPLACE INTO model_aliases (alias, target_model, provider_id, account_ids, preferred_account_id, upstream_api, first_byte_timeout_secs) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO model_aliases (alias, target_model, provider_id, account_ids, preferred_account_id, upstream_api, first_byte_timeout_secs) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(alias) DO UPDATE SET target_model=excluded.target_model, provider_id=excluded.provider_id, account_ids=excluded.account_ids, preferred_account_id=excluded.preferred_account_id, upstream_api=excluded.upstream_api, first_byte_timeout_secs=excluded.first_byte_timeout_secs",
     )
     .bind(&alias)
     .bind(&target_model)
@@ -167,6 +212,27 @@ pub async fn set_model_alias(
                 *cache = None;
             }
             state.invalidate_model_cache(&alias);
+            // 这条普通别名改了绑定 / 协议 / 超时 → 引用它的聚合别名候选跟着重新展开。
+            // 「加进聚合就跟着别名走」是这条机制的全部意义：留着旧快照，用户就会在
+            // 聚合里用到早就停用的账户。失败只记日志 —— 别名本身已经保存成功了，
+            // 不能因为刷新失败回 500 让用户以为别名没存上。
+            match llmux_core::aggregate::resync_alias_candidates(&state.pool, &alias).await {
+                Ok(touched) => {
+                    for agg in &touched {
+                        state.invalidate_aggregate_cache(agg);
+                    }
+                    if !touched.is_empty() {
+                        if let Ok(mut cache) = state.models_cache.lock() {
+                            *cache = None;
+                        }
+                        tracing::info!(
+                            "🔀 别名 {alias} 变更 → {} 个聚合别名候选已重新展开: {:?}",
+                            touched.len(), touched
+                        );
+                    }
+                }
+                Err(e) => tracing::warn!("🔀 刷新引用别名 {alias} 的聚合别名失败: {e}"),
+            }
             tracing::info!("🏷️ Set alias {} -> {} (provider: {:?}), cache invalidated", alias, target_model, provider_id);
             // 保存后自动验证：探到的协议只记录 + 提示，不改配置。
             // 后台跑，别拖慢保存接口（多账户时逐个探可达数分钟）。
@@ -222,6 +288,28 @@ pub async fn delete_model_alias(
             format!("Failed to delete alias: {e}"),
             StatusCode::INTERNAL_SERVER_ERROR,
         );
+    }
+
+    // 引用这条别名的聚合别名：解析缓存立刻作废（`HOT_CACHE_TTL` 60s，不作废的话
+    // 运行时最长一分钟还拿着「来源健在」的旧快照）。候选本身**不删** —— 它们会在
+    // 运行时被标成 `stale_source` 跳过（Deferred，不计失败）；删掉会让「只剩这一个
+    // 候选」的聚合别名变成非法空列表，等于替用户删了别名。
+    // 排在 api_keys 级联之前：那条链路可能提前 return，作废不能跟着一起被跳过。
+    match llmux_core::aggregate::aggregates_referencing(&state.pool, &alias_row.alias).await {
+        Ok(aggs) => {
+            for agg in &aggs {
+                state.invalidate_aggregate_cache(agg);
+            }
+            if !aggs.is_empty() {
+                tracing::warn!(
+                    "🔀 别名 {} 已删除 → {} 个聚合别名的候选来源失效（运行时跳过、不计失败）: {:?}",
+                    alias_row.alias,
+                    aggs.len(),
+                    aggs
+                );
+            }
+        }
+        Err(e) => tracing::warn!("🔀 查找引用别名 {} 的聚合别名失败: {e}", alias_row.alias),
     }
 
     // Cascade-clean API keys: remove the alias name from allowed_models.

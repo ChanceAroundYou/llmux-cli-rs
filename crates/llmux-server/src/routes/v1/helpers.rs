@@ -265,6 +265,28 @@ pub fn note_skip_reason(slot: &mut Option<String>, reason: String) {
     }
 }
 
+/// 候选引用来源是否已经**配置失效**（来源普通别名被删除/改名），返回跳过原因。
+///
+/// 与冷却同一类处理：跳过、且**不记** `note_candidate_failure`、不设 `anchor_attempted`。
+/// 差别在成因 —— 冷却会自己回来，配置失效不会，所以它既不是「上游坏了」也不该被
+/// 当成连续失败证据：删掉一条普通别名就能在 3-confirm 里把聚合的主候选挤下线，
+/// 而 3-confirm 迁移会把用户的配置改动误判成上游故障。
+///
+/// 判据来自 `resolve_aggregate` 里标的 `AggregateCandidate::stale_source`（一次 IN 查询）。
+pub fn stale_candidate_reason(
+    cand: &llmux_core::aggregate::AggregateCandidate,
+) -> Option<String> {
+    if !cand.stale_source {
+        return None;
+    }
+    Some(format!(
+        "Candidate {} ({}) comes from alias '{}' which no longer exists — re-save this aggregate alias or remove the candidate",
+        cand.account_id,
+        cand.model,
+        cand.via_alias.as_deref().unwrap_or("?")
+    ))
+}
+
 /// 全部候选都因 429 耗尽（冷却跳过 or 上游回 429）→ 回 429 + Retry-After，让调用方退避而不是立刻重试
 pub fn rate_limited_response(message: &str, is_anthropic: bool) -> axum::response::Response {
     let retry_after = llmux_core::probe::SUSPEND_SECS.to_string();

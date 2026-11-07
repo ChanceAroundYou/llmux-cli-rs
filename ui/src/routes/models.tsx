@@ -1,6 +1,6 @@
 import React, { useEffect, useState, useMemo, useRef } from 'react';
 import { apiFetch } from "@/lib/api";
-import { useModelsStore } from '../stores/models';
+import { useModelsStore, type AggregateCandidateInput } from '../stores/models';
 import {
   Box,
   Search,
@@ -69,6 +69,24 @@ const TEST_SCOPES: TestScope[] = ['aliases', 'aggregates', 'models'];
 /// 与 `crates/llmux-core/src/adapters/mod.rs` 的 `FIRST_BYTE_TIMEOUT_SECS` 一致；
 /// 这里只用于「显示生效值」，不参与请求构造 —— 改了后端要同步改这里。
 const DEFAULT_FIRST_BYTE_TIMEOUT_SECS = 30;
+
+/// 聚合别名的候选编辑行。两种形态：
+/// - `alias_ref` 非空 → 引用一条**普通别名**，不填账户/模型；后端在保存时把它
+///   完整展开成那条别名当前的绑定（target / 绑定账户 / 协议 / 首字节超时）。
+/// - 否则是手工挑的一对 (账户, 模型)；`via_alias` 是后端已有的来源标记，
+///   编辑时原样送回才不会把 provenance 洗掉（改账户或模型即解绑）。
+type AggregateCandidateRow = {
+  account_id: number | '';
+  model: string;
+  alias_ref?: string;
+  via_alias?: string;
+  upstream_api?: string;
+  first_byte_timeout_secs?: number;
+};
+const isAliasRefRow = (c: AggregateCandidateRow) => c.alias_ref != null;
+/// 引用来源已消失（那条普通别名被删/改名）—— 后端保存时会 400，运行时也会跳过该候选。
+const missingViaAlias = (c: AggregateCandidateRow, ordinary: { alias: string }[]) =>
+  !!c.via_alias && !ordinary.some(a => a.alias === c.via_alias);
 
 /// 拨测入口按钮。三个入口（别名 / 聚合 / 模型）视觉与交互完全一致，只有待测集合
 /// 不同；各自持有独立状态，所以点其中一个不会让另外两个也显示「测试中」。
@@ -161,7 +179,11 @@ export default function Models() {
   const [editingAliasId, setEditingAliasId] = useState<number | null>(null);
   const [isAggregateModalOpen, setIsAggregateModalOpen] = useState(false);
   const [editingAggregateId, setEditingAggregateId] = useState<number | null>(null);
-  const [aggregateForm, setAggregateForm] = useState<{ alias: string; downstreamMode: string; candidates: { account_id: number | ''; model: string }[]; firstByteTimeoutSecs: number | '' }>({ alias: '', downstreamMode: 'chat', candidates: [{ account_id: '', model: '' }], firstByteTimeoutSecs: '' });
+  const [aggregateForm, setAggregateForm] = useState<{ alias: string; downstreamMode: string; candidates: AggregateCandidateRow[]; firstByteTimeoutSecs: number | '' }>({ alias: '', downstreamMode: 'chat', candidates: [{ account_id: '', model: '' }], firstByteTimeoutSecs: '' });
+  const [aggregateFormNotice, setAggregateFormNotice] = useState<string | null>(null);
+  /// 保存后后端回的话：别名候选展开成了什么、丢了哪些停用账户、协议不一致。
+  /// 只有后端知道，不显示出来用户只会问「为什么没走到那个候选」。
+  const [aggregateSaveNotes, setAggregateSaveNotes] = useState<string[]>([]);
 
   const handleTest = async (modelId: string, providerId: string, accountId?: number) => {
     let resolvedAccountId = accountId ?? null;
@@ -427,7 +449,9 @@ export default function Models() {
         aliasForm.preferredAccountId ?? undefined,
         undefined,
         aliasDownstreamMode,
-        aliasForm.firstByteTimeoutSecs
+        aliasForm.firstByteTimeoutSecs,
+        // 编辑态带上自身主键：否则后端把「同名」一律当创建，改自己的绑定会被判成冲突
+        editingAliasId ?? undefined
       );
       showBgVerifyHint();
       setIsModalOpen(false);
@@ -436,6 +460,12 @@ export default function Models() {
     } catch (err: any) {
       if (err?.status === 409 && err?.conflict === 'aggregate') {
         setOverwriteConfirm({ kind: 'aggregate', alias: aliasForm.alias, pending: { target: aliasForm.target, provider: aliasForm.provider, selectedAccountIds: aliasForm.selectedAccountIds, preferredAccountId: aliasForm.preferredAccountId, downstreamMode: aliasForm.downstreamMode } });
+        return;
+      }
+      // 名字被**另一条**普通别名占用：这不是「要覆盖吗」的确认场景，也没有 confirm 逃生口，
+      // 必须直说被谁占了（此前后端会静默改掉那一条的 target/绑定）。
+      if (err?.status === 409 && err?.code === 'alias_name_taken') {
+        setAliasModeNotice(`名字「${aliasForm.alias}」已被另一条别名占用${err.existingId != null ? `（#${err.existingId}）` : ''}，请换一个名字，或先删掉那一条。`);
         return;
       }
       // 服务端强制模式校验返回 409（alias_protocol_unsupported）：高亮提示
@@ -455,9 +485,20 @@ export default function Models() {
   };
 
   const openAggregateModal = (agg?: any) => {
+    setAggregateFormNotice(null);
     if (agg) {
       setEditingAggregateId(agg.id);
-      setAggregateForm({ alias: agg.alias, downstreamMode: normalizeMode((agg as any).upstream_api), candidates: agg.candidates.map((c: any) => ({ account_id: c.account_id, model: c.model })), firstByteTimeoutSecs: (agg as any).first_byte_timeout_secs ?? '' });
+      // 来源标记（via_alias / 别名自己强制的协议 / 超时）必须带进编辑态：
+      // 丢了它，重新保存等于把「这一候选来自别名 d4」洗成一对裸的 (账户, 模型)，
+      // 之后改 d4 不会再带动聚合。
+      const candidates = (agg.candidates || []).map((c: any) => ({
+        account_id: c.account_id,
+        model: c.model,
+        ...(c.via_alias ? { via_alias: c.via_alias } : {}),
+        ...(c.upstream_api ? { upstream_api: c.upstream_api } : {}),
+        ...(c.first_byte_timeout_secs != null ? { first_byte_timeout_secs: c.first_byte_timeout_secs } : {}),
+      }));
+      setAggregateForm({ alias: agg.alias, downstreamMode: normalizeMode((agg as any).upstream_api), candidates: candidates.length ? candidates : [{ account_id: '', model: '' }], firstByteTimeoutSecs: (agg as any).first_byte_timeout_secs ?? '' });
     } else {
       setEditingAggregateId(null);
       setAggregateForm({ alias: '', downstreamMode: 'default', candidates: [{ account_id: '', model: '' }], firstByteTimeoutSecs: '' });
@@ -468,15 +509,47 @@ export default function Models() {
   const closeAggregateModal = () => {
     setIsAggregateModalOpen(false);
     setEditingAggregateId(null);
+    setAggregateFormNotice(null);
     setAggregateForm({ alias: '', downstreamMode: 'default', candidates: [{ account_id: '', model: '' }], firstByteTimeoutSecs: '' });
+  };
+
+  /// 来源别名自己强制的协议与聚合强制的协议不一致 —— 后端**不会** 400（与 2026-08
+  /// 那条「强制协议不在保存时拒」的决定一致），但保存后这一候选会在运行时被跳过。
+  /// 所以在编辑器里先说出来，否则用户只会看到「怎么没走到这个候选」。
+  const aliasModeConflict = (aliasMode?: string | null) => {
+    const aggMode = aggregateForm.downstreamMode;
+    if (aggMode === 'default' || !aliasMode || aliasMode === 'default') return null;
+    return aliasMode === aggMode ? null
+      : `来源别名强制 ${aliasMode}，本聚合强制 ${aggMode} —— 保存后这一候选会在运行时被跳过`;
   };
 
   const handleSaveAggregate = async (e: React.FormEvent) => {
     e.preventDefault();
-    const candidates = aggregateForm.candidates
-      .filter(c => c.account_id !== '' && c.model.trim() !== '')
-      .map(c => ({ account_id: Number(c.account_id), model: c.model.trim() }));
+    const rows = aggregateForm.candidates;
+    const candidates: AggregateCandidateInput[] = [];
+    for (const c of rows) {
+      if (isAliasRefRow(c)) {
+        if (!c.alias_ref) continue; // 引用行还没选别名
+        candidates.push({ alias: c.alias_ref });
+        continue;
+      }
+      if (c.account_id === '' || c.model.trim() === '') continue;
+      candidates.push({
+        account_id: Number(c.account_id),
+        model: c.model.trim(),
+        ...(c.via_alias ? { via_alias: c.via_alias } : {}),
+        ...(c.upstream_api ? { upstream_api: c.upstream_api } : {}),
+        ...(c.first_byte_timeout_secs != null ? { first_byte_timeout_secs: c.first_byte_timeout_secs } : {}),
+      });
+    }
     if (!aggregateForm.alias.trim() || candidates.length === 0) return;
+    // 引用来源已被删除的候选：后端保存时会 400（不能把坏配置悄悄存成「看起来正常」）。
+    // 先在这儿说清该怎么办，比让用户点保存后吃一条英文错误串有用。
+    const broken = rows.filter(c => !isAliasRefRow(c) && missingViaAlias(c, aliases));
+    if (broken.length > 0) {
+      setAggregateFormNotice(`候选来源已删除：${broken.map(c => `账户 #${c.account_id} ← 别名 ${c.via_alias}`).join('、')} —— 删掉这一行，或先建回同名别名再保存。`);
+      return;
+    }
     // If editing and alias changed, delete old first
     if (editingAggregateId !== null) {
       const orig = aggregateAliases.find(a => a.id === editingAggregateId);
@@ -486,7 +559,8 @@ export default function Models() {
     }
     try {
       const timeout = aggregateForm.firstByteTimeoutSecs === '' ? null : Number(aggregateForm.firstByteTimeoutSecs);
-      await saveAggregateAlias(aggregateForm.alias.trim(), candidates, undefined, undefined, aggregateForm.downstreamMode || 'default', timeout);
+      const notes = await saveAggregateAlias(aggregateForm.alias.trim(), candidates, undefined, undefined, aggregateForm.downstreamMode || 'default', timeout);
+      setAggregateSaveNotes(notes);
       showBgVerifyHint();
       closeAggregateModal();
     } catch (err: any) {
@@ -494,6 +568,7 @@ export default function Models() {
         setOverwriteConfirm({ kind: 'ordinary', alias: aggregateForm.alias.trim(), pending: candidates });
         return;
       }
+      setAggregateFormNotice(err?.message || '保存失败');
       console.error(err);
     }
   };
@@ -665,6 +740,15 @@ export default function Models() {
             </Button>
           </div>
         </div>
+        {aggregateSaveNotes.length > 0 && (
+          <div className="rounded-lg border border-primary/20 bg-primary/5 p-2 space-y-1">
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-xs font-bold text-muted-foreground uppercase">这次保存时后端说的话</span>
+              <Button type="button" variant="ghost" size="sm" className="h-6 px-2 text-xs" onClick={() => setAggregateSaveNotes([])}>知道了</Button>
+            </div>
+            {aggregateSaveNotes.map((n, i) => <p key={i} className="text-xs text-muted-foreground">{n}</p>)}
+          </div>
+        )}
         {aggregateAliases.length > 0 && (
         <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3">
               {aggregateAliases.map(agg => {
@@ -708,6 +792,9 @@ export default function Models() {
                       {agg.candidates.map((c: any, idx: number) => {
                         const acc = safeAccounts.find(a => a.id === c.account_id);
                         const lockedHere = !!(agg as any).locked && agg.active === idx;
+                        // 引用来源已被删除：运行时这一候选会被跳过、且不记失败。
+                        // 卡片上不标出来的话，「这个聚合为什么 502」就只能去翻日志。
+                        const staleVia = !!c.via_alias && (agg.missing_alias_sources || []).includes(c.via_alias);
                         return (
                           <div key={idx} className={cn("flex flex-col gap-1 text-xs px-2 py-1.5 rounded", isActive(idx) ? "bg-primary/10 border border-primary/20" : "bg-muted/30")}>
                             <div className="flex items-center gap-2 min-w-0">
@@ -723,7 +810,15 @@ export default function Models() {
                                 className={cn("ml-1 shrink-0 text-[10px] px-1.5 py-0.5 rounded border transition-colors", lockedHere ? "bg-primary/10 text-primary border-primary/20" : isLocked ? "bg-muted/30 text-muted-foreground/40 cursor-not-allowed border-border" : "bg-muted/50 border-border hover:bg-primary/10 hover:text-primary")}
                               >{lockedHere ? "解锁" : "锁定"}</button>
                             </div>
-                            <div className="pl-6 truncate text-muted-foreground">{c.model}</div>
+                            <div className="pl-6 flex items-center gap-1.5 min-w-0">
+                              <span className="truncate text-muted-foreground">{c.model}</span>
+                              {c.via_alias && (
+                                <span
+                                  title={staleVia ? `来源别名 ${c.via_alias} 已删除 —— 这个候选会在运行时被跳过，不计入失败` : `由普通别名 ${c.via_alias} 展开而来`}
+                                  className={cn("shrink-0 text-[10px] px-1.5 py-0.5 rounded border", staleVia ? "text-destructive font-bold border-destructive/30 bg-destructive/10" : "text-muted-foreground border-border bg-muted/40")}
+                                >{staleVia ? `来源 ${c.via_alias} 已删` : `← ${c.via_alias}`}</span>
+                              )}
+                            </div>
                           </div>
                         );
                       })}
@@ -1237,20 +1332,66 @@ export default function Models() {
             <Input type="text" required value={aggregateForm.alias} onChange={e => setAggregateForm({ ...aggregateForm, alias: e.target.value })} placeholder={t('models.aliasPlaceholder')} />
           </div>
           <div className="space-y-1.5">
-            <div className="flex items-center justify-between">
+            <div className="flex items-center justify-between gap-2">
               <label className="text-xs font-bold text-muted-foreground uppercase">候选列表（顶部为默认）</label>
-              <Button type="button" variant="outline" size="sm" onClick={() => setAggregateForm({ ...aggregateForm, candidates: [...aggregateForm.candidates, { account_id: '', model: '' }] })}>+ 添加候选</Button>
+              <div className="flex items-center gap-1.5">
+                <Button type="button" variant="outline" size="sm" onClick={() => setAggregateForm({ ...aggregateForm, candidates: [...aggregateForm.candidates, { account_id: '', model: '' }] })}>+ 添加候选</Button>
+                <Button type="button" variant="outline" size="sm" title="引用一条普通别名：保存时展开成它当前绑定的账户和模型" onClick={() => setAggregateForm({ ...aggregateForm, candidates: [...aggregateForm.candidates, { account_id: '', model: '', alias_ref: '' }] })}>+ 引用别名</Button>
+              </div>
             </div>
+            {aggregateFormNotice && (
+              <p className="text-xs text-destructive font-medium bg-destructive/10 border border-destructive/30 rounded px-2 py-1.5">{aggregateFormNotice}</p>
+            )}
             <div className="space-y-2 max-h-72 overflow-y-auto overflow-x-hidden border border-border rounded-lg p-2 bg-muted/30">
               {aggregateForm.candidates.map((c, idx) => (
                 <div key={idx} className="flex items-start gap-2 p-2 bg-card border border-border rounded-lg min-w-0">
                   <span className="text-xs font-bold w-5 shrink-0 pt-2">#{idx+1}</span>
                   <div className="flex-1 flex flex-col gap-1.5 min-w-0">
+                    {isAliasRefRow(c) ? (
+                      (() => {
+                        const ref = aliases.find(a => a.alias === c.alias_ref);
+                        let boundCount = 0;
+                        if (ref?.account_ids) { try { const ids = JSON.parse(ref.account_ids); if (Array.isArray(ids)) boundCount = ids.length; } catch {} }
+                        return (
+                          <>
+                            <select
+                              value={c.alias_ref ?? ''}
+                              onChange={e => {
+                                const next = [...aggregateForm.candidates];
+                                next[idx] = { account_id: '', model: '', alias_ref: e.target.value };
+                                setAggregateForm({ ...aggregateForm, candidates: next });
+                              }}
+                              className="w-full min-w-0 h-8 px-2 rounded-md border border-input bg-background text-sm"
+                            >
+                              <option value="">选择普通别名</option>
+                              {/* 只列普通别名，且不含本聚合自己：引用聚合别名会被后端拒（只允许一层），
+                                  引用自己则在「同名冲突」那一步当场死掉 —— 别给出存不下来的选项。 */}
+                              {aliases.filter(a => a.alias !== aggregateForm.alias.trim()).map(a => (
+                                <option key={a.id} value={a.alias}>别名 {a.alias} → {a.target_model}</option>
+                              ))}
+                            </select>
+                            {ref && (
+                              <p className="text-xs text-muted-foreground">
+                                保存时展开为 {boundCount} 个账户 · 超时 {ref.first_byte_timeout_secs ?? DEFAULT_FIRST_BYTE_TIMEOUT_SECS}s
+                                <span className="pl-1">（这条别名改绑定后，重新保存本聚合才会跟着变）</span>
+                              </p>
+                            )}
+                            {c.alias_ref && aliasModeConflict(ref?.upstream_api) && (
+                              <p className="text-xs text-destructive font-medium bg-destructive/10 border border-destructive/30 rounded px-2 py-1">{aliasModeConflict(ref?.upstream_api)}</p>
+                            )}
+                            {!c.alias_ref && <p className="text-xs text-muted-foreground">引用普通别名：不填账户/模型，由后端按那条别名当前的绑定展开。</p>}
+                          </>
+                        );
+                      })()
+                    ) : (
+                      <>
                     <select
                       value={c.account_id}
                       onChange={e => {
                         const next = [...aggregateForm.candidates];
-                        next[idx] = { ...next[idx], account_id: e.target.value ? Number(e.target.value) : '' };
+                        // 改了账户 = 这一行不再「就是那条别名的展开」，来源标记要解绑，
+                        // 否则它还会被当成 d4 的候选、继续吃 d4 的协议与超时。
+                        next[idx] = { ...next[idx], account_id: e.target.value ? Number(e.target.value) : '', via_alias: undefined, upstream_api: undefined, first_byte_timeout_secs: undefined };
                         setAggregateForm({ ...aggregateForm, candidates: next });
                       }}
                       className="w-full min-w-0 h-8 px-2 rounded-md border border-input bg-background text-sm"
@@ -1271,7 +1412,7 @@ export default function Models() {
                           disabled={!c.account_id}
                           onChange={e => {
                             const next = [...aggregateForm.candidates];
-                            next[idx] = { ...next[idx], model: e.target.value };
+                            next[idx] = { ...next[idx], model: e.target.value, via_alias: undefined, upstream_api: undefined, first_byte_timeout_secs: undefined };
                             setAggregateForm({ ...aggregateForm, candidates: next });
                           }}
                           className="w-full min-w-0 h-8 px-2 rounded-md border border-input bg-background text-sm disabled:opacity-50"
@@ -1284,6 +1425,16 @@ export default function Models() {
                         </select>
                       );
                     })()}
+                        {c.via_alias && (
+                          <p className={cn("text-xs font-medium", missingViaAlias(c, aliases) ? "text-destructive" : "text-muted-foreground")}>
+                            {missingViaAlias(c, aliases)
+                              ? `来源别名 ${c.via_alias} 已不存在 —— 删掉这一行，或先建回同名别名`
+                              : `来自别名 ${c.via_alias}${c.first_byte_timeout_secs != null ? ` · 超时 ${c.first_byte_timeout_secs}s` : ''}`}
+                          </p>
+                        )}
+                        {c.upstream_api && aliasModeConflict(c.upstream_api) && (
+                          <p className="text-xs text-destructive font-medium bg-destructive/10 border border-destructive/30 rounded px-2 py-1">{aliasModeConflict(c.upstream_api)}</p>
+                        )}
                     {(() => {
                       if (aggregateForm.downstreamMode === 'default' || c.account_id === '') return null;
                       const acc = safeAccounts.find(a => a.id === c.account_id);
@@ -1292,6 +1443,8 @@ export default function Models() {
                       }
                       return null;
                     })()}
+                      </>
+                    )}
                   </div>
                   <div className="flex flex-col gap-1 shrink-0">
                     <Button type="button" variant="ghost" size="icon" className="h-7 w-7" disabled={idx === 0} onClick={() => {
@@ -1312,7 +1465,7 @@ export default function Models() {
               ))}
             </div>
 
-            <p className="text-xs text-muted-foreground">顶部候选为默认模型，拖动排序即改默认/顺序。每行独立账户+模型。</p>
+            <p className="text-xs text-muted-foreground">顶部候选为默认模型，排序即改默认/顺序。每行可以是一对独立账户+模型，也可以引用一条普通别名（保存时展开成它当前的绑定）。</p>
           </div>
           <div className="space-y-1.5 border-t border-border pt-3">
             <label className="text-xs font-bold text-muted-foreground uppercase">{t('models.downstreamMode')}</label>

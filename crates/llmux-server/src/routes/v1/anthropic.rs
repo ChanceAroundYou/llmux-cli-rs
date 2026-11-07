@@ -737,6 +737,7 @@ async fn dispatch_aggregate_anthropic(
     // 耗尽成因分类：全因配额冷却 vs 掺了别的原因（见 helpers::exhausted_status）
     let mut cooled_skips = 0usize;
     let mut failed_candidates = 0usize;
+    let mut stale_skips = 0usize;
     // 推进 3-confirm 的唯一证据形态：这一轮**真的尝试了锚点**（active）且它真的失败了。
     // 被跳过不算证据 —— 冷却 / 装不下 / max_tokens 不合规都是「没试过」，不是「坏了」。
     let mut anchor_attempted = false;
@@ -752,6 +753,13 @@ async fn dispatch_aggregate_anthropic(
     let last = if agg.locked { (active + 1).min(len) } else { len };
     for i in active..last {
         let cand = &agg.candidates[i];
+        // 来源普通别名已被删除 → 配置失效，跳过且不计失败（见 helpers::stale_candidate_reason）。
+        if let Some(reason) = crate::routes::v1::helpers::stale_candidate_reason(cand) {
+            tracing::debug!("🚫  [agg:{}] 跳过 {} | 账户 {}：{reason}", alias, cand.model, cand.account_id);
+            crate::routes::v1::helpers::note_skip_reason(&mut last_error, reason);
+            stale_skips += 1;
+            continue;
+        }
         // 配额/限流冷却中的候选直接跳过 —— 配额类错误当天不会自愈，
         // 重打只是再吃一次 429，还把整条链拖成 502。
         // 这里**不记失败**：冷却 30 分钟后自己会回来，把它当 3-confirm 证据会把
@@ -841,7 +849,9 @@ async fn dispatch_aggregate_anthropic(
         };
 
         let mut provider_request = match provider_request { Ok(r) => r, Err(e) => { tracing::error!("📡 [agg:{}] build request failed: {e}", alias); last_error = Some(format!("Failed to build provider request: {e}")); state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); failed_candidates += 1; continue; } };
-        provider_request.first_byte_timeout_secs = agg.first_byte_timeout_secs;
+        provider_request.first_byte_timeout_secs = cand
+            .first_byte_timeout_secs
+            .or(agg.first_byte_timeout_secs);
 
         tracing::info!("🔀 [agg:{} V={}] {} → {} → {} {}", alias, active, account.alias, cand.model, provider_request.url, if is_conversion { "[anthropic→openai]" } else { "" });
         if let Some(tx) = &state.tui_tx { let _ = tx.send(TuiEvent::Dispatch { timestamp: time::OffsetDateTime::now_utc().format(&DISPATCH_TIME_FMT).unwrap_or_default(), account: account.alias.clone(), model: cand.model.clone(), url: provider_request.url.clone(), tag: Some(format!("agg:{alias}")) }); }
@@ -979,9 +989,14 @@ async fn dispatch_aggregate_anthropic(
     }
     let exhausted_status = crate::routes::v1::helpers::exhausted_status(
         cooled_skips,
-        cooled_skips + failed_candidates,
+        // 配置失效的候选进分母不进分子：掺着「来源别名已删」时回 502 + 那条诊断串，
+        // 别让客户端按 Retry-After 等一个不会自愈的配置问题。
+        cooled_skips + failed_candidates + stale_skips,
         last_status,
     );
+    if stale_skips > 0 {
+        tracing::warn!("🚫  [agg:{}] 本轮 {} 个候选因来源别名已不存在被跳过（共 {}）—— 到别名页重新保存", alias, stale_skips, len);
+    }
     send_tui_request(&state.tui_tx, "/v1/messages", if exhausted_status == Some(429) { 429 } else { 502 }, start, &agg.alias);
     // 全部候选都因 429 耗尽（冷却跳过 or 上游回 429）→ 回 429 + Retry-After，让调用方退避而不是立刻重试
     if exhausted_status == Some(429) {

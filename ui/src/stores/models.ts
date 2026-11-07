@@ -44,11 +44,25 @@ export interface PerAccountMeta {
   count: number;
 }
 
-export interface AggregateCandidate { account_id: number; model: string }
+export interface AggregateCandidate {
+  account_id: number;
+  model: string;
+  /// 这一候选来自哪条**普通别名**（后端保存时展开，回编辑时原样送回即可保留来源）。
+  via_alias?: string | null;
+  /// 来源别名自己强制的协议 / 配的首字节超时 —— 后端用它做保存侧告警与运行时取值。
+  upstream_api?: string | null;
+  first_byte_timeout_secs?: number | null;
+}
+/// 提交给后端的候选：要么是一对 (账户, 模型)，要么是 `{"alias": "d4"}` 引用普通别名
+/// （后端在保存时完整展开成那条别名当前的绑定）。
+export type AggregateCandidateInput = AggregateCandidate | { alias: string };
+
 export interface AggregateAlias {
   id: number;
   alias: string;
   candidates: AggregateCandidate[];
+  /// 引用来源已经不存在的候选是哪几个别名（运行时会被跳过，不计失败）。
+  missing_alias_sources?: string[];
   interval_secs: number;
   upstream_api?: string | null;
   /// 首字节超时（秒）。null = 走后端默认 30s（aggregate.rs 的 payload 用同一个字段名）。
@@ -78,9 +92,9 @@ interface ModelsState {
   fetchAggregateAliases: () => Promise<void>;
   fetchAccounts: () => Promise<void>;
   fetchSummary: (signal?: AbortSignal) => Promise<void>;
-  addAlias: (alias: string, targetModel: string, providerId?: string, accountIds?: number[], preferredAccountId?: number, confirm?: boolean, upstreamApi?: string, firstByteTimeoutSecs?: number | null) => Promise<void>;
+  addAlias: (alias: string, targetModel: string, providerId?: string, accountIds?: number[], preferredAccountId?: number, confirm?: boolean, upstreamApi?: string, firstByteTimeoutSecs?: number | null, id?: number) => Promise<void>;
   deleteAlias: (id: number) => Promise<void>;
-  saveAggregateAlias: (alias: string, candidates: AggregateCandidate[], intervalSecs?: number, confirm?: boolean, upstreamApi?: string, firstByteTimeoutSecs?: number | null) => Promise<void>;
+  saveAggregateAlias: (alias: string, candidates: AggregateCandidateInput[], intervalSecs?: number, confirm?: boolean, upstreamApi?: string, firstByteTimeoutSecs?: number | null) => Promise<string[]>;
   deleteAggregateAlias: (id: number) => Promise<void>;
   setAggregateActive: (id: number, active: number) => Promise<void>;
   setAggregateLock: (id: number, locked: boolean) => Promise<void>;
@@ -256,9 +270,12 @@ export const useModelsStore = create<ModelsState>((set, get) => ({
     }
   },
 
-  addAlias: async (alias, targetModel, providerId, accountIds, preferredAccountId, confirm, upstreamApi, firstByteTimeoutSecs) => {
+  addAlias: async (alias, targetModel, providerId, accountIds, preferredAccountId, confirm, upstreamApi, firstByteTimeoutSecs, id) => {
     try {
       const body: any = { alias, target_model: targetModel, provider_id: providerId };
+      // 编辑态必须带上这条别名自己的主键：后端靠「同名且不是自己」判同名占用，
+      // 不带 id 就是创建语义 —— 改自己的 target/绑定 会被判成冲突。
+      if (id != null) body.id = id;
       if (accountIds && accountIds.length > 0) {
         body.account_ids = accountIds;
       }
@@ -280,6 +297,8 @@ export const useModelsStore = create<ModelsState>((set, get) => ({
         err.code = data.code;
         err.conflict = data.conflict;
         err.status = res.status;
+        // 同名占用：错误里要能看出被哪一条占用，否则用户只知道「名字不能用」
+        err.existingId = data.existing_id;
         throw err;
       }
       // 覆盖聚合别名后聚合列表也会变化，须同步刷新
@@ -294,7 +313,8 @@ export const useModelsStore = create<ModelsState>((set, get) => ({
     try {
       const res = await apiFetch(`/api/models/aliases/${id}`, { method: 'DELETE' });
       if (!res.ok) throw new Error('Failed to delete alias');
-      await get().fetchAliases();
+      // 引用这条别名的聚合别名要重画：它们的候选来源没了（运行时会被跳过）
+      await Promise.all([get().fetchAliases(), get().fetchAggregateAliases()]);
     } catch (err: any) {
       set({ error: err.message });
       throw err;
@@ -306,8 +326,11 @@ export const useModelsStore = create<ModelsState>((set, get) => ({
       const body: any = { alias, candidates, interval_secs: intervalSecs ?? 300, ...(confirm ? { confirm: true } : {}), upstream_api: upstreamApi ?? 'default', ...(firstByteTimeoutSecs != null ? { first_byte_timeout_secs: firstByteTimeoutSecs } : {}) };
       const res = await apiFetch('/api/aggregate-aliases', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
       if (!res.ok) { const data = await res.json(); const err: any = new Error(data.error || 'Failed to save aggregate alias'); err.code = data.code; err.conflict = data.conflict; err.status = res.status; throw err; }
-      // 覆盖普通别名后普通别名列表也会变化，须同步刷新
+      // 别名候选展开成了什么、丢了哪些停用账户、协议不一致 —— 只有后端知道，
+      // 不显示出来用户就只会问「为什么没走到那个候选」。
+      const data = await res.json().catch(() => ({} as any));
       await Promise.all([get().fetchAggregateAliases(), get().fetchAliases()]);
+      return Array.isArray(data.notes) ? data.notes : [];
     } catch (err: any) { set({ error: err.message }); throw err; }
   },
 

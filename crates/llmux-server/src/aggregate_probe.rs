@@ -555,10 +555,8 @@ mod tests {
         .await
         .unwrap();
 
-        let cand = AggregateCandidate {
-            account_id: 99,
-            model: "m".into(),
-        };
+        // 探针测试只关心 (账户, 模型)：其余字段取默认（无来源别名、无协议/超时覆盖）。
+        let cand = AggregateCandidate { account_id: 99, model: "m".into(), ..Default::default() };
         // 账户 99 在库里不存在：若走到主动探测分支，get_account_by_id 会返回
         // None → 函数返回 Dead。返回 Alive 证明确实在发请求之前就短路了。
         assert_eq!(probe_candidate(&cand, chat_mode(), &pool, "key", trust_ms()).await, Verdict::Alive);
@@ -579,10 +577,8 @@ mod tests {
         .await
         .unwrap();
 
-        let cand = AggregateCandidate {
-            account_id: 99,
-            model: "m".into(),
-        };
+        // 探针测试只关心 (账户, 模型)：其余字段取默认（无来源别名、无协议/超时覆盖）。
+        let cand = AggregateCandidate { account_id: 99, model: "m".into(), ..Default::default() };
         // 落到主动探测 → 账户 99 不存在 → Dead。
         assert_eq!(probe_candidate(&cand, chat_mode(), &pool, "key", trust_ms()).await, Verdict::Dead);
     }
@@ -622,10 +618,8 @@ mod tests {
         .await
         .unwrap();
 
-        let cand = AggregateCandidate {
-            account_id: 99,
-            model: "m".into(),
-        };
+        // 探针测试只关心 (账户, 模型)：其余字段取默认（无来源别名、无协议/超时覆盖）。
+        let cand = AggregateCandidate { account_id: 99, model: "m".into(), ..Default::default() };
         assert_eq!(probe_candidate(&cand, chat_mode(), &pool, "key", trust_ms()).await, Verdict::Deferred);
     }
 
@@ -653,7 +647,7 @@ mod tests {
         .await
         .unwrap();
 
-        let cand = AggregateCandidate { account_id: 99, model: "m".into() };
+        let cand = AggregateCandidate { account_id: 99, model: "m".into(), ..Default::default() };
         assert_eq!(probe_candidate(&cand, chat_mode(), &pool, "key", trust_ms()).await, Verdict::Alive);
     }
 
@@ -674,7 +668,7 @@ mod tests {
         .await
         .unwrap();
 
-        let cand = AggregateCandidate { account_id: 99, model: "m".into() };
+        let cand = AggregateCandidate { account_id: 99, model: "m".into(), ..Default::default() };
         // 过期 → 去探 → 账户 99 不存在 → Dead。
         assert_eq!(probe_candidate(&cand, chat_mode(), &pool, "key", trust_ms()).await, Verdict::Dead);
     }
@@ -703,7 +697,7 @@ mod tests {
         .await
         .unwrap();
 
-        let cand = AggregateCandidate { account_id: 99, model: "m".into() };
+        let cand = AggregateCandidate { account_id: 99, model: "m".into(), ..Default::default() };
         assert_eq!(probe_candidate(&cand, chat_mode(), &pool, "key", trust_ms()).await, Verdict::Dead);
     }
 

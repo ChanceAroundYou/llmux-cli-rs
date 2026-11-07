@@ -6,7 +6,7 @@ use axum::{
 };
 use serde_json::{json, Value};
 
-use llmux_core::aggregate::{parse_candidates, AggregateAliasRow};
+use llmux_core::aggregate::{parse_candidates, AggregateAliasRow, AggregateCandidate};
 
 use crate::app::AppState;
 
@@ -25,11 +25,36 @@ pub async fn aggregate_alias_payloads(state: &AppState) -> anyhow::Result<Value>
     .fetch_all(&state.pool)
     .await?;
 
+    // 别名候选的**来源**还在不在：UI 要能标出「来自已删除的别名 d4」，否则用户只看到
+    // 一个永远走不到的候选，只能靠日志查。一次查询取全部普通别名名（这张表只有几十行）。
+    // ⚠️ 必须排在取锁之前：`aggregate_router` 是 `std::Mutex`，守卫跨 `.await` 会让
+    // 这个 handler 的 future 不是 Send，axum 在注册路由时就报 E0277（三个端点一起红），
+    // 而且真跑起来就是「持锁等 IO」的 deadlock 形状。
+    let ordinary_names: std::collections::HashSet<String> =
+        sqlx::query_scalar::<_, String>("SELECT alias FROM model_aliases")
+            .fetch_all(&state.pool)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+    // 取锁之后到函数结束不得再有 `.await`。
     let router = state.aggregate_router.lock().unwrap();
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
-        let candidates: Value =
-            serde_json::from_str(&row.candidates).unwrap_or(Value::Array(vec![]));
+        let typed = parse_candidates(&row.candidates).ok();
+        let candidates: Value = typed
+            .as_ref()
+            .and_then(|c| serde_json::to_value(c).ok())
+            .unwrap_or_else(|| serde_json::from_str(&row.candidates).unwrap_or(Value::Array(vec![])));
+        let missing_alias_sources: Vec<String> = typed
+            .as_deref()
+            .map(|c| {
+                llmux_core::aggregate::referenced_aliases(c)
+                    .into_iter()
+                    .filter(|n| !ordinary_names.contains(n))
+                    .collect()
+            })
+            .unwrap_or_default();
         let entry = router.entries.get(&row.alias);
         // 与 `resolve_aggregate` 的 C-A3 同一口径：内存还没有 entry（重启后还没
         // 请求过、刚保存过 —— 保存会 remove 内存 entry）时回退到库里的 active_idx。
@@ -49,6 +74,7 @@ pub async fn aggregate_alias_payloads(state: &AppState) -> anyhow::Result<Value>
             "id": row.id,
             "alias": row.alias,
             "candidates": candidates,
+            "missing_alias_sources": missing_alias_sources,
             "interval_secs": row.interval_secs.unwrap_or(300),
             "upstream_api": row.upstream_api.clone().unwrap_or_else(|| "chat".to_string()),
             "first_byte_timeout_secs": row.first_byte_timeout_secs,
@@ -110,14 +136,57 @@ pub async fn set_aggregate_alias(
         );
     }
 
-    let mut parsed = Vec::with_capacity(arr.len());
-    let mut account_ids = Vec::with_capacity(arr.len());
+    // 候选两种写法：
+    //   {"account_id": 5, "model": "deepseek-chat"}                手工挑的一对（原有）
+    //   {"alias": "d4"}                                            引用普通别名 → 完整转发并展开成它当前的绑定
+    //   {"account_id": 5, "model": "…", "via_alias": "d4"}         编辑器把已展开的候选原样送回来（保留来源）
+    // 展开只发生在保存这一侧：库里存的永远是具体 (账户, 模型)，索引语义
+    // （active_idx / locked / 3-confirm）完全不用动。
+    let mut parsed: Vec<AggregateCandidate> = Vec::new();
+    let mut account_ids: Vec<i64> = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
     for item in arr {
+        if let Some(alias_ref) = item
+            .get("alias")
+            .and_then(Value::as_str)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+        {
+            // 自引用：保存时同名普通别名还在，但同名冲突那一步（confirm 后）会把
+            // 它删掉 —— 候选的来源当场死掉，运行时永远跳过。当场拒掉，不留这种状态。
+            if alias_ref == alias {
+                return crate::error::simple_error(
+                    format!("Invalid alias candidate: aggregate alias '{alias}' cannot reference itself"),
+                    StatusCode::BAD_REQUEST,
+                );
+            }
+            let (expanded, dropped) = match llmux_core::aggregate::expand_alias_candidate(&state.pool, &alias_ref).await {
+                Ok(v) => v,
+                Err(e) => {
+                    return crate::error::simple_error(
+                        format!("Invalid alias candidate: {e}"),
+                        StatusCode::BAD_REQUEST,
+                    )
+                }
+            };
+            if !dropped.is_empty() {
+                notes.push(format!(
+                    "alias '{alias_ref}' expanded to {} candidates; dropped {} inactive/missing account(s): {:?}",
+                    expanded.len(),
+                    dropped.len(),
+                    dropped
+                ));
+            }
+            account_ids.extend(expanded.iter().map(|c| c.account_id));
+            parsed.extend(expanded);
+            continue;
+        }
+
         let account_id = match item.get("account_id").and_then(Value::as_i64) {
             Some(v) if v > 0 => v,
             _ => {
                 return crate::error::simple_error(
-                    "each candidate requires account_id (>0)",
+                    "each candidate requires account_id (>0) or alias",
                     StatusCode::BAD_REQUEST,
                 )
             }
@@ -131,8 +200,55 @@ pub async fn set_aggregate_alias(
                 )
             }
         };
-        parsed.push(json!({"account_id": account_id, "model": model}));
+        let via_alias = item
+            .get("via_alias")
+            .and_then(Value::as_str)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        if let Some(via) = via_alias.as_deref() {
+            if via == alias {
+                return crate::error::simple_error(
+                    format!("Invalid candidates: candidate #{account_id} references aggregate alias '{alias}' itself — an aggregate alias cannot be a candidate of itself"),
+                    StatusCode::BAD_REQUEST,
+                );
+            }
+            // 保留来源标记（编辑器原样送回已展开的候选时不能把 provenance 洗掉），
+            // 但来源必须还在 —— 否则这次保存会把一个已经坏掉的配置悄悄存成「看起来正常」。
+            if llmux_core::aggregate::is_aggregate_alias(&state.pool, via).await.unwrap_or(false) {
+                return crate::error::simple_error(
+                    format!("Invalid candidates: candidate #{account_id} references aggregate alias '{via}' — aggregate candidates may only reference an ordinary alias (one level)"),
+                    StatusCode::BAD_REQUEST,
+                );
+            }
+            if sqlx::query_scalar::<_, i64>("SELECT id FROM model_aliases WHERE alias = ?")
+                .bind(via)
+                .fetch_optional(&state.pool)
+                .await
+                .ok()
+                .flatten()
+                .is_none()
+            {
+                return crate::error::simple_error(
+                    format!("Invalid candidates: candidate #{account_id} references ordinary alias '{via}' which no longer exists — remove it or pick the alias again"),
+                    StatusCode::BAD_REQUEST,
+                );
+            }
+        }
+        parsed.push(AggregateCandidate {
+            account_id,
+            model,
+            via_alias,
+            upstream_api: item.get("upstream_api").and_then(Value::as_str).map(|s| s.to_string()),
+            first_byte_timeout_secs: item.get("first_byte_timeout_secs").and_then(Value::as_u64),
+            stale_source: false,
+        });
         account_ids.push(account_id);
+    }
+    if parsed.is_empty() {
+        return crate::error::simple_error(
+            "candidates must not be empty",
+            StatusCode::BAD_REQUEST,
+        );
     }
 
     let interval_secs = body
@@ -201,6 +317,30 @@ pub async fn set_aggregate_alias(
     // Forced protocols no longer reject unsupported candidates (2026-08): the UI
     // shows a red warning per candidate and the runtime dispatch skips them
     // (dispatch_aggregate_* guards with protocol::supports / endpoint checks).
+    //
+    // 别名候选同理，但这里能说得更清楚：来源别名自己强制的协议和本聚合强制的协议
+    // 不一致时，明确警告并写进响应（用户挑的是别名，看不到底下的账户，不告诉他就只剩
+    // 「为什么没走到这个候选」这种查不动的问题）。仍然不 400 —— 与 2026-08 那条决定一致，
+    // 拒绝会把「别名后来改了协议」变成保存不进去的聚合别名。
+    {
+        let mode = llmux_core::protocol::DownstreamMode::from_str(&upstream_api);
+        if mode != llmux_core::protocol::DownstreamMode::Default {
+            for c in &parsed {
+                let (Some(via), Some(cand_api)) = (c.via_alias.as_deref(), c.upstream_api.as_deref()) else { continue };
+                let cand_mode = llmux_core::protocol::DownstreamMode::from_str(cand_api);
+                if cand_mode != llmux_core::protocol::DownstreamMode::Default && cand_mode != mode {
+                    tracing::warn!(
+                        "🔀 [agg:{alias}] 候选 {} 来自别名 '{via}'（别名强制 {}），聚合强制 {} —— 运行时会跳过这一候选",
+                        c.account_id, cand_mode.as_str(), mode.as_str()
+                    );
+                    notes.push(format!(
+                        "candidate from alias '{via}' forces {} but this aggregate forces {} — it will be skipped at runtime",
+                        cand_mode.as_str(), mode.as_str()
+                    ));
+                }
+            }
+        }
+    }
 
     // Prevent alias collision with ordinary aliases unless explicitly confirmed
     let ordinary_exists: Option<i64> =
@@ -267,27 +407,15 @@ pub async fn set_aggregate_alias(
     .flatten()
     {
         Some((old_json, old_active, old_locked)) => {
-            let locked = old_locked.unwrap_or(0) == 1;
-            let old_list = parse_candidates(&old_json).unwrap_or_default();
-            let pinned = old_list.get(old_active.unwrap_or(0).max(0) as usize);
-            let moved = pinned.and_then(|old| {
-                parsed.iter().position(|candidate| {
-                    candidate.get("account_id").and_then(Value::as_i64) == Some(old.account_id)
-                        && candidate.get("model").and_then(Value::as_str) == Some(old.model.as_str())
-                })
-            });
-            match moved {
-                Some(idx) => (idx as i64, i64::from(locked)),
-                None => {
-                    if locked {
-                        tracing::warn!(
-                            "🔓 [agg:{}] 锁定的候选不在新列表里了 —— 解锁并回到 #1",
-                            alias
-                        );
-                    }
-                    (0, 0)
-                }
+            let (idx, keep_locked) =
+                llmux_core::aggregate::preserve_active_state(&old_json, old_active, old_locked, &parsed);
+            if old_locked.unwrap_or(0) == 1 && keep_locked == 0 {
+                tracing::warn!(
+                    "🔓 [agg:{}] 锁定的候选不在新列表里了 —— 解锁并回到 #1",
+                    alias
+                );
             }
+            (idx, keep_locked)
         }
         None => (0, 0),
     };
@@ -334,7 +462,16 @@ pub async fn set_aggregate_alias(
                     }
                 }
             });
-            let resp = json!({ "success": true, "message": "Aggregate alias set successfully" });
+            let mut resp = json!({
+                "success": true,
+                "message": "Aggregate alias set successfully",
+                "candidates": parsed.len(),
+            });
+            if !notes.is_empty() {
+                // 别名候选被展开成了几个账户、丢了哪些停用账户、协议不一致 ——
+                // 这些只有后端知道（用户挑的是别名），不写出来就没人会发现。
+                resp["notes"] = json!(notes);
+            }
             Json(resp).into_response()
         }
         Err(e) => crate::error::simple_error(

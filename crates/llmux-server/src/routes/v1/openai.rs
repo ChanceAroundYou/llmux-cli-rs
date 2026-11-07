@@ -915,6 +915,7 @@ pub(crate) async fn dispatch_aggregate_with_conversion(
     // 耗尽成因分类：全因配额冷却 vs 掺了别的原因（见 helpers::exhausted_status）
     let mut cooled_skips = 0usize;
     let mut failed_candidates = 0usize;
+    let mut stale_skips = 0usize;
     // 推进 3-confirm 的唯一证据形态：这一轮**真的尝试了锚点**（active）且它真的失败了。
     // 被跳过不算证据 —— 冷却 / 装不下 / max_tokens 不合规都是「没试过」，不是「坏了」。
     // 此前只要最终落到下游就推进计数，所以一次 30 分钟的限流休息就能把主候选挤下线。
@@ -929,6 +930,13 @@ pub(crate) async fn dispatch_aggregate_with_conversion(
     let last = if agg.locked { (active + 1).min(len) } else { len };
     for i in active..last {
         let cand = &agg.candidates[i];
+        // 来源普通别名已被删除 → 配置失效，跳过且不计失败（见 helpers::stale_candidate_reason）。
+        if let Some(reason) = crate::routes::v1::helpers::stale_candidate_reason(cand) {
+            tracing::debug!("🚫  [agg:{}] 跳过 {} | 账户 {}：{reason}", alias, cand.model, cand.account_id);
+            crate::routes::v1::helpers::note_skip_reason(&mut last_error, reason);
+            stale_skips += 1;
+            continue;
+        }
         // 配额/限流冷却中的候选跳过，见 670 行同处注释。
         if crate::routes::v1::helpers::rate_limit_suspended(&state.pool, cand.account_id, &cand.model).await {
             tracing::debug!("⏸️  [agg:{}] 跳过 {} | 账户 {}：冷却中", alias, cand.model, cand.account_id);
@@ -978,7 +986,12 @@ pub(crate) async fn dispatch_aggregate_with_conversion(
             _ => unreachable!(),
         };
         let mut provider_request = build_target_request(&account, Protocol::Responses, &translated, &None);
-        provider_request.first_byte_timeout_secs = agg.first_byte_timeout_secs;
+        // 完整转发：别名自己配的首字节超时优先于聚合的。`of` 这类别名把超时抬到
+        // 90s 是有具体原因的（大 prompt 冷前缀 prefill 要 100s+），候选不在聚合里
+        // 继承它，就会被聚合自己的默认值掐断 —— 那是把调好的配置改回坏的样子。
+        provider_request.first_byte_timeout_secs = cand
+            .first_byte_timeout_secs
+            .or(agg.first_byte_timeout_secs);
         tracing::info!("🔀 [agg:{} V={}] {} → {} → {} [{:?}→responses] outbound_shape={}", alias, active, account.alias, cand.model, provider_request.url, ingress, responses_body_shape(&translated));
         let mut request_capture = if ingress == Protocol::Messages {
             if let Some(raw_body) = raw_ingress_body.as_ref() {
@@ -1151,9 +1164,15 @@ pub(crate) async fn dispatch_aggregate_with_conversion(
     }
     let exhausted_status = crate::routes::v1::helpers::exhausted_status(
         cooled_skips,
-        cooled_skips + failed_candidates,
+        // 配置失效的候选进分母不进分子：全冷却才回 429（明确该等），掺着「来源别名
+        // 已删」时回 502 + 那条诊断串，而不是让客户端按 Retry-After 干等一个不会
+        // 自愈的配置问题。
+        cooled_skips + failed_candidates + stale_skips,
         last_status,
     );
+    if stale_skips > 0 {
+        tracing::warn!("🚫  [agg:{}] 本轮 {} 个候选因来源别名已不存在被跳过（共 {}）—— 到别名页重新保存", alias, stale_skips, len);
+    }
     send_tui_request(&state.tui_tx, normalized_uri.path(), if exhausted_status == Some(429) { 429 } else { 502 }, start, &agg.alias);
     // 全部候选都因 429 耗尽（冷却跳过 or 上游回 429）→ 回 429 + Retry-After，让调用方退避而不是立刻重试
     if exhausted_status == Some(429) {
@@ -1877,6 +1896,7 @@ async fn dispatch_aggregate_openai(
     // 耗尽成因分类：全因配额冷却 vs 掺了别的原因（见 helpers::exhausted_status）
     let mut cooled_skips = 0usize;
     let mut failed_candidates = 0usize;
+    let mut stale_skips = 0usize;
     // 推进 3-confirm 的唯一证据形态：这一轮**真的尝试了锚点**（active）且它真的失败了。
     // 被跳过不算证据 —— 冷却 / 装不下 / max_tokens 不合规都是「没试过」，不是「坏了」。
     let mut anchor_attempted = false;
@@ -1889,6 +1909,13 @@ async fn dispatch_aggregate_openai(
     let last = if agg.locked { (active + 1).min(len) } else { len };
     for i in active..last {
         let cand = &agg.candidates[i];
+        // 来源普通别名已被删除 → 配置失效，跳过且不计失败（见 helpers::stale_candidate_reason）。
+        if let Some(reason) = super::helpers::stale_candidate_reason(cand) {
+            tracing::debug!("🚫  [agg:{}] 跳过 {} | 账户 {}：{reason}", alias, cand.model, cand.account_id);
+            super::helpers::note_skip_reason(&mut last_error, reason);
+            stale_skips += 1;
+            continue;
+        }
         // 真配额耗尽冷却中的候选跳过。缺这一步会让本函数每轮都重试一个已
         // 知没配额的账户：同族的 dispatch_aggregate_with_conversion(545 行)、
         // anthropic(682)、以及三条直连路径都有，唯独这条漏了。配额是按天
@@ -1933,7 +1960,10 @@ async fn dispatch_aggregate_openai(
             llmux_core::protocol::Protocol::Chat
         };
         let mut provider_request = llmux_core::adapters::build_passthrough_with_beta(&account, proto, &patched_body, None);
-        provider_request.first_byte_timeout_secs = agg.first_byte_timeout_secs;
+        // 完整转发：候选继承来源别名自己的首字节超时，聚合的值只兜底。
+        provider_request.first_byte_timeout_secs = cand
+            .first_byte_timeout_secs
+            .or(agg.first_byte_timeout_secs);
         let log_url = provider_request.url.clone();
 
         tracing::info!("🔀 [agg:{} V={}] {} → {} → {}", alias, active, account.alias, cand.model, log_url);
@@ -2111,9 +2141,14 @@ async fn dispatch_aggregate_openai(
     }
     let exhausted_status = super::helpers::exhausted_status(
         cooled_skips,
-        cooled_skips + failed_candidates,
+        // 配置失效的候选进分母不进分子：掺着「来源别名已删」时回 502 + 那条诊断串，
+        // 别让客户端按 Retry-After 等一个不会自愈的配置问题。
+        cooled_skips + failed_candidates + stale_skips,
         last_status,
     );
+    if stale_skips > 0 {
+        tracing::warn!("🚫  [agg:{}] 本轮 {} 个候选因来源别名已不存在被跳过（共 {}）—— 到别名页重新保存", alias, stale_skips, len);
+    }
     send_tui_request(&state.tui_tx, normalized_uri.path(), if exhausted_status == Some(429) { 429 } else { 502 }, start, &agg.alias);
     // 全部候选都因 429 耗尽（冷却跳过 or 上游回 429）→ 回 429 + Retry-After，让调用方退避而不是立刻重试
     if exhausted_status == Some(429) {
