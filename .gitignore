@@ -76,3 +76,6 @@ Cargo.lock
 # One-shot probe keys (never commit)
 .zenkey
 /tmp/zm.py
+
+# 路由器排查记录（本地分析产物，不入仓）
+docs/router-system-audit-findings-2026-11-09.md
