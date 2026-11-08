@@ -49,13 +49,17 @@ export interface AggregateCandidate {
   model: string;
   /// 这一候选来自哪条**普通别名**（后端保存时展开，回编辑时原样送回即可保留来源）。
   via_alias?: string | null;
+  /// 这一候选来自哪条**聚合别名**（后端把那条聚合拍平进来时打的标记）。
+  /// 与 `via_alias` 互斥；来源聚合被删后这张候选会在运行时被跳过、不计失败。
+  via_aggregate?: string | null;
   /// 来源别名自己强制的协议 / 配的首字节超时 —— 后端用它做保存侧告警与运行时取值。
   upstream_api?: string | null;
   first_byte_timeout_secs?: number | null;
 }
-/// 提交给后端的候选：要么是一对 (账户, 模型)，要么是 `{"alias": "d4"}` 引用普通别名
-/// （后端在保存时完整展开成那条别名当前的绑定）。
-export type AggregateCandidateInput = AggregateCandidate | { alias: string };
+/// 提交给后端的候选：要么是一对 (账户, 模型)，要么是引用 ——
+/// `{"alias": "d4"}` 引用普通别名，`{"aggregate": "G"}` 引用聚合别名
+/// （两者都由后端在保存时完整展开成具体绑定）。
+export type AggregateCandidateInput = AggregateCandidate | { alias: string } | { aggregate: string };
 
 export interface AggregateAlias {
   id: number;
@@ -63,6 +67,8 @@ export interface AggregateAlias {
   candidates: AggregateCandidate[];
   /// 引用来源已经不存在的候选是哪几个别名（运行时会被跳过，不计失败）。
   missing_alias_sources?: string[];
+  /// 同上，来源是**聚合别名**的那一批（`via_aggregate`）。
+  missing_aggregate_sources?: string[];
   interval_secs: number;
   upstream_api?: string | null;
   /// 首字节超时（秒）。null = 走后端默认 30s（aggregate.rs 的 payload 用同一个字段名）。
