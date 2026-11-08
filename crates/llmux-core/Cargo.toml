@@ -31,5 +31,6 @@ zeroize.workspace = true
 
 [dev-dependencies]
 # test-util 只给测试用：`start_paused = true` 让 30s 的首字节超时在测试里瞬间走完。
+# net/io-util 给 balance_contract 的 loopback mock 用（真实 HTTP 路由/头验证）。
 # 放在 dev-dependencies 而不是 workspace 里，`cargo build --release` 就不会带上它。
-tokio = { workspace = true, features = ["test-util"] }
+tokio = { workspace = true, features = ["test-util", "net", "io-util"] }

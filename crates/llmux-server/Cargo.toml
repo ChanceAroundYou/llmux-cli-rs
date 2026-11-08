@@ -32,3 +32,7 @@ time.workspace = true
 hmac.workspace = true
 sha2.workspace = true
 base64.workspace = true
+
+[dev-dependencies]
+# loopback HTTP mock for the New API balance route contract (no external network).
+tokio = { workspace = true, features = ["net", "io-util"] }

@@ -32,6 +32,7 @@ pub enum BalanceKind {
     Bailian,
     ChatGPT,
     OpenAI,
+    NewApi,
 }
 
 impl BalanceKind {
@@ -49,6 +50,7 @@ impl BalanceKind {
             Self::Bailian => "bailian",
             Self::ChatGPT => "chatgpt",
             Self::OpenAI => "openai",
+            Self::NewApi => "newapi",
         }
     }
 }
@@ -74,6 +76,7 @@ pub fn detect_kind(provider_id: &str, endpoints: &[&str], balance_provider: &str
             "bailian" | "dashscope" | "aliyun" | "aliyun-bailian" => Some(BalanceKind::Bailian),
             "chatgpt" | "chatgpt-plus" | "codex" => Some(BalanceKind::ChatGPT),
             "openai" | "openai-api" => Some(BalanceKind::OpenAI),
+            "newapi" | "new-api" | "new_api" => Some(BalanceKind::NewApi),
             _ => None, // "none"/unknown → disabled
         };
     }
@@ -182,7 +185,17 @@ pub fn balance_uses_api_key(kind: BalanceKind, balance_auth: &str, api_key: &str
 /// Fetch and normalize the balance for one account. Never fails with Err on
 /// upstream problems — those become `{"ok":false,"error":...}` payloads so the
 /// caller can still cache them.
-pub async fn fetch_balance(kind: BalanceKind, credential: &str, endpoints: &[String]) -> Value {
+///
+/// `use_api_key` records **where the credential came from** (`balance_uses_api_key`),
+/// not what it looks like: New API reads the wallet with a user access token and
+/// token quota with an account API key, and both may share a prefix. Other kinds
+/// ignore it.
+pub async fn fetch_balance(
+    kind: BalanceKind,
+    credential: &str,
+    use_api_key: bool,
+    endpoints: &[String],
+) -> Value {
     match kind {
         BalanceKind::DeepSeek => fetch_deepseek(credential).await,
         BalanceKind::Copilot => fetch_copilot(credential).await,
@@ -206,6 +219,7 @@ pub async fn fetch_balance(kind: BalanceKind, credential: &str, endpoints: &[Str
         BalanceKind::Bailian => fetch_bailian(credential, endpoints).await,
         BalanceKind::ChatGPT => fetch_chatgpt(credential, endpoints).await,
         BalanceKind::OpenAI => fetch_openai(credential, endpoints).await,
+        BalanceKind::NewApi => fetch_newapi(credential, use_api_key, endpoints).await,
     }
     .unwrap_or_else(|e| err_result(kind.as_str(), &e.to_string()))
 }
@@ -827,7 +841,158 @@ pub fn api123_result(v: &Value) -> Value {
     ok_result("api123", summary, detail, json!(windows_json), json!([]))
 }
 
-// ─── TeamoRouter (teamorouter.cn) ────────────────────────────────────────────
+// ─── New API / 驭风 ─────────────────────────────────────────────────────────
+
+// Contract boundary (checked against QuantumNous/new-api public source,
+// 2026-11-08: controller/user.go, controller/token.go, middleware/auth.go,
+// router/api-router.go). That proves upstream's shape at that commit, not any
+// particular deployment's version or customization. Update this single
+// contract and its synthetic fixtures rather than trying multiple endpoints.
+const NEWAPI_TOKEN_USAGE_PATH: &str = "/api/usage/token/";
+const NEWAPI_WALLET_PATH: &str = "/api/user/self";
+
+/// Derive the New API deployment base from an account endpoint.
+///
+/// Account endpoints point at the OpenAI-compatible surface: the deployment
+/// root, a `/v1` suffix, or a full `/v1/...` path. New API's management routes
+/// live at the deployment root, so strip only that API surface and keep any
+/// deployment sub-path in front of it (`https://host/newapi/v1` →
+/// `https://host/newapi`). Anything else is a hard error — never fall back to
+/// a hard-coded host.
+pub fn newapi_base_url(endpoint: &str) -> Result<String> {
+    let url = url::Url::parse(endpoint).map_err(|e| anyhow!("无效的 New API 地址: {e}"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(anyhow!("New API 地址必须是 http(s)"));
+    }
+    let mut path = url.path().trim_end_matches('/').to_string();
+    for suffix in ["/chat/completions", "/completions", "/messages", "/responses", "/embeddings", "/models"] {
+        if let Some(rest) = path.strip_suffix(suffix) {
+            path = rest.to_string();
+            break;
+        }
+    }
+    if path == "/v1" {
+        path.clear();
+    } else if let Some(rest) = path.strip_suffix("/v1") {
+        path = rest.to_string();
+    }
+    Ok(format!("{}{}", url.origin().ascii_serialization(), path))
+}
+
+async fn fetch_newapi(credential: &str, use_api_key: bool, endpoints: &[String]) -> Result<Value> {
+    let base = endpoints
+        .iter()
+        .filter_map(|endpoint| newapi_base_url(endpoint).ok())
+        .next()
+        .ok_or_else(|| anyhow!("无法从账户端点确定 New API 地址"))?;
+    let path = if use_api_key {
+        NEWAPI_TOKEN_USAGE_PATH
+    } else {
+        NEWAPI_WALLET_PATH
+    };
+    let url = format!("{base}{path}");
+    let (status, payload) = get_json(
+        &url,
+        &[
+            ("authorization", format!("Bearer {}", credential.trim())),
+            ("accept", "application/json".into()),
+        ],
+    )
+    .await?;
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return Err(anyhow!("New API 凭据无效或无权限（HTTP {}）", status.as_u16()));
+    }
+    if !status.is_success() {
+        return Err(anyhow!("HTTP {}: {}", status.as_u16(), truncate_for_err(&payload.to_string())));
+    }
+    Ok(if path == NEWAPI_TOKEN_USAGE_PATH {
+        newapi_token_result(&payload)
+    } else {
+        newapi_wallet_result(&payload)
+    })
+}
+
+fn newapi_num(v: &Value, key: &str) -> Option<f64> {
+    v.get(key)
+        .and_then(Value::as_f64)
+        .or_else(|| v.get(key).and_then(Value::as_str).and_then(|s| s.trim().parse().ok()))
+        .filter(|n: &f64| n.is_finite() && *n >= 0.0)
+}
+
+/// Accept the successful envelope of either New API handler: `/api/user/self`
+/// answers `{"success": true, ...}` while `/api/usage/token/` answers
+/// `{"code": true, ...}`. An explicit `false` on either flag is a failure.
+fn newapi_data(v: &Value) -> Result<&Value> {
+    if v.get("code").and_then(Value::as_bool) == Some(false)
+        || v.get("success").and_then(Value::as_bool) == Some(false)
+    {
+        return Err(anyhow!("上游返回失败"));
+    }
+    if v.get("success").and_then(Value::as_bool) != Some(true)
+        && v.get("code").and_then(Value::as_bool) != Some(true)
+    {
+        return Err(anyhow!("响应缺少成功标记"));
+    }
+    v.get("data").ok_or_else(|| anyhow!("响应缺少 data"))
+}
+
+/// Parse the user-level wallet/quota response without assuming a currency unit.
+pub fn newapi_wallet_result(v: &Value) -> Value {
+    let data = match newapi_data(v) {
+        Ok(data) => data,
+        Err(e) => return err_result("newapi", &e.to_string()),
+    };
+    let Some(quota) = newapi_num(data, "quota") else {
+        return err_result("newapi", "缺少有效 quota");
+    };
+    let Some(used) = newapi_num(data, "used_quota") else {
+        return err_result("newapi", "缺少有效 used_quota");
+    };
+    // New API's user quota is remaining; used_quota is cumulative, not a deduction.
+    let rows = json!([
+        {"label": "可用 quota", "value": format_quota(quota)},
+        {"label": "累计已用 quota", "value": format_quota(used)},
+    ]);
+    ok_result(
+        "newapi",
+        format_quota(quota),
+        "钱包余额（原始 quota，未按系统 QuotaPerUnit 换算币值）".to_string(),
+        json!([]),
+        rows,
+    )
+}
+
+/// Parse a token-level quota response. It is deliberately never presented as money.
+pub fn newapi_token_result(v: &Value) -> Value {
+    let data = match newapi_data(v) {
+        Ok(data) => data,
+        Err(e) => return err_result("newapi", &e.to_string()),
+    };
+    if data.get("unlimited_quota").and_then(Value::as_bool) == Some(true) {
+        return ok_result("newapi", "无限".to_string(), "Token 配额，非钱包余额".to_string(), json!([]), json!([]));
+    }
+    let Some(remain) = newapi_num(data, "total_available") else {
+        return err_result("newapi", "缺少有效 total_available");
+    };
+    let Some(used) = newapi_num(data, "total_used") else {
+        return err_result("newapi", "缺少有效 total_used");
+    };
+    ok_result(
+        "newapi",
+        format!("Token 剩余 {}", format_quota(remain)),
+        format!("Token 配额，非钱包余额；已用 {}", format_quota(used)),
+        json!([]),
+        json!([
+            {"label": "Token 剩余 quota", "value": format_quota(remain)},
+            {"label": "Token 已用 quota", "value": format_quota(used)},
+        ]),
+    )
+}
+
+fn format_quota(value: f64) -> String {
+    if value.fract() == 0.0 { format!("{value:.0}") } else { format!("{value:.4}") }
+}
+
 
 /// 预付费 USD 钱包（无订阅窗口），`GET /v1/billing/me/balance` 用账户自己的
 /// `sk-teamo-…` key 直接鉴权 —— 不需要 cookie，所以走 `balance_uses_api_key` 的

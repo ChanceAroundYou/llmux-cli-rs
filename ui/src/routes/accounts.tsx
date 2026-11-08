@@ -57,7 +57,7 @@ const defaultProtocolFor = (category: string, fallback: string): string =>
   category === 'codex' ? 'responses' : fallback;
 
 // 需要网页登录凭据（Cookie/Token）而非 API Key 的余额查询类型。
-const COOKIE_KINDS = ['copilot', 'commandcode', 'opencode', 'opencode-go', 'opencode-zen', 'deepseek', 'chatgpt', 'openai', 'bailian'];
+const COOKIE_KINDS = ['copilot', 'commandcode', 'opencode', 'opencode-go', 'opencode-zen', 'deepseek', 'chatgpt', 'openai', 'bailian', 'newapi'];
 
 // 各类型的凭据获取教程（小叹号展开）——精确到 Cookie 名。
 const BALANCE_AUTH_HELP: Record<string, string[]> = {
@@ -119,6 +119,11 @@ const BALANCE_AUTH_HELP: Record<string, string[]> = {
     '方式二 · 网页登录 Cookie：浏览器登录 chatgpt.com → F12 → Application → Storage → Cookies → https://chatgpt.com，整串复制（或只复制 __Secure-next-auth.session-token 的 Value）；',
     '可带 Bearer 前缀，系统会自动剥离；凭据只用于余额查询，不影响转发。',
   ],
+  newapi: [
+    'New API 驭风余额查询支持用户 access token；只填 API Key 时仅查询 Token 配额，不代表钱包余额。',
+    '用户 access token 由 New API 个人设置生成，需具备 profile:read 权限，否则查询钱包会返回 403。',
+    '未提供换算系数时只显示原始 quota，不把它换算成金额。',
+  ],
   openai: [
     'OpenAI API 用量走组织账单接口，显示近 30 天消费（按天分桶）与 Tokens。',
     '1. 需要**组织管理员 Key**（sk-admin-…，platform.openai.com → 设置 → 组织 → API Keys，账号需有 Admin 权限）；',
@@ -139,7 +144,9 @@ function BalanceAuthInput({ kind, value, onChange, disabled }: { kind: string; v
         <p className="flex-1 min-w-0 text-xs text-muted-foreground leading-relaxed">
           {isGo
             ? t('accounts.balanceAuthExplainGo', 'OpenCode Go 支持 API Key 或 Cookie 二选一：填 API Key 走 Go API（推荐），填 auth Cookie 走网页用量；请与上方“余额查询接口”的选择保持一致。')
-            : t('accounts.balanceAuthExplain', '该类型的余额接口需要网页登录凭据（Cookie / Token），仅用于余额查询，不影响正常请求转发。留空则使用上方 API Key 查询；编辑时留空表示不修改。')}
+            : kind === 'newapi'
+              ? t('accounts.balanceAuthExplainNewApi', 'New API 驭风：填用户 access token（需 profile:read 权限）查询钱包余额；留空则用 API Key 查询 Token 配额（非钱包余额）。')
+              : t('accounts.balanceAuthExplain', '该类型的余额接口需要网页登录凭据（Cookie / Token），仅用于余额查询，不影响正常请求转发。留空则使用上方 API Key 查询；编辑时留空表示不修改。')}
         </p>
         <button
           type="button"
@@ -612,11 +619,11 @@ export default function Accounts() {
     setIsValidating(true);
     setValidationError(null);
     try {
-      await addAccount({
+      const created = await addAccount({
         alias: formData.alias,
         provider_id: 'custom',
         category: formData.category,
-        api_key: formData.api_key,
+        ...(formData.category === 'codex' ? {} : { api_key: formData.api_key }),
         // 固定端点账户传 null，让服务端钉死（传什么都不生效）。
         chat_endpoint: !formFixedCategory && formEnabled.chat ? formData.chat_endpoint.trim() || null : null,
         responses_endpoint: !formFixedCategory && formEnabled.responses ? formData.responses_endpoint.trim() || null : null,
@@ -630,6 +637,10 @@ export default function Accounts() {
       setFormData({ alias: '', category: 'custom', api_key: '', chat_endpoint: '', responses_endpoint: '', messages_endpoint: '', default_protocol: '', balance_provider: '', balance_auth: '' });
       setFormEnabled({ chat: false, responses: false, messages: false });
       setFormShowKey(false);
+      if (formData.category === 'codex') {
+        const createdAccount = accounts.find(account => account.id === created);
+        setCodexLoginAccount({ id: created, alias: createdAccount?.alias ?? formData.alias });
+      }
     } catch (err: any) {
       setValidationError(err.message || "Validation failed");
     } finally {
@@ -659,6 +670,7 @@ export default function Accounts() {
       balance_auth: '',
     });
     setIsEditOpen(true);
+    setCodexLoginAccount(null);
   };
 
   const handleEditSubmit = async (e: React.FormEvent) => {
@@ -685,7 +697,7 @@ export default function Accounts() {
       };
       // 凭据只在填入且类型匹配时提交；留空 = 不修改已有值。
       if (editData.balance_auth && COOKIE_KINDS.includes(editData.balance_provider)) payload.balance_auth = editData.balance_auth;
-      if (editData.api_key) payload.api_key = editData.api_key;
+      if (editData.api_key && editData.category !== 'codex') payload.api_key = editData.api_key;
       await updateAccount(editingAccount.id, payload);
       // 余额配置可能变了：清掉旧的"不支持"标记与旧结果，让刷新按钮重新出现
       const updatedId = editingAccount.id;
@@ -800,15 +812,9 @@ export default function Accounts() {
                 </div>
                 <div className="flex items-center gap-2 shrink-0">
                   {acc.category === 'codex' && (
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      onClick={() => setCodexLoginAccount({ id: acc.id, alias: acc.alias })}
-                      className={acc.codex_configured ? "text-success hover:text-success hover:bg-success/10" : "text-warning hover:text-warning hover:bg-warning/10"}
-                      title={acc.codex_configured ? `${t('codex.login.title')}（${t('accounts.codexConfigured')})` : t('accounts.codexNotConfigured')}
-                    >
-                      <LogIn size={16} />
-                    </Button>
+                    <span className={acc.codex_configured ? "text-success text-xs" : "text-warning text-xs"}>
+                      {acc.codex_configured ? t('accounts.codexConfigured') : t('accounts.codexNotConfigured')}
+                    </span>
                   )}
                   <Button variant="ghost" size="icon" onClick={() => openEdit(acc)} className="text-warning hover:text-warning hover:bg-warning/10" title="Edit account"><Pencil size={16} /></Button>
                   <Button variant="ghost" size="icon" onClick={() => toggleActive(acc.id, acc.is_active)} className={acc.is_active === 1 ? "text-success hover:text-success hover:bg-success/10" : "text-muted-foreground/40 hover:text-muted-foreground hover:bg-muted"} title={acc.is_active === 1 ? t('common.online') : t('accounts.offline')}><Power size={16} /></Button>
@@ -860,27 +866,39 @@ export default function Accounts() {
                 {ACCOUNT_CATEGORIES.map(category => <option key={category} value={category}>{t(`accounts.categoryOptions.${category}`, category)}</option>)}
               </select>
             </div>
-            <div className="space-y-1.5">
-              <label className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.apiKey')}</label>
-              <div className="relative">
-                <Input
-                  type={formShowKey ? 'text' : 'password'} required value={formData.api_key}
-                  disabled={isValidating}
-                  onChange={e => setFormData({ ...formData, api_key: e.target.value })}
-                  placeholder="sk-..."
-                  className="font-mono pr-10"
-                />
-                <button
-                  type="button"
-                  tabIndex={-1}
-                  aria-label={formShowKey ? 'Hide API key' : 'Show API key'}
-                  onClick={() => setFormShowKey(v => !v)}
-                  className="absolute right-2 top-1/2 -translate-y-1/2 p-1 text-muted-foreground hover:text-foreground"
-                >
-                  {formShowKey ? <EyeOff size={14} /> : <Eye size={14} />}
-                </button>
+            {formData.category !== 'codex' && (
+              <div className="space-y-1.5">
+                <label className="text-xs font-bold text-muted-foreground uppercase">{t('accounts.apiKey')}</label>
+                <div className="relative">
+                  <Input
+                    type={formShowKey ? 'text' : 'password'} required value={formData.api_key}
+                    disabled={isValidating}
+                    onChange={e => setFormData({ ...formData, api_key: e.target.value })}
+                    placeholder="sk-..."
+                    className="font-mono pr-10"
+                  />
+                  <button
+                    type="button"
+                    tabIndex={-1}
+                    aria-label={formShowKey ? 'Hide API key' : 'Show API key'}
+                    onClick={() => setFormShowKey(v => !v)}
+                    className="absolute right-2 top-1/2 -translate-y-1/2 p-1 text-muted-foreground hover:text-foreground"
+                  >
+                    {formShowKey ? <EyeOff size={14} /> : <Eye size={14} />}
+                  </button>
+                </div>
               </div>
-            </div>
+            )}
+
+            {formData.category === 'codex' && (
+              <div className="flex items-center justify-between rounded-md border border-border p-3">
+                <span className="text-xs text-muted-foreground">{t('accounts.codexNotConfigured')}</span>
+                <Button type="submit" size="sm" disabled={isValidating}>
+                  <LogIn size={14} />
+                  {t('codex.login.start')}
+                </Button>
+              </div>
+            )}
 
             {formFixedCategory ? (
               <FixedEndpointNotice label={t('accounts.endpoints', 'Endpoints')} category={formFixedCategory} />
@@ -954,6 +972,7 @@ export default function Accounts() {
                 <option value="opencode-zen">OpenCode Zen</option>
                 <option value="api123">API123</option>
                 <option value="teamorouter">TeamoRouter</option>
+                <option value="newapi">New API（驭风）</option>
                 <option value="bailian">阿里百炼</option>
                 <option value="chatgpt">ChatGPT 订阅</option>
                 <option value="openai">OpenAI API</option>
@@ -1037,30 +1056,48 @@ export default function Accounts() {
                 {ACCOUNT_CATEGORIES.map(category => <option key={category} value={category}>{t(`accounts.categoryOptions.${category}`, category)}</option>)}
               </select>
             </div>
-            <div className="space-y-1.5">
-              <div className="flex items-center justify-between">
-                <label className="text-xs font-bold text-muted-foreground uppercase">API Key</label>
-                <span className="text-xs text-muted-foreground italic">{t('accounts.leaveBlank')}</span>
+            {editData.category !== 'codex' && (
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between">
+                  <label className="text-xs font-bold text-muted-foreground uppercase">API Key</label>
+                  <span className="text-xs text-muted-foreground italic">{t('accounts.leaveBlank')}</span>
+                </div>
+                <div className="relative">
+                  <Input
+                    type={editShowKey ? 'text' : 'password'} value={editData.api_key}
+                    disabled={isValidating}
+                    onChange={e => setEditData({ ...editData, api_key: e.target.value })}
+                    placeholder={t('accounts.leaveBlank')}
+                    className="font-mono pr-10"
+                  />
+                  <button
+                    type="button"
+                    tabIndex={-1}
+                    aria-label={editShowKey ? 'Hide API key' : 'Show API key'}
+                    onClick={() => setEditShowKey(v => !v)}
+                    className="absolute right-2 top-1/2 -translate-y-1/2 p-1 text-muted-foreground hover:text-foreground"
+                  >
+                    {editShowKey ? <EyeOff size={14} /> : <Eye size={14} />}
+                  </button>
+                </div>
               </div>
-              <div className="relative">
-                <Input
-                  type={editShowKey ? 'text' : 'password'} value={editData.api_key}
-                  disabled={isValidating}
-                  onChange={e => setEditData({ ...editData, api_key: e.target.value })}
-                  placeholder={t('accounts.leaveBlank')}
-                  className="font-mono pr-10"
-                />
-                <button
-                  type="button"
-                  tabIndex={-1}
-                  aria-label={editShowKey ? 'Hide API key' : 'Show API key'}
-                  onClick={() => setEditShowKey(v => !v)}
-                  className="absolute right-2 top-1/2 -translate-y-1/2 p-1 text-muted-foreground hover:text-foreground"
-                >
-                  {editShowKey ? <EyeOff size={14} /> : <Eye size={14} />}
-                </button>
+            )}
+
+            {editData.category === 'codex' && (
+              <div className="flex items-center justify-between rounded-md border border-border p-3">
+                <span className="text-xs text-muted-foreground">
+                  {editingAccount?.codex_configured ? t('accounts.codexConfigured') : t('accounts.codexNotConfigured')}
+                </span>
+                <Button type="button" variant="outline" size="sm" onClick={() => {
+                  if (!editingAccount) return;
+                  setIsEditOpen(false);
+                  setCodexLoginAccount({ id: editingAccount.id, alias: editData.alias });
+                }}>
+                  <LogIn size={14} />
+                  {t('codex.login.title')}
+                </Button>
               </div>
-            </div>
+            )}
 
             {editFixedCategory ? (
               <FixedEndpointNotice label={t('accounts.endpoints', 'Endpoints')} category={editFixedCategory} />
@@ -1134,6 +1171,7 @@ export default function Accounts() {
                 <option value="opencode-zen">OpenCode Zen</option>
                 <option value="api123">API123</option>
                 <option value="teamorouter">TeamoRouter</option>
+                <option value="newapi">New API（驭风）</option>
                 <option value="bailian">阿里百炼</option>
                 <option value="chatgpt">ChatGPT 订阅</option>
                 <option value="openai">OpenAI API</option>
@@ -1229,12 +1267,15 @@ export default function Accounts() {
       </Dialog>
 
       <CodexLoginDialog
-        isOpen={codexLoginAccount !== null}
-        onClose={() => setCodexLoginAccount(null)}
+        isOpen={codexLoginAccount !== null && !isEditOpen}
+        onClose={() => {
+          setCodexLoginAccount(null);
+          if (editingAccount) setIsEditOpen(true);
+        }}
         account={codexLoginAccount}
         onSignedIn={() => {
           // 新凭据进了库，账户卡和模型列表都要重读，否则界面还按「未配置凭据」说话。
-          void fetchAccounts();
+          void fetchAccounts(true);
           void fetchModels(true);
         }}
       />

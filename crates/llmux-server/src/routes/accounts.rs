@@ -93,14 +93,17 @@ pub async fn get_account_balance(
     // except for opencode-go accounts that also carry an API key (see the helper).
     // codex 原生账户例外：余额凭据是 codex_auth_json 里的 access_token，
     // api_key 存的是 sidecar 内网 key，拿它打 wham/usage 必 401。
-    let credential = if category == "codex" {
+    // The source matters to the adapter (New API: user token = wallet, API key =
+    // token quota), so it is carried alongside the credential instead of being
+    // re-guessed from the credential's shape later.
+    let (credential, uses_api_key) = if category == "codex" {
         match row
             .try_get::<Option<String>, _>("codex_auth_json")
             .unwrap_or_default()
             .filter(|s| !s.trim().is_empty())
             .and_then(|j| llmux_core::codex_auth::CodexCreds::from_auth_json(&j).ok())
         {
-            Some(creds) => creds.access_token,
+            Some(creds) => (creds.access_token, false),
             None => {
                 return crate::error::simple_error(
                     "codex 账户未配置凭据：先跑 scripts/codex-login.sh 导入 auth.json",
@@ -116,33 +119,35 @@ pub async fn get_account_balance(
                 llmux_core::crypto::decrypt_api_key(cipher, &state.master_key).map_err(|e| e.to_string())
             }
         };
-        let auth_plain = decrypt(&auth_cipher);
-        let key_plain = decrypt(&enc_key);
-        // Dedicated balance_auth (cookie/token) wins; empty falls back to the API key —
-        // except for opencode-go accounts that also carry an sk- key (see the helper).
-        let chosen = if llmux_core::balance::balance_uses_api_key(
-            kind,
-            auth_plain.as_deref().unwrap_or(""),
-            key_plain.as_deref().unwrap_or(""),
-        ) {
-            key_plain
-        } else {
-            auth_plain
-        };
-        match chosen {
-            Ok(k) => k,
-            Err(e) => {
+        let auth_plain = match decrypt(&auth_cipher) {
+            Ok(value) => value,
+            Err(error) => {
                 return crate::error::simple_error(
-                    format!("Failed to decrypt API key: {e}"),
+                    format!("Failed to decrypt balance auth: {error}"),
                     StatusCode::INTERNAL_SERVER_ERROR,
                 )
             }
-        }
+        };
+        let key_plain = match decrypt(&enc_key) {
+            Ok(value) => value,
+            Err(error) if auth_plain.is_empty() => {
+                return crate::error::simple_error(
+                    format!("Failed to decrypt API key: {error}"),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                )
+            }
+            // balance_auth 存在且已解密成功时，key 只用于 opencode-go 的 sk- 探测；
+            // 解不开就当没有，不要为了它让一次本可用的探测失败。
+            Err(_) => String::new(),
+        };
+        let uses_api_key = llmux_core::balance::balance_uses_api_key(kind, &auth_plain, &key_plain);
+        let credential = if uses_api_key { key_plain } else { auth_plain };
+        (credential, uses_api_key)
     };
 
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(20),
-        llmux_core::balance::fetch_balance(kind, &credential, &endpoints),
+        llmux_core::balance::fetch_balance(kind, &credential, uses_api_key, &endpoints),
     )
     .await
     .unwrap_or_else(|_| json!({"provider": kind.as_str(), "ok": false, "error": "timeout"}));
@@ -378,6 +383,9 @@ pub async fn get_account_key(
     };
     use sqlx::Row as _;
     let enc: String = row.try_get("api_key").unwrap_or_default();
+    if enc.is_empty() {
+        return Json(json!({ "key": "" })).into_response();
+    }
     match llmux_core::crypto::decrypt_api_key(&enc, &state.master_key) {
         Ok(k) => Json(json!({ "key": k })).into_response(),
         Err(e) => crate::error::simple_error(
@@ -391,19 +399,17 @@ pub async fn create_account(
     Extension(state): Extension<AppState>,
     Json(body): Json<Value>,
 ) -> Response {
-    let missing = body.get("alias").is_none()
-        || body.get("provider_id").is_none()
-        || body.get("api_key").is_none();
+    let missing = body.get("alias").is_none() || body.get("provider_id").is_none();
     if missing {
         return crate::error::simple_error(
-            "Missing required fields: alias, provider_id, api_key",
+            "Missing required fields: alias, provider_id",
             StatusCode::BAD_REQUEST,
         );
     }
 
     let alias = body["alias"].as_str().unwrap_or_default().to_string();
     let provider_id = body["provider_id"].as_str().unwrap_or_default().to_string();
-    let api_key_plain = body["api_key"].as_str().unwrap_or_default().to_string();
+    let api_key_plain = body.get("api_key").and_then(Value::as_str).unwrap_or_default().to_string();
     // Account category (封闭枚举 custom / codex / zen_free)。缺省 custom。
     let category = match body.get("category").and_then(Value::as_str) {
         None => "custom".to_string(),
@@ -428,7 +434,7 @@ pub async fn create_account(
         .map(|s| s.trim().to_lowercase())
         .unwrap_or_default();
     if !balance_provider.is_empty()
-        && !["deepseek", "copilot", "openrouter", "commandcode", "opencode", "opencode-go", "opencode_go", "opencode-zen", "opencode_zen", "zen", "api123", "teamorouter", "bailian", "dashscope", "aliyun", "chatgpt", "chatgpt-plus", "codex", "openai", "openai-api", "none"]
+        && !["deepseek", "copilot", "openrouter", "commandcode", "opencode", "opencode-go", "opencode_go", "opencode-zen", "opencode_zen", "zen", "api123", "teamorouter", "bailian", "dashscope", "aliyun", "chatgpt", "chatgpt-plus", "codex", "openai", "openai-api", "newapi", "new-api", "new_api", "none"]
             .contains(&balance_provider.as_str())
     {
         return crate::error::simple_error(
@@ -444,7 +450,7 @@ pub async fn create_account(
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
 
-    if alias.is_empty() || provider_id.is_empty() || api_key_plain.is_empty() {
+    if alias.is_empty() || provider_id.is_empty() || (category != "codex" && api_key_plain.trim().is_empty()) {
         return crate::error::simple_error(
             "alias, provider_id, and api_key must not be empty",
             StatusCode::BAD_REQUEST,
@@ -719,7 +725,7 @@ pub async fn update_account(
             let s = v.as_str().unwrap_or("").trim().to_lowercase();
             if !s.is_empty()
                 && s != "none"
-                && !["deepseek", "copilot", "openrouter", "commandcode", "opencode", "opencode-go", "opencode_go", "opencode-zen", "opencode_zen", "zen", "api123", "teamorouter", "bailian", "dashscope", "aliyun", "chatgpt", "chatgpt-plus", "codex", "openai", "openai-api"].contains(&s.as_str())
+                && !["deepseek", "copilot", "openrouter", "commandcode", "opencode", "opencode-go", "opencode_go", "opencode-zen", "opencode_zen", "zen", "api123", "teamorouter", "bailian", "dashscope", "aliyun", "chatgpt", "chatgpt-plus", "codex", "openai", "openai-api", "newapi", "new-api", "new_api"].contains(&s.as_str())
             {
                 return crate::error::simple_error(
                     format!("Invalid balance_provider: {s}"),

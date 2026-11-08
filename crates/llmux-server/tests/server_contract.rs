@@ -162,7 +162,7 @@ async fn api_write_routes_validate_required_fields_and_return_gateway_shapes() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(
         body,
-        json!({"error": "Missing required fields: alias, provider_id, api_key"})
+        json!({"error": "Missing required fields: alias, provider_id"})
     );
 
     let (status, body) =
@@ -777,6 +777,224 @@ async fn alias_bound_to_codex_account_stores_responses_whatever_was_sent() {
             .await
             .unwrap();
     assert_eq!(stored, "responses", "codex 别名不该留下 /chat");
+}
+
+#[tokio::test]
+async fn codex_account_can_be_created_without_api_key_but_custom_still_requires_one() {
+    let state = llmux_server::test_state().await;
+    let app = llmux_server::app(state.clone());
+    let cookie = login_and_get_cookie(&app, &state).await.expect("session cookie");
+
+    let request = |body: Value| {
+        Request::builder()
+            .method(Method::POST)
+            .uri("/api/accounts")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::COOKIE, &cookie)
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+
+    let codex = llmux_server::test_request(app.clone(), request(json!({
+        "alias": "codex-no-key",
+        "provider_id": "codex",
+        "category": "codex",
+    }))).await;
+    assert_eq!(codex.status(), StatusCode::OK);
+    let data: Value = serde_json::from_slice(&axum::body::to_bytes(codex.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let id = data["id"].as_i64().unwrap();
+    let stored: String = sqlx::query_scalar("SELECT api_key FROM accounts WHERE id = ?")
+        .bind(id).fetch_one(&state.pool).await.unwrap();
+    assert_eq!(llmux_core::crypto::decrypt_api_key(&stored, &state.master_key).unwrap(), "");
+
+    let custom = llmux_server::test_request(app, request(json!({
+        "alias": "custom-no-key",
+        "provider_id": "custom",
+    }))).await;
+    assert_eq!(custom.status(), StatusCode::BAD_REQUEST);
+}
+
+/// Loopback HTTP mock: records request path + Authorization header, answers a
+/// fixed JSON body. Kept local to the test process (127.0.0.1), never external.
+async fn spawn_balance_mock(
+    body: &'static str,
+) -> (String, std::sync::Arc<tokio::sync::Mutex<Vec<(String, Option<String>)>>>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let recorder = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let sink = recorder.clone();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let sink = sink.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 8192];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or_default()
+                    .to_string();
+                let authorization = request.lines().find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("authorization")
+                        .then(|| value.trim().to_string())
+                });
+                sink.lock().await.push((path, authorization));
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+    (format!("http://{addr}"), recorder)
+}
+
+/// New API 的余额上游路由由**凭据来源**决定，而不是凭据长什么样：
+/// 只有 API key 的账户查令牌配额，配了 balance_auth 的账户查钱包 —— 即使 API key
+/// 不带 `sk-` 前缀、用户令牌反而带。旧实现按 `sk-` 前缀猜，会把前者打成钱包路由。
+#[tokio::test]
+async fn newapi_balance_route_picks_endpoint_from_credential_source() {
+    let state = llmux_server::test_state().await;
+    let app = llmux_server::app(state.clone());
+    let cookie = login_and_get_cookie(&app, &state).await.expect("session cookie");
+
+    let create = |body: Value| {
+        Request::builder()
+            .method(Method::POST)
+            .uri("/api/accounts")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::COOKIE, &cookie)
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+
+    // API key only → token quota route.
+    let (api_key_base, api_key_hits) = spawn_balance_mock(
+        r#"{"code":true,"message":"ok","data":{"total_available":1200,"total_used":800,"unlimited_quota":false}}"#,
+    )
+    .await;
+    let created = llmux_server::test_request(app.clone(), create(json!({
+        "alias": "newapi-key-only",
+        "provider_id": "custom",
+        "api_key": "plain-account-key",
+        "chat_endpoint": format!("{api_key_base}/v1"),
+        "balance_provider": "newapi",
+        "skip_validation": true,
+        "category": "custom",
+    }))).await;
+    assert_eq!(created.status(), StatusCode::OK);
+    let created: Value =
+        serde_json::from_slice(&axum::body::to_bytes(created.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let id = created["id"].as_i64().unwrap();
+    let balance = llmux_server::test_request(app.clone(), Request::builder()
+        .uri(format!("/api/accounts/{id}/balance"))
+        .header(header::COOKIE, &cookie)
+        .body(Body::empty()).unwrap()).await;
+    assert_eq!(balance.status(), StatusCode::OK);
+    let value: Value =
+        serde_json::from_slice(&axum::body::to_bytes(balance.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(value["balance"]["ok"], true, "{value}");
+    let hits = api_key_hits.lock().await.clone();
+    let hit = hits.iter().find(|(path, _)| path.contains("/api/usage/token/")).unwrap_or_else(|| panic!("no token usage request: {hits:?}"));
+    assert_eq!(hit.1.as_deref(), Some("Bearer plain-account-key"));
+    assert!(!hits.iter().any(|(path, _)| path.contains("/api/user/self")), "key-only account must not probe the wallet: {hits:?}");
+
+    // balance_auth (user access token) → wallet route, even though the account key has an sk- prefix.
+    let (wallet_base, wallet_hits) = spawn_balance_mock(
+        r#"{"success":true,"data":{"quota":2500000,"used_quota":500000}}"#,
+    )
+    .await;
+    let created = llmux_server::test_request(app.clone(), create(json!({
+        "alias": "newapi-with-auth",
+        "provider_id": "custom",
+        "api_key": "sk-account-key",
+        "balance_auth": "user-pat",
+        "chat_endpoint": format!("{wallet_base}/v1"),
+        "balance_provider": "new-api",
+        "skip_validation": true,
+        "category": "custom",
+    }))).await;
+    assert_eq!(created.status(), StatusCode::OK);
+    let created: Value =
+        serde_json::from_slice(&axum::body::to_bytes(created.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let id = created["id"].as_i64().unwrap();
+    let balance = llmux_server::test_request(app, Request::builder()
+        .uri(format!("/api/accounts/{id}/balance"))
+        .header(header::COOKIE, &cookie)
+        .body(Body::empty()).unwrap()).await;
+    assert_eq!(balance.status(), StatusCode::OK);
+    let value: Value =
+        serde_json::from_slice(&axum::body::to_bytes(balance.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(value["balance"]["ok"], true, "{value}");
+    let hits = wallet_hits.lock().await.clone();
+    let hit = hits.iter().find(|(path, _)| path.contains("/api/user/self")).unwrap_or_else(|| panic!("no wallet request: {hits:?}"));
+    assert_eq!(hit.1.as_deref(), Some("Bearer user-pat"));
+    assert!(!hits.iter().any(|(path, _)| path.contains("/api/usage/token/")), "balance_auth account must not probe token quota: {hits:?}");
+}
+
+#[tokio::test]
+async fn newapi_balance_provider_aliases_are_validated_on_create_and_update() {
+    let state = llmux_server::test_state().await;
+    let app = llmux_server::app(state.clone());
+    let cookie = login_and_get_cookie(&app, &state).await.expect("session cookie");
+
+    let create = |balance_provider: &str| {
+        Request::builder()
+            .method(Method::POST)
+            .uri("/api/accounts")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::COOKIE, &cookie)
+            .body(Body::from(json!({
+                "alias": format!("newapi-alias-{balance_provider}"),
+                "provider_id": "custom",
+                "api_key": "sk-test",
+                "chat_endpoint": "http://127.0.0.1:9/v1",
+                "balance_provider": balance_provider,
+                "skip_validation": true,
+                "category": "custom",
+            }).to_string()))
+            .unwrap()
+    };
+
+    let created = llmux_server::test_request(app.clone(), create("new_api")).await;
+    assert_eq!(created.status(), StatusCode::OK);
+    let created: Value =
+        serde_json::from_slice(&axum::body::to_bytes(created.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let id = created["id"].as_i64().unwrap();
+
+    let updated = llmux_server::test_request(app.clone(), Request::builder()
+        .method(Method::PUT)
+        .uri(format!("/api/accounts/{id}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::COOKIE, &cookie)
+        .body(Body::from(json!({"balance_provider": "new-api"}).to_string())).unwrap()).await;
+    assert_eq!(updated.status(), StatusCode::OK);
+
+    let rejected = llmux_server::test_request(app, create("newapi-bogus")).await;
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn codex_account_key_endpoint_returns_empty_string_for_empty_key() {    let state = llmux_server::test_state().await;
+    let app = llmux_server::app(state.clone());
+    let cookie = login_and_get_cookie(&app, &state).await.expect("session cookie");
+    let create = llmux_server::test_request(app.clone(), Request::builder()
+        .method(Method::POST).uri("/api/accounts")
+        .header(header::CONTENT_TYPE, "application/json").header(header::COOKIE, &cookie)
+        .body(Body::from(json!({"alias":"codex-empty-key","provider_id":"codex","category":"codex","api_key":""}).to_string())).unwrap()).await;
+    assert_eq!(create.status(), StatusCode::OK);
+    let data: Value = serde_json::from_slice(&axum::body::to_bytes(create.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let key = llmux_server::test_request(app, Request::builder().uri(format!("/api/accounts/{}/key", data["id"].as_i64().unwrap())).header(header::COOKIE, cookie).body(Body::empty()).unwrap()).await;
+    assert_eq!(key.status(), StatusCode::OK);
+    let value: Value = serde_json::from_slice(&axum::body::to_bytes(key.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(value["key"], "");
 }
 
 /// zen_free 账户的上游地址同样由代码固定（sidecar 前缀），三列都钉成同一个
