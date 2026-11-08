@@ -279,11 +279,17 @@ pub fn stale_candidate_reason(
     if !cand.stale_source {
         return None;
     }
+    let Some(via) = cand.stale_via.as_deref() else {
+        // 理论上不会走到（stale_source 只会由来源标记触发）；别把空名字塞进诊断串。
+        return Some(format!(
+            "Candidate {} ({}) comes from a deleted alias source — re-save this aggregate alias or remove the candidate",
+            cand.account_id, cand.model
+        ));
+    };
     Some(format!(
-        "Candidate {} ({}) comes from alias '{}' which no longer exists — re-save this aggregate alias or remove the candidate",
+        "Candidate {} ({}) comes from {via}, which no longer exists — re-save this aggregate alias or remove the candidate",
         cand.account_id,
-        cand.model,
-        cand.via_alias.as_deref().unwrap_or("?")
+        cand.model
     ))
 }
 

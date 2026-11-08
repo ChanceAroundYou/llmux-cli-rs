@@ -368,3 +368,212 @@ async fn aggregates_referencing_returns_only_the_aggregates_that_declare_the_ali
         .expect("reverse lookup must not fail")
         .is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// 聚合别名引用聚合别名：保存时拍平、沿链跟动
+// ---------------------------------------------------------------------------
+
+/// 带协议 / 超时 / active 的聚合别名（普通 insert_aggregate 只写 alias+candidates）。
+async fn insert_aggregate_full(
+    pool: &sqlx::SqlitePool,
+    alias: &str,
+    candidates: &[AggregateCandidate],
+    upstream_api: Option<&str>,
+    timeout_secs: Option<i64>,
+    active_idx: i64,
+) {
+    let json = serde_json::to_string(candidates).expect("encode candidates");
+    sqlx::query(
+        "INSERT INTO aggregate_aliases (alias, candidates, interval_secs, upstream_api, first_byte_timeout_secs, active_idx) VALUES (?, ?, 300, ?, ?, ?)",
+    )
+    .bind(alias)
+    .bind(json)
+    .bind(upstream_api)
+    .bind(timeout_secs)
+    .bind(active_idx)
+    .execute(pool)
+    .await
+    .expect("insert aggregate");
+}
+
+async fn read_candidates(pool: &sqlx::SqlitePool, alias: &str) -> Vec<AggregateCandidate> {
+    let json: String = sqlx::query_scalar("SELECT candidates FROM aggregate_aliases WHERE alias = ?")
+        .bind(alias)
+        .fetch_one(pool)
+        .await
+        .expect("read candidates");
+    parse_candidates(&json).expect("parse stored candidates")
+}
+
+#[tokio::test]
+async fn expanding_an_aggregate_starts_at_its_active_candidate_and_stamps_provenance() {
+    let pool = memory_db().await;
+    let first = insert_account(&pool, "p-agg", 3, true).await;
+    let second = insert_account(&pool, "p-agg", 2, true).await;
+    let third = insert_account(&pool, "p-agg", 1, true).await;
+    insert_aggregate_full(
+        &pool,
+        "src",
+        &[
+            AggregateCandidate { account_id: first, model: "m1".into(), ..Default::default() },
+            AggregateCandidate { account_id: second, model: "m2".into(), via_alias: Some("d4".into()), ..Default::default() },
+            AggregateCandidate { account_id: third, model: "m3".into(), ..Default::default() },
+        ],
+        None,
+        None,
+        2,
+    )
+    .await;
+
+    let expanded = llmux_core::aggregate::expand_aggregate_candidate(&pool, "src")
+        .await
+        .expect("expand referenced aggregate");
+    // 顺序从被引用聚合的 active 起点轮转：用户引用它是想要「它现在先打谁」。
+    let models: Vec<&str> = expanded.iter().map(|c| c.model.as_str()).collect();
+    assert_eq!(models, vec!["m3", "m1", "m2"]);
+    // 来源记成那条聚合；里面原本来自普通别名的 via_alias 原样保留（删掉那条普通别名时
+    // 这批候选同样要在运行时被判成配置失效）。
+    assert!(expanded.iter().all(|c| c.via_aggregate.as_deref() == Some("src")));
+    assert_eq!(expanded[2].via_alias.as_deref(), Some("d4"));
+}
+
+#[tokio::test]
+async fn expanding_an_aggregate_propagates_its_forced_protocol_and_only_fills_missing_timeouts() {
+    let pool = memory_db().await;
+    let a = insert_account(&pool, "p-agg-proto", 1, true).await;
+    let b = insert_account(&pool, "p-agg-proto", 1, true).await;
+    insert_aggregate_full(
+        &pool,
+        "forced",
+        &[
+            // 候选自带超时：候选值优先，不被聚合级覆盖
+            AggregateCandidate { account_id: a, model: "m".into(), first_byte_timeout_secs: Some(120), ..Default::default() },
+            AggregateCandidate { account_id: b, model: "m".into(), ..Default::default() },
+        ],
+        Some("responses"),
+        Some(45),
+        0,
+    )
+    .await;
+
+    let expanded = llmux_core::aggregate::expand_aggregate_candidate(&pool, "forced")
+        .await
+        .expect("expand");
+    // 协议被强制成 responses 时必须落到候选上：否则引用方按自己的协议发，
+    // 保存侧的「候选强制 X、本聚合强制 Y」检查也就拦不住。
+    assert!(expanded.iter().all(|c| c.upstream_api.as_deref() == Some("responses")));
+    assert_eq!(expanded[0].first_byte_timeout_secs, Some(120));
+    assert_eq!(expanded[1].first_byte_timeout_secs, Some(45));
+}
+
+#[tokio::test]
+async fn resyncing_an_ordinary_alias_cascades_through_aggregate_references() {
+    let pool = memory_db().await;
+    let old_acct = insert_account(&pool, "p-cas", 1, true).await;
+    let new_acct = insert_account(&pool, "p-cas", 2, true).await;
+    insert_alias(&pool, "d4", "m-old", None, Some(&[old_acct]), None, Some("chat"), Some(30)).await;
+    // G 引用普通别名 d4；A 引用聚合别名 G（引用发生在保存时，库里存的是展开后的快照）。
+    insert_aggregate_full(
+        &pool,
+        "G",
+        &[AggregateCandidate { account_id: old_acct, model: "m-old".into(), via_alias: Some("d4".into()), upstream_api: Some("chat".into()), first_byte_timeout_secs: Some(30), ..Default::default() }],
+        Some("chat"),
+        None,
+        0,
+    )
+    .await;
+    insert_aggregate_full(
+        &pool,
+        "A",
+        &[AggregateCandidate { account_id: old_acct, model: "m-old".into(), via_alias: Some("d4".into()), via_aggregate: Some("G".into()), upstream_api: Some("chat".into()), first_byte_timeout_secs: Some(30), ..Default::default() }],
+        Some("chat"),
+        None,
+        0,
+    )
+    .await;
+
+    // 改 d4 的绑定。只刷 G 是不够的：A 里存的是 G 当时那份快照。
+    sqlx::query("UPDATE model_aliases SET target_model = 'm-new', account_ids = ? WHERE alias = 'd4'")
+        .bind(serde_json::to_string(&vec![new_acct]).expect("encode"))
+        .execute(&pool)
+        .await
+        .expect("rebind alias");
+
+    let touched = llmux_core::aggregate::resync_alias_candidates(&pool, "d4")
+        .await
+        .expect("resync");
+    // 级联：G 与引用 G 的 A 都必须被刷新，否则 A 会一直打在 d4 早就换掉的账户上。
+    assert!(touched.contains(&"G".to_string()), "touched={touched:?}");
+    assert!(touched.contains(&"A".to_string()), "touched={touched:?}");
+
+    let g = read_candidates(&pool, "G").await;
+    assert_eq!(g[0].account_id, new_acct);
+    assert_eq!(g[0].model, "m-new");
+    let a = read_candidates(&pool, "A").await;
+    assert_eq!(a[0].account_id, new_acct);
+    assert_eq!(a[0].model, "m-new");
+    // A 的来源标记仍是被引用的那条聚合（不是被 G 的 via_alias 顶掉）。
+    assert_eq!(a[0].via_aggregate.as_deref(), Some("G"));
+}
+
+#[tokio::test]
+async fn resyncing_an_aggregate_refreshes_its_referrers_without_overwriting_itself() {
+    let pool = memory_db().await;
+    let acct = insert_account(&pool, "p-cyc", 1, true).await;
+    // A ↔ B 互相引用：保存侧每次都能展开对方当前的快照（因此是合法配置），
+    // 但跟动时必须停下来 —— 否则两圈之后 B 的旧快照会把 A 刚保存的内容盖回去。
+    insert_aggregate_full(
+        &pool,
+        "A",
+        &[AggregateCandidate { account_id: acct, model: "from-A".into(), via_aggregate: Some("B".into()), ..Default::default() }],
+        None,
+        None,
+        0,
+    )
+    .await;
+    insert_aggregate_full(
+        &pool,
+        "B",
+        &[AggregateCandidate { account_id: acct, model: "from-B".into(), via_aggregate: Some("A".into()), ..Default::default() }],
+        None,
+        None,
+        0,
+    )
+    .await;
+
+    let touched = llmux_core::aggregate::resync_aggregate_candidates(&pool, "A")
+        .await
+        .expect("resync must terminate");
+    // 只有 B 被刷新（A 是本轮来源方，不能被反向覆盖）。
+    assert_eq!(touched, vec!["B".to_string()]);
+    let a = read_candidates(&pool, "A").await;
+    assert_eq!(a[0].model, "from-A");
+    // B 的候选换成 A 当前的快照，来源记作 A。
+    let b = read_candidates(&pool, "B").await;
+    assert_eq!(b[0].model, "from-A");
+    assert_eq!(b[0].via_aggregate.as_deref(), Some("A"));
+}
+
+#[tokio::test]
+async fn an_ordinary_alias_that_redirects_to_an_aggregate_is_refused_as_a_candidate() {
+    let pool = memory_db().await;
+    let acct = insert_account(&pool, "p-redir", 1, true).await;
+    insert_aggregate_full(
+        &pool,
+        "G",
+        &[AggregateCandidate { account_id: acct, model: "m".into(), ..Default::default() }],
+        None,
+        None,
+        0,
+    )
+    .await;
+    // 普通别名写成「重定向到聚合别名」的形状：account_ids / provider 都空，target 落到 G 上。
+    insert_alias(&pool, "redir", "G", None, None, None, Some("default"), None).await;
+
+    // 候选展开不能跟着这条重定向走：dispatch 不会把候选再当聚合解析一次，
+    // 存进去只会变成「打一个叫 G 的模型」。必须当场说清楚。
+    let err = expand_alias_candidate(&pool, "redir")
+        .await
+        .expect_err("a redirect-to-aggregate alias cannot be a candidate source");
+    assert!(format!("{err}").contains("redirects to aggregate alias"), "err={err}");
+}

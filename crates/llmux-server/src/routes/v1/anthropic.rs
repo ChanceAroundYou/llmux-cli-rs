@@ -80,6 +80,15 @@ pub async fn messages(
     let model_for_check = dispatcher::sanitize_model_name(body.get("model").and_then(Value::as_str).unwrap_or(""));
     if !model_for_check.is_empty() {
         if let Ok(res) = state.resolve_model_cached(&model_for_check).await {
+            // 重定向别名指向聚合别名 → 按聚合路径走（与 Chat/Responses 入口同一判据）。
+            if res.account_ids.is_empty() {
+                if let Some(agg) = super::openai::aggregate_for_alias_target(&state, &model_for_check).await {
+                    return super::openai::dispatch_aggregate_with_conversion(
+                        llmux_core::protocol::Protocol::Messages,
+                        state, auth, uri, headers, body, Some(raw_body), agg,
+                    ).await;
+                }
+            }
             return super::openai::dispatch_with_conversion(
                 llmux_core::protocol::Protocol::Messages,
                 state, auth, uri, headers, body, res,

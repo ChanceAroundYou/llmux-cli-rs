@@ -1968,3 +1968,58 @@ async fn e2e_aggregate_unsupported_api_fallback_all_ingresses() {
         assert_ingress_stream(ingress, &raw);
     }
 }
+
+/// 普通别名把 target 指到一条**聚合别名**上：请求按聚合路由（不是把聚合名当模型发）。
+///
+/// 反证点有两个：
+///   1. 聚合名不是模型名 —— 走错路会打到 `/chat/completions` 之外拼出来的地址（404/502），
+///      下面每条请求都会红；
+///   2. 重定向走到底时 `resolve_model` 会回填一个前缀 provider（"gpt-4o" → openai），
+///      只看解析结果分不出「别名重定向」和「裸模型名」，所以这里同时钉住另一种情况：
+///      直接请求聚合别名本身仍然走聚合（第一条分支），两条路径必须给出同一份响应。
+#[tokio::test]
+async fn e2e_ordinary_alias_pointing_at_an_aggregate_alias_all_ingresses() {
+    let (upstream_a, _upstream_b) = spawn_mock_upstreams().await;
+
+    let state = llmux_server::test_state().await;
+    let app = llmux_server::app(state.clone());
+    sqlx::query("INSERT INTO api_keys (name, key, allowed_models) VALUES (?, ?, ?)")
+        .bind("e2e-redir-agg").bind("sk-redir-agg").bind("*")
+        .execute(&state.pool).await.unwrap();
+    let cookie = login(app.clone()).await;
+
+    let account = create_test_account(app.clone(), &cookie, json!({
+        "alias": "redir-agg-acct",
+        "provider_id": "openai",
+        "api_key": "sk-mock",
+        "base_url": upstream_a,
+        "chat_endpoint": upstream_a,
+        "responses_endpoint": upstream_a,
+        "messages_endpoint": upstream_a,
+        "anthropic_base_url": upstream_a,
+        "default_protocol": "chat",
+        "skip_validation": true,
+    })).await;
+    create_aggregate(app.clone(), &cookie, "redir-agg-target", account, "default").await;
+
+    // 重定向写法：不绑账户、不指 provider，target_model 就是那条聚合别名
+    let (status, body) = api_post(app.clone(), &cookie, "/api/models/aliases", json!({
+        "alias": "to-agg",
+        "target_model": "redir-agg-target",
+        "upstream_api": "default",
+    })).await;
+    assert_eq!(status, StatusCode::OK, "redirect alias: {body:?}");
+
+    for (path, ingress) in INGRESSES {
+        let (status, resp, raw) = v1_post(app.clone(), "sk-redir-agg", path, ingress_request(ingress, "to-agg")).await;
+        assert_eq!(status, StatusCode::OK, "{ingress} via redirect alias: {status:?}\nraw={raw}");
+        assert_ingress_shape(ingress, &resp, &raw);
+        assert!(usage_nonzero(&resp), "{ingress} usage: {resp:?}");
+
+        let mut stream_body = ingress_request(ingress, "to-agg");
+        stream_body["stream"] = json!(true);
+        let (status, _resp, raw) = v1_post(app.clone(), "sk-redir-agg", path, stream_body).await;
+        assert_eq!(status, StatusCode::OK, "{ingress} stream via redirect alias: {status:?}\nraw={raw}");
+        assert_ingress_stream(ingress, &raw);
+    }
+}

@@ -37,6 +37,14 @@ pub async fn aggregate_alias_payloads(state: &AppState) -> anyhow::Result<Value>
             .unwrap_or_default()
             .into_iter()
             .collect();
+    // 聚合资格的来源同理：引用了一条聚合别名，那条聚合被删后这批候选会被运行时跳过。
+    let aggregate_names: std::collections::HashSet<String> =
+        sqlx::query_scalar::<_, String>("SELECT alias FROM aggregate_aliases")
+            .fetch_all(&state.pool)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
     // 取锁之后到函数结束不得再有 `.await`。
     let router = state.aggregate_router.lock().unwrap();
     let mut out = Vec::with_capacity(rows.len());
@@ -52,6 +60,15 @@ pub async fn aggregate_alias_payloads(state: &AppState) -> anyhow::Result<Value>
                 llmux_core::aggregate::referenced_aliases(c)
                     .into_iter()
                     .filter(|n| !ordinary_names.contains(n))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let missing_aggregate_sources: Vec<String> = typed
+            .as_deref()
+            .map(|c| {
+                llmux_core::aggregate::referenced_aggregates(c)
+                    .into_iter()
+                    .filter(|n| !aggregate_names.contains(n))
                     .collect()
             })
             .unwrap_or_default();
@@ -75,6 +92,7 @@ pub async fn aggregate_alias_payloads(state: &AppState) -> anyhow::Result<Value>
             "alias": row.alias,
             "candidates": candidates,
             "missing_alias_sources": missing_alias_sources,
+            "missing_aggregate_sources": missing_aggregate_sources,
             "interval_secs": row.interval_secs.unwrap_or(300),
             "upstream_api": row.upstream_api.clone().unwrap_or_else(|| "chat".to_string()),
             "first_byte_timeout_secs": row.first_byte_timeout_secs,
@@ -136,30 +154,80 @@ pub async fn set_aggregate_alias(
         );
     }
 
-    // 候选两种写法：
+    // 候选三种写法：
     //   {"account_id": 5, "model": "deepseek-chat"}                手工挑的一对（原有）
-    //   {"alias": "d4"}                                            引用普通别名 → 完整转发并展开成它当前的绑定
-    //   {"account_id": 5, "model": "…", "via_alias": "d4"}         编辑器把已展开的候选原样送回来（保留来源）
+    //   {"alias": "d4"} / {"aggregate": "G"}                       引用一条别名 → 保存时完整展开
+    //                                                              （普通别名按绑定展开；聚合别名按它当前
+    //                                                              的候选列表拍平，并从它的 active 起点轮转）
+    //   {"account_id": 5, "model": "…", "via_alias"|"via_aggregate": "…"}
+    //                                                              编辑器把已展开的候选原样送回来（保留来源）
+    // `alias` 是「引用一条别名」的旧写法，名字同时属于两种别名时按**普通别名**展开
+    // （全仓一致的口径：普通别名优先于同名聚合）；要对同名聚合下手就用显式的 `aggregate`。
     // 展开只发生在保存这一侧：库里存的永远是具体 (账户, 模型)，索引语义
     // （active_idx / locked / 3-confirm）完全不用动。
     let mut parsed: Vec<AggregateCandidate> = Vec::new();
     let mut account_ids: Vec<i64> = Vec::new();
     let mut notes: Vec<String> = Vec::new();
     for item in arr {
-        if let Some(alias_ref) = item
-            .get("alias")
-            .and_then(Value::as_str)
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-        {
-            // 自引用：保存时同名普通别名还在，但同名冲突那一步（confirm 后）会把
-            // 它删掉 —— 候选的来源当场死掉，运行时永远跳过。当场拒掉，不留这种状态。
-            if alias_ref == alias {
+        let str_field = |key: &str| {
+            item.get(key)
+                .and_then(Value::as_str)
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        };
+        let alias_ref = str_field("alias");
+        let aggregate_ref = str_field("aggregate");
+        if alias_ref.is_some() && aggregate_ref.is_some() {
+            return crate::error::simple_error(
+                "Invalid alias candidate: send either \"alias\" (ordinary alias) or \"aggregate\" (aggregate alias), not both",
+                StatusCode::BAD_REQUEST,
+            );
+        }
+        // 显式引用聚合别名。
+        let aggregate_ref = match aggregate_ref {
+            Some(name) => Some(name),
+            // 旧写法的 `alias` 恰好是一条**聚合**别名名（且没有同名普通别名）→ 按聚合展开。
+            None => match alias_ref.as_deref() {
+                Some(name)
+                    if !llmux_core::aggregate::is_ordinary_alias(&state.pool, name).await
+                        && llmux_core::aggregate::is_aggregate_alias(&state.pool, name)
+                            .await
+                            .unwrap_or(false) =>
+                {
+                    Some(name.to_string())
+                }
+                _ => None,
+            },
+        };
+        if let Some(aggregate_ref) = aggregate_ref {
+            // 自引用：保存时库里那条旧行还在，但同名冲突那一步（confirm 后）会把它
+            // 删掉 —— 候选的来源当场死掉，运行时永远跳过。当场拒掉，不留这种状态。
+            if aggregate_ref == alias {
                 return crate::error::simple_error(
                     format!("Invalid alias candidate: aggregate alias '{alias}' cannot reference itself"),
                     StatusCode::BAD_REQUEST,
                 );
             }
+            // 拍平成它当前的候选（顺序从它的 active 起点开始），来源统一记成那条聚合 ——
+            // 删掉被引用的聚合后，运行时会跳过这批候选。
+            let expanded = match llmux_core::aggregate::expand_aggregate_candidate(&state.pool, &aggregate_ref).await {
+                Ok(v) => v,
+                Err(e) => {
+                    return crate::error::simple_error(
+                        format!("Invalid alias candidate: {e}"),
+                        StatusCode::BAD_REQUEST,
+                    )
+                }
+            };
+            notes.push(format!(
+                "aggregate alias '{aggregate_ref}' expanded to {} candidate(s) from its current active position",
+                expanded.len()
+            ));
+            account_ids.extend(expanded.iter().map(|c| c.account_id));
+            parsed.extend(expanded);
+            continue;
+        }
+        if let Some(alias_ref) = alias_ref {
             let (expanded, dropped) = match llmux_core::aggregate::expand_alias_candidate(&state.pool, &alias_ref).await {
                 Ok(v) => v,
                 Err(e) => {
@@ -205,6 +273,17 @@ pub async fn set_aggregate_alias(
             .and_then(Value::as_str)
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
+        let via_aggregate = item
+            .get("via_aggregate")
+            .and_then(Value::as_str)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        if via_alias.is_some() && via_aggregate.is_some() {
+            return crate::error::simple_error(
+                format!("Invalid candidates: candidate #{account_id} carries both via_alias and via_aggregate — a candidate has exactly one alias source"),
+                StatusCode::BAD_REQUEST,
+            );
+        }
         if let Some(via) = via_alias.as_deref() {
             if via == alias {
                 return crate::error::simple_error(
@@ -216,7 +295,7 @@ pub async fn set_aggregate_alias(
             // 但来源必须还在 —— 否则这次保存会把一个已经坏掉的配置悄悄存成「看起来正常」。
             if llmux_core::aggregate::is_aggregate_alias(&state.pool, via).await.unwrap_or(false) {
                 return crate::error::simple_error(
-                    format!("Invalid candidates: candidate #{account_id} references aggregate alias '{via}' — aggregate candidates may only reference an ordinary alias (one level)"),
+                    format!("Invalid candidates: candidate #{account_id} references aggregate alias '{via}' via via_alias — send it as via_aggregate instead"),
                     StatusCode::BAD_REQUEST,
                 );
             }
@@ -234,13 +313,32 @@ pub async fn set_aggregate_alias(
                 );
             }
         }
+        if let Some(via) = via_aggregate.as_deref() {
+            if via == alias {
+                return crate::error::simple_error(
+                    format!("Invalid candidates: candidate #{account_id} references aggregate alias '{alias}' itself — an aggregate alias cannot be a candidate of itself"),
+                    StatusCode::BAD_REQUEST,
+                );
+            }
+            if !llmux_core::aggregate::is_aggregate_alias(&state.pool, via)
+                .await
+                .unwrap_or(false)
+            {
+                return crate::error::simple_error(
+                    format!("Invalid candidates: candidate #{account_id} references aggregate alias '{via}' which no longer exists — remove it or reference the aggregate again"),
+                    StatusCode::BAD_REQUEST,
+                );
+            }
+        }
         parsed.push(AggregateCandidate {
             account_id,
             model,
             via_alias,
+            via_aggregate,
             upstream_api: item.get("upstream_api").and_then(Value::as_str).map(|s| s.to_string()),
             first_byte_timeout_secs: item.get("first_byte_timeout_secs").and_then(Value::as_u64),
             stale_source: false,
+            stale_via: None,
         });
         account_ids.push(account_id);
     }
@@ -474,6 +572,18 @@ pub async fn set_aggregate_alias(
                 *cache = None;
             }
             tracing::info!("🔀 Set aggregate alias {} ({} candidates)", alias, parsed.len());
+            // 本聚合可能被别的聚合别名引用着（那边存的是拍平快照）。这次候选变了，
+            // 立刻把它们重展开 —— 否则「跟着走」的语义只在新引用时才成立。
+            match llmux_core::aggregate::resync_aggregate_candidates(&state.pool, &alias).await {
+                Ok(touched) => {
+                    for agg in touched {
+                        state.invalidate_aggregate_cache(&agg);
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    "🔀 聚合别名 {alias} 保存后重展开引用它的聚合失败（引用方保持旧快照）：{e}"
+                ),
+            }
             // 验证改到后台：探测逐个走、每个最长 30s，放响应里会让保存接口
             // 卡住（聚合多候选时尤其明显）。结果写 model_test_results，
             // UI 卡片稍后经 health/summary 展示。
@@ -582,6 +692,31 @@ pub async fn delete_aggregate_alias(
         *cache = None;
     }
     state.clear_auth_cache();
+    // 引用本聚合的别名（普通别名重定向 / 其他聚合的拍平候选）现在都指向一个
+    // 已经删掉的名字。立刻作废它们的解析缓存，让「跳过这个候选」在下一个请求
+    // 就生效，而不是等 HOT_CACHE_TTL 过期。
+    match llmux_core::aggregate::aggregates_referencing_aggregate(&state.pool, &row.alias).await {
+        Ok(referrers) => {
+            for agg in referrers {
+                state.invalidate_aggregate_cache(&agg);
+            }
+        }
+        Err(e) => tracing::warn!(
+            "🔀 删除聚合别名 {} 后查找引用方失败（缓存按 TTL 自然过期）：{e}",
+            row.alias
+        ),
+    }
+    match llmux_core::aggregate::aggregates_referencing(&state.pool, &row.alias).await {
+        Ok(referrers) => {
+            for agg in referrers {
+                state.invalidate_aggregate_cache(&agg);
+            }
+        }
+        Err(e) => tracing::warn!(
+            "🔀 删除聚合别名 {} 后查找普通别名引用方失败（缓存按 TTL 自然过期）：{e}",
+            row.alias
+        ),
+    }
 
     Json(json!({ "success": true, "message": "Aggregate alias deleted" })).into_response()
 }

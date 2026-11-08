@@ -275,10 +275,15 @@ async fn an_aggregate_can_forward_an_ordinary_alias_end_to_end() {
     assert!(raw.contains("A-fast"), "应落在 mock 上：{raw}");
 }
 
-// --- 2. 只允许一层 -------------------------------------------------------------
+// --- 2. 引用聚合别名（拍平一层）-----------------------------------------------
 
+/// `{"aggregate":"agg-inner"}`（以及旧写法 `{"alias":"agg-inner"}`）在保存时把
+/// 被引用聚合**当前的候选列表**拍平进来，并给每个候选盖上 `via_aggregate` 来源戳。
+///
+/// 反证：如果保存只存名字、运行时把名字当模型发，最后那条请求会落到
+/// `/fast/chat/completions` 之外的路径（mock 不存在 → 502），而不是回 A-fast。
 #[tokio::test]
-async fn an_aggregate_candidate_may_not_reference_another_aggregate_alias() {
+async fn an_aggregate_candidate_may_reference_another_aggregate_alias() {
     let base = spawn_mock().await;
     let state = llmux_server::test_state().await;
     let app = llmux_server::app(state.clone());
@@ -295,21 +300,63 @@ async fn an_aggregate_candidate_may_not_reference_another_aggregate_alias() {
     .await;
     assert_eq!(st, StatusCode::OK, "{body:?}");
 
-    // 写法一：直接引用聚合别名名
+    // 显式写法：`{"aggregate": ...}`
     let (st, body) = api_post(
         &app,
         &cookie,
         "/api/aggregate-aliases",
-        json!({"alias": "agg-outer", "candidates": [{"alias": "agg-inner"}], "upstream_api": "chat"}),
+        json!({"alias": "agg-outer", "candidates": [{"aggregate": "agg-inner"}], "upstream_api": "chat"}),
     )
     .await;
-    assert_eq!(st, StatusCode::BAD_REQUEST, "二层引用必须 400：{body:?}");
+    assert_eq!(st, StatusCode::OK, "引用聚合别名必须允许：{body:?}");
+    assert_eq!(body["candidates"].as_i64(), Some(1), "应拍平成 1 个候选：{body:?}");
     assert!(
-        body["error"].as_str().unwrap_or_default().contains("one level"),
-        "错误要说清只允许一层：{body:?}"
+        body["notes"].as_array().map(|n| n.iter().any(|x| x.as_str().unwrap_or_default().contains("aggregate alias 'agg-inner'"))).unwrap_or(false),
+        "保存回执要说清「拍平了几条」：{body:?}"
     );
 
-    // 写法二：编辑器把已展开的候选原样送回，但 via_alias 指向聚合别名
+    let row = aggregate_row(&app, &cookie, "agg-outer").await;
+    let cand = &row["candidates"].as_array().unwrap()[0];
+    assert_eq!(cand["account_id"], json!(acct), "{row:?}");
+    assert_eq!(cand["model"], json!("m-in"), "{row:?}");
+    assert_eq!(
+        cand["via_aggregate"],
+        json!("agg-inner"),
+        "候选丢了聚合来源戳（删掉被引用聚合时就查不出失效来源了）：{row:?}"
+    );
+
+    // 旧写法 `{"alias": ...}` 指向聚合名时也按聚合展开（向后兼容）。
+    let (st, body) = api_post(
+        &app,
+        &cookie,
+        "/api/aggregate-aliases",
+        json!({"alias": "agg-outer-legacy", "candidates": [{"alias": "agg-inner"}], "upstream_api": "chat"}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body:?}");
+    let legacy = aggregate_row(&app, &cookie, "agg-outer-legacy").await;
+    assert_eq!(legacy["candidates"][0]["via_aggregate"], json!("agg-inner"));
+
+    // 运行时真的走被拍平进来的候选
+    let (st, raw) = v1_post(&app, "sk-level", "/v1/chat/completions", chat_request("agg-outer")).await;
+    assert_eq!(st, StatusCode::OK, "运行时没走到拍平的候选：{raw}");
+    assert!(raw.contains("A-fast"), "{raw}");
+
+    // 自引用：同名冲突那一步会把旧行删掉，候选来源当场死掉 —— 当场 400
+    let (st, body) = api_post(
+        &app,
+        &cookie,
+        "/api/aggregate-aliases",
+        json!({"alias": "agg-self", "candidates": [{"aggregate": "agg-self"}], "upstream_api": "chat"}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "自引用必须 400：{body:?}");
+    assert!(
+        body["error"].as_str().unwrap_or_default().contains("itself"),
+        "{body:?}"
+    );
+
+    // 编辑器把已展开的候选原样送回，但来源戳写错成 via_alias → 400 并指路 via_aggregate
     let (st, body) = api_post(
         &app,
         &cookie,
@@ -322,32 +369,139 @@ async fn an_aggregate_candidate_may_not_reference_another_aggregate_alias() {
     )
     .await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "{body:?}");
+    assert!(
+        body["error"].as_str().unwrap_or_default().contains("via_aggregate"),
+        "错误要说清该用哪个字段：{body:?}"
+    );
 
-    // 写法三：自引用 —— 同名普通别名会在冲突那一步被删掉，候选来源当场死掉
+    // 不存在的聚合别名名 → 不能悄悄存成「打一个叫 X 的模型」
     let (st, body) = api_post(
         &app,
         &cookie,
         "/api/aggregate-aliases",
-        json!({"alias": "agg-self", "candidates": [{"alias": "agg-self"}], "upstream_api": "chat"}),
+        json!({"alias": "agg-missing-ref", "candidates": [{"aggregate": "nope-agg"}], "upstream_api": "chat"}),
     )
     .await;
-    assert_eq!(st, StatusCode::BAD_REQUEST, "自引用必须 400：{body:?}");
-    assert!(
-        body["error"].as_str().unwrap_or_default().contains("itself"),
-        "{body:?}"
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{body:?}");
+}
+
+/// 被引用的聚合被删：候选保留但运行时按「配置失效」跳过（回 502、点名聚合来源、
+/// 不记候选失败）。删掉候选会让「只剩这一条」的聚合变成非法空列表。
+#[tokio::test]
+async fn deleting_the_referenced_aggregate_skips_the_flattened_candidates() {
+    let base = spawn_mock().await;
+    let state = llmux_server::test_state().await;
+    let app = llmux_server::app(state.clone());
+    add_key(&state, "sk-agggone").await;
+    let cookie = login(&app).await;
+    let acct = create_account(&app, &cookie, "agggoneacct", &format!("{base}/fast")).await;
+
+    api_post(
+        &app,
+        &cookie,
+        "/api/aggregate-aliases",
+        json!({"alias": "agg-src", "candidates": [{"account_id": acct, "model": "m-src"}], "upstream_api": "chat"}),
+    )
+    .await;
+    let (st, body) = api_post(
+        &app,
+        &cookie,
+        "/api/aggregate-aliases",
+        json!({"alias": "agg-user", "candidates": [{"aggregate": "agg-src"}], "upstream_api": "chat"}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body:?}");
+
+    let (st, raw) = v1_post(&app, "sk-agggone", "/v1/chat/completions", chat_request("agg-user")).await;
+    assert_eq!(st, StatusCode::OK, "删除前应正常：{raw}");
+
+    let src_id = aggregate_row(&app, &cookie, "agg-src").await["id"].as_i64().unwrap();
+    let (st, body) = api(
+        &app,
+        &cookie,
+        Method::DELETE,
+        &format!("/api/aggregate-aliases/{src_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body:?}");
+
+    let row = aggregate_row(&app, &cookie, "agg-user").await;
+    assert_eq!(
+        row["candidates"].as_array().unwrap().len(),
+        1,
+        "候选被顺手删了：{row:?}"
+    );
+    assert_eq!(
+        row["missing_aggregate_sources"].as_array().unwrap().as_slice(),
+        [json!("agg-src")],
+        "UI 要能看出这一候选的来源聚合已删除：{row:?}"
     );
 
-    let (_, list) = api(&app, &cookie, Method::GET, "/api/aggregate-aliases", None).await;
-    let names: Vec<&str> = list
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|a| a["alias"].as_str().unwrap_or_default())
-        .collect();
-    assert!(names.contains(&"agg-inner"), "合法的聚合别名不该被牵连：{names:?}");
-    for bad in ["agg-outer", "agg-outer2", "agg-self"] {
-        assert!(!names.contains(&bad), "{bad} 被存进去了：{names:?}");
+    let (st, raw) = v1_post(&app, "sk-agggone", "/v1/chat/completions", chat_request("agg-user")).await;
+    assert_eq!(
+        st,
+        StatusCode::BAD_GATEWAY,
+        "来源聚合已删的候选应被跳过（真去打就会 200 A-fast）：{raw}"
+    );
+    assert!(
+        raw.contains("aggregate alias"),
+        "错误要点名是聚合来源失效，而不是上游坏了：{raw}"
+    );
+
+    let router = state.aggregate_router.lock().unwrap();
+    if let Some(entry) = router.entries.get("agg-user") {
+        // 删除前那次成功会留一个 Some(true)，那是历史，不是这次判定的问题；
+        // 要钉住的是「配置失效不能被记成失败」。
+        assert!(
+            !entry.last_status.iter().any(|s| *s == Some(false)),
+            "配置失效被记成候选失败（last_status 里出现了 false）：{entry:?}"
+        );
     }
+    drop(router);
+}
+
+/// 被引用的聚合改了候选 → 引用它的聚合同步刷新（复用普通别名那条重展开链路）。
+#[tokio::test]
+async fn saving_the_referenced_aggregate_re_expands_its_referrers() {
+    let base = spawn_mock().await;
+    let state = llmux_server::test_state().await;
+    let app = llmux_server::app(state.clone());
+    let cookie = login(&app).await;
+    let acct = create_account(&app, &cookie, "resyncacct", &format!("{base}/fast")).await;
+
+    api_post(
+        &app,
+        &cookie,
+        "/api/aggregate-aliases",
+        json!({"alias": "agg-src2", "candidates": [{"account_id": acct, "model": "m-old"}], "upstream_api": "chat"}),
+    )
+    .await;
+    let (st, body) = api_post(
+        &app,
+        &cookie,
+        "/api/aggregate-aliases",
+        json!({"alias": "agg-user2", "candidates": [{"aggregate": "agg-src2"}], "upstream_api": "chat"}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body:?}");
+
+    let (st, body) = api_post(
+        &app,
+        &cookie,
+        "/api/aggregate-aliases",
+        json!({"alias": "agg-src2", "candidates": [{"account_id": acct, "model": "m-new"}], "upstream_api": "chat"}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body:?}");
+
+    let row = aggregate_row(&app, &cookie, "agg-user2").await;
+    assert_eq!(
+        row["candidates"][0]["model"],
+        json!("m-new"),
+        "被引用聚合改了候选，引用方还是旧快照：{row:?}"
+    );
+    assert_eq!(row["candidates"][0]["via_aggregate"], json!("agg-src2"));
 }
 
 // --- 3. 来源不存在 -------------------------------------------------------------

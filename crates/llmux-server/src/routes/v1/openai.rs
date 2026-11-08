@@ -101,8 +101,14 @@ pub async fn chat_completions(
         return dispatch_aggregate_with_conversion(Protocol::Chat, state, auth, uri, headers, body, None, agg).await;
     }
     // Ordinary alias resolved → unified per-account decision table
-    // (target_protocol(Chat ingress, mode, account)).
+    // (target_protocol(Chat ingress, mode, account)). A redirect alias whose target
+    // is an aggregate alias is dispatched as that aggregate instead.
     if let Ok(res) = state.resolve_model_cached(raw_model).await {
+        if res.account_ids.is_empty() {
+            if let Some(agg) = aggregate_for_alias_target(&state, raw_model).await {
+                return dispatch_aggregate_with_conversion(Protocol::Chat, state, auth, uri, headers, body, None, agg).await;
+            }
+        }
         return dispatch_with_conversion(Protocol::Chat, state, auth, uri, headers, body, res).await;
     }
     openai_dispatch(state, auth, uri, headers, body, "chat/completions").await
@@ -128,6 +134,11 @@ pub async fn responses(
     );
     if !model_for_check.is_empty() {
         if let Ok(res) = state.resolve_model_cached(&model_for_check).await {
+            if res.account_ids.is_empty() {
+                if let Some(agg) = aggregate_for_alias_target(&state, &model_for_check).await {
+                    return dispatch_aggregate_with_conversion(Protocol::Responses, state, auth, uri, headers, body, None, agg).await;
+                }
+            }
             return dispatch_with_conversion(Protocol::Responses, state, auth, uri, headers, body, res).await;
         }
     }
@@ -148,7 +159,38 @@ async fn openai_dispatch_via_body(
     openai_dispatch(state, auth, uri, HeaderMap::new(), patched, endpoint).await
 }
 
-/// Direct dispatch to /responses with back-translation to chat completions
+/// 普通别名把 target 指到一条聚合别名上（重定向写法：不绑账户、不指 provider）
+/// → 这次请求按**聚合**路径走。
+///
+/// 判据只能自己再走一遍别名链（[`llmux_core::dispatcher::redirect_target`]）：
+/// 重定向走到底时 `resolve_model` 会回退到按前缀兜底并**无条件填一个 provider_id**，
+/// 从 `ModelResolution` 上看「别名重定向到聚合 G」和「裸模型名 G」完全一样。
+/// 真的绑了账户/provider 的别名不会被判成重定向，所以「用户绑的账户优先」这条不变。
+/// 聚合别名本身的优先级仍由调用方先查的那次 `resolve_aggregate_cached` 决定。
+pub(crate) async fn aggregate_for_alias_target(
+    state: &AppState,
+    model_name: &str,
+) -> Option<llmux_core::aggregate::AggregateResolution> {
+    let target = match llmux_core::dispatcher::redirect_target(&state.pool, model_name).await {
+        Ok(Some(t)) => t,
+        Ok(None) => return None,
+        Err(e) => {
+            tracing::warn!("解析别名 {model_name} 的重定向链失败（按普通别名继续）：{e}");
+            return None;
+        }
+    };
+    match state.resolve_aggregate_cached(&target).await {
+        Ok(Some(agg)) => Some(agg),
+        Ok(None) => None,
+        Err(e) => {
+            tracing::warn!(
+                "别名 {model_name} 指向聚合别名 {target}，但解析失败（按普通别名继续）：{e}"
+            );
+            None
+        }
+    }
+}
+
 /// Unified ingress→target dispatcher (Task 6).
 ///
 /// For the given `ingress` protocol (Chat or Messages), computes the outbound

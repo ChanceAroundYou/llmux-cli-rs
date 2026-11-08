@@ -451,41 +451,65 @@ ChatGPT Plus 的 Codex 额度直连 `chatgpt.com/backend-api/codex`，llmux 原�
 每个别名绑定一个上游账户（Copilot、DeepSeek、sense、agnes 等），请求按别名路由到对应 API。
 context_length 字段：先查 models_cache（上游提供）→ 再查内置表（`crates/llmux-core/src/context.rs`）。
 
-## 聚合别名引用普通别名（2026-11-07 加）
+## 别名互相引用（2026-11-07 加，2026-11-09 允许聚合↔聚合、普通别名→聚合）
 
-聚合别名的候选两种写法：`{"account_id":5,"model":"x"}`（原有）或 `{"alias":"d4"}`
-（引用一条**普通别名**）。引用在**保存时**展开成那条别名当前的绑定
-（`llmux_core::aggregate::expand_alias_candidate`：preferred 账户在前，其余按
-`weight DESC, id ASC`），`upstream_api` / `first_byte_timeout_secs` 一并带过来，
-候选上只留 `via_alias` 记来源。
+两条独立的引用能力，都是**保存时展开**、运行时不需要递归：
 
-- **只允许一层**：候选引用聚合别名 → 400（含引用自己）；引用不存在的普通别名 → 400。
+1. **聚合别名的候选**可以引用一条别名 —— `{"alias":"d4"}`（普通别名）或
+   `{"aggregate":"G"}`（聚合别名；`{"alias":"G"}` 这种旧写法在 G 不是普通别名名时也按聚合处理）。
+   `expand_alias_candidate` / `expand_aggregate_candidate` 在保存时展开成具体
+   (账户, 模型)，候选上留 `via_alias` / `via_aggregate` 记来源。
+2. **普通别名的 target** 可以是一条聚合别名（重定向写法：不绑账户、不指 provider）。
+   请求按**聚合**路径走（候选轮转 / 故障转移 / 拨测），判据是
+   `v1::openai::aggregate_for_alias_target` + `dispatcher::redirect_target`。
+
+### 判据与坑
+
 - **运行时不解析别名**：库里存的一直是具体 (账户, 模型)，`aggregate_probe`、路由、
-  索引语义（`active_idx` / `locked` / 3-confirm）都不用改。`AggregateCandidate::stale_source`
+  索引语义（`active_idx` / `locked` / 3-confirm）都不用改。`stale_source` / `stale_via`
   是运行时判定，`serde(skip)` 不落库。
-- **来源别名被删/改名 = 配置失效，不是上游坏了**：dispatch 跳过该候选，且**不记**
-  `note_candidate_failure`、不设 `anchor_attempted` —— 否则「删掉一条普通别名」就能在几轮里
-  把聚合的主候选挤下线。跳过只进 `exhausted_status` 的**分母不进分子**：掺着配置失效时回
-  502 + 诊断串，而不是 429 让客户端按 `Retry-After` 干等一个不会自愈的配置问题。
-  判据 `routes::v1::helpers::stale_candidate_reason`。
-- **改普通别名会带动引用它的聚合**：保存普通别名时 `resync_alias_candidates` 重展开；
-  删除普通别名时 `aggregates_referencing` 作废那些聚合的解析缓存（不作废就要最长
-  `HOT_CACHE_TTL` 才生效，取当前值 `grep -n HOT_CACHE_TTL crates/llmux-server/src/app.rs`）。
-  候选本身**不删** —— 别名可能只是改名，或还会被建回来。
-- **超时优先级：候选自带的 > 聚合自己的**（`cand.first_byte_timeout_secs.or(agg.first_byte_timeout_secs)`），
-  「完整转发」就是这个意思。
-- **协议不一致在保存聚合别名时 400**（2026-11-07 改，此前是 `notes` 警告 + 运行时跳过）：
-  候选自带的 `upstream_api`（来自被引用的别名，或候选显式带的）与本聚合强制的 `upstream_api`
-  不一致 → `400 code=candidate_protocol_conflict`，`error` 里点名是哪条候选、两边各强制什么。
-  改判的理由只有一条：候选来自**别名**时用户看不见底下的协议，「保存成功但这条候选永远走不通」
-  不是配置而是坑；而 400 给的两条出路（换候选 / 改这个聚合强制的协议）都在用户手里。
-  **两处不变**：① 运行时跳过保留 —— 改普通别名的协议会经 `resync_alias_candidates` 直接
-  重展开进已存的聚合别名，那条路不经过保存路由，只能靠运行时兜；② 普通别名绑定账户
-  仍不在保存时拒（2026-08 那条决定没被推翻，钉在 `tests/e2e_protocol_split.rs`）。
-  判据只看候选自己的 `upstream_api`（`default` 不算冲突），不挂在 `via_alias` 上。
-  前端在编辑时就拦同一种冲突并给同一句话（`aliasModeConflict`），不让你吃一条英文 400。
-- 契约测试 `crates/llmux-server/tests/aggregate_alias_candidate_contract.rs`（条数取法：
-  `cargo test --test aggregate_alias_candidate_contract 2>&1 | grep '^test result'`）。
+- **拍平从被引用聚合的 active 起点轮转**，并把被引用聚合强制的 `upstream_api` 落到每个
+  候选上（`default` 不覆盖）、聚合级首字节超时只补候选没写的那些。
+- **自引用 400**（`{"alias": self}` / `{"aggregate": self}` / `via_*: self`）；
+  引用不存在的来源 400；引用行 `via_alias` 指向聚合名 → 400 并让你改用 `via_aggregate`。
+- **普通别名重定向到聚合别名，本身不能当聚合候选的来源** → 400：dispatch 不会把候选
+  再当聚合解析一次，存进去只会变成「打一个叫 G 的模型」。
+- ⚠️ **别用 `ModelResolution` 判断「是不是重定向到聚合」**：重定向走到底时
+  `resolve_model` 会回退到 `resolve_model_by_prefix` 并**无条件填一个 provider_id**
+  （`openai`/`anthropic`/`gemini`）、`alias_name` 也丢了 —— 「别名重定向到聚合 G」和
+  「裸模型名 G」在解析结果上完全一样。判据只能是 `dispatcher::redirect_target`
+  （自己按纯重定向的定义再走一遍链）。这条踩过一次：第一版按
+  `provider_id.is_empty()` 判，重定向别名永远走不到聚合分支。
+- **来源消失 = 配置失效，不是上游坏了**：dispatch 跳过该候选，且**不记**
+  `note_candidate_failure`、不设 `anchor_attempted` —— 否则删一个来源就能在几轮里把聚合
+  的主候选挤下线。跳过只进 `exhausted_status` 的**分母不进分子**：掺着配置失效时回
+  502 + 诊断串（`routes::v1::helpers::stale_candidate_reason`，会点名是
+  `alias 'd4'` 还是 `aggregate alias 'G'`），而不是 429 让客户端等一个不会自愈的配置问题。
+  删掉来源时**不删候选**（会让「只剩一条」的聚合变成非法空列表），只作废引用它的聚合的
+  解析缓存（`aggregates_referencing` / `aggregates_referencing_aggregate`）。
+- **沿链跟动是级联的**：保存普通别名 → `resync_alias_candidates`；保存聚合别名 →
+  `resync_aggregate_candidates`。两者共用 `resync_references`，会把「引用被改写聚合的那些
+  聚合」也刷新一层（`visited` 去重，环 A↔B 不会互相覆盖/死循环）。不级联的话
+  d4→G→A 这条链上改 d4 只会刷新 G，A 会一直打在 d4 早就换掉的账户上。
+  ⚠️ 判定「这个候选归哪个来源管」必须与刷新时同一口径：`via_aggregate` 有值的候选**归那条
+  聚合**（它继承来的 `via_alias` 只用于失效判定，不能拿来当刷新入口），否则普通别名那次
+  展开会把 `via_aggregate` 洗掉、聚合再跟动时就找不到它了。
+- **超时优先级：候选自带的 > 聚合自己的**（`cand.first_byte_timeout_secs.or(agg.first_byte_timeout_secs)`）。
+- **协议不一致在保存聚合别名时 400**（2026-11-07 改）：候选自带的 `upstream_api`（来自被引用的
+  别名/聚合，或候选显式带的）与本聚合强制的 `upstream_api` 不一致 →
+  `400 code=candidate_protocol_conflict`。**两处不变**：① 运行时跳过保留 —— 改来源的协议会经
+  resync 直接重展开进已存的聚合别名，那条路不经过保存路由；② 普通别名绑定账户仍不在保存时拒
+  （2026-08 那条决定没被推翻，钉在 `tests/e2e_protocol_split.rs`）。
+  前端在编辑时就拦同一种冲突（`aliasModeConflict`），不让你吃一条英文 400。
+- **同名冲突**：普通别名优先于同名聚合（`resolve_aggregate` 遇到同名普通别名回 None；
+  候选的 `{"alias": X}` 也按普通别名展开）。要对同名聚合下手就写显式的 `{"aggregate": X}`。
+- **UI**：聚合编辑器有两个按钮（`+ 引用别名` / `+ 引用聚合别名`），引用聚合的行、候选来源戳
+  「〔聚合〕G」用紫色区分；普通别名的 target 选择器把聚合别名列为「〔聚合〕name → N 个候选」，
+  列表里目标是聚合的别名带「〔聚合〕」标。
+- 契约测试：`crates/llmux-core/tests/aggregate_candidate_contract.rs`、
+  `crates/llmux-server/tests/aggregate_alias_candidate_contract.rs`、
+  `crates/llmux-server/tests/e2e_protocol_split.rs`（`e2e_ordinary_alias_pointing_at_an_aggregate_alias_all_ingresses`）。
+  条数取法：`cargo test --test aggregate_alias_candidate_contract 2>&1 | grep '^test result'`。
 
 ## 别名同名冲突（2026-11-07 改）
 

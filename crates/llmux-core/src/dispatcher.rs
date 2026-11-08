@@ -328,6 +328,41 @@ pub async fn find_alias(pool: &SqlitePool, name: &str) -> anyhow::Result<Option<
     }
 }
 
+/// 沿着**纯重定向**的普通别名链走到底，返回终点名字；链不属于纯重定向就返回 None。
+///
+/// 「纯重定向」= 沿路每条别名都没有绑账户、也没有 provider —— 那些别名只是把
+/// 模型名换成另一个名字，真正的绑定在别处（比如一条**聚合别名**）。
+///
+/// 为什么不能从 [`ModelResolution`] 反推：重定向走到底时 `resolve_model` 会回退到
+/// `resolve_model_by_prefix`，它会无条件填一个 `provider_id`（`openai` / `anthropic` /
+/// `gemini`），`alias_name` 也丢了 —— 于是「别名重定向到聚合别名」和「一个裸模型名」
+/// 在解析结果里长得一模一样。要区分只能自己再走一遍链。
+pub async fn redirect_target(
+    pool: &SqlitePool,
+    model_name: &str,
+) -> anyhow::Result<Option<String>> {
+    let mut name = sanitize_model_name(model_name);
+    let mut saw_alias = false;
+    for _ in 0..8 {
+        let Some(alias) = find_alias(pool, &name).await? else { break };
+        let has_accounts = alias
+            .account_ids
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<Vec<i64>>(s).ok())
+            .is_some_and(|ids| !ids.is_empty());
+        if has_accounts || alias.provider_id.is_some() {
+            return Ok(None);
+        }
+        saw_alias = true;
+        let next = sanitize_model_name(&alias.target_model);
+        if next == name {
+            break; // 自环：停在原地，别当重定向
+        }
+        name = next;
+    }
+    Ok(saw_alias.then_some(name))
+}
+
 pub async fn resolve_model(pool: &SqlitePool, model_name: &str) -> anyhow::Result<ModelResolution> {
     let mut model_name = sanitize_model_name(model_name);
     // ponytail: 别名可重定向到其他别名 —— target_model 命中 model_aliases 表的另一条
