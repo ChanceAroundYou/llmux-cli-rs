@@ -493,8 +493,9 @@ fn remap_tool_choice_to_chat(tc: &Value) -> Value {
 }
 
 /// responses request body → chat completions request body (inverse of
-/// `chat_to_responses`). The `stream` flag is intentionally dropped so the
-/// upstream is queried buffered and the response can be back-converted once.
+/// `chat_to_responses`). `stream` is preserved: a streaming Responses client
+/// must stay streaming across the conversion, so the caller streams the Chat
+/// SSE through `ChatToResponsesConverter`.
 pub fn responses_req_to_chat_req(v: &Value) -> Value {
     let mut out = Map::new();
     if let Some(m) = v.get("model") { out.insert("model".into(), m.clone()); }
@@ -570,6 +571,16 @@ pub fn responses_req_to_chat_req(v: &Value) -> Value {
     }
     if let Some(tc) = v.get("tool_choice") {
         out.insert("tool_choice".into(), remap_tool_choice_to_chat(tc));
+    }
+    // Streaming stays streaming across the conversion. Ask for the usage tail
+    // chunk too — the Responses client expects token counts on
+    // `response.completed`, and OpenAI-compatible upstreams only send them when
+    // `stream_options.include_usage` is set.
+    if let Some(stream) = v.get("stream") {
+        out.insert("stream".into(), stream.clone());
+        if stream.as_bool() == Some(true) {
+            out.insert("stream_options".into(), json!({ "include_usage": true }));
+        }
     }
     Value::Object(out)
 }
@@ -708,6 +719,11 @@ pub fn responses_req_to_anthropic_req(v: &Value, resolved_model: &str) -> Value 
             _ => json!({"type": "auto"}),
         };
         out.insert("tool_choice".into(), mapped);
+    }
+    // Streaming stays streaming across the conversion: the Anthropic SSE is
+    // fed through `AnthropicToResponsesConverter` rather than buffered.
+    if let Some(stream) = v.get("stream") {
+        out.insert("stream".into(), stream.clone());
     }
     Value::Object(out)
 }
@@ -1229,6 +1245,1123 @@ impl ResponsesToAnthropicConverter {
         out.push(sse_event("message_stop", json!({"type":"message_stop"})));
         out
     }
+}
+
+/// OpenAI Chat SSE → Responses SSE. The inverse of `ResponsesToChatConverter`:
+/// text deltas become `response.output_text.delta`, Chat `tool_calls` fragments
+/// become `function_call` items, and the terminal Chat chunk becomes
+/// `response.completed`.
+pub struct ChatToResponsesConverter {
+    response_id: String,
+    model: String,
+    created_at: i64,
+    started: bool,
+    items: Vec<OutputItem>,
+    /// chat `tool_calls[].index` → index into `items`.
+    tool_items: HashMap<u64, usize>,
+    /// chat `tool_calls[].index` → (id, name, arguments-so-far) held until both
+    /// id and name are known. Opening the item earlier would emit an
+    /// `output_item.added` with an empty `call_id`/`name`, which Responses
+    /// clients use to address the call — the same trap `OpenAISseConverter`
+    /// documents for tool_use blocks.
+    pending_calls: HashMap<u64, (String, String, String)>,
+    last_usage: Option<Value>,
+    finish_reason: Option<String>,
+    terminal: bool,
+    finished: bool,
+    failed: bool,
+}
+
+impl ChatToResponsesConverter {
+    pub fn new(model: &str) -> Self {
+        Self {
+            response_id: format!("resp_{}", uuid_simple()),
+            model: model.to_string(),
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64,
+            started: false,
+            items: Vec::new(),
+            tool_items: HashMap::new(),
+            pending_calls: HashMap::new(),
+            last_usage: None,
+            finish_reason: None,
+            terminal: false,
+            finished: false,
+            failed: false,
+        }
+    }
+
+    fn start(&mut self, out: &mut Vec<String>) {
+        if self.started {
+            return;
+        }
+        self.started = true;
+        out.push(sse_event(
+            "response.created",
+            json!({
+                "type": "response.created",
+                "response": {
+                    "id": self.response_id,
+                    "object": "response",
+                    "created_at": self.created_at,
+                    "status": "in_progress",
+                    "model": self.model,
+                    "output": [],
+                }
+            }),
+        ));
+    }
+
+    fn push_item(&mut self, kind: OutputItemKind, out: &mut Vec<String>) -> usize {
+        self.start(out);
+        let output_index = self.items.len();
+        let (id, call_id, name) = match kind {
+            OutputItemKind::Message => (format!("msg_{}", uuid_simple()), String::new(), String::new()),
+            OutputItemKind::FunctionCall => (format!("fc_{}", uuid_simple()), String::new(), String::new()),
+            OutputItemKind::Reasoning => (format!("rs_{}", uuid_simple()), String::new(), String::new()),
+        };
+        let item = OutputItem { id, kind, output_index, text: String::new(), call_id, name, arguments: String::new(), args_emitted: false, closed: false };
+        let added = item.added();
+        let item_id = item.id.clone();
+        self.items.push(item);
+        out.push(sse_event(
+            "response.output_item.added",
+            json!({"type": "response.output_item.added", "output_index": output_index, "item": added}),
+        ));
+        if kind == OutputItemKind::Message {
+            out.push(sse_event(
+                "response.content_part.added",
+                json!({
+                    "type": "response.content_part.added",
+                    "item_id": item_id,
+                    "output_index": output_index,
+                    "content_index": 0,
+                    "part": {"type": "output_text", "text": ""},
+                }),
+            ));
+        }
+        output_index
+    }
+
+    fn emit_text(&mut self, text: &str, out: &mut Vec<String>) {
+        if text.is_empty() {
+            return;
+        }
+        let index = self
+            .items
+            .last()
+            .filter(|item| item.kind == OutputItemKind::Message && !item.closed)
+            .map(|item| item.output_index);
+        let index = match index {
+            Some(index) => index,
+            None => self.push_item(OutputItemKind::Message, out),
+        };
+        let item = &mut self.items[index];
+        item.text.push_str(text);
+        let item_id = item.id.clone();
+        out.push(sse_event(
+            "response.output_text.delta",
+            json!({
+                "type": "response.output_text.delta",
+                "item_id": item_id,
+                "output_index": index,
+                "content_index": 0,
+                "delta": text,
+            }),
+        ));
+    }
+
+    fn emit_reasoning(&mut self, text: &str, out: &mut Vec<String>) {
+        if text.is_empty() {
+            return;
+        }
+        let index = self
+            .items
+            .iter()
+            .find(|item| item.kind == OutputItemKind::Reasoning && !item.closed)
+            .map(|item| item.output_index);
+        let index = match index {
+            Some(index) => index,
+            None => self.push_item(OutputItemKind::Reasoning, out),
+        };
+        let item = &mut self.items[index];
+        item.text.push_str(text);
+        let item_id = item.id.clone();
+        out.push(sse_event(
+            "response.reasoning_summary_text.delta",
+            json!({
+                "type": "response.reasoning_summary_text.delta",
+                "item_id": item_id,
+                "output_index": index,
+                "summary_index": 0,
+                "delta": text,
+            }),
+        ));
+    }
+
+    /// One Chat `tool_calls` fragment. Identity (`id`, `function.name`) may
+    /// arrive on the first fragment only; the item is opened once both are
+    /// known, and everything buffered so far is emitted as one delta.
+    fn emit_tool_delta(&mut self, fragment: &Value, out: &mut Vec<String>) {
+        let chat_index = fragment.get("index").and_then(Value::as_u64).unwrap_or(0);
+        let call_id = fragment.get("id").and_then(Value::as_str).unwrap_or_default();
+        let name = fragment
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let arguments = fragment
+            .get("function")
+            .and_then(|f| f.get("arguments"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+
+        if let Some(&item_index) = self.tool_items.get(&chat_index) {
+            let item = &mut self.items[item_index];
+            item.arguments.push_str(arguments);
+            if !arguments.is_empty() {
+                let item_id = item.id.clone();
+                let output_index = item.output_index;
+                out.push(sse_event(
+                    "response.function_call_arguments.delta",
+                    json!({
+                        "type": "response.function_call_arguments.delta",
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "delta": arguments,
+                    }),
+                ));
+            }
+            return;
+        }
+
+        let pending = self.pending_calls.entry(chat_index).or_default();
+        if !call_id.is_empty() {
+            pending.0 = call_id.to_string();
+        }
+        if !name.is_empty() {
+            pending.1 = name.to_string();
+        }
+        pending.2.push_str(arguments);
+        if pending.0.is_empty() || pending.1.is_empty() {
+            return;
+        }
+        let (call_id, name, buffered) = self
+            .pending_calls
+            .remove(&chat_index)
+            .unwrap_or_default();
+        let index = self.push_tool_item(&call_id, &name, out);
+        self.tool_items.insert(chat_index, index);
+        let item_id = self.items[index].id.clone();
+        let output_index = self.items[index].output_index;
+        self.items[index].arguments = buffered.clone();
+        if !buffered.is_empty() {
+            self.items[index].args_emitted = true;
+            out.push(sse_event(
+                "response.function_call_arguments.delta",
+                json!({
+                    "type": "response.function_call_arguments.delta",
+                    "item_id": item_id,
+                    "output_index": output_index,
+                    "delta": buffered,
+                }),
+            ));
+        }
+    }
+
+    /// Open a `function_call` item whose identity is already known, so the
+    /// `output_item.added` event is addressable from the very first frame.
+    fn push_tool_item(&mut self, call_id: &str, name: &str, out: &mut Vec<String>) -> usize {
+        self.start(out);
+        let output_index = self.items.len();
+        let item = OutputItem {
+            id: format!("fc_{}", uuid_simple()),
+            kind: OutputItemKind::FunctionCall,
+            output_index,
+            text: String::new(),
+            call_id: call_id.to_string(),
+            name: name.to_string(),
+            arguments: String::new(),
+            args_emitted: false,
+            closed: false,
+        };
+        let added = item.added();
+        self.items.push(item);
+        out.push(sse_event(
+            "response.output_item.added",
+            json!({"type": "response.output_item.added", "output_index": output_index, "item": added}),
+        ));
+        output_index
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.terminal
+    }
+
+    pub fn is_failed(&self) -> bool {
+        self.failed
+    }
+
+    pub fn produced_output(&self) -> bool {
+        self.items.iter().any(|item| !item.text.is_empty() || !item.arguments.is_empty())
+    }
+
+    pub fn usage_tokens(&self) -> (i64, i64) {
+        let usage = self.last_usage.as_ref();
+        let raw = usage
+            .and_then(|u| u.get("prompt_tokens").or_else(|| u.get("input_tokens")))
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let (read, _) = self.usage_cache();
+        let fresh = (raw - read).max(0);
+        (
+            fresh,
+            usage
+                .and_then(|u| u.get("completion_tokens").or_else(|| u.get("output_tokens")))
+                .and_then(Value::as_i64)
+                .unwrap_or(0),
+        )
+    }
+
+    pub fn usage_cache(&self) -> (i64, i64) {
+        self.last_usage
+            .as_ref()
+            .map(super::anthropic_openai::cache_usage_from_openai)
+            .unwrap_or((0, 0))
+    }
+
+    /// `[DONE]` is not JSON, so the route layer reports it here.
+    pub fn mark_done(&mut self) {
+        self.terminal = true;
+    }
+
+    pub fn feed(&mut self, chunk: &Value) -> Vec<String> {
+        if self.finished {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        if let Some(error) = chunk.get("error") {
+            let message = error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("Chat upstream reported an error");
+            self.fail(message, &mut out);
+            return out;
+        }
+        if let Some(usage) = chunk.get("usage") {
+            if usage.is_object() {
+                self.last_usage = Some(usage.clone());
+            }
+        }
+        let Some(choice) = chunk
+            .get("choices")
+            .and_then(Value::as_array)
+            .and_then(|choices| choices.first())
+        else {
+            return out;
+        };
+        if let Some(delta) = choice.get("delta") {
+            if let Some(text) = delta.get("content").and_then(Value::as_str) {
+                self.emit_text(text, &mut out);
+            }
+            if let Some(text) = delta.get("reasoning_content").and_then(Value::as_str) {
+                self.emit_reasoning(text, &mut out);
+            }
+            if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
+                for call in calls {
+                    self.emit_tool_delta(call, &mut out);
+                }
+            }
+        }
+        if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
+            if !reason.is_empty() {
+                self.finish_reason = Some(reason.to_string());
+            }
+        }
+        out
+    }
+
+    fn fail(&mut self, message: &str, out: &mut Vec<String>) {
+        self.start(out);
+        self.failed = true;
+        self.terminal = true;
+        self.finished = true;
+        out.push(sse_event(
+            "response.failed",
+            json!({
+                "type": "response.failed",
+                "response": {
+                    "id": self.response_id,
+                    "object": "response",
+                    "created_at": self.created_at,
+                    "status": "failed",
+                    "model": self.model,
+                    "output": [],
+                    "error": {"code": "server_error", "message": message},
+                }
+            }),
+        ));
+        out.push("data: [DONE]\n\n".to_string());
+    }
+
+    fn close_item(&mut self, index: usize, out: &mut Vec<String>) {
+        let item = &mut self.items[index];
+        if item.closed {
+            return;
+        }
+        item.closed = true;
+        let output_index = item.output_index;
+        let done = item.done();
+        match item.kind {
+            OutputItemKind::Message => {
+                let item_id = item.id.clone();
+                let text = item.text.clone();
+                out.push(sse_event(
+                    "response.output_text.done",
+                    json!({
+                        "type": "response.output_text.done",
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "content_index": 0,
+                        "text": text,
+                    }),
+                ));
+                out.push(sse_event(
+                    "response.content_part.done",
+                    json!({
+                        "type": "response.content_part.done",
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "content_index": 0,
+                        "part": {"type": "output_text", "text": text},
+                    }),
+                ));
+            }
+            OutputItemKind::FunctionCall => {
+                let item_id = item.id.clone();
+                let arguments = item.arguments.clone();
+                out.push(sse_event(
+                    "response.function_call_arguments.done",
+                    json!({
+                        "type": "response.function_call_arguments.done",
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "arguments": arguments,
+                    }),
+                ));
+            }
+            OutputItemKind::Reasoning => {
+                let item_id = item.id.clone();
+                let text = item.text.clone();
+                out.push(sse_event(
+                    "response.reasoning_summary_text.done",
+                    json!({
+                        "type": "response.reasoning_summary_text.done",
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "summary_index": 0,
+                        "text": text,
+                    }),
+                ));
+            }
+        }
+        out.push(sse_event(
+            "response.output_item.done",
+            json!({
+                "type": "response.output_item.done",
+                "output_index": output_index,
+                "item": done,
+            }),
+        ));
+    }
+
+    pub fn finish(&mut self) -> Vec<String> {
+        if self.finished {
+            return Vec::new();
+        }
+        self.finished = true;
+        let mut out = Vec::new();
+        self.start(&mut out);
+        // Drop incomplete tool identities: a function_call without id/name is
+        // not addressable downstream (same rule as the other converters).
+        let dropped: Vec<usize> = self
+            .items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| {
+                item.kind == OutputItemKind::FunctionCall
+                    && (item.call_id.is_empty() || item.name.is_empty())
+                    && !item.closed
+            })
+            .map(|(index, _)| index)
+            .collect();
+        for index in dropped {
+            tracing::warn!(
+                output_index = self.items[index].output_index,
+                "chat tool_calls without a complete id/name; dropped"
+            );
+            self.items[index].closed = true;
+        }
+        for index in 0..self.items.len() {
+            if !self.items[index].closed {
+                self.close_item(index, &mut out);
+            }
+        }
+        let incomplete = matches!(self.finish_reason.as_deref(), Some("length"))
+            || (self.finish_reason.is_none() && !self.terminal);
+        let output: Vec<Value> = self
+            .items
+            .iter()
+            .filter(|item| !(item.kind == OutputItemKind::FunctionCall && (item.call_id.is_empty() || item.name.is_empty())))
+            .map(OutputItem::done)
+            .collect();
+        let status = if incomplete { "incomplete" } else { "completed" };
+        let response = json!({
+            "id": self.response_id,
+            "object": "response",
+            "created_at": self.created_at,
+            "status": status,
+            "model": self.model,
+            "output": output,
+            "usage": response_usage_from_chat(self.last_usage.as_ref()),
+            "incomplete_details": if incomplete {
+                json!({"reason": "max_output_tokens"})
+            } else {
+                Value::Null
+            },
+        });
+        let event_type = if incomplete { "response.incomplete" } else { "response.completed" };
+        out.push(sse_event(
+            event_type,
+            json!({"type": event_type, "response": response}),
+        ));
+        out.push("data: [DONE]\n\n".to_string());
+        out
+    }
+}
+
+/// Anthropic Messages SSE → Responses SSE. The inverse of
+/// `ResponsesToAnthropicConverter`: `text_delta` becomes
+/// `response.output_text.delta`, `thinking_delta` becomes reasoning summary
+/// deltas, `tool_use` blocks become `function_call` items, and `message_stop`
+/// becomes `response.completed`.
+pub struct AnthropicToResponsesConverter {
+    response_id: String,
+    model: String,
+    created_at: i64,
+    started: bool,
+    items: Vec<OutputItem>,
+    /// Anthropic content block index → index into `items`.
+    blocks: HashMap<i64, usize>,
+    last_usage: Option<Value>,
+    stop_reason: Option<String>,
+    terminal: bool,
+    finished: bool,
+    failed: bool,
+}
+
+impl AnthropicToResponsesConverter {
+    pub fn new(model: &str) -> Self {
+        Self {
+            response_id: format!("resp_{}", uuid_simple()),
+            model: model.to_string(),
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64,
+            started: false,
+            items: Vec::new(),
+            blocks: HashMap::new(),
+            last_usage: None,
+            stop_reason: None,
+            terminal: false,
+            finished: false,
+            failed: false,
+        }
+    }
+
+    fn start(&mut self, out: &mut Vec<String>) {
+        if self.started {
+            return;
+        }
+        self.started = true;
+        out.push(sse_event(
+            "response.created",
+            json!({
+                "type": "response.created",
+                "response": {
+                    "id": self.response_id,
+                    "object": "response",
+                    "created_at": self.created_at,
+                    "status": "in_progress",
+                    "model": self.model,
+                    "output": [],
+                }
+            }),
+        ));
+    }
+
+    fn merge_usage(&mut self, usage: &Value) {
+        if !usage.is_object() {
+            return;
+        }
+        let existing = self.last_usage.get_or_insert_with(|| json!({}));
+        if let (Some(existing), Some(incoming)) = (existing.as_object_mut(), usage.as_object()) {
+            for (key, value) in incoming {
+                existing.insert(key.clone(), value.clone());
+            }
+        }
+    }
+
+    fn push_item(&mut self, kind: OutputItemKind, out: &mut Vec<String>) -> usize {
+        self.start(out);
+        let output_index = self.items.len();
+        let id = match kind {
+            OutputItemKind::Message => format!("msg_{}", uuid_simple()),
+            OutputItemKind::FunctionCall => format!("fc_{}", uuid_simple()),
+            OutputItemKind::Reasoning => format!("rs_{}", uuid_simple()),
+        };
+        let item = OutputItem {
+            id,
+            kind,
+            output_index,
+            text: String::new(),
+            call_id: String::new(),
+            name: String::new(),
+            arguments: String::new(),
+            args_emitted: false,
+            closed: false,
+        };
+        let added = item.added();
+        let item_id = item.id.clone();
+        self.items.push(item);
+        out.push(sse_event(
+            "response.output_item.added",
+            json!({"type": "response.output_item.added", "output_index": output_index, "item": added}),
+        ));
+        if kind == OutputItemKind::Message {
+            out.push(sse_event(
+                "response.content_part.added",
+                json!({
+                    "type": "response.content_part.added",
+                    "item_id": item_id,
+                    "output_index": output_index,
+                    "content_index": 0,
+                    "part": {"type": "output_text", "text": ""},
+                }),
+            ));
+        }
+        output_index
+    }
+
+    fn item_for_block(&mut self, block_index: i64, kind: OutputItemKind, out: &mut Vec<String>) -> usize {
+        if let Some(index) = self.blocks.get(&block_index) {
+            return *index;
+        }
+        let index = self.push_item(kind, out);
+        self.blocks.insert(block_index, index);
+        index
+    }
+
+    fn emit_text(&mut self, block_index: i64, text: &str, out: &mut Vec<String>) {
+        if text.is_empty() {
+            return;
+        }
+        let index = self.item_for_block(block_index, OutputItemKind::Message, out);
+        let item = &mut self.items[index];
+        item.text.push_str(text);
+        let item_id = item.id.clone();
+        out.push(sse_event(
+            "response.output_text.delta",
+            json!({
+                "type": "response.output_text.delta",
+                "item_id": item_id,
+                "output_index": index,
+                "content_index": 0,
+                "delta": text,
+            }),
+        ));
+    }
+
+    fn emit_reasoning(&mut self, block_index: i64, text: &str, out: &mut Vec<String>) {
+        if text.is_empty() {
+            return;
+        }
+        let index = self.item_for_block(block_index, OutputItemKind::Reasoning, out);
+        let item = &mut self.items[index];
+        item.text.push_str(text);
+        let item_id = item.id.clone();
+        out.push(sse_event(
+            "response.reasoning_summary_text.delta",
+            json!({
+                "type": "response.reasoning_summary_text.delta",
+                "item_id": item_id,
+                "output_index": index,
+                "summary_index": 0,
+                "delta": text,
+            }),
+        ));
+    }
+
+    fn open_tool_use(&mut self, block_index: i64, block: &Value, out: &mut Vec<String>) {
+        let call_id = block.get("id").and_then(Value::as_str).unwrap_or_default();
+        let name = block.get("name").and_then(Value::as_str).unwrap_or_default();
+        // An id/name the upstream didn't send can't be papered over with "": the
+        // Responses consumer keys tool calls by call_id and dispatches on name,
+        // so an empty pair is worse than no call at all. Drop it before it is
+        // ever announced (`output_item.added` must be addressable).
+        if call_id.is_empty() || name.is_empty() {
+            tracing::warn!(
+                block_index,
+                has_id = !call_id.is_empty(),
+                has_name = !name.is_empty(),
+                "anthropic tool_use without id/name; dropped"
+            );
+            return;
+        }
+        let index = match self.blocks.get(&block_index) {
+            Some(&index) => index,
+            None => {
+                self.start(out);
+                let output_index = self.items.len();
+                let item = OutputItem {
+                    id: format!("fc_{}", uuid_simple()),
+                    kind: OutputItemKind::FunctionCall,
+                    output_index,
+                    text: String::new(),
+                    call_id: call_id.to_string(),
+                    name: name.to_string(),
+                    arguments: String::new(),
+                    args_emitted: false,
+                    closed: false,
+                };
+                let added = item.added();
+                self.items.push(item);
+                out.push(sse_event(
+                    "response.output_item.added",
+                    json!({"type": "response.output_item.added", "output_index": output_index, "item": added}),
+                ));
+                self.blocks.insert(block_index, output_index);
+                output_index
+            }
+        };
+        let item = &mut self.items[index];
+        item.call_id = call_id.to_string();
+        item.name = name.to_string();
+        if let Some(input) = block.get("input").filter(|v| v.as_object().is_some_and(|o| !o.is_empty())) {
+            item.arguments = serde_json::to_string(input).unwrap_or_default();
+        }
+        if item.arguments.is_empty() {
+            return;
+        }
+        item.args_emitted = true;
+        let item_id = item.id.clone();
+        let output_index = item.output_index;
+        let delta = item.arguments.clone();
+        out.push(sse_event(
+            "response.function_call_arguments.delta",
+            json!({
+                "type": "response.function_call_arguments.delta",
+                "item_id": item_id,
+                "output_index": output_index,
+                "delta": delta,
+            }),
+        ));
+    }
+
+    fn emit_arguments(&mut self, block_index: i64, delta: &str, out: &mut Vec<String>) {
+        let Some(&index) = self.blocks.get(&block_index) else {
+            return;
+        };
+        let item = &mut self.items[index];
+        if item.call_id.is_empty() || item.name.is_empty() {
+            return;
+        }
+        item.arguments.push_str(delta);
+        if delta.is_empty() {
+            return;
+        }
+        item.args_emitted = true;
+        let item_id = item.id.clone();
+        let output_index = item.output_index;
+        out.push(sse_event(
+            "response.function_call_arguments.delta",
+            json!({
+                "type": "response.function_call_arguments.delta",
+                "item_id": item_id,
+                "output_index": output_index,
+                "delta": delta,
+            }),
+        ));
+    }
+
+    fn close_item(&mut self, index: usize, out: &mut Vec<String>) {
+        let item = &mut self.items[index];
+        if item.closed {
+            return;
+        }
+        item.closed = true;
+        let output_index = item.output_index;
+        let done = item.done();
+        match item.kind {
+            OutputItemKind::Message => {
+                let item_id = item.id.clone();
+                let text = item.text.clone();
+                out.push(sse_event(
+                    "response.output_text.done",
+                    json!({
+                        "type": "response.output_text.done",
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "content_index": 0,
+                        "text": text,
+                    }),
+                ));
+                out.push(sse_event(
+                    "response.content_part.done",
+                    json!({
+                        "type": "response.content_part.done",
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "content_index": 0,
+                        "part": {"type": "output_text", "text": text},
+                    }),
+                ));
+            }
+            OutputItemKind::FunctionCall => {
+                let item_id = item.id.clone();
+                let arguments = item.arguments.clone();
+                out.push(sse_event(
+                    "response.function_call_arguments.done",
+                    json!({
+                        "type": "response.function_call_arguments.done",
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "arguments": arguments,
+                    }),
+                ));
+            }
+            OutputItemKind::Reasoning => {
+                let item_id = item.id.clone();
+                let text = item.text.clone();
+                out.push(sse_event(
+                    "response.reasoning_summary_text.done",
+                    json!({
+                        "type": "response.reasoning_summary_text.done",
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "summary_index": 0,
+                        "text": text,
+                    }),
+                ));
+            }
+        }
+        out.push(sse_event(
+            "response.output_item.done",
+            json!({
+                "type": "response.output_item.done",
+                "output_index": output_index,
+                "item": done,
+            }),
+        ));
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.terminal
+    }
+
+    pub fn is_failed(&self) -> bool {
+        self.failed
+    }
+
+    pub fn produced_output(&self) -> bool {
+        self.items.iter().any(|item| !item.text.is_empty() || !item.arguments.is_empty())
+    }
+
+    pub fn usage_tokens(&self) -> (i64, i64) {
+        let usage = self.last_usage.as_ref();
+        let raw = usage
+            .and_then(|u| u.get("input_tokens"))
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let (read, _) = self.usage_cache();
+        let fresh = (raw - read).max(0);
+        (
+            fresh,
+            usage
+                .and_then(|u| u.get("output_tokens"))
+                .and_then(Value::as_i64)
+                .unwrap_or(0),
+        )
+    }
+
+    pub fn usage_cache(&self) -> (i64, i64) {
+        let usage = self.last_usage.as_ref();
+        (
+            usage
+                .and_then(|u| u.get("cache_read_input_tokens"))
+                .and_then(Value::as_i64)
+                .unwrap_or(0),
+            usage
+                .and_then(|u| u.get("cache_creation_input_tokens"))
+                .and_then(Value::as_i64)
+                .unwrap_or(0),
+        )
+    }
+
+    pub fn feed(&mut self, event: &Value) -> Vec<String> {
+        if self.finished {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let Some(etype) = event.get("type").and_then(Value::as_str) else {
+            return out;
+        };
+        match etype {
+            "message_start" => {
+                self.start(&mut out);
+                if let Some(usage) = event.get("message").and_then(|m| m.get("usage")) {
+                    self.merge_usage(usage);
+                }
+            }
+            "content_block_start" => {
+                let block_index = event.get("index").and_then(Value::as_i64).unwrap_or(0);
+                let block = event.get("content_block").cloned().unwrap_or(Value::Null);
+                match block.get("type").and_then(Value::as_str) {
+                    // Text/thinking blocks are opened lazily on their first
+                    // delta so an empty block does not create an empty item.
+                    Some("tool_use") => self.open_tool_use(block_index, &block, &mut out),
+                    _ => {}
+                }
+            }
+            "content_block_delta" => {
+                let block_index = event.get("index").and_then(Value::as_i64).unwrap_or(0);
+                let delta = event.get("delta").unwrap_or(&Value::Null);
+                match delta.get("type").and_then(Value::as_str) {
+                    Some("text_delta") => {
+                        if let Some(text) = delta.get("text").and_then(Value::as_str) {
+                            self.emit_text(block_index, text, &mut out);
+                        }
+                    }
+                    Some("thinking_delta") => {
+                        if let Some(text) = delta.get("thinking").and_then(Value::as_str) {
+                            self.emit_reasoning(block_index, text, &mut out);
+                        }
+                    }
+                    Some("input_json_delta") => {
+                        if let Some(partial) = delta.get("partial_json").and_then(Value::as_str) {
+                            self.emit_arguments(block_index, partial, &mut out);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            "content_block_stop" => {
+                let block_index = event.get("index").and_then(Value::as_i64).unwrap_or(0);
+                if let Some(index) = self.blocks.remove(&block_index) {
+                    self.close_item(index, &mut out);
+                }
+            }
+            "message_delta" => {
+                if let Some(reason) = event.get("delta").and_then(|d| d.get("stop_reason")).and_then(Value::as_str) {
+                    self.stop_reason = Some(reason.to_string());
+                }
+                if let Some(usage) = event.get("usage") {
+                    self.merge_usage(usage);
+                }
+            }
+            "message_stop" => {
+                self.terminal = true;
+                self.emit_completion(true, &mut out);
+            }
+            "error" => {
+                let message = event
+                    .get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("Anthropic upstream reported an error");
+                self.start(&mut out);
+                self.failed = true;
+                self.terminal = true;
+                self.finished = true;
+                out.push(sse_event(
+                    "response.failed",
+                    json!({
+                        "type": "response.failed",
+                        "response": {
+                            "id": self.response_id,
+                            "object": "response",
+                            "created_at": self.created_at,
+                            "status": "failed",
+                            "model": self.model,
+                            "output": [],
+                            "error": {"code": "server_error", "message": message},
+                        }
+                    }),
+                ));
+                out.push("data: [DONE]\n\n".to_string());
+            }
+            _ => {}
+        }
+        out
+    }
+
+    fn emit_completion(&mut self, terminal: bool, out: &mut Vec<String>) {
+        self.start(out);
+        // Drop tool items that never carried a usable identity; they are not
+        // addressable downstream (same rule as the other converters).
+        for (index, item) in self.items.iter_mut().enumerate() {
+            if item.kind == OutputItemKind::FunctionCall
+                && (item.call_id.is_empty() || item.name.is_empty())
+                && !item.closed
+            {
+                tracing::warn!(output_index = index, "anthropic tool_use without id/name; dropped");
+                item.closed = true;
+            }
+        }
+        for index in 0..self.items.len() {
+            if !self.items[index].closed {
+                self.close_item(index, out);
+            }
+        }
+        let incomplete = !terminal
+            || matches!(self.stop_reason.as_deref(), Some("max_tokens"))
+            || (self.stop_reason.is_none() && !self.terminal);
+        let output: Vec<Value> = self
+            .items
+            .iter()
+            .filter(|item| !(item.kind == OutputItemKind::FunctionCall && (item.call_id.is_empty() || item.name.is_empty())))
+            .map(OutputItem::done)
+            .collect();
+        let status = if incomplete { "incomplete" } else { "completed" };
+        let response = json!({
+            "id": self.response_id,
+            "object": "response",
+            "created_at": self.created_at,
+            "status": status,
+            "model": self.model,
+            "output": output,
+            "usage": response_usage_from_anthropic(self.last_usage.as_ref()),
+            "incomplete_details": if incomplete {
+                json!({"reason": "max_output_tokens"})
+            } else {
+                Value::Null
+            },
+        });
+        let event_type = if incomplete { "response.incomplete" } else { "response.completed" };
+        out.push(sse_event(
+            event_type,
+            json!({"type": event_type, "response": response}),
+        ));
+        out.push("data: [DONE]\n\n".to_string());
+        self.finished = true;
+    }
+
+    pub fn finish(&mut self) -> Vec<String> {
+        if self.finished {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        self.emit_completion(self.terminal, &mut out);
+        out
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OutputItemKind {
+    Message,
+    FunctionCall,
+    Reasoning,
+}
+
+/// One item in a Responses `output` array, kept mutable until the stream ends
+/// so `response.completed` can carry the full final shape (the same object the
+/// non-streaming converters produce).
+struct OutputItem {
+    id: String,
+    kind: OutputItemKind,
+    output_index: usize,
+    text: String,
+    call_id: String,
+    name: String,
+    arguments: String,
+    args_emitted: bool,
+    closed: bool,
+}
+
+impl OutputItem {
+    fn added(&self) -> Value {
+        match self.kind {
+            OutputItemKind::Message => json!({
+                "id": self.id, "type": "message", "status": "in_progress",
+                "role": "assistant", "content": [],
+            }),
+            OutputItemKind::FunctionCall => json!({
+                "id": self.id, "type": "function_call", "status": "in_progress",
+                "call_id": self.call_id, "name": self.name, "arguments": "",
+            }),
+            OutputItemKind::Reasoning => json!({
+                "id": self.id, "type": "reasoning", "summary": [],
+            }),
+        }
+    }
+
+    fn done(&self) -> Value {
+        match self.kind {
+            OutputItemKind::Message => json!({
+                "id": self.id, "type": "message", "status": "completed",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": self.text}],
+            }),
+            OutputItemKind::FunctionCall => json!({
+                "id": self.id, "type": "function_call", "status": "completed",
+                "call_id": self.call_id, "name": self.name, "arguments": self.arguments,
+            }),
+            OutputItemKind::Reasoning => json!({
+                "id": self.id, "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": self.text}],
+            }),
+        }
+    }
+}
+
+fn response_usage_from_chat(usage: Option<&Value>) -> Value {
+    let usage = usage.unwrap_or(&Value::Null);
+    let raw_input = usage
+        .get("input_tokens")
+        .or_else(|| usage.get("prompt_tokens"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let output = usage
+        .get("output_tokens")
+        .or_else(|| usage.get("completion_tokens"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let (cache_read, _) = super::anthropic_openai::cache_usage_from_openai(usage);
+    json!({
+        "input_tokens": raw_input,
+        "input_tokens_details": { "cached_tokens": cache_read },
+        "output_tokens": output,
+        "total_tokens": raw_input + output,
+    })
+}
+
+fn response_usage_from_anthropic(usage: Option<&Value>) -> Value {
+    let usage = usage.unwrap_or(&Value::Null);
+    let raw_input = usage.get("input_tokens").and_then(Value::as_i64).unwrap_or(0);
+    let output = usage.get("output_tokens").and_then(Value::as_i64).unwrap_or(0);
+    let cache_read = usage
+        .get("cache_read_input_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    json!({
+        "input_tokens": raw_input,
+        "input_tokens_details": { "cached_tokens": cache_read },
+        "output_tokens": output,
+        "total_tokens": raw_input + output,
+    })
 }
 
 fn sse_event(event_type: &str, data: Value) -> String {
@@ -1817,5 +2950,220 @@ mod tests {
         let _ = converter.feed("event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"response\":{\"incomplete_details\":{\"reason\":\"content_filter\"}}}\n\n");
 
         assert!(converter.is_failed(), "非 token 上限的 incomplete 是真失败");
+    }
+
+    fn event_payloads(events: &[String]) -> Vec<Value> {
+        events
+            .iter()
+            .filter_map(|event| sse_data(event))
+            .filter(|data| *data != "[DONE]")
+            .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+            .collect()
+    }
+
+    #[test]
+    fn responses_chat_request_keeps_stream_and_asks_for_usage() {
+        let body = json!({
+            "model": "m",
+            "input": "hi",
+            "stream": true,
+            "max_output_tokens": 64,
+        });
+        let out = responses_req_to_chat_req(&body);
+        assert_eq!(out["stream"], json!(true));
+        assert_eq!(out["stream_options"]["include_usage"], json!(true));
+        assert_eq!(out["max_tokens"], json!(64));
+    }
+
+    #[test]
+    fn responses_anthropic_request_keeps_stream() {
+        let body = json!({
+            "model": "m",
+            "input": "hi",
+            "stream": true,
+            "max_output_tokens": 64,
+        });
+        let out = responses_req_to_anthropic_req(&body, "m");
+        assert_eq!(out["stream"], json!(true));
+        assert_eq!(out["max_tokens"], json!(64));
+    }
+
+    #[test]
+    fn chat_stream_becomes_responses_events() {
+        let mut converter = ChatToResponsesConverter::new("muse");
+        let mut events = Vec::new();
+        events.extend(converter.feed(&json!({
+            "choices": [{"index": 0, "delta": {"role": "assistant", "content": "hel"}, "finish_reason": null}]
+        })));
+        events.extend(converter.feed(&json!({
+            "choices": [{"index": 0, "delta": {"content": "lo"}, "finish_reason": null}]
+        })));
+        events.extend(converter.feed(&json!({
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+        })));
+        converter.mark_done();
+        events.extend(converter.finish());
+
+        let payloads = event_payloads(&events);
+        assert_eq!(payloads[0]["type"], json!("response.created"));
+        assert!(payloads.iter().any(|e| e["type"] == json!("response.output_text.delta") && e["delta"] == json!("hel")));
+        let done = payloads.iter().find(|e| e["type"] == json!("response.output_text.done")).expect("text done event");
+        assert_eq!(done["text"], json!("hello"));
+        let completed = payloads.iter().find(|e| e["type"] == json!("response.completed")).expect("completed event");
+        assert_eq!(completed["response"]["status"], json!("completed"));
+        assert_eq!(completed["response"]["output"][0]["content"][0]["text"], json!("hello"));
+        assert_eq!(completed["response"]["usage"]["input_tokens"], json!(10));
+        assert_eq!(completed["response"]["usage"]["output_tokens"], json!(5));
+        assert!(events.last().is_some_and(|e| e == "data: [DONE]\n\n"));
+    }
+
+    #[test]
+    fn chat_stream_tool_fragments_become_function_call_item() {
+        let mut converter = ChatToResponsesConverter::new("muse");
+        let mut events = Vec::new();
+        // Identity and arguments arrive split across fragments, then the
+        // remainder only carries arguments — the converter must buffer until
+        // the call is addressable and still emit every byte exactly once.
+        events.extend(converter.feed(&json!({
+            "choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "function": {"arguments": "{\"cmd\":"}}]}, "finish_reason": null}]
+        })));
+        events.extend(converter.feed(&json!({
+            "choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": "call-1", "type": "function", "function": {"name": "bash"}}]}, "finish_reason": null}]
+        })));
+        events.extend(converter.feed(&json!({
+            "choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "function": {"arguments": "\"ls\"}"}}]}, "finish_reason": null}]
+        })));
+        events.extend(converter.feed(&json!({
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]
+        })));
+        converter.mark_done();
+        events.extend(converter.finish());
+
+        let payloads = event_payloads(&events);
+        let deltas: String = payloads
+            .iter()
+            .filter(|e| e["type"] == json!("response.function_call_arguments.delta"))
+            .filter_map(|e| e["delta"].as_str())
+            .collect();
+        assert_eq!(deltas, "{\"cmd\":\"ls\"}");
+        let added = payloads
+            .iter()
+            .find(|e| e["type"] == json!("response.output_item.added") && e["item"]["type"] == json!("function_call"))
+            .expect("function_call added event");
+        assert_eq!(added["item"]["call_id"], json!("call-1"), "added must be addressable");
+        assert_eq!(added["item"]["name"], json!("bash"), "added must carry the tool name");
+        let completed = payloads.iter().find(|e| e["type"] == json!("response.completed")).expect("completed event");
+        let call = completed["response"]["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["type"] == json!("function_call"))
+            .expect("function_call item");
+        assert_eq!(call["call_id"], json!("call-1"));
+        assert_eq!(call["name"], json!("bash"));
+        assert_eq!(call["arguments"], json!("{\"cmd\":\"ls\"}"));
+    }
+
+    #[test]
+    fn chat_stream_error_marks_converter_failed() {
+        let mut converter = ChatToResponsesConverter::new("muse");
+        let events = converter.feed(&json!({"error": {"message": "boom"}}));
+        let payloads = event_payloads(&events);
+        let failed = payloads.iter().find(|e| e["type"] == json!("response.failed")).expect("failed event");
+        assert_eq!(failed["response"]["error"]["message"], json!("boom"));
+        assert!(events.last().is_some_and(|e| e == "data: [DONE]\n\n"));
+        assert!(converter.is_done());
+        assert!(converter.is_failed());
+    }
+
+    #[test]
+    fn anthropic_stream_becomes_responses_events() {
+        let mut converter = AnthropicToResponsesConverter::new("muse");
+        let mut events = Vec::new();
+        events.extend(converter.feed(&json!({
+            "type": "message_start",
+            "message": {"id": "msg_1", "usage": {"input_tokens": 12, "cache_read_input_tokens": 2}}
+        })));
+        events.extend(converter.feed(&json!({
+            "type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}
+        })));
+        events.extend(converter.feed(&json!({
+            "type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "hel"}
+        })));
+        events.extend(converter.feed(&json!({
+            "type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "lo"}
+        })));
+        events.extend(converter.feed(&json!({"type": "content_block_stop", "index": 0})));
+        events.extend(converter.feed(&json!({
+            "type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 7}
+        })));
+        events.extend(converter.feed(&json!({"type": "message_stop"})));
+        events.extend(converter.finish());
+
+        let payloads = event_payloads(&events);
+        assert_eq!(payloads[0]["type"], json!("response.created"));
+        assert!(payloads.iter().any(|e| e["type"] == json!("response.output_text.delta") && e["delta"] == json!("hel")));
+        let completed = payloads.iter().find(|e| e["type"] == json!("response.completed")).expect("completed event");
+        assert_eq!(completed["response"]["status"], json!("completed"));
+        assert_eq!(completed["response"]["output"][0]["content"][0]["text"], json!("hello"));
+        assert_eq!(completed["response"]["usage"]["input_tokens"], json!(12));
+        assert_eq!(completed["response"]["usage"]["input_tokens_details"]["cached_tokens"], json!(2));
+        assert_eq!(completed["response"]["usage"]["output_tokens"], json!(7));
+    }
+
+    #[test]
+    fn anthropic_stream_tool_use_becomes_function_call_item() {
+        let mut converter = AnthropicToResponsesConverter::new("muse");
+        let mut events = Vec::new();
+        events.extend(converter.feed(&json!({"type": "message_start", "message": {"usage": {}}})));
+        events.extend(converter.feed(&json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "tool_use", "id": "toolu_1", "name": "bash", "input": {}}
+        })));
+        events.extend(converter.feed(&json!({
+            "type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "{\"cmd\":"}
+        })));
+        events.extend(converter.feed(&json!({
+            "type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "\"ls\"}"}
+        })));
+        events.extend(converter.feed(&json!({"type": "content_block_stop", "index": 0})));
+        events.extend(converter.feed(&json!({
+            "type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 3}
+        })));
+        events.extend(converter.feed(&json!({"type": "message_stop"})));
+
+        let payloads = event_payloads(&events);
+        let added = payloads
+            .iter()
+            .find(|e| e["type"] == json!("response.output_item.added") && e["item"]["type"] == json!("function_call"))
+            .expect("function_call added event");
+        assert_eq!(added["item"]["call_id"], json!("toolu_1"), "added must be addressable");
+        assert_eq!(added["item"]["name"], json!("bash"), "added must carry the tool name");
+        let completed = payloads.iter().find(|e| e["type"] == json!("response.completed")).expect("completed event");
+        let call = completed["response"]["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["type"] == json!("function_call"))
+            .expect("function_call item");
+        assert_eq!(call["call_id"], json!("toolu_1"));
+        assert_eq!(call["name"], json!("bash"));
+        assert_eq!(call["arguments"], json!("{\"cmd\":\"ls\"}"));
+    }
+
+    #[test]
+    fn anthropic_max_tokens_is_incomplete_not_failed() {
+        let mut converter = AnthropicToResponsesConverter::new("muse");
+        let _ = converter.feed(&json!({
+            "type": "message_delta", "delta": {"stop_reason": "max_tokens"}, "usage": {"output_tokens": 9}
+        }));
+        let events = converter.feed(&json!({"type": "message_stop"}));
+        let payloads = event_payloads(&events);
+        let incomplete = payloads.iter().find(|e| e["type"] == json!("response.incomplete")).expect("incomplete event");
+        assert_eq!(incomplete["response"]["incomplete_details"]["reason"], json!("max_output_tokens"));
+        assert!(converter.is_done());
+        assert!(!converter.is_failed());
     }
 }
