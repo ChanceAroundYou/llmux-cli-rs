@@ -850,6 +850,29 @@ pub fn api123_result(v: &Value) -> Value {
 // contract and its synthetic fixtures rather than trying multiple endpoints.
 const NEWAPI_TOKEN_USAGE_PATH: &str = "/api/usage/token/";
 const NEWAPI_WALLET_PATH: &str = "/api/user/self";
+const NEWAPI_STATUS_PATH: &str = "/api/status";
+
+/// Fetch the wallet/money conversion factor from the public status endpoint.
+///
+/// `GET /api/status` is public — no credential required — and carries
+/// `data.quota_per_unit`. It is the upstream's own factor (`quota / unit` is
+/// the USD figure its front end shows), so it is the only source we convert
+/// from. Returns None whenever the endpoint is unreachable or the factor is
+/// missing/invalid: the balance then stays in raw quota instead of guessing a
+/// unit. The credential is never sent to this endpoint.
+async fn fetch_newapi_quota_unit(base: &str) -> Option<f64> {
+    let url = format!("{base}{NEWAPI_STATUS_PATH}");
+    let (status, payload) = get_json(&url, &[("Accept", "application/json".into())])
+        .await
+        .ok()?;
+    if !status.is_success() {
+        return None;
+    }
+    newapi_data(&payload)
+        .ok()
+        .and_then(|data| newapi_num(data, "quota_per_unit"))
+        .filter(|n| *n > 0.0)
+}
 
 /// Derive the New API deployment base from an account endpoint.
 ///
@@ -905,11 +928,35 @@ async fn fetch_newapi(credential: &str, use_api_key: bool, endpoints: &[String])
     if !status.is_success() {
         return Err(anyhow!("HTTP {}: {}", status.as_u16(), truncate_for_err(&payload.to_string())));
     }
-    Ok(if path == NEWAPI_TOKEN_USAGE_PATH {
-        newapi_token_result(&payload)
-    } else {
-        newapi_wallet_result(&payload)
-    })
+    match path {
+        NEWAPI_TOKEN_USAGE_PATH => {
+            let mut parsed = newapi_token_result(&payload);
+            if let Some(unit) = fetch_newapi_quota_unit(&base).await {
+                parsed["quota_per_unit"] = json!(unit);
+                parsed = newapi_token_result(&with_unit(&payload, unit));
+            }
+            Ok(parsed)
+        }
+        _ => {
+            let mut parsed = newapi_wallet_result(&payload);
+            if let Some(unit) = fetch_newapi_quota_unit(&base).await {
+                parsed["quota_per_unit"] = json!(unit);
+                parsed = newapi_wallet_result_with_unit(&with_unit(&payload, unit));
+            }
+            Ok(parsed)
+        }
+    }
+}
+
+/// Return a copy of `payload` with the conversion factor attached at the top
+/// level, the shape the `*_with_unit` parsers read. The original response is
+/// never mutated (parsers take `&Value`).
+fn with_unit(payload: &Value, unit: f64) -> Value {
+    let mut copy = payload.clone();
+    if let Some(object) = copy.as_object_mut() {
+        object.insert("quota_per_unit".to_string(), json!(unit));
+    }
+    copy
 }
 
 fn newapi_num(v: &Value, key: &str) -> Option<f64> {
@@ -936,8 +983,15 @@ fn newapi_data(v: &Value) -> Result<&Value> {
     v.get("data").ok_or_else(|| anyhow!("响应缺少 data"))
 }
 
-/// Parse the user-level wallet/quota response without assuming a currency unit.
-pub fn newapi_wallet_result(v: &Value) -> Value {
+/// Extract a wallet-balance `quota_per_unit` attached to an upstream response.
+///
+/// `GET /api/user/self` does not carry the factor, but the public
+/// `GET /api/status` response does as `data.quota_per_unit` (no auth needed).
+/// The caller in `fetch_newapi` attaches it as a top-level key before parsing,
+/// so a response that already carries one — or a synthetic fixture — parses
+/// the same way. Only a finite positive number counts; anything else leaves
+/// the raw quota unconverted instead of guessing a unit.
+pub fn newapi_wallet_result_with_unit(v: &Value) -> Value {
     let data = match newapi_data(v) {
         Ok(data) => data,
         Err(e) => return err_result("newapi", &e.to_string()),
@@ -953,13 +1007,31 @@ pub fn newapi_wallet_result(v: &Value) -> Value {
         {"label": "可用 quota", "value": format_quota(quota)},
         {"label": "累计已用 quota", "value": format_quota(used)},
     ]);
-    ok_result(
-        "newapi",
-        format_quota(quota),
-        "钱包余额（原始 quota，未按系统 QuotaPerUnit 换算币值）".to_string(),
-        json!([]),
-        rows,
-    )
+    let unit = v
+        .get("quota_per_unit")
+        .and_then(Value::as_f64)
+        .filter(|n: &f64| n.is_finite() && *n > 0.0);
+    match unit {
+        Some(unit) => ok_result(
+            "newapi",
+            format!("${:.2}", quota / unit),
+            format!("钱包余额：{:.0} quota ÷ quota_per_unit={unit}", quota),
+            json!([]),
+            rows,
+        ),
+        None => ok_result(
+            "newapi",
+            format_quota(quota),
+            "钱包余额（未取到 QuotaPerUnit，显示原始 quota）".to_string(),
+            json!([]),
+            rows,
+        ),
+    }
+}
+
+/// Parse the user-level wallet/quota response without assuming a currency unit.
+pub fn newapi_wallet_result(v: &Value) -> Value {
+    newapi_wallet_result_with_unit(v)
 }
 
 /// Parse a token-level quota response.
@@ -969,7 +1041,9 @@ pub fn newapi_wallet_result(v: &Value) -> Value {
 /// default for newly created tokens; it can be switched off per token). When
 /// present, the wallet figure is what the user wants and it is shown as such;
 /// a token without it only ever shows its own token quota, which is never
-/// presented as money.
+/// presented as money. `quota_per_unit` (see `fetch_newapi`) may be attached
+/// as a top-level key by the fetch layer; when present the wallet figure is
+/// converted to USD with it.
 pub fn newapi_token_result(v: &Value) -> Value {
     let data = match newapi_data(v) {
         Ok(data) => data,
@@ -986,13 +1060,26 @@ pub fn newapi_token_result(v: &Value) -> Value {
             {"label": "钱包可用 quota", "value": format_quota(available)},
             {"label": "钱包累计已用 quota", "value": format_quota(used)},
         ]);
-        return ok_result(
-            "newapi",
-            format_quota(available),
-            "钱包余额（原始 quota，未按系统 QuotaPerUnit 换算币值）".to_string(),
-            json!([]),
-            rows,
-        );
+        let unit = v
+            .get("quota_per_unit")
+            .and_then(Value::as_f64)
+            .filter(|n: &f64| n.is_finite() && *n > 0.0);
+        return match unit {
+            Some(unit) => ok_result(
+                "newapi",
+                format!("${:.2}", available / unit),
+                format!("钱包余额：{:.0} quota ÷ quota_per_unit={unit}", available),
+                json!([]),
+                rows,
+            ),
+            None => ok_result(
+                "newapi",
+                format_quota(available),
+                "钱包余额（未取到 QuotaPerUnit，显示原始 quota）".to_string(),
+                json!([]),
+                rows,
+            ),
+        };
     }
     if data.get("unlimited_quota").and_then(Value::as_bool) == Some(true) {
         return ok_result("newapi", "无限(令牌无限制)".to_string(), "Token 令牌本身无限制；未允许查询钱包余额".to_string(), json!([]), json!([]));

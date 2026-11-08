@@ -122,7 +122,7 @@ const BALANCE_AUTH_HELP: Record<string, string[]> = {
   newapi: [
     'New API 驭风余额查询支持用户 access token；只填 API Key 时：若该 Key 开了「允许查询用户额度」，同样显示钱包剩余额度；否则只显示该 Key 自身的限额。',
     '用户 access token 由 New API 个人设置生成，需具备 profile:read 权限，否则查询钱包会返回 403。',
-    '未提供换算系数时只显示原始 quota，不把它换算成金额。',
+    '余额按上游公开的 /api/status 里的 quota_per_unit 换算成美元显示；若该字段缺失，只显示原始 quota，不猜比例。',
   ],
   openai: [
     'OpenAI API 用量走组织账单接口，显示近 30 天消费（按天分桶）与 Tokens。',

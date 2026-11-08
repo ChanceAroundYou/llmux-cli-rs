@@ -7,7 +7,7 @@ alternate URLs.
 
 The field names below were checked against the current public
 `QuantumNous/new-api` source (`controller/user.go`, `controller/token.go`,
-`middleware/auth.go`, `middleware/access_token_routes.go`,
+`controller/misc.go`, `middleware/auth.go`, `middleware/access_token_routes.go`,
 `router/api-router.go`). That proves the upstream shape at the time of writing,
 **not** the version or customization of any particular deployment.
 
@@ -62,17 +62,29 @@ tokens and can be turned off per token. The adapter therefore:
    (in fact especially) when the key itself is `unlimited_quota`, because
    "unlimited" then only describes the per-key cap, not the wallet;
 2. otherwise falls back to the token's own quota and labels it as such —
-   token quota is never displayed as currency or described as wallet balance;
+   token quota is never described as wallet balance;
 3. fails closed if `user_quota` is present but incomplete; it never skips it
    silently in favour of the token figure.
 
-The current public `GET /api/user/self` response has no per-user
-`quota_per_unit`. `QuotaPerUnit` is a global system setting, not a field of
-these responses, so the adapter shows raw quota and never assumes a currency
-conversion. Quota values may be JSON numbers or numeric strings. Missing,
-negative, non-finite, malformed, unauthorized, non-2xx, or unsuccessful
-responses fail closed — no default `0`, no empty success card, and the
-credential is never echoed in an error message.
+### Money conversion
+
+Neither `GET /api/user/self` nor `GET /api/usage/token/` carries a per-user
+`quota_per_unit`. The public `GET /api/status` response does
+(`data.quota_per_unit`, no credential needed), and upstream's own channel
+balance logic converts with exactly that factor (this is also the figure its
+front end displays). The adapter therefore also fetches `GET {base}/api/status`
+— without sending the credential — and:
+
+1. shows the wallet as USD (`$xx.xx`, with the raw quota and the factor in
+   the detail line) when the factor is a finite positive number;
+2. otherwise shows the raw quota as-is, unconverted. It never guesses a
+   currency unit: no factor means no dollar figure, but the probe still
+   succeeds with the raw quota.
+
+Quota values may be JSON numbers or numeric strings. Missing, negative,
+non-finite, malformed, unauthorized, non-2xx, or unsuccessful responses fail
+closed — no default `0`, no empty success card, and the credential is never
+echoed in an error message.
 
 ## Updating the contract
 

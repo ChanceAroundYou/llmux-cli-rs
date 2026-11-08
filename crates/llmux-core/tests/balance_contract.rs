@@ -6,9 +6,10 @@
 
 use llmux_core::balance::{
     balance_credential, balance_uses_api_key, chatgpt_result, commandcode_result, detect_kind,
-    fetch_balance, newapi_base_url, oc_parse_billing_balance, oc_parse_billing_balance_loose,
-    oc_parse_subscription, oc_parse_subscription_goat, oc_scan_balance_any_text, openai_result,
-    teamorouter_result, newapi_token_result, newapi_wallet_result, BalanceKind,
+    fetch_balance, newapi_base_url, newapi_wallet_result, newapi_wallet_result_with_unit,
+    oc_parse_billing_balance, oc_parse_billing_balance_loose, oc_parse_subscription,
+    oc_parse_subscription_goat, oc_scan_balance_any_text, openai_result, teamorouter_result,
+    newapi_token_result, BalanceKind,
 };
 
 #[test]
@@ -142,6 +143,8 @@ fn newapi_wallet_result_requires_valid_quota_and_does_not_assume_currency() {
     assert!(!raw["summary"].as_str().unwrap().contains('$'));
     assert_eq!(raw["rows"][0]["value"], "2500000");
     assert_eq!(raw["rows"][1]["value"], "500000");
+    assert!(raw["detail"].as_str().unwrap().contains("QuotaPerUnit"));
+    assert!(!raw["detail"].as_str().unwrap().contains("$"));
 
     for invalid in [
         serde_json::json!({"data": {"quota": 1, "used_quota": 0}}),
@@ -151,6 +154,37 @@ fn newapi_wallet_result_requires_valid_quota_and_does_not_assume_currency() {
         serde_json::json!({"success": true, "data": {"quota": "NaN", "used_quota": 0}}),
     ] {
         assert_eq!(newapi_wallet_result(&invalid)["ok"], false, "invalid payload: {invalid}");
+    }
+}
+
+#[test]
+fn newapi_wallet_result_converts_with_the_deployment_quota_per_unit() {
+    let raw = newapi_wallet_result_with_unit(&serde_json::json!({
+        "success": true,
+        "data": { "quota": 715_200, "used_quota": 122_800 },
+        "quota_per_unit": 1000,
+    }));
+    assert_eq!(raw["ok"], true);
+    assert_eq!(raw["summary"], "$715.20");
+    assert_eq!(raw["rows"][0]["value"], "715200");
+    assert_eq!(raw["rows"][1]["value"], "122800");
+    assert!(raw["detail"].as_str().unwrap().contains("quota_per_unit=1000"));
+
+    // 缺/非法换算系数不能猜：一律保持原始 quota、不显示美元。
+    for unit in [
+        serde_json::json!(0),
+        serde_json::json!(-1000),
+        serde_json::json!("abc"),
+        serde_json::json!("NaN"),
+    ] {
+        let raw = newapi_wallet_result_with_unit(&serde_json::json!({
+            "success": true,
+            "data": { "quota": 100, "used_quota": 1 },
+            "quota_per_unit": unit,
+        }));
+        assert_eq!(raw["ok"], true, "unit {unit}: {raw}");
+        assert_eq!(raw["summary"], "100", "unit {unit}: {raw}");
+        assert!(!raw["summary"].as_str().unwrap().contains('$'), "unit {unit}: {raw}");
     }
 }
 
@@ -229,13 +263,27 @@ fn newapi_base_url_keeps_deployment_prefix_and_strips_the_api_surface() {
 }
 
 /// Loopback HTTP server: records the request line + Authorization header and
-/// answers with a fixed status/body. Never leaves the machine.
+/// answers with a fixed status/body per path. Never leaves the machine.
+/// `routes` is consulted with the request path (exact match, else the
+/// `/api/usage/token/` default fallback).
 async fn spawn_mock(
     status: &'static str,
     body: &'static str,
 ) -> (String, std::sync::Arc<tokio::sync::Mutex<Vec<(String, Option<String>)>>>) {
+    spawn_mock_routes(&[("/", status, body)]).await
+}
+
+/// Same mock, but with per-path answers — used by tests that need the wallet
+/// endpoint and the public `/api/status` factor endpoint to respond differently.
+async fn spawn_mock_routes(
+    routes: &[(&'static str, &'static str, &'static str)],
+) -> (String, std::sync::Arc<tokio::sync::Mutex<Vec<(String, Option<String>)>>>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    let routes: Vec<(String, String, String)> = routes
+        .iter()
+        .map(|(p, s, b)| (p.to_string(), s.to_string(), b.to_string()))
+        .collect();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let hits = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
@@ -243,6 +291,7 @@ async fn spawn_mock(
     tokio::spawn(async move {
         while let Ok((mut stream, _)) = listener.accept().await {
             let recorder = recorder.clone();
+            let routes = routes.clone();
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 8192];
                 let n = stream.read(&mut buf).await.unwrap_or(0);
@@ -258,7 +307,12 @@ async fn spawn_mock(
                     name.eq_ignore_ascii_case("authorization")
                         .then(|| value.trim().to_string())
                 });
-                recorder.lock().await.push((path, authorization));
+                recorder.lock().await.push((path.clone(), authorization));
+                let (status, body) = routes
+                    .iter()
+                    .find(|(p, _, _)| p == "/" || path.ends_with(p.as_str()))
+                    .map(|(_, s, b)| (s.clone(), b.clone()))
+                    .unwrap_or_else(|| ("404 Not Found".to_string(), "{}".to_string()));
                 let response = format!(
                     "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                     body.len()
@@ -282,9 +336,10 @@ async fn newapi_fetch_picks_route_from_credential_source_not_from_a_sk_prefix() 
     let value = fetch_balance(BalanceKind::NewApi, "sk-user-pat", false, &[format!("{base}/v1")]).await;
     assert_eq!(value["ok"], true, "{value}");
     let hits = hits.lock().await.clone();
-    assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].0, "/api/user/self");
     assert_eq!(hits[0].1.as_deref(), Some("Bearer sk-user-pat"));
+    // 后续的公开 /api/status 探测不属于路由断言，只断言主请求已发出。
+    assert!(hits.len() <= 2, "unexpected extra requests: {hits:?}");
 
     // 账户 API key → 令牌配额路由；不带 sk- 前缀也不能改路由。部署子路径保留。
     let (base, hits) = spawn_mock(
@@ -297,9 +352,53 @@ async fn newapi_fetch_picks_route_from_credential_source_not_from_a_sk_prefix() 
     assert_eq!(value["summary"], "2500000", "{value}");
     assert!(!value["summary"].as_str().unwrap().contains("Token"), "{value}");
     let hits = hits.lock().await.clone();
-    assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].0, "/newapi/api/usage/token/");
     assert_eq!(hits[0].1.as_deref(), Some("Bearer plain-account-key"));
+    assert!(hits.len() <= 2, "unexpected extra requests: {hits:?}");
+}
+
+#[tokio::test]
+async fn newapi_fetch_converts_the_wallet_with_the_public_quota_per_unit() {
+    // 钱包用户 token：/api/user/self 给 quota，公开 /api/status 给换算系数。
+    let (base, hits) = spawn_mock_routes(&[
+        ("/api/user/self", "200 OK", r#"{"success":true,"data":{"quota":715200,"used_quota":122800}}"#),
+        ("/api/status", "200 OK", r#"{"success":true,"data":{"quota_per_unit":1000}}"#),
+    ])
+    .await;
+    let value = fetch_balance(BalanceKind::NewApi, "user-pat", false, &[format!("{base}/v1")]).await;
+    assert_eq!(value["ok"], true, "{value}");
+    assert_eq!(value["summary"], "$715.20", "{value}");
+    assert!(value["detail"].as_str().unwrap().contains("quota_per_unit=1000"), "{value}");
+    let hits = hits.lock().await.clone();
+    let paths: Vec<&str> = hits.iter().map(|(p, _)| p.as_str()).collect();
+    assert!(paths.contains(&"/api/user/self"), "{paths:?}");
+    assert!(paths.contains(&"/api/status"), "{paths:?}");
+    // /api/status 是公开端点：不得带凭据。
+    let status_hit = hits.iter().find(|(p, _)| p == "/api/status").unwrap();
+    assert_eq!(status_hit.1, None, "status endpoint must not receive the credential");
+
+    // API key 模式同样换算（token 载荷里的 user_quota）。
+    let (base, hits) = spawn_mock_routes(&[
+        ("/api/usage/token/", "200 OK", r#"{"code":true,"data":{"user_quota":{"total_available":715200,"total_used":122800},"unlimited_quota":true}}"#),
+        ("/api/status", "200 OK", r#"{"success":true,"data":{"quota_per_unit":1000}}"#),
+    ])
+    .await;
+    let value = fetch_balance(BalanceKind::NewApi, "account-key", true, &[format!("{base}/v1")]).await;
+    assert_eq!(value["summary"], "$715.20", "{value}");
+    let hits = hits.lock().await.clone();
+    assert!(hits.iter().any(|(p, _)| p == "/api/usage/token/"), "{hits:?}");
+    assert!(hits.iter().any(|(p, _)| p == "/api/status"), "{hits:?}");
+
+    // /api/status 拿不到系数时：钱包仍成功，但保持原始 quota、不显示美元。
+    let (base, _) = spawn_mock_routes(&[
+        ("/api/user/self", "200 OK", r#"{"success":true,"data":{"quota":715200,"used_quota":122800}}"#),
+        ("/api/status", "500 Internal Server Error", r#"{"success":false}"#),
+    ])
+    .await;
+    let value = fetch_balance(BalanceKind::NewApi, "user-pat", false, &[format!("{base}/v1")]).await;
+    assert_eq!(value["ok"], true, "{value}");
+    assert_eq!(value["summary"], "715200", "{value}");
+    assert!(!value["summary"].as_str().unwrap().contains('$'), "{value}");
 }
 
 #[tokio::test]
