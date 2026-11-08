@@ -22,6 +22,7 @@
 
 use axum::response::IntoResponse;
 use axum::{body::{to_bytes, Body}, http::{header, Method, Request, StatusCode}};
+use futures_util::StreamExt;
 use serde_json::{json, Value};
 
 // --- mock upstreams -----------------------------------------------------------
@@ -70,28 +71,63 @@ fn anthropic_message_body(marker: &str) -> Value {
     })
 }
 
+/// Responses-API SSE for a streaming request. Mirrors the event sequence a
+/// real `/responses` upstream sends (created → delta → completed + usage).
+fn responses_sse(marker: &str) -> String {
+    format!(concat!(
+        "event: response.created\ndata: {{\"type\":\"response.created\",\"response\":{{\"id\":\"mock_resp_1\",\"object\":\"response\",\"status\":\"in_progress\",\"model\":\"gpt-4o\",\"output\":[]}}}}\n\n",
+        "event: response.output_item.added\ndata: {{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{{\"id\":\"mock_msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[]}}}}\n\n",
+        "event: response.content_part.added\ndata: {{\"type\":\"response.content_part.added\",\"item_id\":\"mock_msg_1\",\"output_index\":0,\"content_index\":0,\"part\":{{\"type\":\"output_text\",\"text\":\"\"}}}}\n\n",
+        "event: response.output_text.delta\ndata: {{\"type\":\"response.output_text.delta\",\"item_id\":\"mock_msg_1\",\"output_index\":0,\"content_index\":0,\"delta\":\"{marker}\"}}\n\n",
+        "event: response.output_text.done\ndata: {{\"type\":\"response.output_text.done\",\"item_id\":\"mock_msg_1\",\"output_index\":0,\"content_index\":0,\"text\":\"{marker}\"}}\n\n",
+        "event: response.completed\ndata: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"mock_resp_1\",\"object\":\"response\",\"status\":\"completed\",\"model\":\"gpt-4o\",\"output\":[{{\"id\":\"mock_msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{{\"type\":\"output_text\",\"text\":\"{marker}\"}}]}}],\"usage\":{{\"input_tokens\":13,\"output_tokens\":24,\"total_tokens\":37}}}}}}\n\n",
+    ), marker = marker)
+}
+
+/// Anthropic Messages SSE for a streaming request.
+fn anthropic_sse(marker: &str) -> String {
+    format!(concat!(
+        "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"id\":\"mock_msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"gpt-4o\",\"content\":[],\"usage\":{{\"input_tokens\":14,\"output_tokens\":0}}}}}}\n\n",
+        "event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\n",
+        "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{marker}\"}}}}\n\n",
+        "event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n",
+        "event: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"output_tokens\":25}}}}\n\n",
+        "event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n",
+    ), marker = marker)
+}
+
+fn sse_response(body: String) -> axum::response::Response {
+    axum::response::Response::builder()
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .body(Body::from(body))
+        .unwrap()
+}
+
 async fn spawn_mock_upstreams() -> (String, String) {
     let listener_a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr_a = listener_a.local_addr().unwrap();
     let router_a = axum::Router::new()
         .route("/chat/completions", axum::routing::post(|axum::Json(body): axum::Json<Value>| async move {
             if body["stream"].as_bool() == Some(true) {
-                return axum::response::Response::builder()
-                    .header(header::CONTENT_TYPE, "text/event-stream")
-                    .body(Body::from(concat!(
-                        "data: {\"id\":\"mock_cmpl_1\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"A-chat-stream\"},\"finish_reason\":null}]}\n\n",
-                        "data: {\"id\":\"mock_cmpl_1\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":22}}\n\n",
-                        "data: [DONE]\n\n",
-                    )))
-                    .unwrap();
+                return sse_response(concat!(
+                    "data: {\"id\":\"mock_cmpl_1\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"A-chat-stream\"},\"finish_reason\":null}]}\n\n",
+                    "data: {\"id\":\"mock_cmpl_1\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":22}}\n\n",
+                    "data: [DONE]\n\n",
+                ).to_string());
             }
             axum::Json(chat_completion_body("A-chat")).into_response()
         }))
-        .route("/responses", axum::routing::post(|| async {
-            axum::Json(responses_body("A-resp"))
+        .route("/responses", axum::routing::post(|axum::Json(body): axum::Json<Value>| async move {
+            if body["stream"].as_bool() == Some(true) {
+                return sse_response(responses_sse("A-resp-stream"));
+            }
+            axum::Json(responses_body("A-resp")).into_response()
         }))
-        .route("/v1/messages", axum::routing::post(|| async {
-            axum::Json(anthropic_message_body("A-msg"))
+        .route("/v1/messages", axum::routing::post(|axum::Json(body): axum::Json<Value>| async move {
+            if body["stream"].as_bool() == Some(true) {
+                return sse_response(anthropic_sse("A-msg-stream"));
+            }
+            axum::Json(anthropic_message_body("A-msg")).into_response()
         }));
     tokio::spawn(async move {
         let _ = axum::serve(listener_a, router_a).await;
@@ -101,8 +137,11 @@ async fn spawn_mock_upstreams() -> (String, String) {
     let listener_b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr_b = listener_b.local_addr().unwrap();
     let router_b = axum::Router::new()
-        .route("/responses", axum::routing::post(|| async {
-            axum::Json(responses_body("B-resp"))
+        .route("/responses", axum::routing::post(|axum::Json(body): axum::Json<Value>| async move {
+            if body["stream"].as_bool() == Some(true) {
+                return sse_response(responses_sse("B-resp-stream"));
+            }
+            axum::Json(responses_body("B-resp")).into_response()
         }));
     tokio::spawn(async move {
         let _ = axum::serve(listener_b, router_b).await;
@@ -1233,5 +1272,407 @@ async fn summary_and_dashboard_also_report_lock_state() {
             Some(45),
             "{uri} 必须报 first_byte_timeout_secs —— 否则编辑表单回填成默认值"
         );
+    }
+}
+
+/// Aggregate matrix: all nine (ingress, forced upstream protocol) pairs must
+/// work both non-streaming and streaming. Streaming is the point of this test:
+/// when the client sets `stream:true`, the downstream must receive incremental
+/// SSE in **its own** protocol, never a buffered JSON reply.
+#[tokio::test]
+async fn e2e_aggregate_streaming_matrix_keeps_streaming() {
+    let (upstream_a, upstream_b) = spawn_mock_upstreams().await;
+
+    let state = llmux_server::test_state().await;
+    let app = llmux_server::app(state.clone());
+
+    sqlx::query("INSERT INTO api_keys (name, key, allowed_models) VALUES (?, ?, ?)")
+        .bind("e2e-matrix")
+        .bind("sk-matrix")
+        .bind("*")
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    let cookie = login(app.clone()).await;
+
+    let (create_status, create_body) = api_post(
+        app.clone(),
+        &cookie,
+        "/api/accounts",
+        json!({
+            "alias": "mockmatrix",
+            "provider_id": "openai",
+            "api_key": "sk-mock",
+            "base_url": upstream_a,
+            "chat_endpoint": upstream_a,
+            "responses_endpoint": upstream_b,
+            "messages_endpoint": upstream_a,
+            "anthropic_base_url": upstream_a,
+            "default_protocol": "chat",
+            "skip_validation": true,
+        }),
+    )
+    .await;
+    assert_eq!(create_status, StatusCode::OK, "{create_body:?}");
+    let acct_id = create_body["id"].as_i64().expect("account id");
+
+    for (alias, upstream_api) in [("mx-chat", "chat"), ("mx-msg", "messages"), ("mx-resp", "responses")] {
+        let (st, body) = api_post(
+            app.clone(),
+            &cookie,
+            "/api/aggregate-aliases",
+            json!({
+                "alias": alias,
+                "candidates": [{"account_id": acct_id, "model": "gpt-4o"}],
+                "upstream_api": upstream_api,
+            }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "aggregate {alias}: {body:?}");
+    }
+
+    let mk_body = |ingress: &str| match ingress {
+        "chat" => json!({"messages": [{"role": "user", "content": "hi"}]}),
+        "responses" => json!({"input": "hi"}),
+        _ => json!({"max_tokens": 64, "messages": [{"role": "user", "content": "hi"}]}),
+    };
+
+    let ingresses = [
+        ("/v1/chat/completions", "chat"),
+        ("/v1/responses", "responses"),
+        ("/v1/messages", "messages"),
+    ];
+    // (aggregate alias, forced upstream, non-stream marker, stream marker)
+    let modes = [
+        ("mx-chat", "chat", "A-chat", "A-chat-stream"),
+        ("mx-msg", "messages", "A-msg", "A-msg-stream"),
+        ("mx-resp", "responses", "B-resp", "B-resp-stream"),
+    ];
+
+    for (alias, _mode, marker, stream_marker) in modes {
+        for (path, ingress) in ingresses {
+            let mut body = mk_body(ingress);
+            body["model"] = json!(alias);
+
+            let (st, resp, raw) = v1_post(app.clone(), "sk-matrix", path, body.clone()).await;
+            assert_eq!(st, StatusCode::OK, "{alias}/{ingress} non-stream: {st:?}\nraw={raw}");
+            assert!(raw.contains(marker), "{alias}/{ingress} non-stream lost '{marker}': {raw}");
+            assert!(usage_nonzero(&resp), "{alias}/{ingress} non-stream usage: {resp:?}");
+
+            body["stream"] = json!(true);
+            let (st, _resp, raw) = v1_post(app.clone(), "sk-matrix", path, body).await;
+            assert_eq!(st, StatusCode::OK, "{alias}/{ingress} stream: {st:?}\nraw={raw}");
+            assert!(
+                raw.contains(stream_marker),
+                "{alias}/{ingress} stream lost '{stream_marker}': {raw}"
+            );
+            match ingress {
+                "chat" => assert!(
+                    raw.contains("\"choices\""),
+                    "{alias}/{ingress} stream must be chat SSE: {raw}"
+                ),
+                "responses" => assert!(
+                    raw.contains("response.output_text.delta") && raw.contains("response.completed"),
+                    "{alias}/{ingress} stream must be responses SSE: {raw}"
+                ),
+                _ => assert!(
+                    raw.contains("event: message_start") && raw.contains("event: message_stop"),
+                    "{alias}/{ingress} stream must be anthropic SSE: {raw}"
+                ),
+            }
+        }
+    }
+}
+
+/// Upstreams that emit one complete SSE frame per protocol and then keep the
+/// connection open forever. If the gateway buffers a cross-protocol stream
+/// until upstream EOF, the downstream receives nothing and these tests time out.
+async fn spawn_hanging_upstreams() -> (String, String) {
+    fn hang_after(first: String) -> axum::response::Response {
+        axum::response::Response::builder()
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from_stream(
+                futures_util::stream::once(async move {
+                    Ok::<_, std::io::Error>(bytes::Bytes::from(first))
+                })
+                .chain(futures_util::stream::pending()),
+            ))
+            .unwrap()
+    }
+
+    let listener_a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_a = listener_a.local_addr().unwrap();
+    let router_a = axum::Router::new()
+        .route("/chat/completions", axum::routing::post(|| async {
+            hang_after(concat!(
+                "data: {\"id\":\"hang_cmpl\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"hang-chat\"},\"finish_reason\":null}]}\n\n",
+            ).to_string())
+        }))
+        .route("/responses", axum::routing::post(|| async {
+            hang_after(responses_sse("hang-resp"))
+        }))
+        .route("/v1/messages", axum::routing::post(|| async {
+            hang_after(anthropic_sse("hang-msg"))
+        }));
+    tokio::spawn(async move {
+        let _ = axum::serve(listener_a, router_a).await;
+    });
+
+    let listener_b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_b = listener_b.local_addr().unwrap();
+    let router_b = axum::Router::new().route("/responses", axum::routing::post(|| async {
+        hang_after(responses_sse("hang-resp"))
+    }));
+    tokio::spawn(async move {
+        let _ = axum::serve(listener_b, router_b).await;
+    });
+
+    (format!("http://{addr_a}"), format!("http://{addr_b}"))
+}
+
+/// Strict-streaming proof for the full 3×3 aggregate matrix: the upstream sends
+/// exactly one frame and then never closes. A gateway that buffers the whole
+/// upstream response would never deliver a downstream frame, so every combo
+/// here must produce its marker within the deadline.
+#[tokio::test]
+async fn e2e_cross_protocol_streams_before_upstream_finishes() {
+    let (upstream_a, upstream_b) = spawn_hanging_upstreams().await;
+
+    let state = llmux_server::test_state().await;
+    let app = llmux_server::app(state.clone());
+
+    sqlx::query("INSERT INTO api_keys (name, key, allowed_models) VALUES (?, ?, ?)")
+        .bind("e2e-live")
+        .bind("sk-live")
+        .bind("*")
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    let cookie = login(app.clone()).await;
+
+    let (create_status, create_body) = api_post(
+        app.clone(),
+        &cookie,
+        "/api/accounts",
+        json!({
+            "alias": "mocklive",
+            "provider_id": "openai",
+            "api_key": "sk-mock",
+            "base_url": upstream_a,
+            "chat_endpoint": upstream_a,
+            "responses_endpoint": upstream_b,
+            "messages_endpoint": upstream_a,
+            "anthropic_base_url": upstream_a,
+            "default_protocol": "chat",
+            "skip_validation": true,
+        }),
+    )
+    .await;
+    assert_eq!(create_status, StatusCode::OK, "{create_body:?}");
+    let acct_id = create_body["id"].as_i64().expect("account id");
+
+    for (alias, upstream_api) in [("lv-chat", "chat"), ("lv-msg", "messages"), ("lv-resp", "responses")] {
+        let (st, body) = api_post(
+            app.clone(),
+            &cookie,
+            "/api/aggregate-aliases",
+            json!({
+                "alias": alias,
+                "candidates": [{"account_id": acct_id, "model": "gpt-4o"}],
+                "upstream_api": upstream_api,
+            }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "aggregate {alias}: {body:?}");
+    }
+
+    // (ingress path, ingress protocol, request body, expected upstream marker)
+    let ingresses = [
+        ("/v1/chat/completions", "chat", json!({"messages": [{"role": "user", "content": "hi"}]})),
+        ("/v1/responses", "responses", json!({"input": "hi"})),
+        ("/v1/messages", "messages", json!({"max_tokens": 64, "messages": [{"role": "user", "content": "hi"}]})),
+    ];
+    let modes = [
+        ("lv-chat", "hang-chat"),
+        ("lv-msg", "hang-msg"),
+        ("lv-resp", "hang-resp"),
+    ];
+
+    for (alias, marker) in modes {
+        for (path, ingress, body) in &ingresses {
+            let mut body = body.clone();
+            body["model"] = json!(alias);
+            body["stream"] = json!(true);
+            let req = Request::builder()
+                .method(Method::POST)
+                .uri(*path)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, "Bearer sk-live")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let resp = llmux_server::test_request(app.clone(), req).await;
+            let status = resp.status();
+            assert_eq!(status, StatusCode::OK, "{alias}/{ingress}: {status:?}");
+            let ct = resp
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            assert!(ct.contains("text/event-stream"), "{alias}/{ingress}: content-type={ct}");
+
+            let mut frames = resp.into_body().into_data_stream();
+            let mut collected = String::new();
+            let saw_marker = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while let Some(Ok(chunk)) = frames.next().await {
+                    collected.push_str(&String::from_utf8_lossy(&chunk));
+                    if collected.contains(marker) {
+                        return true;
+                    }
+                }
+                false
+            })
+            .await
+            .unwrap_or(false);
+            assert!(
+                saw_marker,
+                "{alias}/{ingress}: no downstream frame before the upstream finished (buffered?): {collected}"
+            );
+            match *ingress {
+                "chat" => assert!(collected.contains("\"choices\""), "{alias}/{ingress}: expected chat SSE, got {collected}"),
+                "responses" => assert!(
+                    collected.contains("response.output_text.delta"),
+                    "{alias}/{ingress}: expected responses SSE, got {collected}"
+                ),
+                _ => assert!(
+                    collected.contains("event: message_start"),
+                    "{alias}/{ingress}: expected anthropic SSE, got {collected}"
+                ),
+            }
+        }
+    }
+}
+
+/// Same strict-streaming proof as the aggregate test, but through the ordinary
+/// alias dispatcher (`dispatch_with_conversion`). Covers all six cross-protocol
+/// pairs plus the three passthroughs: the upstream never closes, so any
+/// buffering implementation would time out.
+#[tokio::test]
+async fn e2e_ordinary_cross_protocol_streams_before_upstream_finishes() {
+    let (upstream_a, upstream_b) = spawn_hanging_upstreams().await;
+
+    let state = llmux_server::test_state().await;
+    let app = llmux_server::app(state.clone());
+
+    sqlx::query("INSERT INTO api_keys (name, key, allowed_models) VALUES (?, ?, ?)")
+        .bind("e2e-live-ordinary")
+        .bind("sk-live-ord")
+        .bind("*")
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    let cookie = login(app.clone()).await;
+
+    let (create_status, create_body) = api_post(
+        app.clone(),
+        &cookie,
+        "/api/accounts",
+        json!({
+            "alias": "mockliveord",
+            "provider_id": "openai",
+            "api_key": "sk-mock",
+            "base_url": upstream_a,
+            "chat_endpoint": upstream_a,
+            "responses_endpoint": upstream_b,
+            "messages_endpoint": upstream_a,
+            "anthropic_base_url": upstream_a,
+            "default_protocol": "chat",
+            "skip_validation": true,
+        }),
+    )
+    .await;
+    assert_eq!(create_status, StatusCode::OK, "{create_body:?}");
+    let acct_id = create_body["id"].as_i64().expect("account id");
+
+    for (alias, upstream_api) in [("lv2-chat", "chat"), ("lv2-msg", "messages"), ("lv2-resp", "responses")] {
+        let (st, body) = api_post(
+            app.clone(),
+            &cookie,
+            "/api/models/aliases",
+            json!({
+                "alias": alias,
+                "target_model": "gpt-4o",
+                "account_ids": [acct_id],
+                "upstream_api": upstream_api,
+                "provider_id": "openai",
+            }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "alias {alias}: {body:?}");
+    }
+
+    let ingresses = [
+        ("/v1/chat/completions", "chat", json!({"messages": [{"role": "user", "content": "hi"}]})),
+        ("/v1/responses", "responses", json!({"input": "hi"})),
+        ("/v1/messages", "messages", json!({"max_tokens": 64, "messages": [{"role": "user", "content": "hi"}]})),
+    ];
+    let aliases = [
+        ("lv2-chat", "hang-chat"),
+        ("lv2-msg", "hang-msg"),
+        ("lv2-resp", "hang-resp"),
+    ];
+
+    for (alias, marker) in aliases {
+        for (path, ingress, body) in &ingresses {
+            let mut body = body.clone();
+            body["model"] = json!(alias);
+            body["stream"] = json!(true);
+            let req = Request::builder()
+                .method(Method::POST)
+                .uri(*path)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, "Bearer sk-live-ord")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let resp = llmux_server::test_request(app.clone(), req).await;
+            let status = resp.status();
+            assert_eq!(status, StatusCode::OK, "{alias}/{ingress}: {status:?}");
+            let ct = resp
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            assert!(ct.contains("text/event-stream"), "{alias}/{ingress}: content-type={ct}");
+
+            let mut frames = resp.into_body().into_data_stream();
+            let mut collected = String::new();
+            let saw_marker = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while let Some(Ok(chunk)) = frames.next().await {
+                    collected.push_str(&String::from_utf8_lossy(&chunk));
+                    if collected.contains(marker) {
+                        return true;
+                    }
+                }
+                false
+            })
+            .await
+            .unwrap_or(false);
+            assert!(
+                saw_marker,
+                "{alias}/{ingress}: no downstream frame before the upstream finished (buffered?): {collected}"
+            );
+            match *ingress {
+                "chat" => assert!(collected.contains("\"choices\""), "{alias}/{ingress}: expected chat SSE, got {collected}"),
+                "responses" => assert!(
+                    collected.contains("response.output_text.delta"),
+                    "{alias}/{ingress}: expected responses SSE, got {collected}"
+                ),
+                _ => assert!(
+                    collected.contains("event: message_start"),
+                    "{alias}/{ingress}: expected anthropic SSE, got {collected}"
+                ),
+            }
+        }
     }
 }
