@@ -1,13 +1,14 @@
 //! Contract tests for the balance module (CodexBar port).
 //!
-//! Pure-logic tests only — no network. The parsers are the fragile part
-//! worth locking down; the HTTP layer is exercised in production.
+//! Mostly pure-logic tests. The New API tests also drive the real request path
+//! against a loopback HTTP server so the URL, header, and fail-closed behavior
+//! are locked down without touching any upstream.
 
 use llmux_core::balance::{
     balance_credential, balance_uses_api_key, chatgpt_result, commandcode_result, detect_kind,
-    oc_parse_billing_balance, oc_parse_billing_balance_loose, oc_parse_subscription,
-    oc_parse_subscription_goat, oc_scan_balance_any_text, openai_result, teamorouter_result,
-    BalanceKind,
+    fetch_balance, newapi_base_url, oc_parse_billing_balance, oc_parse_billing_balance_loose,
+    oc_parse_subscription, oc_parse_subscription_goat, oc_scan_balance_any_text, openai_result,
+    teamorouter_result, newapi_token_result, newapi_wallet_result, BalanceKind,
 };
 
 #[test]
@@ -117,6 +118,194 @@ fn detect_kind_none_and_unknown_values() {
     assert!(detect_kind("deepseek", &[], "none").is_none());
     assert!(detect_kind("custom", &["https://api.deepseek.com/v1"], "garbage").is_none());
     assert!(detect_kind("custom", &[], "").is_none());
+}
+
+// ─── New API quota contracts ────────────────────────────────────────────────
+
+#[test]
+fn detect_kind_newapi_is_explicit_only() {
+    for spelling in ["newapi", "new-api", "new_api"] {
+        assert!(matches!(detect_kind("custom", &[], spelling), Some(BalanceKind::NewApi)));
+    }
+    assert!(detect_kind("custom", &["https://relay.example.test/v1"], "").is_none());
+    assert!(detect_kind("newapi", &[], "none").is_none());
+}
+
+#[test]
+fn newapi_wallet_result_requires_valid_quota_and_does_not_assume_currency() {
+    let raw = newapi_wallet_result(&serde_json::json!({
+        "success": true,
+        "data": { "quota": 2_500_000, "used_quota": 500_000 }
+    }));
+    assert_eq!(raw["ok"], true);
+    assert_eq!(raw["summary"], "2500000");
+    assert!(!raw["summary"].as_str().unwrap().contains('$'));
+    assert_eq!(raw["rows"][0]["value"], "2500000");
+    assert_eq!(raw["rows"][1]["value"], "500000");
+
+    for invalid in [
+        serde_json::json!({"data": {"quota": 1, "used_quota": 0}}),
+        serde_json::json!({"success": true, "data": {"used_quota": 1}}),
+        serde_json::json!({"success": false, "message": "denied", "data": {"quota": 1}}),
+        serde_json::json!({"success": true, "data": {"quota": -1, "used_quota": 0}}),
+        serde_json::json!({"success": true, "data": {"quota": "NaN", "used_quota": 0}}),
+    ] {
+        assert_eq!(newapi_wallet_result(&invalid)["ok"], false, "invalid payload: {invalid}");
+    }
+}
+
+#[test]
+fn newapi_token_result_labels_quota_and_handles_unlimited() {
+    let raw = newapi_token_result(&serde_json::json!({
+        "code": true,
+        "message": "ok",
+        "data": { "total_available": 1200, "total_used": 800, "unlimited_quota": false }
+    }));
+    assert_eq!(raw["ok"], true);
+    assert!(!raw["summary"].as_str().unwrap().contains('$'));
+    assert!(raw["detail"].as_str().unwrap().contains("非钱包余额"));
+    assert_eq!(raw["rows"][0]["value"], "1200");
+    assert_eq!(raw["rows"][1]["value"], "800");
+
+    let unlimited = newapi_token_result(&serde_json::json!({
+        "code": true,
+        "message": "ok",
+        "data": { "unlimited_quota": true }
+    }));
+    assert_eq!(unlimited["ok"], true);
+    assert!(unlimited["summary"].as_str().unwrap().contains("无限"));
+
+    assert_eq!(newapi_token_result(&serde_json::json!({"code": true, "data": {}}))["ok"], false);
+    assert_eq!(newapi_token_result(&serde_json::json!({"code": true, "data": {"total_available": 4}}))["ok"], false);
+    assert_eq!(newapi_token_result(&serde_json::json!({"code": true, "data": {"remain_quota": 4, "total_used": 0}}))["ok"], false);
+    assert_eq!(newapi_token_result(&serde_json::json!({"code": true, "data": {"total_available": 4, "total_used": -1}}))["ok"], false);
+    assert_eq!(newapi_token_result(&serde_json::json!({"success": true, "code": false, "data": {"total_available": 4, "total_used": 0}}))["ok"], false);
+}
+
+#[test]
+fn newapi_base_url_keeps_deployment_prefix_and_strips_the_api_surface() {
+    // New API 的管理路由挂在部署根上；账户端点指向 OpenAI 兼容面（/v1 或更长的
+    // /v1/... 路径），所以只剥 API 面，保留它前面的部署子路径。
+    for (endpoint, want) in [
+        ("https://relay.test/v1", "https://relay.test"),
+        ("https://relay.test/v1/", "https://relay.test"),
+        ("https://relay.test/v1/chat/completions", "https://relay.test"),
+        ("https://relay.test/newapi/v1", "https://relay.test/newapi"),
+        ("https://relay.test/newapi/v1/chat/completions", "https://relay.test/newapi"),
+        ("https://relay.test", "https://relay.test"),
+        ("https://relay.test/newapi", "https://relay.test/newapi"),
+        ("https://relay.test:8443/newapi/v1", "https://relay.test:8443/newapi"),
+    ] {
+        assert_eq!(newapi_base_url(endpoint).unwrap(), want, "endpoint: {endpoint}");
+    }
+    assert!(newapi_base_url("not a url").is_err());
+    assert!(newapi_base_url("ftp://relay.test/v1").is_err());
+}
+
+/// Loopback HTTP server: records the request line + Authorization header and
+/// answers with a fixed status/body. Never leaves the machine.
+async fn spawn_mock(
+    status: &'static str,
+    body: &'static str,
+) -> (String, std::sync::Arc<tokio::sync::Mutex<Vec<(String, Option<String>)>>>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let hits = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let recorder = hits.clone();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let recorder = recorder.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 8192];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or_default()
+                    .to_string();
+                let authorization = request.lines().find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("authorization")
+                        .then(|| value.trim().to_string())
+                });
+                recorder.lock().await.push((path, authorization));
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+    (format!("http://{addr}"), hits)
+}
+
+#[tokio::test]
+async fn newapi_fetch_picks_route_from_credential_source_not_from_a_sk_prefix() {
+    // balance_auth（用户 access token）→ 钱包路由。即使它以 sk- 开头也不能改路由。
+    let (base, hits) = spawn_mock(
+        "200 OK",
+        r#"{"success":true,"data":{"quota":2500000,"used_quota":500000}}"#,
+    )
+    .await;
+    let value = fetch_balance(BalanceKind::NewApi, "sk-user-pat", false, &[format!("{base}/v1")]).await;
+    assert_eq!(value["ok"], true, "{value}");
+    let hits = hits.lock().await.clone();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].0, "/api/user/self");
+    assert_eq!(hits[0].1.as_deref(), Some("Bearer sk-user-pat"));
+
+    // 账户 API key → 令牌配额路由；不带 sk- 前缀也不能改路由。部署子路径保留。
+    let (base, hits) = spawn_mock(
+        "200 OK",
+        r#"{"code":true,"message":"ok","data":{"total_available":1200,"total_used":800,"unlimited_quota":false}}"#,
+    )
+    .await;
+    let value = fetch_balance(BalanceKind::NewApi, "plain-account-key", true, &[format!("{base}/newapi/v1")]).await;
+    assert_eq!(value["ok"], true, "{value}");
+    assert!(value["summary"].as_str().unwrap().contains("Token"));
+    let hits = hits.lock().await.clone();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].0, "/newapi/api/usage/token/");
+    assert_eq!(hits[0].1.as_deref(), Some("Bearer plain-account-key"));
+}
+
+#[tokio::test]
+async fn newapi_fetch_fails_closed_without_leaking_the_credential() {
+    for (status, body) in [
+        ("401 Unauthorized", r#"{"success":false,"message":"Unauthorized"}"#),
+        ("403 Forbidden", r#"{"success":false,"message":"a dashboard login session is required"}"#),
+        ("500 Internal Server Error", r#"{"success":false,"message":"boom"}"#),
+        ("200 OK", r#"{"success":true}"#),
+        ("200 OK", r#"{"unexpected":"shape"}"#),
+    ] {
+        let (base, _) = spawn_mock(status, body).await;
+        let value = fetch_balance(
+            BalanceKind::NewApi,
+            "credential-must-not-leak",
+            false,
+            &[format!("{base}/v1")],
+        )
+        .await;
+        assert_eq!(value["ok"], false, "status {status} body {body} → {value}");
+        let error = value["error"].as_str().unwrap_or_default();
+        assert!(!error.contains("credential-must-not-leak"), "credential leaked: {error}");
+    }
+
+    // 非 JSON 的失败页也必须是失败，而不是被当成成功。
+    let (base, _) = spawn_mock("502 Bad Gateway", "upstream exploded").await;
+    let value = fetch_balance(BalanceKind::NewApi, "credential-must-not-leak", true, &[format!("{base}/v1")]).await;
+    assert_eq!(value["ok"], false, "{value}");
+    assert!(value["error"].as_str().unwrap().contains("502"), "{value}");
+
+    // 无法解析任何端点 → 失败，不回落硬编码地址。
+    let value = fetch_balance(BalanceKind::NewApi, "some-key", true, &["not a url".to_string()]).await;
+    assert_eq!(value["ok"], false);
 }
 
 // ─── OpenCode subscription parser ────────────────────────────────────────────
