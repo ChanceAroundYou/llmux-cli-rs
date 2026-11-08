@@ -110,8 +110,8 @@ async fn spawn_mock_upstreams() -> (String, String) {
         .route("/chat/completions", axum::routing::post(|axum::Json(body): axum::Json<Value>| async move {
             if body["stream"].as_bool() == Some(true) {
                 return sse_response(concat!(
-                    "data: {\"id\":\"mock_cmpl_1\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"A-chat-stream\"},\"finish_reason\":null}]}\n\n",
-                    "data: {\"id\":\"mock_cmpl_1\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":22}}\n\n",
+                    "data: {\"id\":\"mock_cmpl_1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"A-chat-stream\"},\"finish_reason\":null}]}\n\n",
+                    "data: {\"id\":\"mock_cmpl_1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":22}}\n\n",
                     "data: [DONE]\n\n",
                 ).to_string());
             }
@@ -1674,5 +1674,297 @@ async fn e2e_ordinary_cross_protocol_streams_before_upstream_finishes() {
                 ),
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Aggregate `default` mode
+//
+// Before the unified dispatcher, `upstream_api=default` bypassed
+// `target_protocol`: a Messages-only account fell back to api.openai.com, and a
+// codex candidate got `/backend-api/codex/chat/completions` (404). These tests
+// pin the fixed behaviour for accounts that a local mock CAN represent. codex's
+// base URL is a compile-time constant and cannot be redirected to a mock, so
+// that half is covered by the unit test
+// `default_codex_account_targets_codex_responses_for_every_ingress`.
+// ---------------------------------------------------------------------------
+
+async fn create_test_account(app: axum::Router, cookie: &str, body: Value) -> i64 {
+    let (status, created) = api_post(app, cookie, "/api/accounts", body).await;
+    assert_eq!(status, StatusCode::OK, "{created:?}");
+    created["id"].as_i64().expect("account id")
+}
+
+async fn create_aggregate(app: axum::Router, cookie: &str, alias: &str, account_id: i64, upstream_api: &str) {
+    let (status, body) = api_post(
+        app,
+        cookie,
+        "/api/aggregate-aliases",
+        json!({
+            "alias": alias,
+            "candidates": [{"account_id": account_id, "model": "gpt-4o"}],
+            "upstream_api": upstream_api,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "aggregate {alias}: {body:?}");
+}
+
+fn ingress_request(ingress: &str, model: &str) -> Value {
+    match ingress {
+        "chat" => json!({"model": model, "messages": [{"role": "user", "content": "hi"}]}),
+        "responses" => json!({"model": model, "input": "hi"}),
+        _ => json!({"model": model, "max_tokens": 64, "messages": [{"role": "user", "content": "hi"}]}),
+    }
+}
+
+fn assert_ingress_shape(ingress: &str, resp: &Value, raw: &str) {
+    match ingress {
+        "chat" => {
+            assert_eq!(resp["object"], json!("chat.completion"), "chat shape: {raw}");
+            assert!(resp["choices"][0]["message"].is_object(), "chat shape: {raw}");
+        }
+        "responses" => {
+            assert_eq!(resp["object"], json!("response"), "responses shape: {raw}");
+            assert!(resp["output"].is_array(), "responses shape: {raw}");
+        }
+        _ => {
+            assert_eq!(resp["type"], json!("message"), "messages shape: {raw}");
+            assert!(resp["content"].is_array(), "messages shape: {raw}");
+        }
+    }
+}
+
+fn assert_ingress_stream(ingress: &str, raw: &str) {
+    match ingress {
+        "chat" => {
+            // Chunks emitted by the converter don't carry `object`; `choices`
+            // is the stable chat-SSE discriminant.
+            assert!(raw.contains("\"choices\""), "chat SSE: {raw}");
+            assert!(!raw.contains("content_block_delta"), "leaked anthropic SSE: {raw}");
+        }
+        "responses" => {
+            assert!(raw.contains("response.output_text.delta"), "responses SSE: {raw}");
+            assert!(!raw.contains("content_block_delta"), "leaked anthropic SSE: {raw}");
+        }
+        _ => {
+            assert!(raw.contains("event: content_block_delta"), "anthropic SSE: {raw}");
+            assert!(!raw.contains("chat.completion.chunk"), "leaked chat SSE: {raw}");
+        }
+    }
+}
+
+const INGRESSES: [(&str, &str); 3] = [
+    ("/v1/chat/completions", "chat"),
+    ("/v1/responses", "responses"),
+    ("/v1/messages", "messages"),
+];
+
+/// `default` + Messages-only account: every ingress must reach the configured
+/// Messages endpoint. Before the fix, Chat/Responses ingress silently fell back
+/// to `https://api.openai.com/v1`.
+#[tokio::test]
+async fn e2e_aggregate_default_messages_only_all_ingresses() {
+    let (upstream_a, _upstream_b) = spawn_mock_upstreams().await;
+
+    let state = llmux_server::test_state().await;
+    let app = llmux_server::app(state.clone());
+    sqlx::query("INSERT INTO api_keys (name, key, allowed_models) VALUES (?, ?, ?)")
+        .bind("e2e-default-msg").bind("sk-default-msg").bind("*")
+        .execute(&state.pool).await.unwrap();
+    let cookie = login(app.clone()).await;
+
+    let account = create_test_account(app.clone(), &cookie, json!({
+        "alias": "only-messages",
+        "provider_id": "openai",
+        "api_key": "sk-mock",
+        "base_url": null,
+        "chat_endpoint": null,
+        "responses_endpoint": null,
+        "messages_endpoint": upstream_a,
+        "default_protocol": "messages",
+        "skip_validation": true,
+    })).await;
+    create_aggregate(app.clone(), &cookie, "def-msg", account, "default").await;
+
+    for (path, ingress) in INGRESSES {
+        let (status, resp, raw) = v1_post(app.clone(), "sk-default-msg", path, ingress_request(ingress, "def-msg")).await;
+        assert_eq!(status, StatusCode::OK, "{ingress}: {status:?}\nraw={raw}");
+        assert!(raw.contains("A-msg"), "{ingress} must hit the Messages endpoint: {raw}");
+        assert_ingress_shape(ingress, &resp, &raw);
+        assert!(usage_nonzero(&resp), "{ingress} usage: {resp:?}");
+
+        let mut stream_body = ingress_request(ingress, "def-msg");
+        stream_body["stream"] = json!(true);
+        let (status, _resp, raw) = v1_post(app.clone(), "sk-default-msg", path, stream_body).await;
+        assert_eq!(status, StatusCode::OK, "{ingress} stream: {status:?}\nraw={raw}");
+        assert!(raw.contains("A-msg-stream"), "{ingress} stream marker: {raw}");
+        assert_ingress_stream(ingress, &raw);
+    }
+}
+
+/// `default` + Responses-only account: every ingress must reach the configured
+/// Responses endpoint (mock B, which serves nothing else).
+#[tokio::test]
+async fn e2e_aggregate_default_responses_only_all_ingresses() {
+    let (_upstream_a, upstream_b) = spawn_mock_upstreams().await;
+
+    let state = llmux_server::test_state().await;
+    let app = llmux_server::app(state.clone());
+    sqlx::query("INSERT INTO api_keys (name, key, allowed_models) VALUES (?, ?, ?)")
+        .bind("e2e-default-resp").bind("sk-default-resp").bind("*")
+        .execute(&state.pool).await.unwrap();
+    let cookie = login(app.clone()).await;
+
+    let account = create_test_account(app.clone(), &cookie, json!({
+        "alias": "only-responses",
+        "provider_id": "openai",
+        "api_key": "sk-mock",
+        "base_url": null,
+        "chat_endpoint": null,
+        "responses_endpoint": upstream_b,
+        "messages_endpoint": null,
+        "default_protocol": "responses",
+        "skip_validation": true,
+    })).await;
+    create_aggregate(app.clone(), &cookie, "def-resp", account, "default").await;
+
+    for (path, ingress) in INGRESSES {
+        let (status, resp, raw) = v1_post(app.clone(), "sk-default-resp", path, ingress_request(ingress, "def-resp")).await;
+        assert_eq!(status, StatusCode::OK, "{ingress}: {status:?}\nraw={raw}");
+        assert!(raw.contains("B-resp"), "{ingress} must hit the Responses endpoint: {raw}");
+        assert_ingress_shape(ingress, &resp, &raw);
+        assert!(usage_nonzero(&resp), "{ingress} usage: {resp:?}");
+
+        let mut stream_body = ingress_request(ingress, "def-resp");
+        stream_body["stream"] = json!(true);
+        let (status, _resp, raw) = v1_post(app.clone(), "sk-default-resp", path, stream_body).await;
+        assert_eq!(status, StatusCode::OK, "{ingress} stream: {status:?}\nraw={raw}");
+        assert!(raw.contains("B-resp-stream"), "{ingress} stream marker: {raw}");
+        assert_ingress_stream(ingress, &raw);
+    }
+}
+
+/// zen free tier forces `stream:true` upstream even for a non-streaming
+/// downstream. The aggregate dispatcher must assemble the SSE by TARGET
+/// protocol (chat vs responses) — the old codex-only coercion 502'd here.
+#[tokio::test]
+async fn e2e_aggregate_zen_nonstreaming_sse_coercion() {
+    let (upstream_a, _upstream_b) = spawn_mock_upstreams().await;
+
+    let state = llmux_server::test_state().await;
+    let app = llmux_server::app(state.clone());
+    sqlx::query("INSERT INTO api_keys (name, key, allowed_models) VALUES (?, ?, ?)")
+        .bind("e2e-zen-agg").bind("sk-zen-agg").bind("*")
+        .execute(&state.pool).await.unwrap();
+    let cookie = login(app.clone()).await;
+
+    let account = create_test_account(app.clone(), &cookie, json!({
+        "alias": "mock-zen",
+        "provider_id": "zen",
+        "category": "zen",
+        "api_key": "sk-mock",
+        "base_url": upstream_a,
+        "chat_endpoint": upstream_a,
+        "responses_endpoint": upstream_a,
+        "skip_validation": true,
+    })).await;
+    create_aggregate(app.clone(), &cookie, "zen-chat", account, "chat").await;
+    create_aggregate(app.clone(), &cookie, "zen-resp", account, "responses").await;
+
+    // Chat target: upstream answers chat SSE, downstream gets one JSON object.
+    let (status, resp, raw) = v1_post(app.clone(), "sk-zen-agg", "/v1/chat/completions",
+        ingress_request("chat", "zen-chat")).await;
+    assert_eq!(status, StatusCode::OK, "{status:?}\nraw={raw}");
+    assert_eq!(resp["object"], json!("chat.completion"), "{raw}");
+    assert!(raw.contains("A-chat-stream"), "{raw}");
+
+    // Responses target: upstream answers responses SSE, downstream gets JSON.
+    let (status, resp, raw) = v1_post(app.clone(), "sk-zen-agg", "/v1/responses",
+        ingress_request("responses", "zen-resp")).await;
+    assert_eq!(status, StatusCode::OK, "{status:?}\nraw={raw}");
+    assert_eq!(resp["object"], json!("response"), "{raw}");
+    assert!(raw.contains("A-resp-stream"), "{raw}");
+
+    // Cross-protocol: Chat ingress → Responses target.
+    let (status, resp, raw) = v1_post(app.clone(), "sk-zen-agg", "/v1/chat/completions",
+        ingress_request("chat", "zen-resp")).await;
+    assert_eq!(status, StatusCode::OK, "{status:?}\nraw={raw}");
+    assert_eq!(resp["object"], json!("chat.completion"), "{raw}");
+    assert!(raw.contains("A-resp-stream"), "{raw}");
+
+    // Cross-protocol: Responses ingress → Chat target.
+    let (status, resp, raw) = v1_post(app.clone(), "sk-zen-agg", "/v1/responses",
+        ingress_request("responses", "zen-chat")).await;
+    assert_eq!(status, StatusCode::OK, "{status:?}\nraw={raw}");
+    assert_eq!(resp["object"], json!("response"), "{raw}");
+    assert!(raw.contains("A-chat-stream"), "{raw}");
+}
+
+/// Mock that rejects `/chat/completions` with GitHub Copilot's
+/// `unsupported_api_for_model` and serves the same model on `/v1/messages`.
+async fn spawn_unsupported_chat_upstream() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = axum::Router::new()
+        .route("/chat/completions", axum::routing::post(|| async {
+            (
+                StatusCode::BAD_REQUEST,
+                axum::Json(json!({"error": {"message": "unsupported_api_for_model: use /v1/messages", "type": "invalid_request_error"}})),
+            )
+        }))
+        .route("/v1/messages", axum::routing::post(|axum::Json(body): axum::Json<Value>| async move {
+            if body["stream"].as_bool() == Some(true) {
+                return sse_response(anthropic_sse("C-msg-stream"));
+            }
+            axum::Json(anthropic_message_body("C-msg")).into_response()
+        }));
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    format!("http://{addr}")
+}
+
+/// `unsupported_api_for_model` fallback now applies to all three ingresses: the
+/// same candidate is retried with a Messages target and the response is
+/// back-translated to whatever the downstream speaks.
+#[tokio::test]
+async fn e2e_aggregate_unsupported_api_fallback_all_ingresses() {
+    let upstream = spawn_unsupported_chat_upstream().await;
+
+    let state = llmux_server::test_state().await;
+    let app = llmux_server::app(state.clone());
+    sqlx::query("INSERT INTO api_keys (name, key, allowed_models) VALUES (?, ?, ?)")
+        .bind("e2e-unsupported").bind("sk-unsupported").bind("*")
+        .execute(&state.pool).await.unwrap();
+    let cookie = login(app.clone()).await;
+
+    let account = create_test_account(app.clone(), &cookie, json!({
+        "alias": "copilot-ish",
+        "provider_id": "openai",
+        "api_key": "sk-mock",
+        "base_url": upstream,
+        "chat_endpoint": upstream,
+        "messages_endpoint": upstream,
+        "default_protocol": "chat",
+        "skip_validation": true,
+    })).await;
+    // Forced chat: every ingress starts on /chat/completions, so the fallback
+    // (not the routing table) is what makes Messages ingress work.
+    create_aggregate(app.clone(), &cookie, "unsupported-agg", account, "chat").await;
+
+    for (path, ingress) in INGRESSES {
+        let (status, resp, raw) = v1_post(app.clone(), "sk-unsupported", path,
+            ingress_request(ingress, "unsupported-agg")).await;
+        assert_eq!(status, StatusCode::OK, "{ingress}: {status:?}\nraw={raw}");
+        assert!(raw.contains("C-msg"), "{ingress} must fall back to /v1/messages: {raw}");
+        assert_ingress_shape(ingress, &resp, &raw);
+
+        let mut stream_body = ingress_request(ingress, "unsupported-agg");
+        stream_body["stream"] = json!(true);
+        let (status, _resp, raw) = v1_post(app.clone(), "sk-unsupported", path, stream_body).await;
+        assert_eq!(status, StatusCode::OK, "{ingress} stream: {status:?}\nraw={raw}");
+        assert!(raw.contains("C-msg-stream"), "{ingress} stream fallback marker: {raw}");
+        assert_ingress_stream(ingress, &raw);
     }
 }
