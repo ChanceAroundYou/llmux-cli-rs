@@ -120,7 +120,7 @@ const BALANCE_AUTH_HELP: Record<string, string[]> = {
     '可带 Bearer 前缀，系统会自动剥离；凭据只用于余额查询，不影响转发。',
   ],
   newapi: [
-    'New API 驭风余额查询支持用户 access token；只填 API Key 时仅查询 Token 配额，不代表钱包余额。',
+    'New API 驭风余额查询支持用户 access token；只填 API Key 时：若该 Key 开了「允许查询用户额度」，同样显示钱包剩余额度；否则只显示该 Key 自身的限额。',
     '用户 access token 由 New API 个人设置生成，需具备 profile:read 权限，否则查询钱包会返回 403。',
     '未提供换算系数时只显示原始 quota，不把它换算成金额。',
   ],
@@ -145,7 +145,7 @@ function BalanceAuthInput({ kind, value, onChange, disabled }: { kind: string; v
           {isGo
             ? t('accounts.balanceAuthExplainGo', 'OpenCode Go 支持 API Key 或 Cookie 二选一：填 API Key 走 Go API（推荐），填 auth Cookie 走网页用量；请与上方“余额查询接口”的选择保持一致。')
             : kind === 'newapi'
-              ? t('accounts.balanceAuthExplainNewApi', 'New API 驭风：填用户 access token（需 profile:read 权限）查询钱包余额；留空则用 API Key 查询 Token 配额（非钱包余额）。')
+              ? t('accounts.balanceAuthExplainNewApi', 'New API 驭风：填用户 access token（需 profile:read 权限）查询钱包余额；留空则用 API Key 查询 —— 该 Key 允许查询用户额度时显示钱包剩余额度，否则只显示该 Key 自身的限额。')
               : t('accounts.balanceAuthExplain', '该类型的余额接口需要网页登录凭据（Cookie / Token），仅用于余额查询，不影响正常请求转发。留空则使用上方 API Key 查询；编辑时留空表示不修改。')}
         </p>
         <button

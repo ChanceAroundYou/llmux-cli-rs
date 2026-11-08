@@ -962,14 +962,40 @@ pub fn newapi_wallet_result(v: &Value) -> Value {
     )
 }
 
-/// Parse a token-level quota response. It is deliberately never presented as money.
+/// Parse a token-level quota response.
+///
+/// Upstream's usage endpoint optionally nests `user_quota` — the wallet balance
+/// of the token's owner — whenever the token has `allow_user_quota_query` (the
+/// default for newly created tokens; it can be switched off per token). When
+/// present, the wallet figure is what the user wants and it is shown as such;
+/// a token without it only ever shows its own token quota, which is never
+/// presented as money.
 pub fn newapi_token_result(v: &Value) -> Value {
     let data = match newapi_data(v) {
         Ok(data) => data,
         Err(e) => return err_result("newapi", &e.to_string()),
     };
+    if let Some(wallet) = data.get("user_quota") {
+        let Some(available) = newapi_num(wallet, "total_available") else {
+            return err_result("newapi", "缺少有效 user_quota.total_available");
+        };
+        let Some(used) = newapi_num(wallet, "total_used") else {
+            return err_result("newapi", "缺少有效 user_quota.total_used");
+        };
+        let rows = json!([
+            {"label": "钱包可用 quota", "value": format_quota(available)},
+            {"label": "钱包累计已用 quota", "value": format_quota(used)},
+        ]);
+        return ok_result(
+            "newapi",
+            format_quota(available),
+            "钱包余额（原始 quota，未按系统 QuotaPerUnit 换算币值）".to_string(),
+            json!([]),
+            rows,
+        );
+    }
     if data.get("unlimited_quota").and_then(Value::as_bool) == Some(true) {
-        return ok_result("newapi", "无限".to_string(), "Token 配额，非钱包余额".to_string(), json!([]), json!([]));
+        return ok_result("newapi", "无限(令牌无限制)".to_string(), "Token 令牌本身无限制；未允许查询钱包余额".to_string(), json!([]), json!([]));
     }
     let Some(remain) = newapi_num(data, "total_available") else {
         return err_result("newapi", "缺少有效 total_available");

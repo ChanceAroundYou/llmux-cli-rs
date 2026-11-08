@@ -20,8 +20,7 @@ looks like (`sk-` prefix means nothing here):
   `/api/user/self` (wallet). It must be a dashboard access token with the
   `profile:read` scope — without that scope New API answers 403.
 - When `balance_auth` is empty, the encrypted account **API key** is used to
-  query `/api/usage/token/` (token quota only, `TokenAuthReadOnly`).
-- Token quota is never displayed as currency or described as wallet balance.
+  query `/api/usage/token/` (`TokenAuthReadOnly`).
 
 ## Current contract
 
@@ -45,25 +44,35 @@ Accept: application/json
 
 - Wallet (`balance_auth`): `GET {base}/api/user/self`, envelope
   `{"success": true, "data": {...}}` with `data.quota` and `data.used_quota`.
-- Token quota (API key): `GET {base}/api/usage/token/` (trailing slash
+  `data.quota` is the **remaining** user wallet quota; `used_quota` is
+  cumulative usage and is shown separately, never subtracted from `quota` a
+  second time.
+- Token usage (API key): `GET {base}/api/usage/token/` (trailing slash
   included), envelope `{"code": true, "message": "...", "data": {...}}` with
   `data.total_available`, `data.total_used`, and `data.unlimited_quota`.
-  `data.user_quota` may appear only when the token allows wallet queries; this
-  adapter deliberately ignores it and shows token quota only.
 
-Field semantics:
+### Wallet quota through the token endpoint
 
-- `quota` is the **remaining** user wallet quota. `used_quota` is cumulative
-  usage; it is displayed separately and is **not** subtracted from `quota`
-  again.
-- The current public `GET /api/user/self` response has no per-user
-  `quota_per_unit`. `QuotaPerUnit` is a global system setting, not a field of
-  this response, so the adapter shows raw quota and never assumes a currency
-  conversion.
-- Quota values may be JSON numbers or numeric strings. Missing, negative,
-  non-finite, malformed, unauthorized, non-2xx, or unsuccessful responses fail
-  closed — no default `0`, no empty success card, and the credential is never
-  echoed in an error message.
+Upstream's `GetTokenUsage` nests `data.user_quota.total_available` /
+`total_used` (the token owner's wallet) **whenever the token has
+`allow_user_quota_query`**. That flag defaults to `true` for newly created
+tokens and can be turned off per token. The adapter therefore:
+
+1. shows `user_quota` as the wallet balance whenever it is present — including
+   (in fact especially) when the key itself is `unlimited_quota`, because
+   "unlimited" then only describes the per-key cap, not the wallet;
+2. otherwise falls back to the token's own quota and labels it as such —
+   token quota is never displayed as currency or described as wallet balance;
+3. fails closed if `user_quota` is present but incomplete; it never skips it
+   silently in favour of the token figure.
+
+The current public `GET /api/user/self` response has no per-user
+`quota_per_unit`. `QuotaPerUnit` is a global system setting, not a field of
+these responses, so the adapter shows raw quota and never assumes a currency
+conversion. Quota values may be JSON numbers or numeric strings. Missing,
+negative, non-finite, malformed, unauthorized, non-2xx, or unsuccessful
+responses fail closed — no default `0`, no empty success card, and the
+credential is never echoed in an error message.
 
 ## Updating the contract
 

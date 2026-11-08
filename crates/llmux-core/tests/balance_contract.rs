@@ -155,6 +155,24 @@ fn newapi_wallet_result_requires_valid_quota_and_does_not_assume_currency() {
 }
 
 #[test]
+fn newapi_token_result_prefers_wallet_quota_even_when_the_key_is_unlimited() {
+    let raw = newapi_token_result(&serde_json::json!({
+        "code": true,
+        "message": "ok",
+        "data": {
+            "unlimited_quota": true,
+            "user_quota": { "total_available": 2500000, "total_used": 500000 }
+        }
+    }));
+    assert_eq!(raw["ok"], true);
+    assert_eq!(raw["summary"], "2500000");
+    assert_eq!(raw["rows"][0]["value"], "2500000");
+    assert_eq!(raw["rows"][1]["value"], "500000");
+    assert!(raw["detail"].as_str().unwrap().contains("钱包余额"));
+    assert!(!raw["summary"].as_str().unwrap().contains("Token"));
+}
+
+#[test]
 fn newapi_token_result_labels_quota_and_handles_unlimited() {
     let raw = newapi_token_result(&serde_json::json!({
         "code": true,
@@ -173,7 +191,15 @@ fn newapi_token_result_labels_quota_and_handles_unlimited() {
         "data": { "unlimited_quota": true }
     }));
     assert_eq!(unlimited["ok"], true);
-    assert!(unlimited["summary"].as_str().unwrap().contains("无限"));
+    assert_eq!(unlimited["summary"], "无限(令牌无限制)");
+    assert!(unlimited["detail"].as_str().unwrap().contains("未允许查询钱包余额"));
+    assert!(unlimited["rows"].as_array().unwrap().is_empty());
+
+    // user_quota 只返回了一半也算失败，不能拿它拼一个半成品。
+    assert_eq!(newapi_token_result(&serde_json::json!({
+        "code": true,
+        "data": { "unlimited_quota": true, "user_quota": { "total_available": 4 } }
+    }))["ok"], false);
 
     assert_eq!(newapi_token_result(&serde_json::json!({"code": true, "data": {}}))["ok"], false);
     assert_eq!(newapi_token_result(&serde_json::json!({"code": true, "data": {"total_available": 4}}))["ok"], false);
@@ -263,12 +289,13 @@ async fn newapi_fetch_picks_route_from_credential_source_not_from_a_sk_prefix() 
     // 账户 API key → 令牌配额路由；不带 sk- 前缀也不能改路由。部署子路径保留。
     let (base, hits) = spawn_mock(
         "200 OK",
-        r#"{"code":true,"message":"ok","data":{"total_available":1200,"total_used":800,"unlimited_quota":false}}"#,
+        r#"{"code":true,"message":"ok","data":{"user_quota":{"total_available":2500000,"total_used":500000},"unlimited_quota":true}}"#,
     )
     .await;
     let value = fetch_balance(BalanceKind::NewApi, "plain-account-key", true, &[format!("{base}/newapi/v1")]).await;
     assert_eq!(value["ok"], true, "{value}");
-    assert!(value["summary"].as_str().unwrap().contains("Token"));
+    assert_eq!(value["summary"], "2500000", "{value}");
+    assert!(!value["summary"].as_str().unwrap().contains("Token"), "{value}");
     let hits = hits.lock().await.clone();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].0, "/newapi/api/usage/token/");
