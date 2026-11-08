@@ -25,7 +25,7 @@ use llmux_core::proxy::openai_anthropic::{
     anthropic_to_openai_response, is_unsupported_api_for_model, openai_to_anthropic_request,
     AnthropicSseConverter,
 };
-use llmux_core::proxy::anthropic_openai::{cache_usage_from_openai, openai_to_anthropic_response, anthropic_to_openai_request, anthropic_to_openai_request_with};
+use llmux_core::proxy::anthropic_openai::{cache_usage_from_openai, openai_to_anthropic_response, anthropic_to_openai_request_with};
 use llmux_core::proxy::responses::{
     anthropic_to_responses, anthropic_resp_to_responses_resp, chat_resp_to_responses_resp,
     chat_to_responses, responses_to_anthropic, responses_to_chat, responses_req_to_anthropic_req,
@@ -94,20 +94,11 @@ pub async fn chat_completions(
     llmux_core::proxy::sanitize_chat_messages(&mut body);
     // Resolve early to check upstream_api — chat ingress may be routed to responses upstream
     let raw_model = body.get("model").and_then(Value::as_str).unwrap_or("");
-    // Aggregate alias takes precedence over ordinary alias/prefix
+    // Aggregate alias takes precedence over ordinary alias/prefix. All modes —
+    // including `default` — go through the unified dispatcher, which computes
+    // the target protocol per candidate via `target_protocol`.
     if let Ok(Some(agg)) = state.resolve_aggregate_cached(raw_model).await {
-        // honor aggregate's upstream_api
-        if DownstreamMode::from_str(agg.upstream_api.as_str()) == DownstreamMode::Messages {
-            // Chat ingress + Messages upstream: the conversion dispatcher owns
-            // the (Chat, Messages) pair, including streaming.
-            return dispatch_aggregate_with_conversion(Protocol::Chat, state, auth, uri, headers, body, None, agg).await;
-        }
-        let endpoint = if agg.upstream_api.wants_responses() { "responses" } else { "chat/completions" };
-        // if responses preferred, use responses dispatch with translation
-        if endpoint == "responses" {
-            return dispatch_aggregate_openai_responses(state, auth, uri, headers, body, agg).await;
-        }
-        return dispatch_aggregate_openai(state, auth, uri, headers, body, "chat/completions", agg).await;
+        return dispatch_aggregate_with_conversion(Protocol::Chat, state, auth, uri, headers, body, None, agg).await;
     }
     // Ordinary alias resolved → unified per-account decision table
     // (target_protocol(Chat ingress, mode, account)).
@@ -128,14 +119,9 @@ pub async fn responses(
     Json(body): Json<Value>,
 ) -> Response {
     if let Ok(Some(agg)) = state.resolve_aggregate_cached(body.get("model").and_then(Value::as_str).unwrap_or_default()).await {
-        // Responses ingress keeps passthrough for Responses/Default aggregates;
-        // explicitly forced Chat/Messages upstreams go through the conversion
-        // dispatcher (request + response conversion, streaming included).
-        let mode = DownstreamMode::from_str(agg.upstream_api.as_str());
-        if mode == DownstreamMode::Chat || mode == DownstreamMode::Messages {
-            return dispatch_aggregate_with_conversion(Protocol::Responses, state, auth, uri, headers, body, None, agg).await;
-        }
-        return dispatch_aggregate_openai(state, auth, uri, headers, body, "responses", agg).await;
+        // All modes (`chat`/`responses`/`messages`/`default`) share one dispatcher;
+        // the target protocol is computed per candidate.
+        return dispatch_aggregate_with_conversion(Protocol::Responses, state, auth, uri, headers, body, None, agg).await;
     }
     let model_for_check = dispatcher::sanitize_model_name(
         body.get("model").and_then(Value::as_str).unwrap_or(""),
@@ -146,17 +132,6 @@ pub async fn responses(
         }
     }
     openai_dispatch(state, auth, uri, headers, body, "responses").await
-}
-
-async fn dispatch_aggregate_openai_responses(
-    state: AppState,
-    auth: AuthContext,
-    uri: axum::http::Uri,
-    headers: HeaderMap,
-    body: Value,
-    agg: llmux_core::aggregate::AggregateResolution,
-) -> Response {
-    dispatch_aggregate_with_conversion(Protocol::Chat, state, auth, uri, headers, body, None, agg).await
 }
 
 #[allow(dead_code)]
@@ -446,23 +421,9 @@ pub(crate) async fn dispatch_with_conversion(
                 let data: Value = match serde_json::from_slice(&body_bytes) {
                     Ok(v) => v,
                     Err(e) => {
-                        // codex 原生非流式：后端回的是 SSE 不是 JSON，走流组装。
-                        let text = String::from_utf8_lossy(&body_bytes);
-                        if llmux_core::adapters::is_codex_native(account) && text.contains("data:") {
-                            match collect_codex_response(&body_bytes, &provider_request.body).await {
-                                Some(assembled) => assembled,
-                                None => { last_error = Some(format!("Failed to assemble codex stream: {e}")); failed_candidates += 1; continue; }
-                            }
-                        // zen 原生非流式：免费档强制上游 stream（缺了 403），
-                        // 回来的只能是 SSE。Responses 入口走 responses 形组装，
-                        // Chat 入口走 chat 形组装。透传不做幽灵过滤。
-                        } else if llmux_core::adapters::is_zen_native(account) && text.contains("data:") {
-                            match collect_zen_passthrough_response(&body_bytes, &provider_request.body, ingress).await {
-                                Some(assembled) => assembled,
-                                None => { last_error = Some(format!("Failed to assemble zen stream: {e}")); failed_candidates += 1; continue; }
-                            }
-                        } else {
-                            last_error = Some(format!("Failed to parse response: {e}")); failed_candidates += 1; continue;
+                        match coerce_nonstreaming_sse(account, target, &body_bytes, &provider_request.body, &e).await {
+                            Ok(assembled) => assembled,
+                            Err(msg) => { last_error = Some(msg); failed_candidates += 1; continue; }
                         }
                     }
                 };
@@ -483,15 +444,9 @@ pub(crate) async fn dispatch_with_conversion(
                 let data: Value = match serde_json::from_slice(&body_bytes) {
                     Ok(v) => v,
                     Err(e) => {
-                        // codex 原生非流式：后端回的是 SSE 不是 JSON，走流组装。
-                        let text = String::from_utf8_lossy(&body_bytes);
-                        if llmux_core::adapters::is_codex_native(account) && text.contains("data:") {
-                            match collect_codex_response(&body_bytes, &provider_request.body).await {
-                                Some(assembled) => assembled,
-                                None => { last_error = Some(format!("Failed to assemble codex stream: {e}")); failed_candidates += 1; continue; }
-                            }
-                        } else {
-                            last_error = Some(format!("Failed to parse response: {e}")); failed_candidates += 1; continue;
+                        match coerce_nonstreaming_sse(account, target, &body_bytes, &provider_request.body, &e).await {
+                            Ok(assembled) => assembled,
+                            Err(msg) => { last_error = Some(msg); failed_candidates += 1; continue; }
                         }
                     }
                 };
@@ -516,20 +471,9 @@ pub(crate) async fn dispatch_with_conversion(
                 let data: Value = match serde_json::from_slice(&body_bytes) {
                     Ok(v) => v,
                     Err(e) => {
-                        // codex/zen 原生非流式：后端回的是 SSE 不是 JSON，走流组装。
-                        let text = String::from_utf8_lossy(&body_bytes);
-                        if llmux_core::adapters::is_codex_native(account) && text.contains("data:") {
-                            match collect_codex_response(&body_bytes, &provider_request.body).await {
-                                Some(assembled) => assembled,
-                                None => { last_error = Some(format!("Failed to assemble codex stream: {e}")); failed_candidates += 1; continue; }
-                            }
-                        } else if llmux_core::adapters::is_zen_native(account) && text.contains("data:") {
-                            match collect_zen_chat_response(&body_bytes).await {
-                                Some(assembled) => assembled,
-                                None => { last_error = Some(format!("Failed to assemble zen stream: {e}")); failed_candidates += 1; continue; }
-                            }
-                        } else {
-                            last_error = Some(format!("Failed to parse response: {e}")); failed_candidates += 1; continue;
+                        match coerce_nonstreaming_sse(account, target, &body_bytes, &provider_request.body, &e).await {
+                            Ok(assembled) => assembled,
+                            Err(msg) => { last_error = Some(msg); failed_candidates += 1; continue; }
                         }
                     }
                 };
@@ -554,15 +498,9 @@ pub(crate) async fn dispatch_with_conversion(
                 let data: Value = match serde_json::from_slice(&body_bytes) {
                     Ok(v) => v,
                     Err(e) => {
-                        // codex 原生非流式：后端回的是 SSE 不是 JSON，走流组装。
-                        let text = String::from_utf8_lossy(&body_bytes);
-                        if llmux_core::adapters::is_codex_native(account) && text.contains("data:") {
-                            match collect_codex_response(&body_bytes, &provider_request.body).await {
-                                Some(assembled) => assembled,
-                                None => { last_error = Some(format!("Failed to assemble codex stream: {e}")); failed_candidates += 1; continue; }
-                            }
-                        } else {
-                            last_error = Some(format!("Failed to parse response: {e}")); failed_candidates += 1; continue;
+                        match coerce_nonstreaming_sse(account, target, &body_bytes, &provider_request.body, &e).await {
+                            Ok(assembled) => assembled,
+                            Err(msg) => { last_error = Some(msg); failed_candidates += 1; continue; }
                         }
                     }
                 };
@@ -586,18 +524,12 @@ pub(crate) async fn dispatch_with_conversion(
                 let data: Value = match serde_json::from_slice(&body_bytes) {
                     Ok(v) => v,
                     Err(e) => {
-                        // codex/zen 原生非流式：后端回的是 SSE 不是 JSON，走流组装。
-                        // zen 侧：Messages 上游只有 Anthropic 形状，SSE 形是 anthropic
-                        // 事件 —— anthropic_to_openai_response 消费 JSON body，
-                        // 此处只处理 JSON 解析失败的 SSE 回退（与 codex 同形）。
-                        let text = String::from_utf8_lossy(&body_bytes);
-                        if llmux_core::adapters::is_codex_native(account) && text.contains("data:") {
-                            match collect_codex_response(&body_bytes, &provider_request.body).await {
-                                Some(assembled) => assembled,
-                                None => { last_error = Some(format!("Failed to assemble codex stream: {e}")); failed_candidates += 1; continue; }
-                            }
-                        } else {
-                            last_error = Some(format!("Failed to parse response: {e}")); failed_candidates += 1; continue;
+                        // codex 原生非流式：后端回的是 SSE 不是 JSON，走流组装。
+                        // zen 侧 target=Messages 是普通 Anthropic passthrough，不会被
+                        // 强制改写成 SSE，所以 coerce 对它返回 None（保持原错误）。
+                        match coerce_nonstreaming_sse(account, target, &body_bytes, &provider_request.body, &e).await {
+                            Ok(assembled) => assembled,
+                            Err(msg) => { last_error = Some(msg); failed_candidates += 1; continue; }
                         }
                     }
                 };
@@ -622,22 +554,9 @@ pub(crate) async fn dispatch_with_conversion(
                 let data: Value = match serde_json::from_slice(&body_bytes) {
                     Ok(v) => v,
                     Err(e) => {
-                        // codex/zen 原生非流式：后端回的是 SSE 不是 JSON，走流组装。
-                        // zen 侧 Responses 上游是标准 responses SSE —— 先按 JSON 试，
-                        // 失败且含 data: 行时按 responses 事件组装（collect_stream）。
-                        let text = String::from_utf8_lossy(&body_bytes);
-                        if llmux_core::adapters::is_codex_native(account) && text.contains("data:") {
-                            match collect_codex_response(&body_bytes, &provider_request.body).await {
-                                Some(assembled) => assembled,
-                                None => { last_error = Some(format!("Failed to assemble codex stream: {e}")); failed_candidates += 1; continue; }
-                            }
-                        } else if llmux_core::adapters::is_zen_native(account) && text.contains("data:") {
-                            match collect_zen_responses_response(&body_bytes, &provider_request.body).await {
-                                Some(assembled) => assembled,
-                                None => { last_error = Some(format!("Failed to assemble zen stream: {e}")); failed_candidates += 1; continue; }
-                            }
-                        } else {
-                            last_error = Some(format!("Failed to parse response: {e}")); failed_candidates += 1; continue;
+                        match coerce_nonstreaming_sse(account, target, &body_bytes, &provider_request.body, &e).await {
+                            Ok(assembled) => assembled,
+                            Err(msg) => { last_error = Some(msg); failed_candidates += 1; continue; }
                         }
                     }
                 };
@@ -659,20 +578,9 @@ pub(crate) async fn dispatch_with_conversion(
                 let data: Value = match serde_json::from_slice(&body_bytes) {
                     Ok(v) => v,
                     Err(e) => {
-                        // codex/zen 原生非流式：后端回的是 SSE 不是 JSON，走流组装。
-                        let text = String::from_utf8_lossy(&body_bytes);
-                        if llmux_core::adapters::is_codex_native(account) && text.contains("data:") {
-                            match collect_codex_response(&body_bytes, &provider_request.body).await {
-                                Some(assembled) => assembled,
-                                None => { last_error = Some(format!("Failed to assemble codex stream: {e}")); failed_candidates += 1; continue; }
-                            }
-                        } else if llmux_core::adapters::is_zen_native(account) && text.contains("data:") {
-                            match collect_zen_chat_response(&body_bytes).await {
-                                Some(assembled) => assembled,
-                                None => { last_error = Some(format!("Failed to assemble zen stream: {e}")); failed_candidates += 1; continue; }
-                            }
-                        } else {
-                            last_error = Some(format!("Failed to parse response: {e}")); failed_candidates += 1; continue;
+                        match coerce_nonstreaming_sse(account, target, &body_bytes, &provider_request.body, &e).await {
+                            Ok(assembled) => assembled,
+                            Err(msg) => { last_error = Some(msg); failed_candidates += 1; continue; }
                         }
                     }
                 };
@@ -1044,19 +952,17 @@ pub(crate) async fn dispatch_aggregate_with_conversion(
         }
         let mut account = match get_account_by_id(&state.pool, cand.account_id, &state.master_key).await {
             Ok(Some(a)) => a,
-            Ok(None) => { state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); crate::routes::v1::helpers::note_skip_reason(&mut last_error, format!("Candidate {} account {} not found", i, cand.account_id)); failed_candidates += 1; continue; }
+            Ok(None) => { state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); crate::routes::v1::helpers::note_skip_reason(&mut last_error, format!("Candidate {} account {} not found or inactive", i, cand.account_id)); failed_candidates += 1; continue; }
             Err(e) => { state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); crate::routes::v1::helpers::note_skip_reason(&mut last_error, format!("Failed to load account {}: {e}", cand.account_id)); failed_candidates += 1; continue; }
         };
         // codex 原生账户：JWT 过期就先 refresh（与 dispatch_with_conversion 主循环同逻辑）。
-        let mut refreshed_owned_agg;
         if llmux_core::adapters::is_codex_native(&account) {
             match llmux_core::codex_auth::load_creds(&account) {
                 Some(creds) if creds.is_expired() => {
                     match llmux_core::codex_auth::refresh_and_save(&state.pool, account.id, &account.codex_auth_json).await {
                         Ok(new_json) => {
                             tracing::info!("🔑 codex token refreshed pre-request for account {}", account.alias);
-                            refreshed_owned_agg = llmux_core::adapters::Account { codex_auth_json: new_json, ..account.clone() };
-                            account = refreshed_owned_agg;
+                            account = llmux_core::adapters::Account { codex_auth_json: new_json, ..account.clone() };
                         }
                         Err(e) => {
                             last_error = Some(format!("Codex token refresh failed for {}: {e}", account.alias));
@@ -1069,7 +975,7 @@ pub(crate) async fn dispatch_aggregate_with_conversion(
             }
         }
         // Per-candidate target computation (Task 6).
-        let target = target_protocol(ingress, mode, &account);
+        let mut target = target_protocol(ingress, mode, &account);
         if !llmux_core::protocol::supports(&account, target) {
             crate::routes::v1::helpers::note_skip_reason(&mut last_error, format!("Candidate {} account {} does not support {:?} target", i, cand.account_id, target));
             failed_candidates += 1;
@@ -1078,7 +984,7 @@ pub(crate) async fn dispatch_aggregate_with_conversion(
         let mut patched = body.clone();
         patched["model"] = Value::String(cand.model.clone());
         let add_bp = state.cache_breakpoint_ok(&account.provider_id);
-        let (forward_body, back) = match forward_and_back(ingress, target, &patched, &cand.model, add_bp) {
+        let (forward_body, mut back) = match forward_and_back(ingress, target, &patched, &cand.model, add_bp) {
             Ok(pair) => pair,
             Err(e) => {
                 last_error = Some(format!("Request conversion failed: {e}"));
@@ -1094,6 +1000,15 @@ pub(crate) async fn dispatch_aggregate_with_conversion(
             .first_byte_timeout_secs
             .or(agg.first_byte_timeout_secs);
         tracing::info!("🔀 [agg:{} V={}] {} → {} → {} [{:?}→{:?}] outbound_shape={}", alias, active, account.alias, cand.model, provider_request.url, ingress, target, responses_body_shape(&forward_body));
+        if let Some(tx) = &state.tui_tx {
+            let _ = tx.send(TuiEvent::Dispatch {
+                timestamp: time::OffsetDateTime::now_utc().format(&DISPATCH_TIME_FMT).unwrap_or_default(),
+                account: account.alias.clone(),
+                model: cand.model.clone(),
+                url: provider_request.url.clone(),
+                tag: Some(format!("agg:{alias}")),
+            });
+        }
         let mut request_capture = if ingress == Protocol::Messages {
             if let Some(raw_body) = raw_ingress_body.as_ref() {
                 let log_dir = std::env::var("LOG_DIR")
@@ -1120,7 +1035,9 @@ pub(crate) async fn dispatch_aggregate_with_conversion(
         };
         // 走到这里说明前面那些「没试过」的分支都没触发 —— 锚点被真的尝试了。
         if i == active { anchor_attempted = true; }
-        let response = match execute_provider_request(&provider_request).await {
+        // `Option` because a failed response must be read (`.text()` moves it)
+        // before the Messages-fallback retry can install a replacement.
+        let mut response = Some(match execute_provider_request(&provider_request).await {
             Ok(r) => r,
             Err(e) => {
                 if let Some(capture) = request_capture.take() {
@@ -1128,13 +1045,50 @@ pub(crate) async fn dispatch_aggregate_with_conversion(
                 }
                 state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len);
                 last_error = Some(format!("Provider request failed: {e}"));
+                if let Some(tx) = &state.tui_tx {
+                    let _ = tx.send(TuiEvent::Retry { account: account.alias.clone(), status: 0, message: format!("Network error: {e}") });
+                }
                 failed_candidates += 1;
                 continue;
             }
-        };
-        let status = response.status();
+        });
+        let mut status = response.as_ref().expect("response just built").status();
+        // codex 原生账户 401 → refresh 后重建请求重试一次
+        //（`backend.go:doAuthenticated` 的 reactive 路径），与普通 dispatcher 同逻辑。
+        if !status.is_success()
+            && status.as_u16() == 401
+            && llmux_core::adapters::is_codex_native(&account)
+        {
+            match llmux_core::codex_auth::refresh_and_save(&state.pool, account.id, &account.codex_auth_json).await {
+                Ok(new_json) => {
+                    tracing::info!("🔑 codex 401 → refreshed token for account {}, retrying once", account.alias);
+                    account = llmux_core::adapters::Account { codex_auth_json: new_json, ..account.clone() };
+                    let mut retry = build_target_request(&account, target, &forward_body, &anthropic_beta);
+                    retry.first_byte_timeout_secs = cand.first_byte_timeout_secs.or(agg.first_byte_timeout_secs);
+                    match execute_provider_request(&retry).await {
+                        Ok(r) => { status = r.status(); response = Some(r); provider_request = retry; }
+                        Err(e) => {
+                            if let Some(capture) = request_capture.take() {
+                                capture.finish(None, None, Some(e.to_string())).await;
+                            }
+                            state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len);
+                            last_error = Some(format!("Codex retry request failed: {e}"));
+                            failed_candidates += 1;
+                            continue;
+                        }
+                    }
+                }
+                Err(e) => {
+                    // refresh 失败 = 凭据彻底失效。别的候选还能试 —— continue 让 failover 继续。
+                    state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len);
+                    last_error = Some(format!("Codex token refresh failed for {}: {e}（凭据失效，请重新登录）", account.alias));
+                    failed_candidates += 1;
+                    continue;
+                }
+            }
+        }
         if !status.is_success() {
-            let error_body = response.text().await.unwrap_or_default();
+            let error_body = response.take().expect("failed response").text().await.unwrap_or_default();
             if let Some(capture) = request_capture.take() {
                 capture.finish(Some(status.as_u16()), Some(error_body.clone()), None).await;
             }
@@ -1170,17 +1124,59 @@ pub(crate) async fn dispatch_aggregate_with_conversion(
             if is_retryable_status(status.as_u16()) {
                 // 429 → 记冷却，见 anthropic.rs 同处注释。
                 super::helpers::note_upstream_throttle(&state.pool, account.id, &cand.model, &error_body).await;
-                state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); failed_candidates += 1; continue;
+                state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len);
+                if let Some(tx) = &state.tui_tx {
+                    let _ = tx.send(TuiEvent::Retry { account: account.alias.clone(), status: status.as_u16(), message: error_body.clone() });
+                }
+                failed_candidates += 1;
+                continue;
             }
-            tracing::warn!("🔀 [agg:{}] Account {} (id={}) failed ({}) — trying next (non-retryable): {}", alias, account.alias, account.id, status.as_u16(), error_body.chars().take(200).collect::<String>());
-            state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len);
-            failed_candidates += 1;
-            continue;
+            // 有些网关（GitHub Copilot）只把模型挂在 /v1/messages 上，
+            // /chat/completions 回 `unsupported_api_for_model`。同一个候选换
+            // Messages 目标重试一次 —— 三种入口各自回译（Chat→ChatFromMessages，
+            // Messages→Passthrough，Responses→ResponsesFromMessages）。
+            if target == Protocol::Chat
+                && is_unsupported_api_for_model(&error_body)
+                && llmux_core::protocol::endpoint_for(&account, Protocol::Messages).is_some()
+            {
+                tracing::info!("↩️ [agg:{}] {} rejected /chat/completions — retrying via /v1/messages", alias, account.alias);
+                match forward_and_back(ingress, Protocol::Messages, &patched, &cand.model, add_bp) {
+                    Ok((fb_body, fb_back)) => {
+                        let mut fb_request = build_target_request(&account, Protocol::Messages, &fb_body, &anthropic_beta);
+                        fb_request.first_byte_timeout_secs = cand.first_byte_timeout_secs.or(agg.first_byte_timeout_secs);
+                        match execute_provider_request(&fb_request).await {
+                            Ok(fb_response) if fb_response.status().is_success() => {
+                                status = fb_response.status();
+                                response = Some(fb_response);
+                                target = Protocol::Messages;
+                                back = fb_back;
+                                provider_request = fb_request;
+                            }
+                            Ok(fb_response) => tracing::warn!(
+                                "↩️ [agg:{}] /v1/messages fallback returned {} — keeping original error",
+                                alias,
+                                fb_response.status()
+                            ),
+                            Err(e) => tracing::warn!("↩️ [agg:{}] /v1/messages fallback failed: {e}", alias),
+                        }
+                    }
+                    Err(e) => tracing::warn!("↩️ [agg:{}] Messages conversion failed: {e}", alias),
+                }
+            }
+            if !status.is_success() {
+                tracing::warn!("🔀 [agg:{}] Account {} (id={}) failed ({}) — trying next (non-retryable): {}", alias, account.alias, account.id, status.as_u16(), error_body.chars().take(200).collect::<String>());
+                state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len);
+                failed_candidates += 1;
+                continue;
+            }
         }
+        let response = response.take().expect("successful response");
         if let Some(capture) = request_capture.take() {
             capture.finish(Some(status.as_u16()), None, None).await;
         }
         if streaming {
+            // 发出去的那档被接受了 → 记下来（与普通 dispatcher 同）。
+            provider_request.effort.record_success();
             state.aggregate_router.lock().unwrap().note_candidate_success(&alias, i, len);
             hit_index = Some(i); hit_account = Some(account.clone()); hit_stream_resp = Some(response); hit_back = Some(back); break;
         }
@@ -1188,19 +1184,19 @@ pub(crate) async fn dispatch_aggregate_with_conversion(
             Ok(b) => b,
             Err(e) => { last_error = Some(format!("Failed to read response: {e}")); state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); failed_candidates += 1; continue; }
         };
-        // codex 原生非流式：后端回的不是标准 JSON 而是 SSE（`collect` 语义）。
-        // 先按 JSON 试，失败且 body 含 `data:` 行时走流组装，避免把 SSE 当 JSON 炸掉。
+        // codex/zen 原生非流式：后端回的不是标准 JSON 而是 SSE（`collect` 语义）。
+        // 按 target 选组装器（见 coerce_nonstreaming_sse），不是按 ingress。
         let data: Value = match serde_json::from_slice(&body_bytes) {
             Ok(v) => v,
             Err(e) => {
-                let text = String::from_utf8_lossy(&body_bytes);
-                if llmux_core::adapters::is_codex_native(&account) && text.contains("data:") {
-                    match collect_codex_response(&body_bytes, &provider_request.body).await {
-                        Some(assembled) => assembled,
-                        None => { last_error = Some(format!("Failed to assemble codex stream: {e}")); state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); continue; }
+                match coerce_nonstreaming_sse(&account, target, &body_bytes, &provider_request.body, &e).await {
+                    Ok(assembled) => assembled,
+                    Err(msg) => {
+                        last_error = Some(msg);
+                        state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len);
+                        failed_candidates += 1;
+                        continue;
                     }
-                } else {
-                    last_error = Some(format!("Failed to parse response: {e}")); state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); continue;
                 }
             }
         };
@@ -1322,27 +1318,45 @@ async fn collect_codex_response(body: &[u8], request: &Value) -> Option<Value> {
     Some(llmux_core::codex_compat::collect_stream(&events, request))
 }
 
+/// Non-streaming request whose upstream still answered with SSE. Some providers
+/// force streaming upstream even when the downstream asked for one JSON object
+/// (codex backend, zen free tier). Select the assembler by the TARGET protocol
+/// — the shape the upstream was actually asked to speak — not by ingress/`Back`.
+/// `parse_err` only feeds the same diagnostics the callers used to build inline.
+async fn coerce_nonstreaming_sse(
+    account: &adapters::Account,
+    target: Protocol,
+    body_bytes: &[u8],
+    request_body: &Value,
+    parse_err: &serde_json::Error,
+) -> Result<Value, String> {
+    if !String::from_utf8_lossy(body_bytes).contains("data:") {
+        return Err(format!("Failed to parse response: {parse_err}"));
+    }
+    if llmux_core::adapters::is_codex_native(account) {
+        return collect_codex_response(body_bytes, request_body)
+            .await
+            .ok_or_else(|| format!("Failed to assemble codex stream: {parse_err}"));
+    }
+    if llmux_core::adapters::is_zen_native(account) {
+        let assembled = match target {
+            Protocol::Responses => collect_zen_responses_response(body_bytes, request_body).await,
+            Protocol::Chat => collect_zen_chat_response(body_bytes).await,
+            // zen free tier only forces upstream streaming for Chat/Responses
+            // targets; a Messages target is a plain Anthropic passthrough. Do
+            // NOT fall back to the chat assembler — it would emit the wrong
+            // protocol shape downstream.
+            Protocol::Messages => None,
+        };
+        return assembled.ok_or_else(|| format!("Failed to assemble zen stream: {parse_err}"));
+    }
+    Err(format!("Failed to parse response: {parse_err}"))
+}
+
 /// zen 免费档 chat SSE body → 完整 chat.completion JSON。zen 强制上游 `stream:true`
 ///（缺了 403），非流式下游在这里收成 JSON —— 与 collect_codex_response 同形，
 /// 只是组装器是 chat 形的（`collect_chat_stream`），不用 normalize（标准 OpenAI
 /// 形状）。空流返回 None（调用方记失败换候选）。
-/// Passthrough 分发：zen 免费档强制上游 stream，非流式下游收 SSE。
-/// 入口是什么形、就用什么组装器 —— Responses 入口经 Responses 上游（muse 系）
-/// 走 responses 形（`collect_stream`），Chat 入口经 chat 上游走 chat 形。
-/// 形错了组装出来的是另一个协议的 JSON，下游按错形解析直接 502。
-async fn collect_zen_passthrough_response(
-    body: &[u8],
-    request: &Value,
-    ingress: Protocol,
-) -> Option<Value> {
-    if ingress == Protocol::Responses {
-        collect_zen_responses_response(body, request).await
-    } else {
-        collect_zen_chat_response(body).await
-    }
-}
-
-/// zen 免费档 chat SSE body → 完整 chat.completion JSON。
 async fn collect_zen_chat_response(body: &[u8]) -> Option<Value> {
     let text = String::from_utf8_lossy(body);
     let mut events: Vec<Value> = Vec::new();
@@ -2212,305 +2226,6 @@ async fn openai_dispatch(
 }
 
 // ---------------------------------------------------------------------------
-// Aggregate (cross-model) OpenAI dispatch — V-anchored, 3-confirm
-// ---------------------------------------------------------------------------
-
-async fn dispatch_aggregate_openai(
-    state: AppState,
-    auth: AuthContext,
-    uri: axum::http::Uri,
-    _headers: HeaderMap,
-    body: Value,
-    endpoint: &str,
-    agg: llmux_core::aggregate::AggregateResolution,
-) -> Response {
-    let normalized_uri = crate::app::normalize_gateway_uri(&uri);
-    let is_anthropic = false;
-    let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
-    if !middleware::is_model_allowed(&auth.allowed_models, &agg.alias) {
-        return middleware::send_error(
-            &format!("Model '{}' is not allowed for this API key", agg.alias),
-            "permission_error",
-            StatusCode::UNAUTHORIZED,
-            is_anthropic,
-        );
-    }
-
-    let len = agg.candidates.len();
-    if len == 0 {
-        return middleware::send_error("Aggregate alias has no candidates", "server_error", StatusCode::INTERNAL_SERVER_ERROR, is_anthropic);
-    }
-
-    let start = Instant::now();
-    let alias = agg.alias.clone();
-    let active = agg.active.min(len.saturating_sub(1));
-    let mut last_error: Option<String> = None;
-    let mut last_status: Option<u16> = None;
-    // 耗尽成因分类：全因配额冷却 vs 掺了别的原因（见 helpers::exhausted_status）
-    let mut cooled_skips = 0usize;
-    let mut failed_candidates = 0usize;
-    let mut stale_skips = 0usize;
-    // 推进 3-confirm 的唯一证据形态：这一轮**真的尝试了锚点**（active）且它真的失败了。
-    // 被跳过不算证据 —— 冷却 / 装不下 / max_tokens 不合规都是「没试过」，不是「坏了」。
-    let mut anchor_attempted = false;
-    let mut hit_index: Option<usize> = None;
-    let mut hit_account: Option<adapters::Account> = None;
-    let mut hit_data: Option<Value> = None;
-    let mut hit_stream_resp: Option<reqwest::Response> = None;
-
-    // 锁定 = 硬钉，与上面 dispatch_aggregate 同一条规则。
-    let last = if agg.locked { (active + 1).min(len) } else { len };
-    for i in active..last {
-        let cand = &agg.candidates[i];
-        // 来源普通别名已被删除 → 配置失效，跳过且不计失败（见 helpers::stale_candidate_reason）。
-        if let Some(reason) = super::helpers::stale_candidate_reason(cand) {
-            tracing::debug!("🚫  [agg:{}] 跳过 {} | 账户 {}：{reason}", alias, cand.model, cand.account_id);
-            super::helpers::note_skip_reason(&mut last_error, reason);
-            stale_skips += 1;
-            continue;
-        }
-        // 真配额耗尽冷却中的候选跳过。缺这一步会让本函数每轮都重试一个已
-        // 知没配额的账户：同族的 dispatch_aggregate_with_conversion(545 行)、
-        // anthropic(682)、以及三条直连路径都有，唯独这条漏了。配额是按天
-        // 重置的，不跳的话 30 分钟里的每个请求都在吃同一个 429。
-        // 冷却由 note_rate_limit 写入，本函数自己也会写（429 分支）。
-        // 这里**不记失败**：冷却 30 分钟后自己会回来，把它当 3-confirm 证据会把
-        // 本来健康的主候选永久挤下线。
-        if super::helpers::rate_limit_suspended(&state.pool, cand.account_id, &cand.model).await {
-            tracing::debug!("⏸️  [agg:{}] 跳过 {} | 账户 {}：冷却中", alias, cand.model, cand.account_id);
-            last_error = Some(format!("Candidate {} ({}) rate limited, cooling down", i, cand.model));
-            cooled_skips += 1;
-            continue;
-        }
-        let account = match get_account_by_id(&state.pool, cand.account_id, &state.master_key).await {
-            Ok(Some(a)) => a,
-            Ok(None) => {
-                state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len);
-                crate::routes::v1::helpers::note_skip_reason(&mut last_error, format!("Candidate {} account {} not found or inactive", i, cand.account_id));
-                failed_candidates += 1;
-                continue;
-            }
-            Err(e) => {
-                state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len);
-                last_error = Some(format!("Failed to load account {}: {e}", cand.account_id));
-                failed_candidates += 1;
-                continue;
-            }
-        };
-
-        // Patch body model to this candidate's model
-        let mut patched_body = body.clone();
-        patched_body["model"] = Value::String(cand.model.clone());
-
-        // Build provider request via the shared builder so codex 原生账户走
-        // 私有后端 + 私有头（之前这里手拼 base_url/authorization，把
-        // is_codex_native 完全绕过去了 —— op 聚合打 sidecar 的根因）。
-        let proto = if endpoint == "v1/messages" {
-            llmux_core::protocol::Protocol::Messages
-        } else if endpoint == "responses" {
-            llmux_core::protocol::Protocol::Responses
-        } else {
-            llmux_core::protocol::Protocol::Chat
-        };
-        let mut provider_request = llmux_core::adapters::build_passthrough_with_beta(&account, proto, &patched_body, None);
-        // 完整转发：候选继承来源别名自己的首字节超时，聚合的值只兜底。
-        provider_request.first_byte_timeout_secs = cand
-            .first_byte_timeout_secs
-            .or(agg.first_byte_timeout_secs);
-        let log_url = provider_request.url.clone();
-
-        tracing::info!("🔀 [agg:{} V={}] {} → {} → {}", alias, active, account.alias, cand.model, log_url);
-        if let Some(tx) = &state.tui_tx {
-            let _ = tx.send(TuiEvent::Dispatch { timestamp: time::OffsetDateTime::now_utc().format(&DISPATCH_TIME_FMT).unwrap_or_default(), account: account.alias.clone(), model: cand.model.clone(), url: log_url, tag: Some(format!("agg:{alias}")) });
-        }
-
-        // 走到这里说明前面那些「没试过」的分支都没触发 —— 锚点被真的尝试了。
-        if i == active { anchor_attempted = true; }
-
-        let response = match execute_provider_request(&provider_request).await {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!("🔀 [agg:{}] Account {} request failed: {e}", alias, account.alias);
-                last_error = Some(format!("Provider request failed: {e}"));
-                state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len);
-                if let Some(tx) = &state.tui_tx { let _ = tx.send(TuiEvent::Retry { account: account.alias.clone(), status: 0, message: format!("Network error: {e}") }); }
-                failed_candidates += 1;
-                continue;
-            }
-        };
-
-        let status = response.status();
-        if !status.is_success() {
-            let error_body = response.text().await.unwrap_or_default();
-            provider_request.effort.record_rejection(&error_body);
-            // 同一处回错顺便学 max_tokens 上限：客户端发 65536、上游只收
-            // 32768 时整轮 400，不学会就会一直白打（见 max_tokens 模块注释）。
-            provider_request.max_tokens.record_rejection(&error_body);
-            // 上游拒了这个档位 → 记下来，后续请求不再重复失败。
-            // 没有这一步，请求前解析只生效一次，整个机制等于空操作。
-
-            last_error = Some(format!("Provider returned {status}: {error_body}"));
-            last_status = Some(status.as_u16());
-            // 「装不下」不等于「坏了」：跳过这个候选去试更大的，但**不记失败**。
-            // 记失败会触发 3-confirm 迁移，把本来能服务其余请求的候选挤下线，
-            // 而且会自锁（迁移后别名报更大的窗口，客户端不再压缩）。见
-            // helpers::is_request_side_rejection 的实测说明。
-            if super::helpers::is_request_side_rejection(&error_body) {
-                tracing::warn!(
-                    "🔀 [agg:{}] {} 的拒绝属于请求侧（上下文/ max_tokens 不合规）— 试下一个，不记失败",
-                    alias,
-                    account.alias
-                );
-                // 请求侧的拒绝不是「这个候选坏了」→ 撤掉刚才那一笔尝试记录。
-                if i == active { anchor_attempted = false; }
-                failed_candidates += 1;
-                continue;
-            }
-            if is_retryable_status(status.as_u16()) {
-                tracing::warn!("🔀 [agg:{}] Account {} failed ({}) — trying next...", alias, account.alias, status.as_u16());
-                // 429 → 记冷却，见 anthropic.rs 同处注释。
-                super::helpers::note_upstream_throttle(&state.pool, account.id, &cand.model, &error_body).await;
-                state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len);
-                if let Some(tx) = &state.tui_tx { let _ = tx.send(TuiEvent::Retry { account: account.alias.clone(), status: status.as_u16(), message: error_body.clone() }); }
-                failed_candidates += 1;
-                continue;
-            }
-            if endpoint == "chat/completions" && is_unsupported_api_for_model(&error_body) && llmux_core::protocol::endpoint_for(&account, llmux_core::protocol::Protocol::Messages).is_some() {
-                tracing::info!("↩️ [agg:{}] {} rejected /chat/completions — retrying via /v1/messages", alias, account.alias);
-                if let Some(resp) = anthropic_fallback_response(&patched_body, &account, &cand.model, streaming, &state, start).await {
-                    let switched = state.aggregate_router.lock().unwrap().record_request_outcome(&alias, i, len, Instant::now(), anchor_attempted);
-                    if switched { llmux_core::aggregate::persist_active(&state.pool, &alias, i).await; }
-                    send_tui_request(&state.tui_tx, normalized_uri.path(), 200, start, &cand.model);
-                    return resp;
-                }
-            }
-            let latency_ms = start.elapsed().as_millis() as i64;
-            spawn_log_usage(state.pool.clone(), account.clone(), cand.model.clone(), account.provider_id.clone(), 0, 0, 0, 0, latency_ms, false, last_error.clone(), Some(body.to_string()), None, Some(latency_ms), false);
-            send_tui_request(&state.tui_tx, normalized_uri.path(), status.as_u16(), start, &cand.model);
-            // Non-retryable final for this candidate — treat as candidate failure, try next candidate
-            state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len);
-            // For non-retryable upstream errors, we still continue to next candidate (spec: failover down the list)
-            // But to avoid hiding the upstream error when all candidates fail with non-retryable, we keep last_error.
-            failed_candidates += 1;
-            continue;
-        }
-
-        if streaming {
-            provider_request.effort.record_success();
-            state.aggregate_router.lock().unwrap().note_candidate_success(&alias, i, len);
-            hit_index = Some(i);
-            hit_account = Some(account.clone());
-            hit_stream_resp = Some(response);
-            break;
-        }
-
-        let body_bytes = match response.bytes().await { Ok(b) => b, Err(e) => { last_error = Some(format!("Failed to read response: {e}")); state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); failed_candidates += 1; continue; } };
-        // codex 原生非流式：后端回 SSE，JSON 解析失败时走流组装（与聚合转换路径同逻辑）。
-        let data: Value = match serde_json::from_slice(&body_bytes) {
-            Ok(v) => v,
-            Err(e) => {
-                let text = String::from_utf8_lossy(&body_bytes);
-                if llmux_core::adapters::is_codex_native(&account) && text.contains("data:") {
-                    match collect_codex_response(&body_bytes, &provider_request.body).await {
-                        Some(assembled) => assembled,
-                        None => { last_error = Some(format!("Failed to assemble codex stream: {e}")); state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); failed_candidates += 1; continue; }
-                    }
-                } else {
-                    last_error = Some(format!("Failed to parse response: {e}")); state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len); failed_candidates += 1; continue;
-                }
-            }
-        };
-        let (prompt_tokens, completion_tokens, cache_read, cache_create) = passthrough_usage(&data);
-        let latency_ms = start.elapsed().as_millis() as i64;
-        provider_request.effort.record_success();
-        spawn_log_usage(state.pool.clone(), account.clone(), cand.model.clone(), account.provider_id.clone(), prompt_tokens, completion_tokens, cache_read, cache_create, latency_ms, true, None, Some(body.to_string()), Some(data.to_string()), Some(latency_ms), false);
-        state.aggregate_router.lock().unwrap().note_candidate_success(&alias, i, len);
-        hit_index = Some(i);
-        hit_account = Some(account);
-        hit_data = Some(data);
-        break;
-    }
-
-    if let Some(hit) = hit_index {
-        let now = Instant::now();
-        let switched = state.aggregate_router
-            .lock()
-            .unwrap()
-            .record_request_outcome(&alias, hit, len, now, anchor_attempted);
-        if switched {
-            tracing::info!("🔀 [agg:{}] V migrated -> {} (after 3-confirm)", alias, hit);
-            llmux_core::aggregate::persist_active(&state.pool, &alias, hit).await;
-        } else if hit != active {
-            // 三种「没迁移」在日志里此前长得一样而含义不同，分开写：
-            // - 锁着的别名根本不计数（record_request_outcome 遇 locked 直接回 false）
-            //   —— 以前照样打 pending (0/3)，读日志的人会等一个永远不会来的第 3 次。
-            // - 锚点被跳过的（退避 / 上下文装不下 / max_tokens）不是证据。以前这条
-            //   完全静默 —— 跳过时连 decision 行都不打，线上看不出规则有没有生效。
-            let router = state.aggregate_router.lock().unwrap();
-            let e = router.entries.get(&alias);
-            let why = if e.map(|e| e.locked).unwrap_or(false) {
-                format!("hit {hit} but locked (migration frozen)")
-            } else if !anchor_attempted {
-                format!("hit {hit} but the anchor was skipped (cooldown / request-side) — not evidence")
-            } else {
-                format!("hit {hit} pending V migration ({}/3)", e.map(|e| e.confirm_count).unwrap_or(0))
-            };
-            tracing::info!("🔀 [agg:{}] {}", alias, why);
-        }
-        if let Some(resp) = hit_stream_resp {
-            // need cand model for stream
-            let cand_model = agg.candidates[hit].model.clone();
-            let account = hit_account.unwrap();
-            send_tui_request(&state.tui_tx, normalized_uri.path(), 200, start, &cand_model);
-            return openai_streaming_passthrough(resp, &cand_model, &account, state.pool.clone(), start, Some(body.to_string())).await;
-        }
-        if let Some(data) = hit_data {
-            send_tui_request(&state.tui_tx, normalized_uri.path(), 200, start, &agg.candidates[hit].model);
-            return Json(data).into_response();
-        }
-        // fallback path (anthropic fallback already returned above)
-    }
-
-    // All candidates exhausted
-    let switched = state.aggregate_router
-        .lock()
-        .unwrap()
-        .record_request_all_failed(&alias, len, Instant::now(), anchor_attempted);
-    if switched {
-        tracing::info!("🔀 [agg:{}] all failed — V reset to 0 (after 3-confirm)", alias);
-        llmux_core::aggregate::persist_active(&state.pool, &alias, 0).await;
-    }
-    let latency_ms = start.elapsed().as_millis() as i64;
-    let error_msg = last_error.unwrap_or_else(|| "All aggregate candidates exhausted".to_string());
-    if let Some(idx) = hit_index {
-        if let Some(account) = hit_account {
-            spawn_log_usage(state.pool.clone(), account, agg.candidates[idx].model.clone(), String::new(), 0, 0, 0, 0, latency_ms, false, Some(error_msg.clone()), Some(body.to_string()), None, Some(latency_ms), false);
-        }
-    } else if len > 0 {
-        // best-effort: log with alias name
-        if let Ok(Some(acc)) = get_account_by_id(&state.pool, agg.candidates[0].account_id, &state.master_key).await {
-            spawn_log_usage(state.pool.clone(), acc, agg.candidates[0].model.clone(), String::new(), 0, 0, 0, 0, latency_ms, false, Some(error_msg.clone()), Some(body.to_string()), None, Some(latency_ms), false);
-        }
-    }
-    let exhausted_status = super::helpers::exhausted_status(
-        cooled_skips,
-        // 配置失效的候选进分母不进分子：掺着「来源别名已删」时回 502 + 那条诊断串，
-        // 别让客户端按 Retry-After 等一个不会自愈的配置问题。
-        cooled_skips + failed_candidates + stale_skips,
-        last_status,
-    );
-    if stale_skips > 0 {
-        tracing::warn!("🚫  [agg:{}] 本轮 {} 个候选因来源别名已不存在被跳过（共 {}）—— 到别名页重新保存", alias, stale_skips, len);
-    }
-    send_tui_request(&state.tui_tx, normalized_uri.path(), if exhausted_status == Some(429) { 429 } else { 502 }, start, &agg.alias);
-    // 全部候选都因 429 耗尽（冷却跳过 or 上游回 429）→ 回 429 + Retry-After，让调用方退避而不是立刻重试
-    if exhausted_status == Some(429) {
-        return super::helpers::rate_limited_response(&error_msg, is_anthropic);
-    }
-    middleware::send_error(&error_msg, "upstream_error", StatusCode::BAD_GATEWAY, is_anthropic)
-}
-
-// ---------------------------------------------------------------------------
 // Streaming helpers
 // ---------------------------------------------------------------------------
 
@@ -2936,7 +2651,7 @@ async fn openai_streaming_passthrough(
 #[cfg(test)]
 mod tests {
     use super::{observe_and_should_forward, responses_body_shape, should_forward_event, StreamAccounting};
-    use serde_json::json;
+    use serde_json::{json, Value};
 
     #[test]
     fn responses_shape_reports_tool_results_that_precede_calls_without_logging_content() {
@@ -3240,6 +2955,191 @@ mod tests {
             assert!(acc.produced_nothing(), "empty value is not output: {empty}");
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Aggregate `default` mode: target selection must not depend on the old
+    // per-dispatcher endpoint choice. These are network-free: they assert the
+    // decision table and the outbound URL that the unified dispatcher builds.
+    // (codex's base URL is a compile-time constant, so only unit tests can pin
+    // it — e2e mocks cannot redirect it.)
+    // -----------------------------------------------------------------------
+
+    use super::{anthropic_fallback_body, build_target_request, coerce_nonstreaming_sse, forward_and_back};
+    use llmux_core::adapters::Account;
+    use llmux_core::protocol::{target_protocol, DownstreamMode, Protocol};
+
+    fn test_account(category: &str) -> Account {
+        Account {
+            id: 1,
+            alias: "test".to_string(),
+            provider_id: "test".to_string(),
+            api_key: "test-key".to_string(),
+            base_url: None,
+            anthropic_base_url: None,
+            is_active: 1,
+            weight: 0,
+            openai_compatible: 0,
+            chat_endpoint: None,
+            responses_endpoint: None,
+            messages_endpoint: None,
+            default_protocol: None,
+            balance_provider: String::new(),
+            balance_auth: String::new(),
+            codex_auth_json: String::new(),
+            category: category.to_string(),
+        }
+    }
+
+    fn ingress_body(ingress: Protocol) -> Value {
+        match ingress {
+            Protocol::Chat => json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "hello"}]
+            }),
+            Protocol::Responses => json!({
+                "model": "m",
+                "input": [{"type": "message", "role": "user",
+                           "content": [{"type": "input_text", "text": "hello"}]}]
+            }),
+            Protocol::Messages => json!({
+                "model": "m",
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "hello"}]
+            }),
+        }
+    }
+
+    const ALL_INGRESSES: [Protocol; 3] = [Protocol::Chat, Protocol::Responses, Protocol::Messages];
+
+    /// Regression: `default` mode used to bypass `target_protocol`, so codex
+    /// candidates got `/backend-api/codex/chat/completions` (404). Every ingress
+    /// must force Responses and hit the codex Responses URL.
+    #[test]
+    fn default_codex_account_targets_codex_responses_for_every_ingress() {
+        let account = test_account("codex");
+        for ingress in ALL_INGRESSES {
+            let target = target_protocol(ingress, DownstreamMode::Default, &account);
+            assert_eq!(
+                target,
+                Protocol::Responses,
+                "codex must force Responses from {ingress:?}"
+            );
+            let body = ingress_body(ingress);
+            let (forward, _back) = forward_and_back(ingress, target, &body, "gpt-5-codex", false)
+                .expect("ingress→Responses conversion");
+            let request = build_target_request(&account, target, &forward, &None);
+            assert_eq!(
+                request.url,
+                "https://chatgpt.com/backend-api/codex/responses",
+                "{ingress:?} ingress"
+            );
+        }
+    }
+
+    /// Regression: `default` mode + Messages-only account used to fall back to
+    /// `https://api.openai.com/v1` for Chat/Responses ingress. The decision
+    /// table must route every ingress to the configured Messages endpoint.
+    #[test]
+    fn default_messages_only_account_targets_messages_for_every_ingress() {
+        let mut account = test_account("custom");
+        account.messages_endpoint = Some("https://anthropic.test".to_string());
+        account.default_protocol = Some("messages".to_string());
+        for ingress in ALL_INGRESSES {
+            let target = target_protocol(ingress, DownstreamMode::Default, &account);
+            assert_eq!(target, Protocol::Messages, "{ingress:?} ingress");
+            let body = ingress_body(ingress);
+            let (forward, _back) = forward_and_back(ingress, target, &body, "m", false)
+                .expect("ingress→Messages conversion");
+            let request = build_target_request(&account, target, &forward, &None);
+            assert_eq!(request.url, "https://anthropic.test/v1/messages");
+            assert_eq!(
+                request.headers.get("x-api-key").map(String::as_str),
+                Some("test-key")
+            );
+        }
+    }
+
+    /// Same regression for a Responses-only account: no `base_url`, only
+    /// `responses_endpoint` + `default_protocol=responses`.
+    #[test]
+    fn default_responses_only_account_targets_responses_for_every_ingress() {
+        let mut account = test_account("custom");
+        account.responses_endpoint = Some("https://openai.test".to_string());
+        account.default_protocol = Some("responses".to_string());
+        for ingress in ALL_INGRESSES {
+            let target = target_protocol(ingress, DownstreamMode::Default, &account);
+            assert_eq!(target, Protocol::Responses, "{ingress:?} ingress");
+            let body = ingress_body(ingress);
+            let (forward, _back) = forward_and_back(ingress, target, &body, "m", false)
+                .expect("ingress→Responses conversion");
+            let request = build_target_request(&account, target, &forward, &None);
+            assert_eq!(request.url, "https://openai.test/responses");
+        }
+    }
+
+    /// The `unsupported_api_for_model` fallback must SEND an Anthropic body to
+    /// `/v1/messages`. It used to call the reverse converter, so a Chat body
+    /// went out unchanged (OpenAI-shaped) to an Anthropic endpoint.
+    #[test]
+    fn anthropic_fallback_converts_chat_into_anthropic_shape() {
+        let chat = json!({
+            "model": "placeholder",
+            "max_tokens": 32,
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {
+                "name": "lookup",
+                "description": "d",
+                "parameters": {"type": "object", "properties": {}}
+            }}],
+        });
+        let converted = anthropic_fallback_body(&chat, "resolved-model")
+            .expect("chat→messages conversion");
+        assert_eq!(converted["model"], json!("resolved-model"));
+        assert_eq!(converted["max_tokens"], json!(32));
+        // Anthropic tool shape: flat `name` + `input_schema`, no nested `function`.
+        assert_eq!(converted["tools"][0]["name"], json!("lookup"));
+        assert!(converted["tools"][0]["input_schema"].is_object(), "{converted}");
+        assert!(converted["tools"][0].get("function").is_none(), "{converted}");
+    }
+
+    /// Non-streaming requests whose upstream still answers with SSE are
+    /// assembled by the TARGET protocol, not by the ingress/`Back` pair.
+    #[tokio::test]
+    async fn zen_nonstreaming_sse_is_assembled_by_target_protocol() {
+        let account = test_account("zen");
+        let chat_sse = b"data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1}}\n\ndata: [DONE]\n\n";
+        let responses_sse = b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_abc\"}}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_abc\",\"model\":\"m\",\"output\":[],\"status\":\"completed\"}}\n\n";
+        let parse_err = serde_json::from_slice::<Value>(b"data: {...}").unwrap_err();
+
+        let chat = coerce_nonstreaming_sse(&account, Protocol::Chat, chat_sse, &json!({"model": "m"}), &parse_err)
+            .await
+            .expect("chat target assembles chat SSE");
+        assert_eq!(chat["object"], json!("chat.completion"));
+
+        let responses = coerce_nonstreaming_sse(&account, Protocol::Responses, responses_sse, &json!({"model": "m"}), &parse_err)
+            .await
+            .expect("Responses target assembles Responses SSE");
+        assert_eq!(responses["object"], json!("response"));
+        assert_eq!(responses["id"], json!("resp_abc"));
+
+        // zen only forces upstream streaming for Chat/Responses targets; a
+        // Messages target is a plain passthrough and must NOT be coerced into
+        // the wrong protocol shape.
+        assert!(coerce_nonstreaming_sse(&account, Protocol::Messages, chat_sse, &json!({}), &parse_err)
+            .await
+            .is_err());
+
+        // Plain JSON failure (no SSE frames) stays an error for every target.
+        assert!(coerce_nonstreaming_sse(&account, Protocol::Chat, b"{\"error\":\"nope\"}", &json!({}), &parse_err)
+            .await
+            .is_err());
+
+        // Non-zen/non-codex accounts are never coerced.
+        let custom = test_account("custom");
+        assert!(coerce_nonstreaming_sse(&custom, Protocol::Chat, chat_sse, &json!({}), &parse_err)
+            .await
+            .is_err());
+    }
 }
 
 /// Retry an OpenAI chat/completions request through the account's Anthropic
@@ -3247,6 +3147,16 @@ mod tests {
 /// for a model that IS served on `/v1/messages` (GitHub Copilot GPT-5.x).
 /// Returns `None` when the account has no usable anthropic_base_url or the
 /// Anthropic attempt fails (the caller keeps the original error).
+/// Convert a Chat-completions body into the Anthropic Messages body that the
+/// `unsupported_api_for_model` fallback sends upstream.
+///
+/// Kept as its own function so the DIRECTION is testable without network I/O:
+/// this used to call `anthropic_to_openai_request_with` (Anthropic→Chat) on an
+/// already-Chat body, which sent an OpenAI-shaped payload to `/v1/messages`.
+fn anthropic_fallback_body(openai_body: &Value, model: &str) -> anyhow::Result<Value> {
+    openai_to_anthropic_request(openai_body, model)
+}
+
 async fn anthropic_fallback_response(
     openai_body: &Value,
     account: &adapters::Account,
@@ -3259,8 +3169,7 @@ async fn anthropic_fallback_response(
     let anthropic_base =
         llmux_core::protocol::endpoint_for(account, llmux_core::protocol::Protocol::Messages)?;
 
-    let add_bp = state.cache_breakpoint_ok(&account.provider_id);
-    let mut anthropic_body = match llmux_core::proxy::anthropic_openai::anthropic_to_openai_request_with(openai_body, model, add_bp) {
+    let mut anthropic_body = match anthropic_fallback_body(openai_body, model) {
         Ok(b) => b,
         Err(e) => {
             tracing::warn!("↩️ OpenAI→Anthropic conversion failed: {e}");
