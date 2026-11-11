@@ -466,17 +466,163 @@ pub fn responses_to_chat(resp: &Value, model: &str) -> Value {
 // non-Responses upstream (dispatch_with_conversion).
 // ---------------------------------------------------------------------------
 
-/// Flatten responses content parts ([{type:"text","text":...}]) into a plain
-/// string — chat upstreams expect string content on messages.
+/// Flatten responses content parts into a plain string — chat upstreams expect
+/// string content on messages.
+///
+/// Accepts `input_text` (user/system turns) and `output_text` (assistant turns)
+/// alongside legacy `text`. Codex sends nothing but `input_text`/`output_text`;
+/// filtering on `text` alone dropped every part of its history, turning a
+/// 148 KB request into a handful of null-content messages that upstreams reject
+/// with `messages.0.content` / `messages[8].role`.
 fn flatten_content(v: Value) -> Value {
     let Some(parts) = v.as_array() else { return v; };
     let mut s = String::new();
     for p in parts {
-        if p.get("type").and_then(Value::as_str) == Some("text") {
+        let kind = p.get("type").and_then(Value::as_str).unwrap_or("text");
+        if matches!(kind, "text" | "input_text" | "output_text") {
             if let Some(t) = p.get("text").and_then(Value::as_str) { s.push_str(t); }
         }
     }
     Value::String(s)
+}
+
+/// Tool definitions flattened out of a Responses request for a chat-style
+/// upstream, plus the names declared `type:"custom"`.
+struct FlattenedTools {
+    /// Chat-format `{"type":"function","function":{...}}` entries.
+    tools: Vec<Value>,
+    custom_names: HashSet<String>,
+}
+
+/// Flatten one Responses tool entry (optionally inside a namespace) into the
+/// chat vocabulary.
+///
+/// Codex wraps its tools in `additional_tools` items shaped
+/// `{"type":"namespace","name":"functions","tools":[...]}`; the model sees and
+/// calls them by bare name (`exec`, `wait`, …), so namespaces are dropped.
+/// `type:"custom"` tools (raw-text tools such as `exec`) become functions that
+/// take a single `input` string — the closest chat representation.
+fn push_chat_tool(tool: &Value, out: &mut FlattenedTools, seen: &mut HashSet<String>) {
+    if tool.get("type").and_then(Value::as_str) == Some("namespace") {
+        for child in tool.get("tools").and_then(Value::as_array).into_iter().flatten() {
+            push_chat_tool(child, out, seen);
+        }
+        return;
+    }
+    let Some(name) = tool.get("name").and_then(Value::as_str) else { return; };
+    if name.is_empty() || !seen.insert(name.to_string()) {
+        return;
+    }
+    let is_custom = tool.get("type").and_then(Value::as_str) == Some("custom");
+    let parameters = if is_custom {
+        json!({
+            "type": "object",
+            "properties": {"input": {"type": "string", "description": "Raw tool input"}},
+            "required": ["input"],
+        })
+    } else {
+        tool.get("parameters").cloned().unwrap_or(json!({}))
+    };
+    let mut function = Map::new();
+    function.insert("name".into(), json!(name));
+    function.insert("description".into(), tool.get("description").cloned().unwrap_or(Value::Null));
+    function.insert("parameters".into(), parameters);
+    if let Some(strict) = tool.get("strict") {
+        function.insert("strict".into(), strict.clone());
+    }
+    out.tools.push(json!({"type": "function", "function": Value::Object(function)}));
+    if is_custom {
+        out.custom_names.insert(name.to_string());
+    }
+}
+
+/// Collect tools from both the top-level `tools` array and the
+/// `additional_tools` input items Codex uses.
+fn collect_tools(v: &Value) -> FlattenedTools {
+    let mut out = FlattenedTools { tools: Vec::new(), custom_names: HashSet::new() };
+    let mut seen = HashSet::new();
+    for tool in v.get("tools").and_then(Value::as_array).into_iter().flatten() {
+        push_chat_tool(tool, &mut out, &mut seen);
+    }
+    for item in v.get("input").and_then(Value::as_array).into_iter().flatten() {
+        if item.get("type").and_then(Value::as_str) != Some("additional_tools") {
+            continue;
+        }
+        for tool in item.get("tools").and_then(Value::as_array).into_iter().flatten() {
+            push_chat_tool(tool, &mut out, &mut seen);
+        }
+    }
+    out
+}
+
+/// Names the request declared as `type:"custom"`. The response direction needs
+/// them to emit `custom_tool_call` instead of `function_call` — Codex's
+/// custom-tool handlers (e.g. `exec`) accept only raw-text input and error out
+/// on a function-call payload.
+pub fn responses_custom_tool_names(v: &Value) -> HashSet<String> {
+    collect_tools(v).custom_names
+}
+
+/// Map Responses/Codex roles onto the chat role vocabulary. `developer` carries
+/// the same content as a system prompt; most OpenAI-compatible validators
+/// (sglang, DeepSeek behind New API) reject it or reject a null-content user
+/// message, so anything unknown becomes a user turn.
+fn chat_role_for(role: &str) -> &'static str {
+    match role {
+        "assistant" => "assistant",
+        "system" | "developer" => "system",
+        "tool" | "function" => "tool",
+        _ => "user",
+    }
+}
+
+/// Append one assistant `tool_calls` entry, merging into the trailing assistant
+/// message when there is one (parallel calls in a single turn).
+fn push_chat_tool_call(messages: &mut Vec<Value>, call_id: String, name: String, arguments: String) {
+    let call = json!({"id": call_id, "type": "function", "function": {"name": name, "arguments": arguments}});
+    if let Some(m) = messages.last_mut() {
+        if m.get("role").and_then(Value::as_str) == Some("assistant") {
+            m["tool_calls"] = match m.get("tool_calls").cloned() {
+                Some(Value::Array(mut a)) => { a.push(call); Value::Array(a) }
+                _ => json!([call]),
+            };
+            return;
+        }
+    }
+    messages.push(json!({"role": "assistant", "content": "", "tool_calls": [call]}));
+}
+
+/// Tool output → plain text. Codex sends `custom_tool_call_output` as an array
+/// of `input_text` parts; JSON-encoding that array would hand the model a blob
+/// of markup instead of the result.
+fn tool_output_text(v: Value) -> String {
+    match flatten_content(v.clone()) {
+        Value::String(s) if !s.is_empty() => s,
+        _ => stringify_output(v),
+    }
+}
+
+/// Append a Messages turn, merging into the previous one when the role matches.
+/// The Messages API requires alternating user/assistant turns, while a Codex
+/// history is a flat item list (several developer/user items in a row, parallel
+/// tool results, …). Merging preserves the content without inventing roles.
+fn push_anthropic_message(messages: &mut Vec<Value>, role: &str, blocks: Vec<Value>) {
+    if blocks.is_empty() {
+        return;
+    }
+    if let Some(last) = messages.last_mut() {
+        if last.get("role").and_then(Value::as_str) == Some(role) {
+            let mut merged = match last.get("content").cloned() {
+                Some(Value::Array(a)) => a,
+                Some(Value::String(s)) if !s.is_empty() => vec![json!({"type": "text", "text": s})],
+                _ => Vec::new(),
+            };
+            merged.extend(blocks);
+            last["content"] = Value::Array(merged);
+            return;
+        }
+    }
+    messages.push(json!({"role": role, "content": blocks}));
 }
 
 /// responses tool_choice → chat tool_choice ("auto"/"none"/"required" share
@@ -518,31 +664,37 @@ pub fn responses_req_to_chat_req(v: &Value) -> Value {
                             Value::String(s) => s.clone(),
                             _ => serde_json::to_string(&args_val).unwrap_or_else(|_| "{}".into()),
                         };
-                        let call = json!({"id": call_id, "type": "function", "function": {"name": name, "arguments": arguments}});
-                        let mut appended = false;
-                        if let Some(m) = messages.last_mut() {
-                            if m.get("role").and_then(Value::as_str) == Some("assistant") {
-                                m["tool_calls"] = match m.get("tool_calls").cloned() {
-                                    Some(Value::Array(a)) => { let mut a = a; a.push(call.clone()); Value::Array(a) }
-                                    _ => json!([call]),
-                                };
-                                appended = true;
-                            }
-                        }
-                        if !appended {
-                            messages.push(json!({"role": "assistant", "content": Value::Null, "tool_calls": [call]}));
-                        }
+                        push_chat_tool_call(&mut messages, call_id, name, arguments);
                     }
-                    Some("function_call_output") => {
+                    Some("custom_tool_call") => {
+                        // Raw-text custom call (Codex `exec`): the chat side
+                        // models it as a function whose single argument is the
+                        // raw input string.
+                        let call_id = item.get("call_id").or_else(|| item.get("id")).and_then(Value::as_str).unwrap_or_default().to_string();
+                        let name = item.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
+                        let input = item.get("input").and_then(Value::as_str).unwrap_or_default();
+                        push_chat_tool_call(&mut messages, call_id, name, json!({"input": input}).to_string());
+                    }
+                    Some("function_call_output") | Some("custom_tool_call_output") => {
                         let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or_default().to_string();
-                        let output = stringify_output(item.get("output").cloned().unwrap_or(Value::Null));
+                        let output = tool_output_text(item.get("output").cloned().unwrap_or(Value::Null));
                         messages.push(json!({"role": "tool", "tool_call_id": call_id, "content": output}));
                     }
-                    _ => {
-                        let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
+                    Some("message") | None => {
+                        let Some(role) = item.get("role").and_then(Value::as_str) else { continue; };
                         let content = flatten_content(item.get("content").cloned().unwrap_or(Value::Null));
-                        messages.push(json!({"role": role, "content": content}));
+                        let text = content.as_str().unwrap_or_default();
+                        // Empty turns carry nothing forward; emitting
+                        // `content: null` makes strict validators reject the
+                        // whole request (the original Codex 502).
+                        if text.is_empty() { continue; }
+                        messages.push(json!({"role": chat_role_for(role), "content": text}));
                     }
+                    // `reasoning` is encrypted and unforwardable; `additional_tools`
+                    // became `tools` above; other Codex-only items (`compaction`,
+                    // `tool_search_call`, …) have no chat representation. Skipping
+                    // them beats inventing a null-content message.
+                    _ => {}
                 }
             }
         }
@@ -555,20 +707,8 @@ pub fn responses_req_to_chat_req(v: &Value) -> Value {
     if let Some(x) = v.get("max_output_tokens") {
         out.insert("max_tokens".into(), x.clone());
     }
-    if let Some(tools) = v.get("tools").and_then(Value::as_array) {
-        let mapped: Vec<Value> = tools.iter().filter_map(|t| {
-            let name = t.get("name").and_then(Value::as_str)?;
-            Some(json!({
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "description": t.get("description").cloned().unwrap_or(Value::Null),
-                    "parameters": t.get("parameters").cloned().unwrap_or(json!({})),
-                },
-            }))
-        }).collect();
-        if !mapped.is_empty() { out.insert("tools".into(), Value::Array(mapped)); }
-    }
+    let collected = collect_tools(v);
+    if !collected.tools.is_empty() { out.insert("tools".into(), Value::Array(collected.tools)); }
     if let Some(tc) = v.get("tool_choice") {
         out.insert("tool_choice".into(), remap_tool_choice_to_chat(tc));
     }
@@ -592,10 +732,23 @@ fn stringify_output(v: Value) -> String {
     }
 }
 
+/// Extract the raw input of a custom tool call from the chat-side arguments
+/// object (`{"input": "<raw text>"}`). Falls back to the raw arguments string
+/// when the upstream did not wrap it — Codex's handlers need the original text,
+/// not a JSON envelope.
+fn custom_input_from_arguments(arguments: &str) -> String {
+    serde_json::from_str::<Value>(arguments)
+        .ok()
+        .and_then(|v| v.get("input").and_then(Value::as_str).map(str::to_string))
+        .unwrap_or_else(|| arguments.to_string())
+}
+
 /// chat completions body → responses-format response object (inverse of
 /// `responses_to_chat`). Text becomes an `output_text` item; chat tool_calls
-/// become `function_call` items with their call ids preserved.
-pub fn chat_resp_to_responses_resp(chat: &Value, model: &str) -> Value {
+/// become `function_call` items with their call ids preserved. Names the
+/// client declared `type:"custom"` come back as `custom_tool_call` (raw input)
+/// — Codex rejects a function-call payload for those tools.
+pub fn chat_resp_to_responses_resp(chat: &Value, model: &str, custom_tools: &HashSet<String>) -> Value {
     let msg = &chat["choices"][0]["message"];
     let mut output: Vec<Value> = Vec::new();
     if let Some(text) = msg.get("content").and_then(Value::as_str) {
@@ -610,11 +763,25 @@ pub fn chat_resp_to_responses_resp(chat: &Value, model: &str) -> Value {
         }
     }
     for c in msg.get("tool_calls").and_then(Value::as_array).into_iter().flatten() {
-        output.push(function_call_item(
-            c.get("id").and_then(Value::as_str).unwrap_or_default(),
-            c["function"]["name"].as_str().unwrap_or_default(),
-            serde_json::from_str(c["function"]["arguments"].as_str().unwrap_or("{}")).unwrap_or(json!({})),
-        ));
+        let call_id = c.get("id").and_then(Value::as_str).unwrap_or_default();
+        let name = c["function"]["name"].as_str().unwrap_or_default();
+        let arguments = c["function"]["arguments"].as_str().unwrap_or("{}");
+        if custom_tools.contains(name) {
+            output.push(json!({
+                "type": "custom_tool_call",
+                "id": format!("ctc_{}", uuid_simple()),
+                "call_id": call_id,
+                "name": name,
+                "input": custom_input_from_arguments(arguments),
+                "status": "completed",
+            }));
+        } else {
+            output.push(function_call_item(
+                call_id,
+                name,
+                serde_json::from_str(arguments).unwrap_or(json!({})),
+            ));
+        }
     }
     let usage = &chat["usage"];
     json!({
@@ -653,56 +820,49 @@ pub fn responses_req_to_anthropic_req(v: &Value, resolved_model: &str) -> Value 
                             other => other.clone(),
                         };
                         let block = json!({"type": "tool_use", "id": call_id, "name": name, "input": input_val});
-                        let mut appended = false;
-                        if let Some(m) = messages.last_mut() {
-                            if m.get("role").and_then(Value::as_str) == Some("assistant") {
-                                if let Some(a) = m["content"].as_array_mut() {
-                                    a.push(block.clone());
-                                } else {
-                                    m["content"] = Value::Array(vec![block.clone()]);
-                                }
-                                appended = true;
-                            }
-                        }
-                        if !appended {
-                            messages.push(json!({"role": "assistant", "content": [block]}));
-                        }
+                        push_anthropic_message(&mut messages, "assistant", vec![block]);
                     }
-                    Some("function_call_output") => {
+                    Some("custom_tool_call") => {
+                        let call_id = item.get("call_id").or_else(|| item.get("id")).and_then(Value::as_str).unwrap_or_default();
+                        let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
+                        let input = item.get("input").and_then(Value::as_str).unwrap_or_default();
+                        let block = json!({"type": "tool_use", "id": call_id, "name": name, "input": {"input": input}});
+                        push_anthropic_message(&mut messages, "assistant", vec![block]);
+                    }
+                    Some("function_call_output") | Some("custom_tool_call_output") => {
                         let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or_default();
-                        let output = stringify_output(item.get("output").cloned().unwrap_or(Value::Null));
-                        messages.push(json!({
-                            "role": "user",
-                            "content": [{"type": "tool_result", "tool_use_id": call_id, "content": output}],
-                        }));
+                        let output = tool_output_text(item.get("output").cloned().unwrap_or(Value::Null));
+                        let block = json!({"type": "tool_result", "tool_use_id": call_id, "content": output});
+                        push_anthropic_message(&mut messages, "user", vec![block]);
                     }
-                    _ => {
-                        let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
-                        let content = match item.get("content").cloned().unwrap_or(Value::Null) {
-                            Value::String(s) => Value::String(s),
-                            Value::Array(parts) => {
-                                let blocks: Vec<Value> = parts.iter().filter_map(|p| {
-                                    p.get("text").and_then(Value::as_str).map(|t| json!({"type": "text", "text": t}))
-                                }).collect();
-                                Value::Array(blocks)
-                            }
-                            other => other,
-                        };
-                        messages.push(json!({"role": role, "content": content}));
+                    Some("message") | None => {
+                        let Some(role) = item.get("role").and_then(Value::as_str) else { continue; };
+                        // `developer` is a user-visible instruction block; the
+                        // Messages API only knows user/assistant.
+                        let role = if role == "assistant" { "assistant" } else { "user" };
+                        let content = flatten_content(item.get("content").cloned().unwrap_or(Value::Null));
+                        let text = content.as_str().unwrap_or_default();
+                        if text.is_empty() { continue; }
+                        push_anthropic_message(&mut messages, role, vec![json!({"type": "text", "text": text})]);
                     }
+                    // Encrypted reasoning, tool-definition carriers and other
+                    // Codex-only items have no Messages representation.
+                    _ => {}
                 }
             }
         }
         _ => {}
     }
     if !messages.is_empty() { out.insert("messages".into(), Value::Array(messages)); }
-    if let Some(tools) = v.get("tools").and_then(Value::as_array) {
-        let mapped: Vec<Value> = tools.iter().filter_map(|t| {
-            let name = t.get("name").and_then(Value::as_str)?;
+    let collected = collect_tools(v);
+    if !collected.tools.is_empty() {
+        let mapped: Vec<Value> = collected.tools.iter().filter_map(|t| {
+            let f = t.get("function")?;
+            let name = f.get("name").and_then(Value::as_str)?;
             Some(json!({
                 "name": name,
-                "description": t.get("description").cloned().unwrap_or(Value::Null),
-                "input_schema": t.get("parameters").cloned().unwrap_or(json!({})),
+                "description": f.get("description").cloned().unwrap_or(Value::Null),
+                "input_schema": f.get("parameters").cloned().unwrap_or(json!({})),
             }))
         }).collect();
         if !mapped.is_empty() { out.insert("tools".into(), Value::Array(mapped)); }
@@ -1265,6 +1425,9 @@ pub struct ChatToResponsesConverter {
     /// clients use to address the call — the same trap `OpenAISseConverter`
     /// documents for tool_use blocks.
     pending_calls: HashMap<u64, (String, String, String)>,
+    /// Tool names the client declared `type:"custom"` (Codex `exec`, …).
+    /// Their calls must come back as `custom_tool_call`, not `function_call`.
+    custom_tools: HashSet<String>,
     last_usage: Option<Value>,
     finish_reason: Option<String>,
     terminal: bool,
@@ -1285,12 +1448,20 @@ impl ChatToResponsesConverter {
             items: Vec::new(),
             tool_items: HashMap::new(),
             pending_calls: HashMap::new(),
+            custom_tools: HashSet::new(),
             last_usage: None,
             finish_reason: None,
             terminal: false,
             finished: false,
             failed: false,
         }
+    }
+
+    /// Mark which tool names are `type:"custom"` in the client's request.
+    /// Must be called before feeding chunks; only affects how tool calls are
+    /// shaped on the way back.
+    pub fn set_custom_tools(&mut self, names: HashSet<String>) {
+        self.custom_tools = names;
     }
 
     fn start(&mut self, out: &mut Vec<String>) {
@@ -1320,6 +1491,7 @@ impl ChatToResponsesConverter {
         let (id, call_id, name) = match kind {
             OutputItemKind::Message => (format!("msg_{}", uuid_simple()), String::new(), String::new()),
             OutputItemKind::FunctionCall => (format!("fc_{}", uuid_simple()), String::new(), String::new()),
+            OutputItemKind::CustomToolCall => (format!("ctc_{}", uuid_simple()), String::new(), String::new()),
             OutputItemKind::Reasoning => (format!("rs_{}", uuid_simple()), String::new(), String::new()),
         };
         let item = OutputItem { id, kind, output_index, text: String::new(), call_id, name, arguments: String::new(), args_emitted: false, closed: false };
@@ -1421,7 +1593,10 @@ impl ChatToResponsesConverter {
         if let Some(&item_index) = self.tool_items.get(&chat_index) {
             let item = &mut self.items[item_index];
             item.arguments.push_str(arguments);
-            if !arguments.is_empty() {
+            // Custom tools stream their raw input as one block at close time
+            // (`response.custom_tool_call_input.delta`); JSON argument deltas
+            // would expose the `{"input": …}` envelope instead of the text.
+            if !arguments.is_empty() && item.kind == OutputItemKind::FunctionCall {
                 let item_id = item.id.clone();
                 let output_index = item.output_index;
                 out.push(sse_event(
@@ -1457,17 +1632,20 @@ impl ChatToResponsesConverter {
         let item_id = self.items[index].id.clone();
         let output_index = self.items[index].output_index;
         self.items[index].arguments = buffered.clone();
+        let is_function_call = self.items[index].kind == OutputItemKind::FunctionCall;
         if !buffered.is_empty() {
             self.items[index].args_emitted = true;
-            out.push(sse_event(
-                "response.function_call_arguments.delta",
-                json!({
-                    "type": "response.function_call_arguments.delta",
-                    "item_id": item_id,
-                    "output_index": output_index,
-                    "delta": buffered,
-                }),
-            ));
+            if is_function_call {
+                out.push(sse_event(
+                    "response.function_call_arguments.delta",
+                    json!({
+                        "type": "response.function_call_arguments.delta",
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "delta": buffered,
+                    }),
+                ));
+            }
         }
     }
 
@@ -1476,9 +1654,19 @@ impl ChatToResponsesConverter {
     fn push_tool_item(&mut self, call_id: &str, name: &str, out: &mut Vec<String>) -> usize {
         self.start(out);
         let output_index = self.items.len();
+        let kind = if self.custom_tools.contains(name) {
+            OutputItemKind::CustomToolCall
+        } else {
+            OutputItemKind::FunctionCall
+        };
+        let id = if kind == OutputItemKind::CustomToolCall {
+            format!("ctc_{}", uuid_simple())
+        } else {
+            format!("fc_{}", uuid_simple())
+        };
         let item = OutputItem {
-            id: format!("fc_{}", uuid_simple()),
-            kind: OutputItemKind::FunctionCall,
+            id,
+            kind,
             output_index,
             text: String::new(),
             call_id: call_id.to_string(),
@@ -1652,6 +1840,30 @@ impl ChatToResponsesConverter {
                     }),
                 ));
             }
+            OutputItemKind::CustomToolCall => {
+                let item_id = item.id.clone();
+                let input = custom_input_from_arguments(&item.arguments);
+                if !input.is_empty() {
+                    out.push(sse_event(
+                        "response.custom_tool_call_input.delta",
+                        json!({
+                            "type": "response.custom_tool_call_input.delta",
+                            "item_id": item_id,
+                            "output_index": output_index,
+                            "delta": input,
+                        }),
+                    ));
+                }
+                out.push(sse_event(
+                    "response.custom_tool_call_input.done",
+                    json!({
+                        "type": "response.custom_tool_call_input.done",
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "input": input,
+                    }),
+                ));
+            }
             OutputItemKind::Reasoning => {
                 let item_id = item.id.clone();
                 let text = item.text.clone();
@@ -1691,7 +1903,7 @@ impl ChatToResponsesConverter {
             .iter()
             .enumerate()
             .filter(|(_, item)| {
-                item.kind == OutputItemKind::FunctionCall
+                matches!(item.kind, OutputItemKind::FunctionCall | OutputItemKind::CustomToolCall)
                     && (item.call_id.is_empty() || item.name.is_empty())
                     && !item.closed
             })
@@ -1714,7 +1926,7 @@ impl ChatToResponsesConverter {
         let output: Vec<Value> = self
             .items
             .iter()
-            .filter(|item| !(item.kind == OutputItemKind::FunctionCall && (item.call_id.is_empty() || item.name.is_empty())))
+            .filter(|item| !(matches!(item.kind, OutputItemKind::FunctionCall | OutputItemKind::CustomToolCall) && (item.call_id.is_empty() || item.name.is_empty())))
             .map(OutputItem::done)
             .collect();
         let status = if incomplete { "incomplete" } else { "completed" };
@@ -1821,6 +2033,7 @@ impl AnthropicToResponsesConverter {
         let id = match kind {
             OutputItemKind::Message => format!("msg_{}", uuid_simple()),
             OutputItemKind::FunctionCall => format!("fc_{}", uuid_simple()),
+            OutputItemKind::CustomToolCall => format!("ctc_{}", uuid_simple()),
             OutputItemKind::Reasoning => format!("rs_{}", uuid_simple()),
         };
         let item = OutputItem {
@@ -2043,6 +2256,30 @@ impl AnthropicToResponsesConverter {
                     }),
                 ));
             }
+            OutputItemKind::CustomToolCall => {
+                let item_id = item.id.clone();
+                let input = custom_input_from_arguments(&item.arguments);
+                if !input.is_empty() {
+                    out.push(sse_event(
+                        "response.custom_tool_call_input.delta",
+                        json!({
+                            "type": "response.custom_tool_call_input.delta",
+                            "item_id": item_id,
+                            "output_index": output_index,
+                            "delta": input,
+                        }),
+                    ));
+                }
+                out.push(sse_event(
+                    "response.custom_tool_call_input.done",
+                    json!({
+                        "type": "response.custom_tool_call_input.done",
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "input": input,
+                    }),
+                ));
+            }
             OutputItemKind::Reasoning => {
                 let item_id = item.id.clone();
                 let text = item.text.clone();
@@ -2232,7 +2469,7 @@ impl AnthropicToResponsesConverter {
         let output: Vec<Value> = self
             .items
             .iter()
-            .filter(|item| !(item.kind == OutputItemKind::FunctionCall && (item.call_id.is_empty() || item.name.is_empty())))
+            .filter(|item| !(matches!(item.kind, OutputItemKind::FunctionCall | OutputItemKind::CustomToolCall) && (item.call_id.is_empty() || item.name.is_empty())))
             .map(OutputItem::done)
             .collect();
         let status = if incomplete { "incomplete" } else { "completed" };
@@ -2273,6 +2510,7 @@ impl AnthropicToResponsesConverter {
 enum OutputItemKind {
     Message,
     FunctionCall,
+    CustomToolCall,
     Reasoning,
 }
 
@@ -2302,6 +2540,10 @@ impl OutputItem {
                 "id": self.id, "type": "function_call", "status": "in_progress",
                 "call_id": self.call_id, "name": self.name, "arguments": "",
             }),
+            OutputItemKind::CustomToolCall => json!({
+                "id": self.id, "type": "custom_tool_call", "status": "in_progress",
+                "call_id": self.call_id, "name": self.name, "input": "",
+            }),
             OutputItemKind::Reasoning => json!({
                 "id": self.id, "type": "reasoning", "summary": [],
             }),
@@ -2318,6 +2560,11 @@ impl OutputItem {
             OutputItemKind::FunctionCall => json!({
                 "id": self.id, "type": "function_call", "status": "completed",
                 "call_id": self.call_id, "name": self.name, "arguments": self.arguments,
+            }),
+            OutputItemKind::CustomToolCall => json!({
+                "id": self.id, "type": "custom_tool_call", "status": "completed",
+                "call_id": self.call_id, "name": self.name,
+                "input": custom_input_from_arguments(&self.arguments),
             }),
             OutputItemKind::Reasoning => json!({
                 "id": self.id, "type": "reasoning",
@@ -2986,6 +3233,164 @@ mod tests {
         let out = responses_req_to_anthropic_req(&body, "m");
         assert_eq!(out["stream"], json!(true));
         assert_eq!(out["max_tokens"], json!(64));
+    }
+
+    /// The exact shape Codex 0.5x sends: `additional_tools` namespaces with a
+    /// `custom` tool, `input_text`/`output_text` parts, encrypted reasoning and
+    /// custom tool call/output pairs.
+    fn codex_responses_body() -> Value {
+        json!({
+            "model": "gpt-6-luna",
+            "instructions": "be helpful",
+            "input": [
+                {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "You are Codex."}]},
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "ok"}]},
+                {"type": "reasoning", "id": "rs_1", "summary": [], "encrypted_content": "gAAAA"},
+                {"type": "additional_tools", "id": "at_1", "role": "developer", "tools": [
+                    {"type": "namespace", "name": "functions", "description": "", "tools": [
+                        {"type": "custom", "name": "exec", "description": "run js", "format": {"type": "grammar"}},
+                        {"type": "function", "name": "wait", "description": "wait", "strict": false,
+                         "parameters": {"type": "object", "properties": {"ms": {"type": "integer"}}}}
+                    ]}
+                ]},
+                {"type": "custom_tool_call", "call_id": "call-1", "name": "exec", "input": "const r = 1;"},
+                {"type": "custom_tool_call_output", "call_id": "call-1", "output": [{"type": "input_text", "text": "done\n"}]}
+            ]
+        })
+    }
+
+    #[test]
+    fn codex_history_keeps_text_roles_and_tools() {
+        let out = responses_req_to_chat_req(&codex_responses_body());
+        let msgs = out["messages"].as_array().expect("messages");
+
+        // Every turn survives, in order, with its text intact. Before the fix
+        // `input_text` parts were dropped and this was a list of empty turns.
+        assert_eq!(msgs[0], json!({"role": "system", "content": "be helpful"}));
+        assert_eq!(msgs[1], json!({"role": "system", "content": "You are Codex."}));
+        assert_eq!(msgs[2], json!({"role": "user", "content": "ok"}));
+        // No message may carry null content — strict validators reject the
+        // whole request (`messages.0.content`, `messages[8].role`).
+        assert!(msgs.iter().all(|m| m["content"].is_string()), "null content leaked: {msgs:?}");
+
+        let call = msgs.iter().find(|m| m["tool_calls"].is_array()).expect("assistant tool_calls");
+        assert_eq!(call["tool_calls"][0]["id"], json!("call-1"));
+        assert_eq!(call["tool_calls"][0]["function"]["name"], json!("exec"));
+        assert_eq!(call["tool_calls"][0]["function"]["arguments"], json!("{\"input\":\"const r = 1;\"}"));
+
+        let tool = msgs.iter().find(|m| m["role"] == json!("tool")).expect("tool result");
+        assert_eq!(tool["content"], json!("done\n"));
+
+        // Tools declared inside `additional_tools` reach the upstream.
+        let tools = out["tools"].as_array().expect("tools");
+        assert_eq!(tools.len(), 2, "{tools:?}");
+        let exec = tools.iter().find(|t| t["function"]["name"] == json!("exec")).expect("exec");
+        assert_eq!(exec["function"]["parameters"]["required"], json!(["input"]));
+        let wait = tools.iter().find(|t| t["function"]["name"] == json!("wait")).expect("wait");
+        assert_eq!(wait["function"]["parameters"]["properties"]["ms"]["type"], json!("integer"));
+    }
+
+    #[test]
+    fn codex_custom_tool_names_are_collected() {
+        let names = responses_custom_tool_names(&codex_responses_body());
+        assert!(names.contains("exec"), "{names:?}");
+        assert!(!names.contains("wait"), "function tools are not custom: {names:?}");
+    }
+
+    #[test]
+    fn custom_tool_call_non_streaming_round_trip() {
+        let chat = json!({"choices": [{"message": {"content": null, "tool_calls": [
+            {"id": "call-1", "function": {"name": "exec", "arguments": "{\"input\":\"console.log(1)\"}"}},
+            {"id": "call-2", "function": {"name": "wait", "arguments": "{\"ms\":5}"}}
+        ]}}]});
+        let custom: HashSet<String> = ["exec".to_string()].into_iter().collect();
+        let resp = chat_resp_to_responses_resp(&chat, "m", &custom);
+        let output = resp["output"].as_array().expect("output");
+        assert_eq!(output[0]["type"], json!("custom_tool_call"));
+        assert_eq!(output[0]["call_id"], json!("call-1"));
+        assert_eq!(output[0]["input"], json!("console.log(1)"));
+        assert_eq!(output[1]["type"], json!("function_call"));
+        assert_eq!(output[1]["arguments"], json!("{\"ms\":5}"));
+    }
+
+    #[test]
+    fn custom_tool_call_streaming_round_trip() {
+        let mut converter = ChatToResponsesConverter::new("m");
+        converter.set_custom_tools(["exec".to_string()].into_iter().collect());
+        let mut events = Vec::new();
+        events.extend(converter.feed(&json!({
+            "choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": "call-1", "function": {"name": "exec", "arguments": "{\"input\":\"const "}}]}, "finish_reason": null}]
+        })));
+        events.extend(converter.feed(&json!({
+            "choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "function": {"arguments": "r = 1;\"}"}}]}, "finish_reason": "tool_calls"}]
+        })));
+        converter.mark_done();
+        events.extend(converter.finish());
+
+        let payloads = event_payloads(&events);
+        let added = payloads
+            .iter()
+            .find(|e| e["type"] == json!("response.output_item.added"))
+            .expect("item added");
+        assert_eq!(added["item"]["type"], json!("custom_tool_call"));
+        assert_eq!(added["item"]["call_id"], json!("call-1"));
+        assert_eq!(added["item"]["name"], json!("exec"));
+        assert!(
+            !payloads.iter().any(|e| e["type"] == json!("response.function_call_arguments.delta")),
+            "custom tools must not stream JSON argument deltas"
+        );
+        let input_done = payloads
+            .iter()
+            .find(|e| e["type"] == json!("response.custom_tool_call_input.done"))
+            .expect("custom input done");
+        assert_eq!(input_done["input"], json!("const r = 1;"));
+
+        let completed = payloads.iter().find(|e| e["type"] == json!("response.completed")).expect("completed");
+        let item = completed["response"]["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["type"] == json!("custom_tool_call"))
+            .expect("custom_tool_call item");
+        assert_eq!(item["input"], json!("const r = 1;"));
+        assert_eq!(item["call_id"], json!("call-1"));
+    }
+
+    #[test]
+    fn codex_history_to_anthropic_never_emits_invalid_messages() {
+        let out = responses_req_to_anthropic_req(&codex_responses_body(), "m");
+        let msgs = out["messages"].as_array().expect("messages");
+        for m in msgs {
+            assert!(m["role"] == json!("user") || m["role"] == json!("assistant"), "{m}");
+            assert!(m["content"].is_array(), "null content leaked: {m}");
+        }
+        // developer + user merge into one user turn; text survives.
+        let texts: Vec<&str> = msgs[0]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|b| b["text"].as_str())
+            .collect();
+        assert_eq!(texts, vec!["You are Codex.", "ok"]);
+
+        let tool_use = msgs
+            .iter()
+            .flat_map(|m| m["content"].as_array().cloned().unwrap_or_default())
+            .find(|b| b["type"] == json!("tool_use"))
+            .expect("tool_use block");
+        assert_eq!(tool_use["name"], json!("exec"));
+        assert_eq!(tool_use["input"], json!({"input": "const r = 1;"}));
+
+        let tool_result = msgs
+            .iter()
+            .flat_map(|m| m["content"].as_array().cloned().unwrap_or_default())
+            .find(|b| b["type"] == json!("tool_result"))
+            .expect("tool_result block");
+        assert_eq!(tool_result["content"], json!("done\n"));
+
+        let tools = out["tools"].as_array().expect("tools");
+        let exec = tools.iter().find(|t| t["name"] == json!("exec")).expect("exec");
+        assert_eq!(exec["input_schema"]["required"], json!(["input"]));
     }
 
     #[test]

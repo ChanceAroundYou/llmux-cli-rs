@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::LazyLock;
 use std::time::Instant;
 
@@ -246,6 +246,15 @@ pub(crate) async fn dispatch_with_conversion(
     // Patch the model field in the body to the resolved target model.
     let mut patched = body;
     patched["model"] = Value::String(model_name.clone());
+    // Codex declares raw-text tools (`exec`, …) inside `additional_tools` as
+    // `type:"custom"`. The response direction must give those calls back as
+    // `custom_tool_call`; a `function_call` payload makes Codex's handler reject
+    // the call. Computed from the ingress body, which survives conversion.
+    let custom_tools = if ingress == Protocol::Responses {
+        llmux_core::proxy::responses::responses_custom_tool_names(&patched)
+    } else {
+        HashSet::new()
+    };
 
     let start = Instant::now();
     let mut last_error: Option<String> = None;
@@ -506,7 +515,7 @@ pub(crate) async fn dispatch_with_conversion(
             (Back::ResponsesFromChat, true) => {
                 { let mut r = state.dispatch_router.lock().unwrap(); r.record_result(&dispatch_key, &dispatch_meta, Some(account.id), true); }
                 send_tui_request(&state.tui_tx, normalized_uri.path(), 200, start, &model_name);
-                return chat_to_responses_streaming(response, &model_name, account, state.pool.clone(), start, Some(forward_body.to_string())).await;
+                return chat_to_responses_streaming(response, &model_name, account, state.pool.clone(), start, Some(forward_body.to_string()), custom_tools.clone()).await;
             }
             (Back::ResponsesFromChat, false) => {
                 let body_bytes = match response.bytes().await { Ok(b) => b, Err(e) => { last_error = Some(format!("Failed to read response: {e}")); failed_candidates += 1; continue; } };
@@ -519,7 +528,7 @@ pub(crate) async fn dispatch_with_conversion(
                         }
                     }
                 };
-                let resp_body = chat_resp_to_responses_resp(&data, &model_name);
+                let resp_body = chat_resp_to_responses_resp(&data, &model_name, &custom_tools);
                 let (raw_prompt, completion_tokens) = adapters::usage_from_openai_response_body(&data);
                 let (cache_read, _) = cache_usage_from_openai(&data["usage"]);
                 let prompt_tokens = (raw_prompt - cache_read).max(0);
@@ -679,7 +688,7 @@ fn build_target_request(
 /// Convert one non-streaming upstream body back to the client protocol and
 /// return `(converted, prompt, completion, cache_read, cache_create)`.
 /// Mirrors the `Back` variants used by the streaming path.
-fn back_convert_non_streaming(back: Back, data: &Value, model: &str) -> (Value, i64, i64, i64, i64) {
+fn back_convert_non_streaming(back: Back, data: &Value, model: &str, custom_tools: &HashSet<String>) -> (Value, i64, i64, i64, i64) {
     match back {
         Back::Passthrough => {
             let (p, c, r, k) = passthrough_usage(data);
@@ -709,7 +718,7 @@ fn back_convert_non_streaming(back: Back, data: &Value, model: &str) -> (Value, 
             (anth, (raw_p - r).max(0), c, r, 0)
         }
         Back::ResponsesFromChat => {
-            let resp = chat_resp_to_responses_resp(data, model);
+            let resp = chat_resp_to_responses_resp(data, model, custom_tools);
             let (raw_p, c) = adapters::usage_from_openai_response_body(data);
             let (r, _) = cache_usage_from_openai(&data["usage"]);
             (resp, (raw_p - r).max(0), c, r, 0)
@@ -957,6 +966,13 @@ pub(crate) async fn dispatch_aggregate_with_conversion(
     let active = agg.active.min(len.saturating_sub(1));
     let mode = DownstreamMode::from_str(agg.upstream_api.as_str());
     let start = Instant::now();
+    // See dispatch_with_conversion: custom tools live in the Responses ingress
+    // body and must shape the back-converted calls.
+    let custom_tools = if ingress == Protocol::Responses {
+        llmux_core::proxy::responses::responses_custom_tool_names(&body)
+    } else {
+        HashSet::new()
+    };
     let mut last_error: Option<String> = None;
     let mut last_status: Option<u16> = None;
     // 耗尽成因分类：全因配额冷却 vs 掺了别的原因（见 helpers::exhausted_status）
@@ -1242,7 +1258,7 @@ pub(crate) async fn dispatch_aggregate_with_conversion(
                 }
             }
         };
-        let (converted, pt, ct, cr, cc) = back_convert_non_streaming(back, &data, &cand.model);
+        let (converted, pt, ct, cr, cc) = back_convert_non_streaming(back, &data, &cand.model, &custom_tools);
         let latency_ms = start.elapsed().as_millis() as i64;
         spawn_log_usage(state.pool.clone(), account.clone(), cand.model.clone(), account.provider_id.clone(), pt, ct, cr, cc, latency_ms, true, None, Some(body.to_string()), Some(converted.to_string()), Some(latency_ms), false);
         provider_request.effort.record_success();
@@ -1275,7 +1291,7 @@ pub(crate) async fn dispatch_aggregate_with_conversion(
                 Back::ChatFromMessages => anthropic_fallback_streaming(resp, &cand_model, &account, state.pool.clone(), start, Some(body.to_string())).await,
                 Back::MessagesFromResponses => super::anthropic::responses_to_anthropic_streaming(resp, &cand_model, &account, state.pool.clone(), &account.provider_id, start, Some(body.to_string())).await,
                 Back::MessagesFromChat => super::anthropic::anthropic_to_openai_streaming(resp, &cand_model, &account, state.pool.clone(), &account.provider_id, start, Some(body.to_string())).await,
-                Back::ResponsesFromChat => chat_to_responses_streaming(resp, &cand_model, &account, state.pool.clone(), start, Some(body.to_string())).await,
+                Back::ResponsesFromChat => chat_to_responses_streaming(resp, &cand_model, &account, state.pool.clone(), start, Some(body.to_string()), custom_tools.clone()).await,
                 Back::ResponsesFromMessages => anthropic_to_responses_streaming(resp, &cand_model, &account, state.pool.clone(), start, Some(body.to_string())).await,
             };
         }
@@ -1567,6 +1583,7 @@ async fn chat_to_responses_streaming(
     pool: sqlx::SqlitePool,
     start: Instant,
     request_body: Option<String>,
+    custom_tools: HashSet<String>,
 ) -> Response {
     let model = model.to_string();
     let account = account.clone();
@@ -1579,6 +1596,7 @@ async fn chat_to_responses_streaming(
         // 有界头尾缓冲：见 helpers::StreamCapture。
         let mut received = super::helpers::StreamCapture::new(131072);
         let mut converter = llmux_core::proxy::responses::ChatToResponsesConverter::new(&model);
+        converter.set_custom_tools(custom_tools);
         let mut sse = response.bytes_stream();
         let mut chunks: u64 = 0;
         let mut ttft_ms: Option<i64> = None;
