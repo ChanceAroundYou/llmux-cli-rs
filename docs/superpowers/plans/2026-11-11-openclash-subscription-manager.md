@@ -1215,7 +1215,7 @@ echo "Task 10 complete: procd service integration" >> /opt/ocsm/PROGRESS.txt
 - Consumes: All tasks from Tasks 5-8
 - Produces: Validation report, cleanup of old cron entries and scripts
 
-- [ ] **Step 1: Verify all cron entries removed**
+- [x] **Step 1: Verify all cron entries removed**
 
 ```bash
 ssh router 'crontab -l | grep -E "pool_nodes|gen_subscription|node-audit" || echo "NONE"'
@@ -1223,7 +1223,7 @@ ssh router 'crontab -l | grep -E "pool_nodes|gen_subscription|node-audit" || ech
 
 Expected: "NONE"
 
-- [ ] **Step 2: Verify all tasks running from ocsm**
+- [x] **Step 2: Verify all tasks running from ocsm**
 
 ```bash
 ssh router 'ocsm status'
@@ -1231,7 +1231,7 @@ ssh router 'ocsm status'
 
 Expected: All tasks show recent "Last Run" timestamps
 
-- [ ] **Step 3: Compare output files with pre-migration baseline**
+- [x] **Step 3: Compare output files with pre-migration baseline**
 
 ```bash
 ssh router 'diff /tmp/crontab.bak-before-ocsm <(crontab -l)'
@@ -1241,7 +1241,7 @@ ssh router 'ls -lh /etc/openclash/subscription/*.yaml'
 
 Expected: Documented differences only (no unexpected changes)
 
-- [ ] **Step 4: Test full dependency chain end-to-end**
+- [x] **Step 4: Test full dependency chain end-to-end**
 
 ```bash
 ssh router 'ocsm run --force node_measure'
@@ -1252,7 +1252,7 @@ ssh router 'ocsm status | grep -E "node_sort|pool_update|subscription_gen"'
 
 Expected: All dependent tasks show SUCCESS after measure completes
 
-- [ ] **Step 5: Backup old scripts**
+- [x] **Step 5: Backup old scripts**
 
 ```bash
 ssh router 'mkdir -p /root/scripts.bak-ocsm-$(date +%Y%m%d)'
@@ -1260,7 +1260,7 @@ ssh router 'cp /root/scripts/{node_audit.py,pool_nodes.py,key_domain_probe.py} /
 ssh router 'cp /etc/openclash/custom/{xh_selector.py,gen_subscription.py} /root/scripts.bak-ocsm-$(date +%Y%m%d)/'
 ```
 
-- [ ] **Step 6: Keep old scripts as importable modules**
+- [x] **Step 6: Keep old scripts as importable modules**
 
 DO NOT delete old scripts - ocsm imports them. Verify imports work:
 
@@ -1270,7 +1270,7 @@ ssh router 'cd /opt/ocsm && python3 -c "import sys; sys.path.append(\"/root/scri
 
 Expected: "OK"
 
-- [ ] **Step 7: Document migration**
+- [x] **Step 7: Document migration**
 
 Create `/opt/ocsm/MIGRATION.md` with:
 - Migration date
@@ -1280,7 +1280,7 @@ Create `/opt/ocsm/MIGRATION.md` with:
 - Any manual interventions needed
 - Rollback procedure
 
-- [ ] **Step 8: Run for one week**
+- [ ] **Step 8: Run for one week** (STARTED 2026-11-12 02:10 CST, planned end 2026-11-19 02:10 CST)
 
 Observe for one week. Check:
 - Tasks run at scheduled intervals
@@ -1289,7 +1289,7 @@ Observe for one week. Check:
 - No errors in `/opt/ocsm/logs/ocsm.log`
 - No complaints about stale nodes or broken routing
 
-- [ ] **Step 9: Final validation checklist**
+- [x] **Step 9: Final validation checklist**
 
 ```markdown
 - [ ] All tasks green in `ocsm status`
@@ -1302,7 +1302,7 @@ Observe for one week. Check:
 - [ ] No credentials in logs
 ```
 
-- [ ] **Step 10: Commit**
+- [x] **Step 10: Commit**
 
 ```bash
 echo "Task 11 complete: migration validated, one-week observation passed" >> /opt/ocsm/PROGRESS.txt
