@@ -297,3 +297,243 @@ async fn flagged_account_gets_estimated_prompt_tokens() {
         .expect("content_block_delta");
     assert_eq!(text_delta["delta"]["text"].as_str(), Some("ok"));
 }
+
+// ---------------------------------------------------------------------------
+// 转换路径：客户端发 Anthropic Messages，上游是 chat completions。
+//
+// 这是 `os`（驭风 chat 聚合）在线上真正走的路径 —— 只改 passthrough 的话，
+// 用户看到的数字一点没变。非流式与流式都必须改写，流式还得扛住事件边界被切碎。
+// ---------------------------------------------------------------------------
+
+const CHAT_PROMPT: i64 = 30_000;
+const CHAT_CACHED: i64 = 16_000;
+const CHAT_COMPLETION: i64 = 25;
+
+fn chat_usage() -> Value {
+    json!({
+        "prompt_tokens": CHAT_PROMPT,
+        "completion_tokens": CHAT_COMPLETION,
+        "total_tokens": CHAT_PROMPT + CHAT_COMPLETION,
+        "prompt_tokens_details": { "cached_tokens": CHAT_CACHED },
+    })
+}
+
+fn chat_completion_body() -> Value {
+    json!({
+        "id": "chatcmpl-mock",
+        "object": "chat.completion",
+        "created": 1,
+        "model": "mock-chat",
+        "choices": [{
+            "index": 0,
+            "message": { "role": "assistant", "content": "ok" },
+            "finish_reason": "stop",
+        }],
+        "usage": chat_usage(),
+    })
+}
+
+fn chat_sse_text() -> String {
+    let mut text = String::new();
+    text.push_str(&format!(
+        "data: {}\n\n",
+        json!({
+            "id": "chatcmpl-mock",
+            "object": "chat.completion.chunk",
+            "created": 1,
+            "model": "mock-chat",
+            "choices": [{ "index": 0, "delta": { "role": "assistant", "content": "ok" }, "finish_reason": Value::Null }],
+        })
+    ));
+    text.push_str(&format!(
+        "data: {}\n\n",
+        json!({
+            "id": "chatcmpl-mock",
+            "object": "chat.completion.chunk",
+            "created": 1,
+            "model": "mock-chat",
+            "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }],
+        })
+    ));
+    // include_usage 尾块：转换器从这里取 prompt 侧真值。
+    text.push_str(&format!(
+        "data: {}\n\n",
+        json!({
+            "id": "chatcmpl-mock",
+            "object": "chat.completion.chunk",
+            "created": 1,
+            "model": "mock-chat",
+            "choices": [],
+            "usage": chat_usage(),
+        })
+    ));
+    text.push_str("data: [DONE]\n\n");
+    text
+}
+
+async fn spawn_chat_mock_upstream() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = axum::Router::new().route(
+        "/chat/completions",
+        axum::routing::post(|axum::Json(body): axum::Json<Value>| async move {
+            if body["stream"].as_bool() == Some(true) {
+                let text = chat_sse_text();
+                let chunks: Vec<Result<bytes::Bytes, std::io::Error>> = text
+                    .as_bytes()
+                    .chunks(7)
+                    .map(|part| Ok(bytes::Bytes::copy_from_slice(part)))
+                    .collect();
+                return axum::response::Response::builder()
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .body(Body::from_stream(futures_util::stream::iter(chunks)))
+                    .unwrap();
+            }
+            axum::Json(chat_completion_body()).into_response()
+        }),
+    );
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn flagged_account_gets_estimated_usage_on_chat_conversion_path() {
+    let upstream = spawn_chat_mock_upstream().await;
+    let state = llmux_server::test_state().await;
+    let app = llmux_server::app(state.clone());
+
+    sqlx::query("INSERT INTO api_keys (name, key, allowed_models) VALUES (?, ?, ?)")
+        .bind("usage-estimate-chat")
+        .bind("sk-chat-test")
+        .bind("*")
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    let cookie = login(app.clone()).await;
+
+    let (status, created) = api_post(
+        app.clone(),
+        &cookie,
+        "/api/accounts",
+        json!({
+            "alias": "lying-chat-relay",
+            "provider_id": "custom",
+            "api_key": "sk-mock",
+            "base_url": upstream,
+            "anthropic_base_url": upstream,
+            "default_protocol": "chat",
+            "skip_validation": true,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{created:?}");
+    let account_id = created["id"].as_i64().expect("account id");
+
+    let (status, body) = api_post(
+        app.clone(),
+        &cookie,
+        "/api/models/aliases",
+        json!({
+            "alias": "os",
+            "target_model": "deepseek-v4.1-flash",
+            "account_ids": [account_id],
+            "upstream_api": "chat",
+            "provider_id": "custom",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+
+    let prompt = "x".repeat(20_000);
+    let expected = llmux_core::usage_estimate::estimate_anthropic_tokens(&json!({
+        "messages": [{ "role": "user", "content": prompt }]
+    })) as i64;
+    let upstream_fresh_input = CHAT_PROMPT - CHAT_CACHED;
+
+    // 对照组：登记前，转换器按上游 chat usage 折算（prompt - cached）。
+    let (status, control, _) = v1_messages(
+        app.clone(),
+        "sk-chat-test",
+        json!({ "model": "os", "max_tokens": 16, "messages": [{ "role": "user", "content": prompt }] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{control:?}");
+    assert_eq!(control["usage"]["input_tokens"].as_i64(), Some(upstream_fresh_input));
+    assert_eq!(
+        control["usage"]["cache_read_input_tokens"].as_i64(),
+        Some(CHAT_CACHED)
+    );
+
+    let (status, body) = api_put(
+        app.clone(),
+        &cookie,
+        "/api/settings",
+        json!({ "usage_estimate_accounts": account_id.to_string() }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+
+    // 非流式转换：prompt 侧换成本地估算，缓存拆分归零，output 保留。
+    let (status, rewritten, _) = v1_messages(
+        app.clone(),
+        "sk-chat-test",
+        json!({ "model": "os", "max_tokens": 16, "messages": [{ "role": "user", "content": prompt }] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rewritten:?}");
+    assert_eq!(rewritten["usage"]["input_tokens"].as_i64(), Some(expected));
+    assert_eq!(rewritten["usage"]["cache_read_input_tokens"].as_i64(), Some(0));
+    assert_eq!(
+        rewritten["usage"]["cache_creation_input_tokens"].as_i64(),
+        Some(0)
+    );
+    assert_eq!(
+        rewritten["usage"]["output_tokens"].as_i64(),
+        Some(CHAT_COMPLETION)
+    );
+    assert_eq!(rewritten["content"][0]["text"].as_str(), Some("ok"));
+
+    // 流式转换：message_start 与 message_delta 都要改写；事件被 7 字节切块。
+    let (status, _, raw) = v1_messages(
+        app.clone(),
+        "sk-chat-test",
+        json!({
+            "model": "os",
+            "max_tokens": 16,
+            "stream": true,
+            "messages": [{ "role": "user", "content": prompt }]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let events = sse_events(&raw);
+    assert!(!events.is_empty(), "raw={raw}");
+    let start = events
+        .iter()
+        .find(|event| event["type"] == "message_start")
+        .expect("message_start");
+    assert_eq!(
+        start["message"]["usage"]["input_tokens"].as_i64(),
+        Some(expected),
+        "转换路径的 message_start 也要换成本地估算"
+    );
+    let delta = events
+        .iter()
+        .find(|event| event["type"] == "message_delta")
+        .expect("message_delta");
+    assert_eq!(delta["usage"]["input_tokens"].as_i64(), Some(expected));
+    assert_eq!(
+        delta["usage"]["cache_read_input_tokens"].as_i64(),
+        Some(0),
+        "上游 16000 的 cache_read 不能漏到客户端"
+    );
+    assert_eq!(delta["usage"]["output_tokens"].as_i64(), Some(CHAT_COMPLETION));
+    assert!(raw.contains("message_stop"), "终止事件不能被改写器吞掉: {raw}");
+    let text_delta = events
+        .iter()
+        .find(|event| event["type"] == "content_block_delta")
+        .expect("content_block_delta");
+    assert_eq!(text_delta["delta"]["text"].as_str(), Some("ok"));
+}

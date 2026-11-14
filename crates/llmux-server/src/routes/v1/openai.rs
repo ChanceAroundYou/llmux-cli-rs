@@ -612,7 +612,7 @@ pub(crate) async fn dispatch_with_conversion(
             (Back::MessagesFromResponses, true) => {
                 { let mut r = state.dispatch_router.lock().unwrap(); r.record_result(&dispatch_key, &dispatch_meta, Some(account.id), true); }
                 send_tui_request(&state.tui_tx, normalized_uri.path(), 200, start, &model_name);
-                return super::anthropic::responses_to_anthropic_streaming(response, &model_name, account, state.pool.clone(), &account.provider_id, start, Some(forward_body.to_string())).await;
+                return super::anthropic::responses_to_anthropic_streaming(response, &model_name, account, state.pool.clone(), &account.provider_id, start, Some(forward_body.to_string()), usage_override).await;
             }
             (Back::MessagesFromResponses, false) => {
                 let body_bytes = match response.bytes().await { Ok(b) => b, Err(e) => { last_error = Some(format!("Failed to read response: {e}")); failed_candidates += 1; continue; } };
@@ -625,18 +625,22 @@ pub(crate) async fn dispatch_with_conversion(
                         }
                     }
                 };
-                let anth_resp = responses_to_anthropic(&data, &model_name);
+                let mut anth_resp = responses_to_anthropic(&data, &model_name);
                 let (input_tokens, output_tokens, cache_read, cache_create) = anthropic_usage(&data);
                 let latency_ms = start.elapsed().as_millis() as i64;
                 spawn_log_usage(state.pool.clone(), (*account).clone(), model_name.clone(), res.provider_id.clone(), input_tokens, output_tokens, cache_read, cache_create, latency_ms, true, None, Some(forward_body.to_string()), Some(anth_resp.to_string()), Some(latency_ms), false);
                 { let mut r = state.dispatch_router.lock().unwrap(); r.record_result(&dispatch_key, &dispatch_meta, Some(account.id), true); }
                 send_tui_request(&state.tui_tx, normalized_uri.path(), 200, start, &model_name);
+                // 日志已按上游原值落库，客户端拿到的是估算值。
+                if let Some(tokens) = usage_override {
+                    super::anthropic::apply_estimated_usage(&mut anth_resp, tokens);
+                }
                 return Json(anth_resp).into_response();
             }
             (Back::MessagesFromChat, true) => {
                 { let mut r = state.dispatch_router.lock().unwrap(); r.record_result(&dispatch_key, &dispatch_meta, Some(account.id), true); }
                 send_tui_request(&state.tui_tx, normalized_uri.path(), 200, start, &model_name);
-                return super::anthropic::anthropic_to_openai_streaming(response, &model_name, account, state.pool.clone(), &account.provider_id, start, Some(forward_body.to_string())).await;
+                return super::anthropic::anthropic_to_openai_streaming(response, &model_name, account, state.pool.clone(), &account.provider_id, start, Some(forward_body.to_string()), usage_override).await;
             }
             (Back::MessagesFromChat, false) => {
                 let body_bytes = match response.bytes().await { Ok(b) => b, Err(e) => { last_error = Some(format!("Failed to read response: {e}")); failed_candidates += 1; continue; } };
@@ -649,7 +653,7 @@ pub(crate) async fn dispatch_with_conversion(
                         }
                     }
                 };
-                let anth_resp = openai_to_anthropic_response(&data, &model_name);
+                let mut anth_resp = openai_to_anthropic_response(&data, &model_name);
                 let (raw_prompt, completion_tokens) = adapters::usage_from_openai_response_body(&data);
                 let (cache_read, _) = cache_usage_from_openai(&data["usage"]);
                 let prompt_tokens = (raw_prompt - cache_read).max(0);
@@ -658,6 +662,10 @@ pub(crate) async fn dispatch_with_conversion(
                 spawn_log_usage(state.pool.clone(), (*account).clone(), model_name.clone(), res.provider_id.clone(), prompt_tokens, completion_tokens, cache_read, cache_create, latency_ms, true, None, Some(forward_body.to_string()), Some(anth_resp.to_string()), Some(latency_ms), false);
                 { let mut r = state.dispatch_router.lock().unwrap(); r.record_result(&dispatch_key, &dispatch_meta, Some(account.id), true); }
                 send_tui_request(&state.tui_tx, normalized_uri.path(), 200, start, &model_name);
+                // 日志已按上游原值落库，客户端拿到的是估算值。
+                if let Some(tokens) = usage_override {
+                    super::anthropic::apply_estimated_usage(&mut anth_resp, tokens);
+                }
                 return Json(anth_resp).into_response();
             }
         }
@@ -1313,8 +1321,8 @@ pub(crate) async fn dispatch_aggregate_with_conversion(
                 }
                 Back::ChatFromResponses => responses_to_chat_streaming(resp, &cand_model, &account, state.pool.clone(), start, Some(body.to_string())).await,
                 Back::ChatFromMessages => anthropic_fallback_streaming(resp, &cand_model, &account, state.pool.clone(), start, Some(body.to_string())).await,
-                Back::MessagesFromResponses => super::anthropic::responses_to_anthropic_streaming(resp, &cand_model, &account, state.pool.clone(), &account.provider_id, start, Some(body.to_string())).await,
-                Back::MessagesFromChat => super::anthropic::anthropic_to_openai_streaming(resp, &cand_model, &account, state.pool.clone(), &account.provider_id, start, Some(body.to_string())).await,
+                Back::MessagesFromResponses => super::anthropic::responses_to_anthropic_streaming(resp, &cand_model, &account, state.pool.clone(), &account.provider_id, start, Some(body.to_string()), hit_usage_override).await,
+                Back::MessagesFromChat => super::anthropic::anthropic_to_openai_streaming(resp, &cand_model, &account, state.pool.clone(), &account.provider_id, start, Some(body.to_string()), hit_usage_override).await,
                 Back::ResponsesFromChat => chat_to_responses_streaming(resp, &cand_model, &account, state.pool.clone(), start, Some(body.to_string()), custom_tools.clone()).await,
                 Back::ResponsesFromMessages => anthropic_to_responses_streaming(resp, &cand_model, &account, state.pool.clone(), start, Some(body.to_string())).await,
             };

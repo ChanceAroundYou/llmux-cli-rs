@@ -461,6 +461,7 @@ pub async fn messages(
                     &model_resolution.provider_id,
                     start,
                     Some(body.to_string()),
+                    usage_override,
                 )
                 .await;
             }
@@ -790,6 +791,15 @@ fn sse_event_boundary(buf: &[u8]) -> Option<usize> {
     None
 }
 
+/// 转换器吐出的每个事件都是完整 SSE 帧，逐帧改写 usage 即可；不是 Anthropic
+/// 形状的帧原样返回（见 [`rewrite_usage_event`]）。
+fn outbound_event(ev: String, prompt_tokens: Option<i64>) -> Bytes {
+    match prompt_tokens {
+        Some(tokens) => Bytes::from(rewrite_usage_event(ev.as_bytes(), tokens)),
+        None => Bytes::from(ev),
+    }
+}
+
 fn rewrite_usage_event(event: &[u8], prompt_tokens: i64) -> Vec<u8> {
     let Ok(text) = std::str::from_utf8(event) else { return event.to_vec() };
     let mut event_line: Option<String> = None;
@@ -984,6 +994,7 @@ pub(crate) async fn anthropic_to_openai_streaming(
     provider_id: &str,
     start: Instant,
     request_body: Option<String>,
+    usage_override: Option<i64>,
 ) -> Response {
     let model = model.to_string();
     let account = account.clone();
@@ -1035,7 +1046,7 @@ pub(crate) async fn anthropic_to_openai_streaming(
                     continue;
                 };
                 for ev in converter.feed(&parsed) {
-                    let sent = tx.send(Ok(Bytes::from(ev))).await.is_ok();
+                    let sent = tx.send(Ok(outbound_event(ev, usage_override))).await.is_ok();
                     if sent && ttft_ms.is_none() {
                         ttft_ms = Some(start.elapsed().as_millis() as i64);
                     }
@@ -1071,7 +1082,7 @@ pub(crate) async fn anthropic_to_openai_streaming(
                     continue;
                 };
                 for ev in converter.feed(&parsed) {
-                    let sent = tx.send(Ok(Bytes::from(ev))).await.is_ok();
+                    let sent = tx.send(Ok(outbound_event(ev, usage_override))).await.is_ok();
                     if sent && ttft_ms.is_none() {
                         ttft_ms = Some(start.elapsed().as_millis() as i64);
                     }
@@ -1093,7 +1104,7 @@ pub(crate) async fn anthropic_to_openai_streaming(
                 if payload.trim() != "[DONE]" {
                     if let Ok(parsed) = serde_json::from_str::<Value>(payload) {
                         for ev in converter.feed(&parsed) {
-                            let sent = tx.send(Ok(Bytes::from(ev))).await.is_ok();
+                            let sent = tx.send(Ok(outbound_event(ev, usage_override))).await.is_ok();
                             if sent && ttft_ms.is_none() {
                                 ttft_ms = Some(start.elapsed().as_millis() as i64);
                             }
@@ -1106,7 +1117,7 @@ pub(crate) async fn anthropic_to_openai_streaming(
 
         for ev in converter.finish() {
             // terminal frame (finish_reason / [DONE]) — not counted as TTFT
-            if tx.send(Ok(Bytes::from(ev))).await.is_err() {
+            if tx.send(Ok(outbound_event(ev, usage_override))).await.is_err() {
                 tracing::debug!("[stream:{model}] client gone during finish send");
                 return;
             }
@@ -1194,6 +1205,7 @@ pub(crate) async fn responses_to_anthropic_streaming(
     provider_id: &str,
     start: Instant,
     request_body: Option<String>,
+    usage_override: Option<i64>,
 ) -> Response {
     let model = model.to_string();
     let account = account.clone();
@@ -1216,7 +1228,7 @@ pub(crate) async fn responses_to_anthropic_streaming(
             received.push(&c);
             for ev in llmux_core::proxy::anthropic_openai::parse_sse_chunks(&mut buffer, 0) {
                 for out in conv.feed(&ev) {
-                    let sent = tx.send(Ok(Bytes::from(out))).await.is_ok();
+                    let sent = tx.send(Ok(outbound_event(out, usage_override))).await.is_ok();
                     if sent && ttft_ms.is_none() { ttft_ms = Some(start.elapsed().as_millis() as i64); }
                     if !sent { return; }
                 }
@@ -1228,7 +1240,7 @@ pub(crate) async fn responses_to_anthropic_streaming(
         if !conv.is_done() {
             for ev in llmux_core::proxy::anthropic_openai::parse_sse_chunks(&mut buffer, 0) {
                 for out in conv.feed(&ev) {
-                    let sent = tx.send(Ok(Bytes::from(out))).await.is_ok();
+                    let sent = tx.send(Ok(outbound_event(out, usage_override))).await.is_ok();
                     if sent && ttft_ms.is_none() { ttft_ms = Some(start.elapsed().as_millis() as i64); }
                     if !sent { return; }
                 }
@@ -1236,7 +1248,7 @@ pub(crate) async fn responses_to_anthropic_streaming(
             }
         }
         for out in conv.finish() {
-            let sent = tx.send(Ok(Bytes::from(out))).await.is_ok();
+            let sent = tx.send(Ok(outbound_event(out, usage_override))).await.is_ok();
             if sent && ttft_ms.is_none() { ttft_ms = Some(start.elapsed().as_millis() as i64); }
             if !sent { return; }
         }

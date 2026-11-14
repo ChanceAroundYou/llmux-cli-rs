@@ -30,9 +30,15 @@
   流式改写按 SSE 事件边界缓冲，事件被 chunk 切开也不会吐半截 JSON。
   契约测试 `crates/llmux-server/tests/usage_estimate_contract.rs`（对照组 + 非流式 +
   流式逐项钉住，两条变异验证会红）；设置解析的单测在 `app.rs`。
-  **已知边界**：只覆盖 Messages→Messages 的 Passthrough（以及统一分发器的命中点）。
-  若把虚报账户改成 chat/responses 目标、走回 `*FromChat` 转换，换算出的 usage 仍是上游
-  原值 —— 那种账户要另加改写点，别以为登记了就全覆盖。
+  **转换路径也覆盖**（2026-11-14 补）：线上 `os` 是 chat 聚合别名，Claude Code 的
+  Messages 请求走 `MessagesFromChat` 转换，只改 passthrough 等于没改（实测 `os`
+  流式仍回上游 6/16000 之类的数字）。现在非流式在转换结果上改写、流式在
+  `anthropic_to_openai_streaming` / `responses_to_anthropic_streaming` 的每个出站 SSE
+  帧上改写，第二条契约测试钉住（含 7 字节切块的事件边界与对照组）。
+  **已知边界**：客户端**不是** Anthropic Messages 形状（chat/responses ingress）时
+  不改写 —— 那些客户端不按 `input + cache_read + cache_creation` 判压缩。
+  转换路径的流式若上游压根不给 usage 尾块，估算值也不会凭空出现（没有 prompt 侧
+  字段就无从改写），这与上游行为一致。
 
 - **聚合候选的纯逻辑有了 core 层契约测试**（新文件
   `crates/llmux-core/tests/aggregate_candidate_contract.rs`，13 条）。此前这些判据只被
