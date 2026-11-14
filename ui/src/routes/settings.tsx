@@ -250,6 +250,27 @@ export default function Settings() {
                 </Button>
              </div>
            </SettingItem>
+           <SettingItem label={t('settings.usageEstimate')} description={t('settings.usageEstimateDesc')}>
+             <div className="relative flex items-center gap-2">
+                <Input
+                  type="text"
+                  placeholder="64,63"
+                  value={localConfig.usage_estimate_accounts || ''}
+                  onChange={e => setLocalConfig({...localConfig, usage_estimate_accounts: e.target.value})}
+                  onKeyDown={e => e.key === 'Enter' && handleAutoSave(localConfig)}
+                  className="h-auto py-1.5 text-xs font-semibold w-40 text-center"
+                />
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  onClick={() => handleAutoSave(localConfig)}
+                  className="h-8 w-8 text-primary hover:text-primary-foreground"
+                  title={t('common.save')}
+                >
+                  <CheckCircle2 size={14} />
+                </Button>
+             </div>
+           </SettingItem>
         </SettingGroup>
 
         <SettingGroup title={t('settings.ui')} icon={Monitor}>

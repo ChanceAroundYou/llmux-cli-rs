@@ -263,7 +263,9 @@
     "reservedPort": "该端口已被常用数据库或 Web 服务占用，为了避免冲突，请选择其他端口。",
     "restartRequired": "需要重新启动",
     "restartDesc": "服务端口已修改成功。为了使更改生效，请手动关闭当前运行的 LLMux 进程并重新启动。",
-    "themeSystem": "跟随系统"
+    "themeSystem": "跟随系统",
+    "usageEstimate": "用量不可信账户",
+    "usageEstimateDesc": "填账户 id（逗号分隔）。这些上游回报的 usage 与请求无关，下发客户端的 prompt token 改用本地估算；账单日志仍记上游原值。"
   },
   "accounts": {
     "title": "账户管理",

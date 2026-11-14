@@ -108,6 +108,10 @@ pub struct AppState {
     /// Providers whose upstream rejected the `prompt_cache_breakpoint` marker.
     /// Requests routed to them are converted without it.
     pub cache_breakpoint_unsupported: Arc<Mutex<HashSet<String>>>,
+    /// 上游 usage 不可信的账户（`usage_estimate_accounts` 设置，逗号分隔的 id）。
+    /// 命中时下发客户端的 usage 改用本地估算，见
+    /// [`llmux_core::usage_estimate`] 与 [`AppState::usage_estimate_enabled`]。
+    pub usage_estimate_accounts: Arc<Mutex<HashSet<i64>>>,
 }
 
 pub type AppRouter = Router;
@@ -527,6 +531,7 @@ pub async fn test_state() -> AppState {
         sessions: Arc::new(Mutex::new(HashMap::new())),
         codex_device_logins: Arc::new(Mutex::new(HashMap::new())),
         cache_breakpoint_unsupported: Arc::new(Mutex::new(HashSet::new())),
+        usage_estimate_accounts: Arc::new(Mutex::new(HashSet::new())),
     }
 }
 
@@ -618,6 +623,55 @@ impl AppState {
             .unwrap()
             .insert(provider_id.to_string());
     }
+
+    /// 该账户的上游 usage 是否已知不可信（`usage_estimate_accounts` 命中）。
+    /// 命中时下发客户端的 prompt 侧 token 数改用本地估算；落库日志仍记上游原值。
+    pub fn usage_estimate_enabled(&self, account_id: i64) -> bool {
+        self.usage_estimate_accounts.lock().unwrap().contains(&account_id)
+    }
+
+    /// 用设置里的新值替换内存快照（`PUT /api/settings` 命中该键时调用）。
+    pub fn set_usage_estimate_accounts(&self, ids: HashSet<i64>) {
+        *self.usage_estimate_accounts.lock().unwrap() = ids;
+    }
+
+    /// 从 settings 表读 `usage_estimate_accounts` 并刷新内存快照。
+    /// 取值支持 `"64,63"`、`[64,63]`、单个数字；无法识别的片段直接跳过 ——
+    /// 一条写错的设置不该让网关拒绝启动。
+    pub async fn reload_usage_estimate_accounts(&self) -> anyhow::Result<()> {
+        let settings = llmux_core::settings::SettingsService::new(self.pool.clone())
+            .get_all()
+            .await?;
+        let ids = parse_usage_estimate_accounts(settings.get("usage_estimate_accounts"));
+        self.set_usage_estimate_accounts(ids);
+        Ok(())
+    }
+}
+
+/// 解析 `usage_estimate_accounts`：逗号分隔字符串、数字数组、单个数字都认。
+pub fn parse_usage_estimate_accounts(value: Option<&Value>) -> HashSet<i64> {
+    let mut ids = HashSet::new();
+    let mut push = |item: &Value| {
+        if let Some(id) = item.as_i64() {
+            if id > 0 {
+                ids.insert(id);
+            }
+        } else if let Some(text) = item.as_str() {
+            for part in text.split(',') {
+                if let Ok(id) = part.trim().parse::<i64>() {
+                    if id > 0 {
+                        ids.insert(id);
+                    }
+                }
+            }
+        }
+    };
+    match value {
+        Some(Value::Array(items)) => items.iter().for_each(&mut push),
+        Some(other) => push(other),
+        None => {}
+    }
+    ids
 }
 
 pub fn normalize_gateway_uri(uri: &Uri) -> Uri {
@@ -652,5 +706,42 @@ mod tests {
         assert_eq!(n("/v1/v1/chat/completions?x=1"), "/v1/chat/completions?x=1");
         assert_eq!(n("/v1/messages"), "/v1/messages");
         assert_eq!(n("/api/health"), "/api/health");
+    }
+
+    #[test]
+    fn parse_usage_estimate_accounts_accepts_all_documented_shapes() {
+        use serde_json::json;
+        // 逗号分隔字符串（设置面板实际写的形式）。
+        assert_eq!(
+            parse_usage_estimate_accounts(Some(&json!("64, 63"))),
+            HashSet::from([64, 63])
+        );
+        // 数字数组。
+        assert_eq!(
+            parse_usage_estimate_accounts(Some(&json!([7, 8]))),
+            HashSet::from([7, 8])
+        );
+        // 单个数字。
+        assert_eq!(
+            parse_usage_estimate_accounts(Some(&json!(9))),
+            HashSet::from([9])
+        );
+        // 没设置 / 空串 —— 谁都不标记：默认行为必须是「原样转发上游 usage」。
+        assert!(parse_usage_estimate_accounts(None).is_empty());
+        assert!(parse_usage_estimate_accounts(Some(&json!(""))).is_empty());
+    }
+
+    #[test]
+    fn parse_usage_estimate_accounts_skips_garbage_instead_of_panicking() {
+        use serde_json::json;
+        // 写错一条设置不能让网关起不来：非数字、0、负数都跳过，同段里合法的照收。
+        assert_eq!(
+            parse_usage_estimate_accounts(Some(&json!("64,abc,0,-3"))),
+            HashSet::from([64])
+        );
+        assert_eq!(
+            parse_usage_estimate_accounts(Some(&json!(["12", null, "x"]))),
+            HashSet::from([12])
+        );
     }
 }

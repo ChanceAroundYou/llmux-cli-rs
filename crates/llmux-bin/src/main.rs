@@ -173,8 +173,14 @@ async fn start(port_override: Option<u16>, use_tui: bool) -> anyhow::Result<()> 
         sessions,
         codex_device_logins: Arc::new(Mutex::new(std::collections::HashMap::new())),
         cache_breakpoint_unsupported: Arc::new(Mutex::new(std::collections::HashSet::new())),
+        usage_estimate_accounts: Arc::new(Mutex::new(std::collections::HashSet::new())),
         tui_tx,
     };
+    // `usage_estimate_accounts` 是运行期才生效的开关（见 llmux_core::usage_estimate）。
+    // 读失败只 warn：网关照常起，只是回到「原样转发上游 usage」。
+    if let Err(error) = state.reload_usage_estimate_accounts().await {
+        tracing::warn!("load usage_estimate_accounts failed: {error}");
+    }
     // Spawn aggregate background probe (5 min, V-anchored, 3-confirm)
     llmux_server::aggregate_probe::spawn_aggregate_probe(pool.clone(), master_key.clone(), aggregate_router.clone());
     // Spawn periodic DB reclaim (6h, only when freelist is actually large).

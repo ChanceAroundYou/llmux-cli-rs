@@ -257,6 +257,13 @@ pub(crate) async fn dispatch_with_conversion(
     };
 
     let start = Instant::now();
+    // 这条请求的 prompt 体积估算，只在 Messages ingress 且账户被标记
+    // `usage_estimate_accounts` 时下发（见 llmux_core::usage_estimate）。
+    let prompt_estimate = if is_anthropic {
+        Some(llmux_core::usage_estimate::estimate_anthropic_tokens(&patched) as i64)
+    } else {
+        None
+    };
     let mut last_error: Option<String> = None;
     // 上游最后回的状态码。耗尽时用它决定回 429（该退避）还是 502（网关问题）——
     // 瞬时 429 不冷却，`last_error` 里没有 "cooling down"，只能靠这个判断。
@@ -266,6 +273,7 @@ pub(crate) async fn dispatch_with_conversion(
     let mut failed_candidates = 0usize;
 
     for account in &ordered_accounts {
+        let usage_override = prompt_estimate.filter(|_| state.usage_estimate_enabled(account.id));
         // 配额/限流冷却中的账户跳过。裸模型名走的就是这条路径 —— Ling
         // 每日 100 次配额耗尽后，不跳的话每次请求都原样吃一个 429。
         if super::helpers::rate_limit_suspended(&state.pool, account.id, &model_name).await {
@@ -463,7 +471,7 @@ pub(crate) async fn dispatch_with_conversion(
         match (back, streaming) {
             (Back::Passthrough, true) => {
                 if is_anthropic {
-                    return super::anthropic::anthropic_streaming_passthrough(response, &model_name, account, state.pool.clone(), &account.provider_id, start, Some(forward_body.to_string())).await;
+                    return super::anthropic::anthropic_streaming_passthrough(response, &model_name, account, state.pool.clone(), &account.provider_id, start, Some(forward_body.to_string()), usage_override).await;
                 }
                 return openai_streaming_passthrough(response, &model_name, account, state.pool.clone(), start, Some(forward_body.to_string())).await;
             }
@@ -480,9 +488,15 @@ pub(crate) async fn dispatch_with_conversion(
                 };
                 let latency_ms = start.elapsed().as_millis() as i64;
                 let (prompt_tokens, completion_tokens, cache_read, cache_create) = passthrough_usage(&data);
+                // 日志/账本记上游原值，客户端拿到的是估算值 —— 两件事。
                 spawn_log_usage(state.pool.clone(), (*account).clone(), model_name.clone(), res.provider_id.clone(), prompt_tokens, completion_tokens, cache_read, cache_create, latency_ms, true, None, Some(forward_body.to_string()), Some(data.to_string()), Some(latency_ms), false);
                 { let mut r = state.dispatch_router.lock().unwrap(); r.record_result(&dispatch_key, &dispatch_meta, Some(account.id), true); }
                 send_tui_request(&state.tui_tx, normalized_uri.path(), 200, start, &model_name);
+                if let (Some(tokens), true) = (usage_override, is_anthropic) {
+                    let mut data = data;
+                    super::anthropic::apply_estimated_usage(&mut data, tokens);
+                    return Json(data).into_response();
+                }
                 return Json(data).into_response();
             }
             (Back::ChatFromResponses, true) => {
@@ -966,6 +980,13 @@ pub(crate) async fn dispatch_aggregate_with_conversion(
     let active = agg.active.min(len.saturating_sub(1));
     let mode = DownstreamMode::from_str(agg.upstream_api.as_str());
     let start = Instant::now();
+    // 同 dispatch_with_conversion：prompt 估算只在 Messages ingress 且账户被
+    // `usage_estimate_accounts` 标记时下发（见 llmux_core::usage_estimate）。
+    let prompt_estimate = if ingress == Protocol::Messages {
+        Some(llmux_core::usage_estimate::estimate_anthropic_tokens(&body) as i64)
+    } else {
+        None
+    };
     // See dispatch_with_conversion: custom tools live in the Responses ingress
     // body and must shape the back-converted calls.
     let custom_tools = if ingress == Protocol::Responses {
@@ -987,6 +1008,8 @@ pub(crate) async fn dispatch_aggregate_with_conversion(
     let mut hit_stream_resp: Option<reqwest::Response> = None;
     let mut hit_data: Option<Value> = None;
     let mut hit_account: Option<adapters::Account> = None;
+    // 命中候选的 usage 改写值（只有 Messages ingress + 被标记账户才有）。
+    let mut hit_usage_override: Option<i64> = None;
     let mut hit_back: Option<Back> = None;
     // 锁定 = 硬钉：只发锁定的那个候选，失败就如实报错。以前锁只冻结「迁移」，
     // 单次请求失败仍会顺着列表往下故障转移 —— 下游看到的模型照样换来换去，
@@ -1236,7 +1259,7 @@ pub(crate) async fn dispatch_aggregate_with_conversion(
             // 发出去的那档被接受了 → 记下来（与普通 dispatcher 同）。
             provider_request.effort.record_success();
             state.aggregate_router.lock().unwrap().note_candidate_success(&alias, i, len);
-            hit_index = Some(i); hit_account = Some(account.clone()); hit_stream_resp = Some(response); hit_back = Some(back); break;
+            hit_index = Some(i); hit_account = Some(account.clone()); hit_stream_resp = Some(response); hit_back = Some(back); hit_usage_override = prompt_estimate.filter(|_| state.usage_estimate_enabled(account.id)); break;
         }
         let body_bytes = match response.bytes().await {
             Ok(b) => b,
@@ -1263,7 +1286,8 @@ pub(crate) async fn dispatch_aggregate_with_conversion(
         spawn_log_usage(state.pool.clone(), account.clone(), cand.model.clone(), account.provider_id.clone(), pt, ct, cr, cc, latency_ms, true, None, Some(body.to_string()), Some(converted.to_string()), Some(latency_ms), false);
         provider_request.effort.record_success();
         state.aggregate_router.lock().unwrap().note_candidate_success(&alias, i, len);
-        hit_index = Some(i); hit_account = Some(account); hit_data = Some(converted); break;
+        let override_tokens = prompt_estimate.filter(|_| state.usage_estimate_enabled(account.id));
+        hit_index = Some(i); hit_account = Some(account); hit_data = Some(converted); hit_usage_override = override_tokens; break;
     }
     if let Some(hit) = hit_index {
         let switched = state.aggregate_router
@@ -1282,7 +1306,7 @@ pub(crate) async fn dispatch_aggregate_with_conversion(
             return match back {
                 Back::Passthrough => {
                     if ingress == Protocol::Messages {
-                        super::anthropic::anthropic_streaming_passthrough(resp, &cand_model, &account, state.pool.clone(), &account.provider_id, start, Some(body.to_string())).await
+                        super::anthropic::anthropic_streaming_passthrough(resp, &cand_model, &account, state.pool.clone(), &account.provider_id, start, Some(body.to_string()), hit_usage_override).await
                     } else {
                         openai_streaming_passthrough(resp, &cand_model, &account, state.pool.clone(), start, Some(body.to_string())).await
                     }
@@ -1295,7 +1319,15 @@ pub(crate) async fn dispatch_aggregate_with_conversion(
                 Back::ResponsesFromMessages => anthropic_to_responses_streaming(resp, &cand_model, &account, state.pool.clone(), start, Some(body.to_string())).await,
             };
         }
-        if let Some(data) = hit_data { send_tui_request(&state.tui_tx, normalized_uri.path(), 200, start, &agg.candidates[hit].model); return Json(data).into_response(); }
+        if let Some(data) = hit_data {
+            send_tui_request(&state.tui_tx, normalized_uri.path(), 200, start, &agg.candidates[hit].model);
+            if let Some(tokens) = hit_usage_override {
+                let mut data = data;
+                super::anthropic::apply_estimated_usage(&mut data, tokens);
+                return Json(data).into_response();
+            }
+            return Json(data).into_response();
+        }
     }
     let switched = state.aggregate_router
         .lock()

@@ -39,7 +39,14 @@ pub async fn update_settings(
         .batch_set(&settings_map)
         .await
     {
-        Ok(()) => Json(json!({ "success": true })).into_response(),
+        Ok(()) => {
+            // 内存快照要在同一个请求里跟上，否则新登记/摘除的「usage 不可信账户」
+            // 得等下次重启才生效。
+            if let Some(value) = settings_map.get("usage_estimate_accounts") {
+                state.set_usage_estimate_accounts(crate::app::parse_usage_estimate_accounts(Some(value)));
+            }
+            Json(json!({ "success": true })).into_response()
+        }
         Err(e) => crate::error::simple_error(
             format!("Failed to update settings: {e}"),
             StatusCode::INTERNAL_SERVER_ERROR,

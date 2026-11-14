@@ -21,3 +21,4 @@ pub mod streaming;
 pub mod protocol;
 pub mod upstream_api;
 pub mod usage;
+pub mod usage_estimate;

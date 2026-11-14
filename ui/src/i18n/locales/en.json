@@ -261,7 +261,9 @@
     "reservedPort": "This port is reserved for common database or web services. Please choose another port to avoid conflicts.",
     "restartRequired": "Restart Required",
     "restartDesc": "Service port updated successfully. To apply these changes, please manually stop the running LLMux process and restart it.",
-    "themeSystem": "System"
+    "themeSystem": "System",
+    "usageEstimate": "Accounts with untrustworthy usage",
+    "usageEstimateDesc": "Account ids, comma separated. Their reported usage is unrelated to the request, so the prompt token count sent to clients is estimated locally; billing logs keep the upstream values."
   },
   "accounts": {
     "title": "Account Management",

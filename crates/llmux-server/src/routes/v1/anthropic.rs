@@ -439,6 +439,13 @@ pub async fn messages(
 
         // Success — streaming or non-streaming
         provider_request.effort.record_success();
+        // usage 不可信的账户：下发客户端前把 prompt 侧换成本地估算（见
+        // llmux_core::usage_estimate）。落库仍用上游原值。
+        let usage_override = if state.usage_estimate_enabled(account.id) {
+            Some(llmux_core::usage_estimate::estimate_anthropic_tokens(&body) as i64)
+        } else {
+            None
+        };
         if streaming {
             {
                 let mut router = state.dispatch_router.lock().unwrap();
@@ -465,6 +472,7 @@ pub async fn messages(
                 &model_resolution.provider_id,
                 start,
                 Some(body.to_string()),
+                usage_override,
             )
             .await;
         }
@@ -555,6 +563,11 @@ pub async fn messages(
             router.record_result(&dispatch_key, &dispatch_meta, Some(account.id), true);
         }
         send_tui_request(&state.tui_tx, "/v1/messages", 200, start, &model_resolution.target_model);
+        if let Some(tokens) = usage_override {
+            let mut data = data;
+            apply_estimated_usage(&mut data, tokens);
+            return Json(data).into_response();
+        }
         return Json(data).into_response();
     }
 
@@ -684,19 +697,11 @@ fn anthropic_text_len(content: &Value) -> usize {
     }
 }
 
-/// ~4 bytes/token heuristic over messages, system, and tool definitions.
+/// Prompt 体积估算的统一入口（含 CJK 口径），实现在 `llmux_core::usage_estimate`。
+/// 这里保留薄封装是因为 `/count_tokens` 与「usage 不可信账户」的下发修正必须
+/// 用同一口径，两处各写一份迟早分叉。
 fn estimate_anthropic_tokens(body: &Value) -> u64 {
-    let mut chars: usize = 0;
-    if let Some(msgs) = body["messages"].as_array() {
-        for m in msgs {
-            chars += anthropic_text_len(&m["content"]);
-        }
-    }
-    chars += anthropic_text_len(&body["system"]);
-    if let Some(tools) = body["tools"].as_array() {
-        chars += serde_json::to_string(tools).unwrap_or_default().len();
-    }
-    (chars as u64).saturating_add(4) / 4
+    llmux_core::usage_estimate::estimate_anthropic_tokens(body)
 }
 
 #[cfg(test)]
@@ -721,9 +726,128 @@ mod tests {
     }
 }
 
+/// 非流式响应：把 usage 里的 prompt 侧数字换成本地估算，`output_tokens` 保留上游值。
+/// Anthropic 语义里 `input + cache_read + cache_creation` 才是整条 prompt 的大小，
+/// 所以缓存拆分一并归零 —— 上游那份拆分本身是假的，留着只会继续把总量抬上去。
+pub(crate) fn apply_estimated_usage(data: &mut Value, prompt_tokens: i64) {
+    let Some(usage) = data.get("usage").filter(|u| u.is_object()) else { return };
+    if usage.get("input_tokens").is_none() && usage.get("cache_read_input_tokens").is_none() {
+        return; // 不是 Anthropic 形状的 usage，不动
+    }
+    let output_tokens = usage.get("output_tokens").and_then(Value::as_i64).unwrap_or(0);
+    data["usage"] = serde_json::json!({
+        "input_tokens": prompt_tokens,
+        "output_tokens": output_tokens,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+    });
+}
+
+/// 流式 passthrough 的 usage 改写器。
+///
+/// 只重写带 usage 的事件（`message_start` / `message_delta`），其余字节原样
+/// 送出；不完整的事件一直攒到分隔符到达，chunk 边界落在事件中间也不会发出
+/// 半截 JSON。
+struct UsageOverrideStream {
+    pending: Vec<u8>,
+    prompt_tokens: i64,
+}
+
+impl UsageOverrideStream {
+    fn new(prompt_tokens: i64) -> Self {
+        Self { pending: Vec::new(), prompt_tokens }
+    }
+
+    fn push(&mut self, chunk: &[u8]) -> Vec<u8> {
+        self.pending.extend_from_slice(chunk);
+        let mut out = Vec::new();
+        while let Some(end) = sse_event_boundary(&self.pending) {
+            let event: Vec<u8> = self.pending.drain(..end).collect();
+            out.extend_from_slice(&rewrite_usage_event(&event, self.prompt_tokens));
+        }
+        out
+    }
+
+    /// 上游结束时仍未闭合的尾巴：原样送出（不是合法 SSE 的话客户端自己会忽略，
+    /// 但我们不能替它吞掉字节）。
+    fn finish(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.pending)
+    }
+}
+
+/// 返回事件分隔符之后的下标（`\n\n` 或 `\r\n\r\n`）。
+fn sse_event_boundary(buf: &[u8]) -> Option<usize> {
+    let mut i = 0;
+    while i < buf.len() {
+        if i + 1 < buf.len() && buf[i] == b'\n' && buf[i + 1] == b'\n' {
+            return Some(i + 2);
+        }
+        if i + 4 <= buf.len() && &buf[i..i + 4] == b"\r\n\r\n" {
+            return Some(i + 4);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn rewrite_usage_event(event: &[u8], prompt_tokens: i64) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(event) else { return event.to_vec() };
+    let mut event_line: Option<String> = None;
+    let mut data: Option<(usize, String)> = None;
+    let mut data_lines = 0usize;
+    for (index, raw) in text.split('\n').enumerate() {
+        let line = raw.trim_end_matches('\r');
+        if let Some(rest) = line.strip_prefix("event:") {
+            event_line = Some(format!("event:{rest}"));
+        } else if let Some(rest) = line.strip_prefix("data:") {
+            data_lines += 1;
+            data = Some((index, rest.trim_start().to_string()));
+        }
+    }
+    // 一个事件里多条 data 行不是 Anthropic 的写法；遇到就整体放行，不猜。
+    let Some((_, payload)) = data.filter(|_| data_lines == 1) else { return event.to_vec() };
+    let Ok(mut value) = serde_json::from_str::<Value>(&payload) else { return event.to_vec() };
+
+    let kind = value["type"].as_str().unwrap_or_default();
+    let usage = match kind {
+        "message_start" => value.get_mut("message").and_then(|m| m.get_mut("usage")),
+        "message_delta" => value.get_mut("usage"),
+        _ => None,
+    };
+    let Some(usage) = usage.filter(|u| u.is_object()) else { return event.to_vec() };
+    let has_prompt_side = ["input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"]
+        .iter()
+        .any(|key| usage.get(*key).is_some());
+    if !has_prompt_side {
+        return event.to_vec(); // 只有 output_tokens 的增量事件，没什么可改
+    }
+    let output_tokens = usage.get("output_tokens").cloned().unwrap_or(Value::from(0));
+    *usage = serde_json::json!({
+        "input_tokens": prompt_tokens,
+        "output_tokens": output_tokens,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+    });
+
+    let mut rebuilt = String::new();
+    if let Some(line) = event_line {
+        rebuilt.push_str(&line);
+        rebuilt.push('\n');
+    }
+    rebuilt.push_str("data: ");
+    rebuilt.push_str(&value.to_string());
+    rebuilt.push_str("\n\n");
+    rebuilt.into_bytes()
+}
+
 /// Streaming passthrough for Anthropic responses. Bytes are forwarded as-is;
 /// usage is extracted from the buffered stream at EOF (message_start carries
 /// the cache breakdown, message_delta the output) and logged with real values.
+///
+/// `usage_override` 是「这个上游的 usage 不可信」时（见
+/// [`llmux_core::usage_estimate`]）要下发给客户端的 prompt token 数：
+/// 流里带 usage 的事件会被改写成它，其余字节原样转发。**落库日志仍用上游原值**
+/// —— 那是上游实际计费口径，改它就等于篡改账单。
 pub(crate) async fn anthropic_streaming_passthrough(
     response: reqwest::Response,
     model: &str,
@@ -732,6 +856,7 @@ pub(crate) async fn anthropic_streaming_passthrough(
     provider_id: &str,
     start: Instant,
     request_body: Option<String>,
+    usage_override: Option<i64>,
 ) -> Response {
     let model = model.to_string();
     let account = account.clone();
@@ -754,6 +879,7 @@ pub(crate) async fn anthropic_streaming_passthrough(
         let mut received = crate::routes::v1::helpers::StreamCapture::new(131072);
         let mut sse = response.bytes_stream();
         let mut ttft_ms: Option<i64> = None;
+        let mut rewriter = usage_override.map(UsageOverrideStream::new);
         while let Some(chunk) = sse.next().await {
             let chunk = match chunk {
                 Ok(c) => c,
@@ -763,12 +889,25 @@ pub(crate) async fn anthropic_streaming_passthrough(
                 }
             };
             received.push(&chunk);
-            let sent = tx.send(Ok(chunk)).await.is_ok();
+            let outbound: Bytes = match rewriter.as_mut() {
+                Some(rw) => Bytes::from(rw.push(&chunk)),
+                None => chunk,
+            };
+            if outbound.is_empty() {
+                continue; // 事件还没收完，等下一个 chunk 再发
+            }
+            let sent = tx.send(Ok(outbound)).await.is_ok();
             if sent && ttft_ms.is_none() {
                 ttft_ms = Some(start.elapsed().as_millis() as i64);
             }
             if !sent {
                 return; // client gone
+            }
+        }
+        if let Some(rw) = rewriter.as_mut() {
+            let tail = rw.finish();
+            if !tail.is_empty() {
+                let _ = tx.send(Ok(Bytes::from(tail))).await;
             }
         }
 

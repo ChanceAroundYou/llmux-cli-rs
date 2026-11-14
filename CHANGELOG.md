@@ -7,6 +7,33 @@
 
 ### Added
 
+- **`usage_estimate_accounts`：上游 usage 虚报时，下发客户端的 prompt token 改用本地估算。**
+  现场（2026-11-14 直连 `192.168.10.106:3000` 实测，完全绕开 llmux）：同一条 `say hi`
+  先报 10,940、几分钟后报 43,552；20,000 字符报 59,872；100,000 字符报 385,481
+  （真实约 25k）。这些数字是上游自己 harness 的上下文，与转发出去的请求无关 —— 它对
+  `/v1/messages/count_tokens` 却能给出正确值（20000 → 5001），所以问题只在响应体 usage。
+  按它计量的客户端会立刻失准：Claude Code 的 auto-compact 阈值取
+  `input + cache_read + cache_creation`，200k 窗口上刚压缩完就「又满了」，
+  于是反复压缩到 thrashing（pc 节点活跃会话实测）。
+  同一条会话在 llmux 侧 6 秒内的两条记录即为铁证（`usage_logs`，account 64）：
+  `in=59481 read=65050 create=0` → 124,531，紧接着
+  `in=43277 read=62951 create=252932` → 359,160 —— 真实 prompt 前后不可能相差 23 万。
+  实现：`llmux_core::usage_estimate` 做 JSON 级 CJK 感知估算（ASCII 4 字符/token、
+  非 ASCII 1 字符/token —— 早先一律 `len/4` 对中文低估约 3 倍，低估比高估危险）；
+  图片/文档按 1600 token 上限计、历史 `thinking` 块与 `tool_result` 嵌套正文一并计入
+  （只读 `text` 字段会把截图和工具输出算成 0）；
+  `messages` 的流式与非流式、以及统一分发器的 Passthrough 命中点都会把
+  `input_tokens` 换成估算值、缓存拆分归零、`output_tokens` 保留上游值。
+  **落库（`usage_logs`）仍是上游原值** —— 账单和对账不能被估算污染。
+  账户清单存在 `settings` 表，不是 schema 变更；`PUT /api/settings` 在同一请求里刷新
+  内存快照（新登记立刻生效，不用重启）。默认空 = 原样透传，对没登记的账户零行为变化。
+  流式改写按 SSE 事件边界缓冲，事件被 chunk 切开也不会吐半截 JSON。
+  契约测试 `crates/llmux-server/tests/usage_estimate_contract.rs`（对照组 + 非流式 +
+  流式逐项钉住，两条变异验证会红）；设置解析的单测在 `app.rs`。
+  **已知边界**：只覆盖 Messages→Messages 的 Passthrough（以及统一分发器的命中点）。
+  若把虚报账户改成 chat/responses 目标、走回 `*FromChat` 转换，换算出的 usage 仍是上游
+  原值 —— 那种账户要另加改写点，别以为登记了就全覆盖。
+
 - **聚合候选的纯逻辑有了 core 层契约测试**（新文件
   `crates/llmux-core/tests/aggregate_candidate_contract.rs`，13 条）。此前这些判据只被
   server 层的 HTTP 契约测试**间接**覆盖，间接覆盖挡不住两类回归：库里**已有的**旧
