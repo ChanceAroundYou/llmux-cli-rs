@@ -225,6 +225,38 @@ pub async fn get_available_models(
     Json(json!({ "data": data, "stale": false, "cached_at": now })).into_response()
 }
 
+/// 把 `model_aliases` 里的别名当作「上游模型」补进列表（账户缓存里没有的模型，
+/// 比如别名手工指向了一个上游 `/models` 不广告的 id）。
+///
+/// **只补真的绑定了上游的别名**：`provider_id` 或 `account_ids` 至少有一个非空。
+/// 两者都空的是**纯重定向**（`target_model` 存的是另一个别名的名字，见
+/// `llmux_core::dispatcher::redirect_target`）—— 它不对应任何上游模型，它指向的
+/// 那个模型在别处已经列出来了。此前的判据只看 `provider_id`，于是重定向别名被
+/// 归进 `owned_by="custom"`，在模型管理页凭空造出一个「custom 账户」，里面挂着
+/// 与真实账户**同名重复**的模型（生产实测：`gpt-6-sol → gpt6sol`、
+/// `gpt-6-luna → os`）。
+///
+/// 不能改成「`provider_id` 为空就跳过」：`provider_id` 为空但 `account_ids` 非空
+/// 是**合法绑定**（UI 里勾选账户保存就是这个形状）。
+pub(super) async fn alias_model_rows(pool: &sqlx::SqlitePool) -> Vec<(String, String)> {
+    sqlx::query(
+        "SELECT DISTINCT target_model, provider_id FROM model_aliases \
+         WHERE target_model IS NOT NULL AND target_model != '' \
+           AND (COALESCE(provider_id, '') != '' OR COALESCE(account_ids, '') NOT IN ('', '[]'))",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .map(|r| {
+        (
+            r.try_get::<String, _>("target_model").unwrap_or_default(),
+            r.try_get::<String, _>("provider_id").unwrap_or_default(),
+        )
+    })
+    .collect()
+}
+
 async fn load_persistent_snapshot(pool: &sqlx::SqlitePool) -> Option<(Vec<Value>, Vec<Value>, i64, bool)> {
     let rows = sqlx::query("SELECT c.account_id, c.alias, c.models_json, c.error, c.updated_at FROM account_model_cache c JOIN accounts a ON a.id = c.account_id AND a.is_active = 1 ORDER BY c.updated_at DESC")
         .fetch_all(pool).await.ok()?;
@@ -247,9 +279,8 @@ async fn load_persistent_snapshot(pool: &sqlx::SqlitePool) -> Option<(Vec<Value>
         per_account.push(json!({"account_id": account_id, "alias": alias, "updated_at": updated_at, "error": err, "count": models.len()}));
     }
     // merge alias custom models
-    let alias_rows = sqlx::query("SELECT DISTINCT target_model, provider_id FROM model_aliases WHERE target_model IS NOT NULL AND target_model != ''")
-        .fetch_all(pool).await.unwrap_or_default();
-    for r in alias_rows { let model_id: String = r.try_get("target_model").unwrap_or_default(); let provider: String = r.try_get("provider_id").unwrap_or_default(); if model_id.is_empty() { continue; } let owned_by = if provider.is_empty() { "custom".to_string() } else { provider.clone() }; let key = format!("{}:{}", owned_by, model_id); if seen.insert(key) { all.push(json!({"id": model_id, "object": "model", "created": 0, "owned_by": owned_by})); } }
+    let alias_rows = alias_model_rows(pool).await;
+    for (model_id, provider) in alias_rows { if model_id.is_empty() { continue; } let owned_by = if provider.is_empty() { "custom".to_string() } else { provider.clone() }; let key = format!("{}:{}", owned_by, model_id); if seen.insert(key) { all.push(json!({"id": model_id, "object": "model", "created": 0, "owned_by": owned_by})); } }
     const TTL: i64 = 24*60*60;
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
     let stale = per_account.iter().any(|p| now - p.get("updated_at").and_then(Value::as_i64).unwrap_or(0) >= TTL);
@@ -345,19 +376,11 @@ async fn do_fetch_models(state: &AppState) -> Vec<Value> {
     }
 
     // Merge custom models from aliases
-    let alias_model_rows = sqlx::query(
-        "SELECT DISTINCT target_model, provider_id FROM model_aliases \
-         WHERE target_model IS NOT NULL AND target_model != ''",
-    )
-    .fetch_all(&state.pool)
-    .await
-    .unwrap_or_default();
+    let alias_model_rows = alias_model_rows(&state.pool).await;
 
     let alias_model_count = alias_model_rows.len();
 
-    for row in alias_model_rows {
-        let model_id: String = row.try_get("target_model").unwrap_or_default();
-        let provider: String = row.try_get("provider_id").unwrap_or_default();
+    for (model_id, provider) in alias_model_rows {
         if model_id.is_empty() {
             continue;
         }

@@ -174,11 +174,10 @@ async fn load_snapshot(pool: &sqlx::SqlitePool) -> (Vec<Value>, Vec<Value>) {
         per_account.push(json!({"account_id": account_id, "alias": alias, "updated_at": updated_at, "error": err, "count": models.len()}));
     }
     // merge custom alias models (not tied to a cache row)
-    let alias_rows = sqlx::query("SELECT DISTINCT target_model, provider_id FROM model_aliases WHERE target_model IS NOT NULL AND target_model != ''")
-        .fetch_all(pool).await.unwrap_or_default();
-    for r in alias_rows {
-        let model_id: String = r.try_get("target_model").unwrap_or_default();
-        let provider: String = r.try_get("provider_id").unwrap_or_default();
+    // 只补真的绑定了上游的别名 —— 纯重定向别名（provider_id 与 account_ids 都空）
+    // 不对应任何上游模型，补进来只会造出 owned_by=custom 的幽灵卡片。判据见
+    // `available::alias_model_rows`。
+    for (model_id, provider) in super::available::alias_model_rows(pool).await {
         if model_id.is_empty() { continue; }
         let owned_by = if provider.is_empty() { "custom".to_string() } else { provider.clone() };
         let key = format!("{}:{}", owned_by, model_id);
