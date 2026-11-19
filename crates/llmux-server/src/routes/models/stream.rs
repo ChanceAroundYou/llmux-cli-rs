@@ -53,22 +53,24 @@ pub async fn stream_available_models(
         }).collect();
 
         if !force {
-            // only refresh stale/missing entries (TTL 24h)
-            const TTL: i64 = 24 * 60 * 60;
+            // only refresh stale/missing entries (TTL 24h; 失败的行按 5 分钟短退避)
             let now = now_secs();
-            // build map of cached updated_at
-            let cached_map: std::collections::HashMap<i64, i64> = {
-                let rows = sqlx::query("SELECT account_id, updated_at FROM account_model_cache")
+            // build map of cached updated_at + error
+            let cached_map: std::collections::HashMap<i64, (i64, Option<String>)> = {
+                let rows = sqlx::query("SELECT account_id, updated_at, error FROM account_model_cache")
                     .fetch_all(&state_task.pool).await.unwrap_or_default();
                 rows.into_iter().map(|r| {
                     let id: i64 = r.try_get("account_id").unwrap_or(0);
                     let ts: i64 = r.try_get("updated_at").unwrap_or(0);
-                    (id, ts)
+                    let err: Option<String> = r.try_get("error").unwrap_or(None);
+                    (id, (ts, err))
                 }).collect()
             };
             targets.retain(|a| {
-                let ts = cached_map.get(&(a.id as i64)).copied().unwrap_or(0);
-                now - ts >= TTL
+                let (ts, err) = cached_map.get(&(a.id as i64)).cloned().unwrap_or((0, None));
+                // 失败也写了 updated_at=now，只看时间戳会把「刚失败」当成「刚成功」，
+                // 于是账户被自己的占位卡锁住 24 小时。判据收在 `cache_needs_refresh`。
+                super::available::cache_needs_refresh(ts, err.as_deref(), now)
             });
             if targets.is_empty() {
                 let _ = tx.send(Ok(format!("event: done\ndata: {}\n\n", json!({"total": 0, "skipped": true})))).await;
@@ -93,7 +95,7 @@ pub async fn stream_available_models(
                 let payload_models: Vec<Value>;
                 if models.is_empty() {
                     let mut ph = json!({
-                        "id": format!("{}-models-unavailable", account.alias),
+                        "id": super::available::placeholder_id(&account.alias),
                         "name": account.alias,
                         "object": "model",
                         "created": 0,
@@ -190,10 +192,14 @@ async fn load_snapshot(pool: &sqlx::SqlitePool) -> (Vec<Value>, Vec<Value>) {
 
 fn is_stale(per_account: &[Value]) -> bool {
     if per_account.is_empty() { return true; }
-    const TTL: i64 = 24*60*60;
     let now = now_secs();
+    // 与刷新判据同一口径：失败的行按短退避算「陈旧」，否则一次网络抖动会让面板
+    // 顶着 24 小时的旧占位卡还自称「新鲜」。
     per_account.iter().any(|p| {
-        let ts = p.get("updated_at").and_then(Value::as_i64).unwrap_or(0);
-        now - ts >= TTL
+        super::available::cache_needs_refresh(
+            p.get("updated_at").and_then(Value::as_i64).unwrap_or(0),
+            p.get("error").and_then(Value::as_str),
+            now,
+        )
     })
 }

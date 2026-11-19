@@ -134,7 +134,6 @@ pub async fn get_available_models(
     Extension(state): Extension<AppState>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response {
-    const CACHE_TTL: i64 = 24 * 60 * 60;
     let force = params.get("force").map(|v| v == "true").unwrap_or(false);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -175,7 +174,7 @@ pub async fn get_available_models(
             None => (None, false),
             Some(entry) => {
                 let age = now - entry.created_at;
-                let stale = age >= CACHE_TTL;
+                let stale = age >= MODELS_TTL_SECS;
                 let do_refresh = stale && !entry.refreshing;
                 if do_refresh {
                     entry.refreshing = true;
@@ -223,6 +222,36 @@ pub async fn get_available_models(
         });
     }
     Json(json!({ "data": data, "stale": false, "cached_at": now })).into_response()
+}
+
+/// 抓取**成功**的模型缓存多久算「新鲜」。
+const MODELS_TTL_SECS: i64 = 24 * 60 * 60;
+
+/// 抓取**失败**的短退避。
+///
+/// 失败结果不能按成功 TTL 冻 24 小时：`account_model_cache.updated_at` 在失败时
+/// 同样被写成当前时间，于是「刚试过、失败了」和「刚抓成功」在时间戳上长得一模一样。
+/// 生产实测（2026-11-19）：Copilot 账户因容器到 LAN 的回程路由坏掉而失败一次，
+/// 面板就把它的占位卡锁 24 小时，只能靠手动刷新（`force=true`）才重试。
+/// 网络抖动、上游短暂 5xx、令牌刚换新，都属于「过一会儿就能自愈」的失败。
+const MODELS_FAILED_RETRY_SECS: i64 = 5 * 60;
+
+/// 一条缓存行是否需要重新抓取。`error` 非空 = 上次抓失败了，按短退避重试。
+pub(super) fn cache_needs_refresh(updated_at: i64, error: Option<&str>, now: i64) -> bool {
+    let age = now - updated_at;
+    if error.is_some() {
+        age >= MODELS_FAILED_RETRY_SECS
+    } else {
+        age >= MODELS_TTL_SECS
+    }
+}
+
+/// 抓取失败（或上游确实回了空清单）时列表里那张占位卡的 id。
+///
+/// 创建处（SSE 的 `account` 事件、`do_fetch_models`）与识别处（`persist_snapshot`
+/// 把错误串写回 `error` 列）必须是同一个字符串，所以只留这一处。
+pub(super) fn placeholder_id(alias: &str) -> String {
+    format!("{alias}-models-unavailable")
 }
 
 /// 把 `model_aliases` 里的别名当作「上游模型」补进列表（账户缓存里没有的模型，
@@ -281,9 +310,15 @@ async fn load_persistent_snapshot(pool: &sqlx::SqlitePool) -> Option<(Vec<Value>
     // merge alias custom models
     let alias_rows = alias_model_rows(pool).await;
     for (model_id, provider) in alias_rows { if model_id.is_empty() { continue; } let owned_by = if provider.is_empty() { "custom".to_string() } else { provider.clone() }; let key = format!("{}:{}", owned_by, model_id); if seen.insert(key) { all.push(json!({"id": model_id, "object": "model", "created": 0, "owned_by": owned_by})); } }
-    const TTL: i64 = 24*60*60;
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
-    let stale = per_account.iter().any(|p| now - p.get("updated_at").and_then(Value::as_i64).unwrap_or(0) >= TTL);
+    // 失败的行按短退避判定，别让一次网络抖动把账户冻 24 小时。判据见 `cache_needs_refresh`。
+    let stale = per_account.iter().any(|p| {
+        cache_needs_refresh(
+            p.get("updated_at").and_then(Value::as_i64).unwrap_or(0),
+            p.get("error").and_then(Value::as_str),
+            now,
+        )
+    });
     Some((all, per_account, max_ts, stale))
 }
 
@@ -301,9 +336,21 @@ async fn persist_snapshot(pool: &sqlx::SqlitePool, all_models: &[Value]) {
         // 禁用的模型也写进缓存（前端要显示灰卡），但打上 disabled 标记
         let mut models = models.clone();
         mark_disabled(&mut models, aid, pool).await;
+        // 这次抓取是不是失败，只能从占位卡上看：`do_fetch_models` 把失败折进
+        // `<alias>-models-unavailable` 这一条里（带 `error` 字段），没有别的出口。
+        // 必须写回 `error` 列 —— 否则失败会被持久化成「刚刚成功」，刷新判据就按
+        // 24h TTL 把它锁住（见 `cache_needs_refresh`）。
+        let placeholder = placeholder_id(&alias);
+        let fetch_error: Option<String> = models.iter().find_map(|m| {
+            if m.get("id").and_then(Value::as_str) == Some(placeholder.as_str()) {
+                m.get("error").and_then(Value::as_str).map(str::to_string)
+            } else {
+                None
+            }
+        });
         let j = serde_json::to_string(&models).unwrap_or_else(|_| "[]".into());
-        let _ = sqlx::query("INSERT OR REPLACE INTO account_model_cache (account_id, alias, models_json, error, updated_at) VALUES (?, ?, ?, NULL, ?)")
-            .bind(aid).bind(&alias).bind(&j).bind(now).execute(pool).await;
+        let _ = sqlx::query("INSERT OR REPLACE INTO account_model_cache (account_id, alias, models_json, error, updated_at) VALUES (?, ?, ?, ?, ?)")
+            .bind(aid).bind(&alias).bind(&j).bind(&fetch_error).bind(now).execute(pool).await;
     }
 }
 
@@ -350,7 +397,7 @@ async fn do_fetch_models(state: &AppState) -> Vec<Value> {
             let key = format!("{}:__unavailable__", alias);
             if seen_keys.insert(key) {
                 let mut placeholder = json!({
-                    "id": format!("{}-models-unavailable", alias),
+                    "id": placeholder_id(&alias),
                     "name": alias,
                     "object": "model",
                     "created": 0,

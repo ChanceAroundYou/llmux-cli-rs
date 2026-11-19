@@ -458,6 +458,23 @@ ChatGPT Plus 的 Codex 额度直连 `chatgpt.com/backend-api/codex`，llmux 原�
 每个别名绑定一个上游账户（Copilot、DeepSeek、sense、agnes 等），请求按别名路由到对应 API。
 context_length 字段：先查 models_cache（上游提供）→ 再查内置表（`crates/llmux-core/src/context.rs`）。
 
+### 模型清单缓存的刷新判据（2026-11-19）
+
+`account_model_cache` 一行 = 一台账户的模型清单（`models_json` + `error` + `updated_at`）。
+两套 TTL：**成功 24h、失败 5 分钟短退避**，判据统一在 `available::cache_needs_refresh`
+（`error` 非空走后者）。三处消费必须同一口径：SSE 的 targets 过滤、SSE 的 `per_account.stale`、
+持久快照的 `stale`。
+
+⚠️ **失败也会写 `updated_at = now`** —— 只看时间戳，「刚失败」和「刚成功」长得一模一样，
+于是一次网络抖动就把账户锁 24 小时，只能靠手动刷新（`force=true`）恢复。生产实例：
+2026-11-19 Copilot 账户因容器到 LAN 的回程路由坏掉失败一次，面板占位卡冻了整 24h。
+⚠️ **`force` 路径必须把错误串写回 `error` 列**：`do_fetch_models` 把失败折进
+`<alias>-models-unavailable` 占位卡（带 `error` 字段），占位卡 id 由
+`available::placeholder_id` 单点定义，`persist_snapshot` 从它反推。不写回 =
+失败被持久化成「刚刚成功」，短退避永远不触发。
+回归测试 `crates/llmux-server/tests/model_refresh_retry_contract.rs`（4 条：1 小时前的失败
+要重抓、30 秒前的失败不重抓、1 小时前的成功不重抓、force 失败要落 `error`）。
+
 ## 别名互相引用（2026-11-07 加，2026-11-09 允许聚合↔聚合、普通别名→聚合）
 
 两条独立的引用能力，都是**保存时展开**、运行时不需要递归：
