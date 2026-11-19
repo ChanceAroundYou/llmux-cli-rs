@@ -223,6 +223,13 @@ BASE_PATH=llmux ./deploy/deploy.sh -y           # 带基路径前缀（build 时
   - **日志不在容器里**，走 fnos NAS（`LOG_DIR=/data/llmux-logs`，6.4T 大盘，**不占路由器的 3.9G overlay**）。
   - **本机读取路径**：`~/HD/openwrt/log-archive/llmux/`（fnos 挂载点，`~/HD` = fnos 共享）。容器内 `/data/llmux-logs` 是**空的**（只有挂载点，日志直写 NAS），别去容器里找。同目录还有 `request-captures/next.json`（一次性捕获开关，见上）。
   - 文件很大（**单个小时** 90–930 MB，2026-11-07 读到），**别直接 `cat`**；用 `grep`/`rg`（明文）或 `zgrep`（已压缩）定位。
+- **容器 → LAN 主机必须 SNAT**（2026-11-19 加）：Docker daemon 是 `"iptables": false`，不会自动给容器出流量做 MASQUERADE。容器访问 LAN 网段（如 `home.xiaokubao.space` = `192.168.1.6`）时源地址仍是 `172.18.0.x`，而**对端 ubuntu 主机自己也有一张 `172.18.0.0/16` 的 docker bridge（portainer_default）**，它会把「回 `172.18.0.2`」的包路由进本地网桥而不是 `eth0` → SYN-ACK 回不来 → 连接超时。
+  症状是账户模型拉不出来（Copilot 账户报 `Network error: error sending request for url (https://home.xiaokubao.space/copilot-api/v1/models)`），但**只有 LAN 目标受影响**，走 OpenClash TUN 的出口不受影响。
+  规则在路由器 `/etc/firewall.user` 末尾（`docker-to-lan-masq`，`-s 172.18.0.0/16 -d 192.168.1.0/24 -o br-lan -j MASQUERADE`），备份 `/root/firewall.user.bak-20261119`。
+  判据（两条，缺一不可）：
+  `ssh router 'iptables -t nat -S POSTROUTING | grep docker-to-lan-masq'`（规则在）
+  + `ssh router 'docker run --rm --network llmux_default curlimages/curl:latest -sS -m 12 -o /dev/null -w "%{http_code}\n" https://home.xiaokubao.space/copilot-api/v1/models'`（应出 `200`，无规则时是 12s 超时 + `000`）。
+  ⚠️ 路由器没有 `nsenter` / `timeout`；容器是 `debian:trixie-slim`，里面**没有** `curl`/`wget`/`nc`/`bash`，所以探针要在另一个容器里跑，别指望 `docker exec llmux sh -c 'echo > /dev/tcp/...'`。
 - 数据铁律：**绝不 `docker run -v /opt/llmux/data`**（2026-08-06 误用初始化空库）
 - binary 是 glibc 动态链接（在 Proxmox VM / Ubuntu 26.04 构建，**不是 WSL**；最高符号 `GLIBC_2.39`），**不能跑 Alpine/musl**
 - 容器实测内存 **~386MiB**（路由器 2GB）。⚠️ 早先记的「~18MiB」已过时——那是
@@ -510,6 +517,16 @@ context_length 字段：先查 models_cache（上游提供）→ 再查内置表
   `crates/llmux-server/tests/aggregate_alias_candidate_contract.rs`、
   `crates/llmux-server/tests/e2e_protocol_split.rs`（`e2e_ordinary_alias_pointing_at_an_aggregate_alias_all_ingresses`）。
   条数取法：`cargo test --test aggregate_alias_candidate_contract 2>&1 | grep '^test result'`。
+- **模型列表只补「真的绑定了上游」的别名**（2026-11-19 加）：判据是
+  `provider_id` 非空 **或** `account_ids` 非空，即 `available::alias_model_rows`。
+  纯重定向别名（两者都空）不对应任何上游模型 —— 它指向的模型在别处已经列出；把
+  它当成 `owned_by="custom"` 补进去，会在模型管理页凭空造出一个「custom 账户」，
+  里面是与真实账户**同名重复**的模型（生产上是 `gpt-6-sol → gpt6sol`、
+  `gpt-6-luna → os`）。三处合并点（persistent snapshot / `do_fetch_models` /
+  SSE `load_snapshot`）共用同一判据，别各写一份 SQL。
+  ⚠️ 别退化成「`provider_id` 为空就跳过」：`provider_id` 空但 `account_ids` 非空是
+  **合法绑定**（UI 里勾选账户保存就是这个形状），滤掉会让真实模型从列表里消失。
+  回归测试 `crates/llmux-server/tests/model_list_redirect_alias_contract.rs`。
 
 ## 别名同名冲突（2026-11-07 改）
 
