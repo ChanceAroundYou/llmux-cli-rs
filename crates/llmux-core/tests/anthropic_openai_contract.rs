@@ -1084,9 +1084,13 @@ fn sse_complete_tool_call_is_unaffected() {
     let text: Vec<&str> = all.iter().map(|s| s.as_str()).collect();
     let start = text.iter().find(|s| s.contains("\"type\":\"tool_use\"")).expect("must open immediately");
     assert!(start.contains("call_1") && start.contains("Bash"), "bad start: {start}");
+    // A tool-only turn has no thinking/text block before it, so the tool block
+    // is index 0 — not 1. Indices must be dense from zero: `@anthropic-ai/sdk`
+    // accumulates `content.push(...)` per `content_block_start`, and the
+    // servers that skip 0 leave clients unable to place the block.
     assert!(
-        text.iter().any(|s| s.contains("content_block_stop") && s.contains("\"index\":1")),
-        "opened tool block must be closed: {text:?}"
+        text.iter().any(|s| s.contains("content_block_stop") && s.contains("\"index\":0")),
+        "opened tool block must be closed at index 0: {text:?}"
     );
 }
 
