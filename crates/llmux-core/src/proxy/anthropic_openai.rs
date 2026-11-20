@@ -8,7 +8,7 @@
 //! `image` url sources.
 
 use serde_json::{json, Map, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
 // Request conversion: Anthropic Messages → OpenAI Chat Completions
@@ -425,6 +425,50 @@ pub fn map_tool_choice_to_openai(choice: &Value) -> Value {
 // Response conversion: OpenAI Chat Completions → Anthropic Messages
 // ---------------------------------------------------------------------------
 
+/// 从 chat 的 message / delta 里取推理文本。三种落法（2026-11-20 实测）：
+///
+/// - `reasoning_content`：DeepSeek 系与多数 OpenAI 兼容上游；
+/// - `reasoning_details`：OpenRouter 形状，条目按 `type` 分
+///   `reasoning.text`（`text`）/ `reasoning.summary`（`summary`）；
+/// - `reasoning`：OpenRouter 的纯字符串版本。
+///
+/// 优先级按上面顺序，且**只取第一个非空的**：`hy4-flash-free` 的每个 chunk
+/// 同时带 `reasoning` 与 `reasoning_details`（同一段文本的两份表示），照单全收
+/// 会把每个思考片段重复发两遍。`null`（结束 chunk 上确实出现过 `"reasoning":null`）
+/// 一律当「没有」。
+///
+/// 这个函数是唯一判据 —— 漏掉一种落法不是「少显示一段思考」：只在 reasoning 里
+/// 出 token 的流会被 `produced_output()` 判成空响应，整笔记成失败。
+fn reasoning_text(obj: &Value) -> Option<String> {
+    if let Some(rc) = obj.get("reasoning_content").and_then(Value::as_str) {
+        if !rc.is_empty() {
+            return Some(rc.to_string());
+        }
+    }
+    if let Some(details) = obj.get("reasoning_details").and_then(Value::as_array) {
+        let mut text = String::new();
+        for item in details {
+            let piece = match item.get("type").and_then(Value::as_str) {
+                Some("reasoning.summary") => item.get("summary").and_then(Value::as_str),
+                // `reasoning.text` and any future text-bearing type.
+                _ => item.get("text").and_then(Value::as_str),
+            };
+            if let Some(piece) = piece {
+                text.push_str(piece);
+            }
+        }
+        if !text.is_empty() {
+            return Some(text);
+        }
+    }
+    if let Some(r) = obj.get("reasoning").and_then(Value::as_str) {
+        if !r.is_empty() {
+            return Some(r.to_string());
+        }
+    }
+    None
+}
+
 /// Convert a non-streaming OpenAI Chat Completions response to an Anthropic
 /// Messages response. `resolved_model` is echoed back as the response model.
 pub fn openai_to_anthropic_response(openai_body: &Value, resolved_model: &str) -> Value {
@@ -433,14 +477,12 @@ pub fn openai_to_anthropic_response(openai_body: &Value, resolved_model: &str) -
 
     let mut content: Vec<Value> = Vec::new();
 
-    if let Some(rc) = message.get("reasoning_content").and_then(Value::as_str) {
-        if !rc.is_empty() {
-            let mut block = json!({ "type": "thinking", "thinking": rc });
-            if let Some(sig) = message.get("reasoning_signature").and_then(Value::as_str) {
-                block["signature"] = json!(sig);
-            }
-            content.push(block);
+    if let Some(rc) = reasoning_text(message) {
+        let mut block = json!({ "type": "thinking", "thinking": rc });
+        if let Some(sig) = message.get("reasoning_signature").and_then(Value::as_str) {
+            block["signature"] = json!(sig);
         }
+        content.push(block);
     }
 
     match message.get("content") {
@@ -657,13 +699,24 @@ fn resolve_pending(p: &PendingTool) -> Resolution {
 /// Stateful converter from OpenAI stream chunks to Anthropic SSE events.
 /// `feed` returns Anthropic event strings (`event: <type>\ndata: <json>\n\n`)
 /// to emit for each OpenAI chunk; `finish` closes open blocks and terminates
-/// with `message_stop`. Block indexing follows the Bun reference: thinking=0,
-/// text=1 (when thinking present, else 0), tools start after text.
+/// with `message_stop`.
+///
+/// Block indices are **allocated in the order blocks actually open**, never
+/// computed from what is expected to precede them. Anthropic's SDK accumulates
+/// a stream with `content.push(block)` plus `content[event.index] = …`, so a
+/// gap in the numbering is not cosmetic: a tool-only turn (no thinking, no
+/// text) used to start at index 1, and `@anthropic-ai/sdk` died with
+/// `Cannot read properties of undefined (reading 'push')` (2026-11-20, hy4
+/// via zen go). A turn is free to open thinking-only, text-only, tool-only,
+/// or any combination — the counter makes every sequence dense from 0.
 pub struct OpenAISseConverter {
     message_started: bool,
-    thinking_started: bool,
-    text_block_started: bool,
-    tool_indices: HashSet<usize>,
+    /// Block index of the open thinking/text block, `None` until it opens.
+    thinking_index: Option<usize>,
+    text_index: Option<usize>,
+    /// OpenAI tool index → Anthropic block index, for opened calls only.
+    tool_indices: HashMap<usize, usize>,
+    next_block_index: usize,
     message_id: String,
     model: String,
     pending_stop_reason: Option<String>,
@@ -681,7 +734,7 @@ pub struct OpenAISseConverter {
     /// forever (the arguments arriving say nothing about whether the identity
     /// will).
     pending_tools: HashMap<usize, PendingTool>,
-    /// tool indices that were opened and are awaiting `content_block_stop`.
+    /// Block indices that were opened and are awaiting `content_block_stop`.
     live_tools: Vec<usize>,
     finished: bool,
 }
@@ -691,9 +744,10 @@ impl OpenAISseConverter {
         let message_id = format!("msg_{}", uuid_simple());
         Self {
             message_started: false,
-            thinking_started: false,
-            text_block_started: false,
-            tool_indices: HashSet::new(),
+            thinking_index: None,
+            text_index: None,
+            tool_indices: HashMap::new(),
+            next_block_index: 0,
             message_id,
             model: model.to_string(),
             pending_stop_reason: None,
@@ -703,6 +757,13 @@ impl OpenAISseConverter {
             live_tools: Vec::new(),
             finished: false,
         }
+    }
+
+    /// Reserve the next content block index. Indices must be dense from 0.
+    fn alloc_block(&mut self) -> usize {
+        let index = self.next_block_index;
+        self.next_block_index += 1;
+        index
     }
 
     /// Feed one OpenAI SSE `data:` payload (parsed JSON). Returns the Anthropic
@@ -741,6 +802,16 @@ impl OpenAISseConverter {
                         "type": "message",
                         "role": "assistant",
                         "model": self.model,
+                        // `content` must be present and empty. The official SDK
+                        // seeds its accumulator with this very object and then
+                        // does `snapshot.content.push(...)` on every
+                        // `content_block_start`; omitting the key crashed every
+                        // stream with `Cannot read properties of undefined
+                        // (reading 'push')` (2026-11-20, @anthropic-ai/sdk
+                        // 1.11.0 against /v1/messages on chat-backed aliases).
+                        "content": [],
+                        "stop_reason": null,
+                        "stop_sequence": null,
                         "usage": { "input_tokens": 0, "output_tokens": 0 },
                     }
                 }),
@@ -763,72 +834,87 @@ impl OpenAISseConverter {
         };
 
         if let Some(delta) = choice.get("delta") {
-            // Reasoning (thinking) content.
-            if let Some(rc) = delta.get("reasoning_content").and_then(Value::as_str) {
-                if !rc.is_empty() {
-                    if !self.thinking_started {
-                        self.thinking_started = true;
+            // Reasoning (thinking) content. 三种落法见 `reasoning_text`。
+            if let Some(rc) = reasoning_text(delta) {
+                let index = match self.thinking_index {
+                    Some(index) => index,
+                    None => {
+                        let index = self.alloc_block();
+                        self.thinking_index = Some(index);
                         events.push(sse_event(
                             "content_block_start",
                             json!({
                                 "type": "content_block_start",
-                                "index": 0,
+                                "index": index,
                                 "content_block": { "type": "thinking", "thinking": "" }
                             }),
                         ));
+                        index
                     }
-                    events.push(sse_event(
-                        "content_block_delta",
-                        json!({
-                            "type": "content_block_delta",
-                            "index": 0,
-                            "delta": { "type": "thinking_delta", "thinking": rc }
-                        }),
-                    ));
-                }
+                };
+                events.push(sse_event(
+                    "content_block_delta",
+                    json!({
+                        "type": "content_block_delta",
+                        "index": index,
+                        "delta": { "type": "thinking_delta", "thinking": rc }
+                    }),
+                ));
             }
             if let Some(sig) = delta.get("reasoning_signature").and_then(Value::as_str) {
                 if !sig.is_empty() {
-                    events.push(sse_event(
-                        "content_block_delta",
-                        json!({
-                            "type": "content_block_delta",
-                            "index": 0,
-                            "delta": { "type": "signature_delta", "signature": sig }
-                        }),
-                    ));
+                    // The signature belongs to the thinking block and that block
+                    // is closed the moment the text block opens. With dense
+                    // indices a stale `index` is no longer harmless — 0 may be
+                    // some other block by now — so drop it instead of guessing.
+                    match (self.thinking_index, self.text_index) {
+                        (Some(index), None) => events.push(sse_event(
+                            "content_block_delta",
+                            json!({
+                                "type": "content_block_delta",
+                                "index": index,
+                                "delta": { "type": "signature_delta", "signature": sig }
+                            }),
+                        )),
+                        _ => tracing::debug!(
+                            "converter.feed: reasoning_signature without an open thinking block; dropped"
+                        ),
+                    }
                 }
             }
 
             // Visible text.
             if let Some(text) = delta.get("content").and_then(Value::as_str) {
                 if !text.is_empty() {
-                    if !self.text_block_started {
-                        let text_index = if self.thinking_started { 1 } else { 0 };
-                        // Close the thinking block before opening text (Anthropic
-                        // requires blocks to be closed before a sibling opens).
-                        if self.thinking_started {
+                    let index = match self.text_index {
+                        Some(index) => index,
+                        None => {
+                            // Close the thinking block before opening text (Anthropic
+                            // requires blocks to be closed before a sibling opens).
+                            if let Some(thinking) = self.thinking_index {
+                                events.push(sse_event(
+                                    "content_block_stop",
+                                    json!({ "type": "content_block_stop", "index": thinking }),
+                                ));
+                            }
+                            let index = self.alloc_block();
+                            self.text_index = Some(index);
                             events.push(sse_event(
-                                "content_block_stop",
-                                json!({ "type": "content_block_stop", "index": 0 }),
+                                "content_block_start",
+                                json!({
+                                    "type": "content_block_start",
+                                    "index": index,
+                                    "content_block": { "type": "text", "text": "" }
+                                }),
                             ));
+                            index
                         }
-                        self.text_block_started = true;
-                        events.push(sse_event(
-                            "content_block_start",
-                            json!({
-                                "type": "content_block_start",
-                                "index": text_index,
-                                "content_block": { "type": "text", "text": "" }
-                            }),
-                        ));
-                    }
-                    let text_index = if self.thinking_started { 1 } else { 0 };
+                    };
                     events.push(sse_event(
                         "content_block_delta",
                         json!({
                             "type": "content_block_delta",
-                            "index": text_index,
+                            "index": index,
                             "delta": { "type": "text_delta", "text": text }
                         }),
                     ));
@@ -845,7 +931,6 @@ impl OpenAISseConverter {
                         continue;
                     };
                     let tc_index = tc_index as usize;
-                    let block_index = if self.thinking_started { 2 } else { 1 } + tc_index;
                     let id = tc.get("id").and_then(Value::as_str).unwrap_or_default();
                     let name = tc
                         .get("function")
@@ -860,7 +945,7 @@ impl OpenAISseConverter {
 
                     // Not open yet: absorb whatever identity arrived plus any
                     // arguments so far, and only open once complete.
-                    if !self.tool_indices.contains(&tc_index) {
+                    if !self.tool_indices.contains_key(&tc_index) {
                         let now = now_ms();
                         let slot = self.pending_tools.entry(tc_index).or_insert_with(|| PendingTool {
                             id: String::new(),
@@ -886,8 +971,9 @@ impl OpenAISseConverter {
                             continue;
                         }
                         self.pending_tools.remove(&tc_index);
-                        self.tool_indices.insert(tc_index);
-                        self.live_tools.push(tc_index);
+                        let block_index = self.alloc_block();
+                        self.tool_indices.insert(tc_index, block_index);
+                        self.live_tools.push(block_index);
                         events.push(sse_event(
                             "content_block_start",
                             json!({
@@ -913,7 +999,7 @@ impl OpenAISseConverter {
                             "content_block_delta",
                             json!({
                                 "type": "content_block_delta",
-                                "index": block_index,
+                                "index": self.tool_indices[&tc_index],
                                 "delta": { "type": "input_json_delta", "partial_json": args }
                             }),
                         ));
@@ -974,7 +1060,6 @@ impl OpenAISseConverter {
     /// Emit (or discard) one resolved tool_call. `trigger` only shapes the log
     /// line — the decision comes from the field asymmetry in `resolve_pending`.
     fn emit_resolved(&mut self, tc_index: usize, p: &PendingTool, trigger: &'static str) -> Vec<String> {
-        let block_index = if self.thinking_started { 2 } else { 1 } + tc_index;
         match resolve_pending(p) {
             Resolution::Drop { reason } => {
                 tracing::warn!(
@@ -1000,8 +1085,9 @@ impl OpenAISseConverter {
                         "upstream omitted tool_call id; synthesized one so the call is not lost"
                     );
                 }
-                self.tool_indices.insert(tc_index);
-                self.live_tools.push(tc_index);
+                let block_index = self.alloc_block();
+                self.tool_indices.insert(tc_index, block_index);
+                self.live_tools.push(block_index);
                 let mut events = vec![sse_event(
                     "content_block_start",
                     json!({
@@ -1046,8 +1132,8 @@ impl OpenAISseConverter {
             .clone()
             .unwrap_or_else(|| "end_turn".to_string());
         tracing::trace!(
-            text_block = self.text_block_started,
-            thinking = self.thinking_started,
+            text_block = self.text_index.is_some(),
+            thinking = self.thinking_index.is_some(),
             tools = self.tool_indices.len(),
             stop_reason,
             "converter.finish"
@@ -1070,23 +1156,21 @@ impl OpenAISseConverter {
 
         // Close blocks in order: text first (its thinking sibling was already
         // closed at open time), then tools.
-        if self.text_block_started {
-            let text_index = if self.thinking_started { 1 } else { 0 };
+        if let Some(text_index) = self.text_index {
             events.push(sse_event(
                 "content_block_stop",
                 json!({ "type": "content_block_stop", "index": text_index }),
             ));
-        } else if self.thinking_started {
+        } else if let Some(thinking_index) = self.thinking_index {
             events.push(sse_event(
                 "content_block_stop",
-                json!({ "type": "content_block_stop", "index": 0 }),
+                json!({ "type": "content_block_stop", "index": thinking_index }),
             ));
         }
 
         let mut sorted: Vec<usize> = self.live_tools.clone();
         sorted.sort_unstable();
-        for tc_index in sorted {
-            let block_index = if self.thinking_started { 2 } else { 1 } + tc_index;
+        for block_index in sorted {
             events.push(sse_event(
                 "content_block_stop",
                 json!({ "type": "content_block_stop", "index": block_index }),
@@ -1137,11 +1221,11 @@ impl OpenAISseConverter {
     /// thinking-only turn legitimately reports few or zero completion tokens,
     /// and a stream that emitted nothing at all may still bill tokens.
     ///
-    /// `text_block_started` / `thinking_started` are only set when a real
-    /// block is opened, and `tool_indices` only when a tool block is opened —
+    /// `text_index` / `thinking_index` are only set when a real block is
+    /// opened, and `tool_indices` only when a tool block is opened —
     /// all three are driven by the payload, not by any arrival heuristic.
     pub fn produced_output(&self) -> bool {
-        self.text_block_started || self.thinking_started || !self.tool_indices.is_empty()
+        self.text_index.is_some() || self.thinking_index.is_some() || !self.tool_indices.is_empty()
     }
 }
 
@@ -1407,6 +1491,146 @@ mod tests {
         assert!(conv.produced_output(), "reasoning content IS output");
     }
 
+    /// 一个纯 tool_call 的回合（没有思考、没有文本）必须从 block index **0**
+    /// 开始。旧实现按「tools 总在 text 之后」推算索引，于是这种流从 1 开始、
+    /// 0 是个洞 —— `@anthropic-ai/sdk` 按 `content[event.index]` 累积，遇到洞直接
+    /// 抛 `Cannot read properties of undefined (reading 'push')`（2026-11-20，
+    /// hy4-flash-free 强制调用 Bash 时复现）。客户端整条回复丢失。
+    #[test]
+    fn block_indices_are_dense_from_zero_when_a_turn_is_tool_only() {
+        let mut conv = OpenAISseConverter::new("m");
+        let events = conv.feed(&json!({
+            "choices": [{"index": 0, "finish_reason": "tool_calls", "delta": {
+                "content": "",
+                "tool_calls": [{
+                    "index": 0, "id": "call_1", "type": "function",
+                    "function": {"name": "Bash", "arguments": "{\"command\":\"echo hi\"}"}
+                }]
+            }}]
+        }));
+        let started = events.iter().find(|e| e.contains("content_block_start")).expect("a tool block must open");
+        assert!(started.contains("\"index\":0"), "tool-only turn must start at 0: {started}");
+        let finished = conv.finish();
+        let stops: Vec<_> = finished.iter().filter(|e| e.contains("content_block_stop")).collect();
+        assert_eq!(stops.len(), 1);
+        assert!(stops[0].contains("\"index\":0"), "must close the same block: {stops:?}");
+    }
+
+    /// 思考 + 工具调用（没有文本）时索引是 0、1 —— 不是 0、2。
+    #[test]
+    fn a_thinking_then_tool_turn_numbers_its_blocks_contiguously() {
+        let mut conv = OpenAISseConverter::new("m");
+        conv.feed(&json!({
+            "choices": [{"index": 0, "finish_reason": null, "delta": {"reasoning": "plan"}}]
+        }));
+        let events = conv.feed(&json!({
+            "choices": [{"index": 0, "finish_reason": "tool_calls", "delta": {
+                "tool_calls": [{
+                    "index": 0, "id": "call_1", "type": "function",
+                    "function": {"name": "Bash", "arguments": "{}"}
+                }]
+            }}]
+        }));
+        let started = events.iter().find(|e| e.contains("content_block_start")).expect("tool block");
+        assert!(started.contains("\"index\":1"), "tool follows thinking at 1: {started}");
+    }
+
+    /// 思考 + 文本 + 工具依次出现时是 0、1、2，且各自的 close 落在同一个索引上。
+    #[test]
+    fn thinking_text_and_tools_get_sequential_indices() {
+        let mut conv = OpenAISseConverter::new("m");
+        conv.feed(&json!({
+            "choices": [{"index": 0, "finish_reason": null, "delta": {"reasoning": "plan"}}]
+        }));
+        conv.feed(&json!({
+            "choices": [{"index": 0, "finish_reason": null, "delta": {"content": "hi"}}]
+        }));
+        let events = conv.feed(&json!({
+            "choices": [{"index": 0, "finish_reason": "tool_calls", "delta": {
+                "tool_calls": [{
+                    "index": 0, "id": "call_1", "type": "function",
+                    "function": {"name": "Bash", "arguments": "{}"}
+                }]
+            }}]
+        }));
+        let started = events.iter().find(|e| e.contains("content_block_start")).expect("tool block");
+        assert!(started.contains("\"index\":2"), "tool follows thinking+text at 2: {started}");
+    }
+
+    /// OpenRouter 形状的推理字段（生产：`hy4-flash-free` 经 zen go 直连）：
+    /// 思考文本只在 `reasoning` / `reasoning_details` 里，`content` 一直是空串。
+    /// 只认 `reasoning_content` 时这种流会被判成「空响应」→ 按失败记账，而客户端
+    /// 收到的是**没有任何 content block** 的 message_stop（2026-11-20 实测 221 条
+    /// `truncated: done=true empty=true` 全是这个形状）。
+    #[test]
+    fn reasoning_and_reasoning_details_are_thinking_output() {
+        let mut conv = OpenAISseConverter::new("m");
+        let events = conv.feed(&json!({
+            "choices": [{"index": 0, "finish_reason": null, "delta": {
+                "content": "",
+                "reasoning": "We",
+                "reasoning_details": [{"type": "reasoning.text", "text": "We", "format": "unknown", "index": 0}]
+            }}]
+        }));
+        assert!(conv.produced_output(), "reasoning IS output");
+        // `reasoning` 与 `reasoning_details` 是同一段文本的两份表示，只能发一次。
+        let deltas: Vec<_> = events
+            .iter()
+            .filter(|e| e.contains("thinking_delta"))
+            .collect();
+        assert_eq!(deltas.len(), 1, "duplicated thinking deltas: {events:?}");
+        assert!(deltas[0].contains("\"thinking\":\"We\""));
+    }
+
+    /// `reasoning_details` 里的摘要型条目也带文本；`reasoning.encrypted` 之类
+    /// 没有可显示文本的条目必须被忽略而不是拼进思考块。
+    #[test]
+    fn reasoning_details_summaries_count_and_encrypted_entries_are_skipped() {
+        let mut conv = OpenAISseConverter::new("m");
+        conv.feed(&json!({
+            "choices": [{"index": 0, "finish_reason": null, "delta": {
+                "reasoning_details": [
+                    {"type": "reasoning.summary", "summary": "sum"},
+                    {"type": "reasoning.encrypted", "data": "AAAA"}
+                ]
+            }}]
+        }));
+        assert!(conv.produced_output());
+    }
+
+    /// 结束 chunk 会带 `"reasoning": null` —— 不是文本，不能因此开一个空的思考块。
+    #[test]
+    fn a_null_reasoning_field_is_not_output() {
+        let mut conv = OpenAISseConverter::new("m");
+        let events = conv.feed(&json!({
+            "choices": [{"index": 0, "finish_reason": "length", "delta": {"content": "", "reasoning": null}}],
+            "usage": {"prompt_tokens": 26, "completion_tokens": 1}
+        }));
+        assert!(!conv.produced_output());
+        assert!(events.iter().all(|e| !e.contains("thinking_delta")));
+    }
+
+    /// 非流式响应走的是另一条代码路径（`openai_to_anthropic_response`），同一份
+    /// 上游响应必须得到同样的 thinking 块。
+    #[test]
+    fn non_stream_reasoning_becomes_a_thinking_block() {
+        let msg = openai_to_anthropic_response(
+            &json!({
+                "choices": [{"index": 0, "finish_reason": "stop", "message": {
+                    "role": "assistant",
+                    "content": "hello",
+                    "reasoning": "thinking…",
+                    "reasoning_details": [{"type": "reasoning.text", "text": "thinking…"}]
+                }}],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 7}
+            }),
+            "m",
+        );
+        assert_eq!(msg["content"][0]["type"], json!("thinking"));
+        assert_eq!(msg["content"][0]["thinking"], json!("thinking…"));
+        assert_eq!(msg["content"][1]["type"], json!("text"));
+    }
+
     /// The case `c7b57e2` existed to catch: a stream that finishes without ever
     /// emitting text, thinking or a tool call — no matter how many keep-alive
     /// frames preceded it.
@@ -1474,6 +1698,28 @@ mod tests {
         assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[0]["text"], json!("You are Claude Code."));
         assert_eq!(blocks[1]["text"], json!("main system prompt"));
+    }
+
+    /// `message_start.message` must be a complete Message object — in
+    /// particular `content` must exist (as `[]`) before any
+    /// `content_block_start`. The official SDK takes this object as its
+    /// accumulator snapshot and pushes each opened block onto `.content`; a
+    /// missing key turns the first block into
+    /// `Cannot read properties of undefined (reading 'push')` and the client
+    /// loses the whole turn (2026-11-20, SDK 1.11.0).
+    #[test]
+    fn message_start_carries_an_empty_content_array() {
+        let mut conv = OpenAISseConverter::new("m");
+        let events = conv.feed(&json!({
+            "choices": [{"index": 0, "finish_reason": null, "delta": {"content": "hi"}}]
+        }));
+        let start = events
+            .iter()
+            .find(|e| e.contains("\"type\":\"message_start\""))
+            .expect("stream must start with message_start");
+        assert!(start.contains("\"content\":[]"), "content missing: {start}");
+        assert!(start.contains("\"stop_reason\":null"), "stop_reason missing: {start}");
+        assert!(start.contains("\"stop_sequence\":null"), "stop_sequence missing: {start}");
     }
 
     /// A plain string `system` has no blocks to inspect and must pass through
