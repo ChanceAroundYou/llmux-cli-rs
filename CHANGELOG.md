@@ -170,6 +170,30 @@
 
 ### Fixed
 
+- **Messages 入口经 chat 上游的流式响应：思考字段、块索引与 `message_start` 形状**
+  （`crates/llmux-core/src/proxy/anthropic_openai.rs`，2026-11-20）。
+  现场是 `hy4-flash-free`（zen go，OpenRouter 形状）：推理文本只在 `reasoning` /
+  `reasoning_details` 里，`content` 一直是空串。旧转换只认 `reasoning_content`，
+  于是整条流**没有任何 content block** —— llmux 记成
+  `truncated: done=true empty=true overflow=false`（当天 221 条，全部 `output_tokens=1`），
+  客户端收到一个空回复。三处一起修：
+  - `reasoning_text()` 统一识别三种落法（`reasoning_content` / `reasoning_details`
+    的 `reasoning.text`、`reasoning.summary` / 纯字符串 `reasoning`），**只取第一个
+    非空的** —— hy4 的每个 chunk 同时带 `reasoning` 与 `reasoning_details`（同一段
+    文本的两份表示），照单全收会把思考重复发两遍。
+  - **块索引改为按实际打开的块顺序分配**（`alloc_block`），保证从 0 起稠密。
+    旧实现按「thinking=0、text=1、tools 从 2 起」推算：纯 tool_call 回合（无思考无
+    文本）从 **1** 开始，0 是个洞。用官方 `@anthropic-ai/sdk` 1.11.0 实测，工具回合
+    直接抛 `AnthropicError`。同类问题也影响 thinking + tool（0、2）。
+  - `message_start.message` 补上 `content: []`（以及 `stop_reason` / `stop_sequence`：
+    null）。SDK 把**这个对象本身**当累加器，`content_block_start` 时执行
+    `snapshot.content.push(...)` —— 缺这个键时**所有** chat 上游的 Messages 流都会
+    以 `Cannot read properties of undefined (reading 'push')` 失败（同日实测 `ok`、
+    `local` 全部命中，不只是 hy4）。
+  回归测试：`anthropic_openai.rs` 内 8 条（推理三种落法各一、null 不算输出、非流式
+  thinking 块、纯工具 0 起、思考+工具 0/1、思考+文本+工具 0/1/2、`message_start`
+  形状）；`anthropic_openai_contract.rs` 的 `sse_complete_tool_call_is_unaffected`
+  由「工具块在 1」改为「在 0」——它原来钉的是错的索引。
 - **旧日志压缩不再挂在启动路径上 —— 每次部署约 80–90s 的生产空档消掉了**
   （`crates/llmux-bin/src/main.rs`）。启动时只 `cleanup_at_startup()` 删超期的（不压缩）；
   压缩改由 `spawn_log_cleanup` 的后台循环干（启动后 20s 第一轮、之后每 6h，
