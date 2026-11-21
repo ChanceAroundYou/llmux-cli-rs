@@ -225,7 +225,52 @@ POST /api/models/aliases
 
 **没走通的最后一段**：第 3 步（换 token）必须人在浏览器里输码确认，我没有代做 —— 实测只到 Pending → 取消。凭据真正落库那一段的路径（`finish_login` → 写 `codex_auth_json` → 拉模型）只有测试覆盖，等真人登录一次才算验证过。
 
-## 8. 风险提醒
+## 8. 客户端版本与模型清单自动更新（2026-11-21）
+
+`GET /models?client_version=` 会按版本过滤：**旧版本回 200 + 空数组**，未知新版本回全量。
+以前这个版本写死在 `codex_compat::CODEX_MODELS_CLIENT_VERSION`，而且空清单被当成成功缓存
+24 小时 —— 官方发新模型、CLI 升版之后，面板就只剩空列表，没有任何「版本过期」的信号。
+
+现在：
+
+- **生效版本优先级**：手动 pin（`settings.codex_client_version`）> 自动探测通过的
+  `last_good_version`（`codex_update_state` 单行表）> 编译期兜底常量。
+- **自动发现**：npm `@openai/codex/latest` → GitHub `openai/codex` 的 `releases/latest`
+  （去掉 `rust-v` 前缀）；只接受 `major.minor.patch`，拒绝 prerelease；失败只写
+  `last_error`，不影响网关。
+- **探测与安全门**：用真实 codex 账户按新版本打 `/models`，清单非空才算通过；若应用后
+  会丢掉**任何现有别名正在指向的模型**，默认不应用（`pending_reason` 点名是哪条别名），
+  需要界面里「强制应用」。
+- **应用后**：只失效 codex 账户的模型缓存（`updated_at=0`，不删行），重新拉取，
+  diff 出新模型并按需自动建别名（默认开，最多 50 条/轮，永不覆盖同名别名）。
+- **空清单 = 错误**：codex 分支返回 0 个模型时写 `error`，走 5 分钟短退避，
+  不再冻 24 小时。
+
+界面：**设置 → Codex 更新**。可开关自动检查/自动应用/自动建别名、设检查间隔、手动 pin
+版本、查看账户健康（缺凭据 / 令牌过期 / 模型数 / 缓存错误）并直接重新登录、勾选新模型建别名、
+撤销自动创建的别名（删除前二次确认，且只删 target 仍等于记录值的别名）。
+
+接口（全部走会话鉴权）：
+
+| 方法/路径 | 作用 |
+|---|---|
+| `GET /api/system/codex-update` | 状态快照（版本/来源/偏好/账户健康/new/stale/自动创建记录/CLI） |
+| `POST /api/system/codex-update/check` | 只发现最新版本，不应用 |
+| `POST /api/system/codex-update/apply` | `{version?, pin?, force?}`：探测 + 安全门 + 切换 + 刷新 + 建别名 |
+| `POST /api/system/codex-update/aliases` | `{slugs: []}`：对勾选的新模型手动建别名（幂等） |
+| `POST /api/system/codex-update/reset` | 清除手动 pin |
+
+后台循环每 6 小时（可配 1–168）检查一次，首轮延迟 30s —— 不跑在启动路径上。
+**判据**（重跑，别信本节数字）：
+
+```bash
+# 生效版本 / 上次检查 / 待确认原因
+curl -s -b 'session=<cookie>' https://openwrt.xiaokubao.space/llmux/api/system/codex-update | jq '{effective_version,effective_source,latest_version,last_error,pending_reason}'
+# 后台循环日志（旧小时可能已 gzip，用 zgrep）
+rg -N -a 'codex-update' ~/HD/openwrt/log-archive/llmux/llmux.log.$(date +%Y-%m-%d)*
+```
+
+## 9. 风险提醒
 
 走的是 ChatGPT 订阅的**未公开私有后端**（`backend-api/codex` + 私有头），随时可能被上游改掉；可能违背 OpenAI ToS，有账号风控风险。私有 API、私有头、`client_version` 都跟着官方 CLI 走（`CODEX_MODELS_CLIENT_VERSION`），失效时先看 CLI 版本，别急着怀疑 llmux。
 设备码登录用的是官方 CLI 同一个 `client_id` 和同一条 device-auth 流程 —— 登录这件事本身不额外增加伪装面，但换来的是同一套随时可能失效的私有凭据。

@@ -7,6 +7,26 @@
 
 ### Added
 
+- **Codex 客户端版本自动发现 / 探测 / 应用，新模型自动建别名。** 根因：codex 私有后端
+  `GET /models?client_version=` 按版本过滤，旧版本回 **200 + 空数组**，而旧实现把空清单当成功
+  缓存 24 小时 —— 官方发新模型、CLI 升版后，面板只剩空列表且没有任何「版本过期」信号；
+  版本号还写死在 `CODEX_MODELS_CLIENT_VERSION`。现在生效版本按「手动 pin >
+  自动探测通过的 `last_good_version` > 编译期兜底」解析，状态放独立的
+  `codex_update_state` 单行表（迁移 0037，**不放进 `settings`** —— `GET/PUT /api/settings`
+  整表回吐/合并，运行期元数据会被前端写回或被当成配置导出）。自动发现走 npm
+  `@openai/codex/latest` → GitHub `releases/latest`（10s 超时、只认 `x.y.z`、拒绝
+  prerelease，失败只记 `last_error` 不阻塞网关）；应用前用真实 codex 账户按新版本探测，
+  清单非空才通过，且**安全门**会拦下「会让现有别名指向的模型消失」的切换（界面可强制应用）；
+  通过后只失效 codex 账户的模型缓存（`updated_at=0`，不删行）并重新拉取，按 diff
+  自动创建别名（默认开、每轮上限 50、同名绝不覆盖、形状与 UI `pickModel` 一致：
+  `provider_id` 用账户 alias 而不是字符串 `"codex"`，否则模型列表出现重复行）。
+  空的 codex 清单现在返回错误并走 5 分钟短退避，不再冻 24 小时。
+  接口：`GET /api/system/codex-update`、`POST …/check`、`…/apply`、`…/aliases`、`…/reset`；
+  后台循环首轮延迟 30s、之后每 6h（可配 1–168，关掉自动检查则只睡不联网）。
+  界面：设置页新增「Codex 更新」分组（版本/来源徽标、立即检查、应用并刷新、三个开关、
+  间隔、手动 pin、账户健康 + 重新登录、新模型勾选建别名、失效别名只报告、自动创建记录可撤销）。
+  不在网关容器里安装/更新 Codex CLI —— 原生登录走设备码，不需要它。
+
 - **`usage_estimate_accounts`：上游 usage 虚报时，下发客户端的 prompt token 改用本地估算。**
   现场（2026-11-14 直连 `192.168.10.106:3000` 实测，完全绕开 llmux）：同一条 `say hi`
   先报 10,940、几分钟后报 43,552；20,000 字符报 59,872；100,000 字符报 385,481
