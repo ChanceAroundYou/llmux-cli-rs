@@ -1049,15 +1049,33 @@ async fn create_aliases(
             continue;
         }
 
-        let disabled = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM disabled_models WHERE model = ?",
+        // 账户级 disable：只看**本模型的提供账户**。别的账户禁用同名模型
+        // （例如 Copilot 禁了 `gpt-6.1-terra`）不阻塞 codex 建别名；只有提供该模型
+        // 的账户全部被禁用时才跳过。`disabled_models` 是 (account_id, model) 按账户，
+        // 此前的全局 `WHERE model = ?` 会把别的账户的禁用误判成处处禁用。
+        let account_ids = model
+            .get("account_ids")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if account_ids.is_empty() {
+            continue;
+        }
+        let model_account_ids: Vec<i64> = account_ids.iter().filter_map(Value::as_i64).collect();
+        if model_account_ids.is_empty() {
+            continue;
+        }
+        let disabled_accounts: Vec<i64> = sqlx::query_scalar::<_, i64>(
+            "SELECT account_id FROM disabled_models WHERE model = ?",
         )
         .bind(slug)
-        .fetch_one(&state.pool)
+        .fetch_all(&state.pool)
         .await
-        .unwrap_or(0)
-            > 0;
-        if disabled {
+        .unwrap_or_default();
+        if model_account_ids
+            .iter()
+            .all(|id| disabled_accounts.contains(id))
+        {
             continue;
         }
 
@@ -1071,14 +1089,6 @@ async fn create_aliases(
             .and_then(Value::as_str)
             .unwrap_or("");
         if provider.is_empty() {
-            continue;
-        }
-        let account_ids = model
-            .get("account_ids")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        if account_ids.is_empty() {
             continue;
         }
         let account_ids_json =

@@ -298,7 +298,7 @@ async fn alias_creation_shape_conflicts_and_idempotency() {
             .unwrap();
     assert_eq!(owner, "user-owned");
 
-    // 禁用模型不建别名（disabled 可能来自任一账户）。
+    // 账户级 disable：提供该模型的账户（本例只有 9201）全部禁用时才跳过。
     seed_cache(&state, 9201, "codex-a", &[("disabled-slug", 1)]).await;
     sqlx::query("INSERT INTO disabled_models (account_id, model) VALUES (9201, 'disabled-slug')")
         .execute(&state.pool)
@@ -308,6 +308,28 @@ async fn alias_creation_shape_conflicts_and_idempotency() {
         .await
         .expect("skip disabled");
     assert!(skipped.is_empty());
+    set_accounts_override_for_test(None);
+    skip_alias_verify_for_test(false);
+}
+
+#[tokio::test]
+async fn disabling_on_a_non_provider_account_does_not_skip_the_alias() {
+    let _guard = override_guard();
+    skip_alias_verify_for_test(true);
+    set_accounts_override_for_test(Some(vec![(9203, "codex-c".to_string())]));
+    let state = llmux_server::test_state().await;
+    seed_codex_account(&state, 9203, "codex-c").await;
+    seed_cache(&state, 9203, "codex-c", &[("shared-slug", 1)]).await;
+    // 另一个非 codex 账户禁用了同名模型 —— 不该阻塞 codex 建别名。
+    seed_custom_account(&state, 9403, "custom-c").await;
+    sqlx::query("INSERT INTO disabled_models (account_id, model) VALUES (9403, 'shared-slug')")
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    let created = create_aliases_for_slugs(&state, &["shared-slug".to_string()])
+        .await
+        .expect("create alias despite foreign disable");
+    assert_eq!(created.len(), 1);
     set_accounts_override_for_test(None);
     skip_alias_verify_for_test(false);
 }
