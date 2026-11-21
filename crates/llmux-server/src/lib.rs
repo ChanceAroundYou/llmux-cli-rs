@@ -1,5 +1,6 @@
 pub mod aggregate_probe;
 pub mod app;
+pub mod codex_update;
 pub mod db_vacuum;
 pub mod error;
 pub mod middleware;

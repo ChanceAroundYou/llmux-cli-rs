@@ -198,6 +198,8 @@ async fn start(port_override: Option<u16>, use_tui: bool) -> anyhow::Result<()> 
         tracing::info!("[reasoning-effort] 恢复 {restored} 条历史能力行");
     }
     llmux_core::reasoning_effort::spawn_capability_flush(pool.clone());
+    // Codex 模型清单版本发现/探测/应用：首轮延迟 30s，不跑在启动路径上。
+    llmux_server::codex_update::spawn_codex_update(state.clone());
     let router = app(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], effective_port));

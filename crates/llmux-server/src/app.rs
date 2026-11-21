@@ -424,6 +424,28 @@ fn core_router() -> AppRouter {
             post(system::cancel_codex_device_login),
         )
         .route(
+            // Codex 模型清单的客户端版本：状态 / 发现 / 应用 / 批量建别名 / 清空 pin。
+            // 运行期状态在独立表 `codex_update_state`，不混进 /api/settings。
+            "/api/system/codex-update",
+            get(system::get_codex_update),
+        )
+        .route(
+            "/api/system/codex-update/check",
+            post(system::check_codex_update),
+        )
+        .route(
+            "/api/system/codex-update/apply",
+            post(system::apply_codex_update),
+        )
+        .route(
+            "/api/system/codex-update/aliases",
+            post(system::create_codex_aliases),
+        )
+        .route(
+            "/api/system/codex-update/reset",
+            post(system::reset_codex_version),
+        )
+        .route(
             "/api/system/gemini-settings",
             get(system::get_gemini_settings).post(system::apply_gemini_settings),
         )

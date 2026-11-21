@@ -64,6 +64,173 @@ pub async fn get_model_aliases(Extension(state): Extension<AppState>) -> Respons
     }
 }
 
+/// 测试用：跳过保存别名后的后台协议探测。生产默认 false。
+/// 那个探测会打真实上游（codex 固定后端 / 账户 base_url），在离线契约测试里
+/// 只会拖慢 runtime 关闭；不影响任何写入语义。
+pub(crate) static SKIP_VERIFY_FOR_TEST: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[doc(hidden)]
+pub fn skip_alias_verify_for_test(skip: bool) {
+    SKIP_VERIFY_FOR_TEST.store(skip, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 普通别名写入失败的原因。路由层把它翻译成具体 HTTP 状态；自动建别名
+/// （`codex_update`）只关心「同名冲突 → 跳过」和「内部错误 → 记日志」。
+pub(crate) enum AliasWriteError {
+    OrdinaryConflict { existing_id: i64 },
+    AggregateConflict,
+    Internal(String),
+}
+
+/// 普通别名的唯一写入内核：同名冲突判定 → 聚合冲突处理 → UPSERT → 缓存失效 →
+/// 引用它的聚合候选重展开 → 后台拨测。
+///
+/// 路由 `set_model_alias` 与 codex 自动建别名共用这一份，保证：
+/// - 同名普通别名**永不静默覆盖**（只有 `self_id` 是自己时才更新）；
+/// - 聚合同名只有 `overwrite_aggregate=true`（用户 confirm）才覆盖；
+/// - 写完必须同时失效 models 缓存、聚合缓存并 resync。
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn upsert_model_alias(
+    state: &AppState,
+    alias: &str,
+    target_model: &str,
+    provider_id: Option<String>,
+    account_ids: Option<String>,
+    preferred_account_id: Option<i64>,
+    upstream_api: String,
+    first_byte_timeout_secs: Option<i64>,
+    self_id: Option<i64>,
+    overwrite_aggregate: bool,
+) -> Result<(), AliasWriteError> {
+    // 同名冲突：alias 上有 UNIQUE，而 `INSERT … ON CONFLICT(alias) DO UPDATE` 永远不会
+    // 报冲突 —— 目标名已被**另一条**别名占用时，它会静默改掉那一条的 target/绑定/协议。
+    // 判据只有「同名且不是自己」这一条；同名且是自己 → 正常更新。
+    //
+    // 这里排在聚合别名冲突检查之前：名字被普通别名占用时**没有 confirm 逃生口**
+    // （静默删掉别人的别名不是用户想要的），而前端对 409 的分支是看 `conflict` 字段，
+    // 先返回才不会把这种冲突渲染成「要覆盖聚合别名吗？」的确认框。
+    match sqlx::query_scalar::<_, i64>("SELECT id FROM model_aliases WHERE alias = ?")
+        .bind(alias)
+        .fetch_optional(&state.pool)
+        .await
+    {
+        Ok(Some(existing_id)) if Some(existing_id) != self_id => {
+            tracing::warn!(
+                "🏷️ 拒绝保存别名 {alias}：名字已被别名 #{existing_id} 占用（请求携带 self_id={self_id:?}）"
+            );
+            return Err(AliasWriteError::OrdinaryConflict { existing_id });
+        }
+        Ok(_) => {}
+        Err(e) => {
+            return Err(AliasWriteError::Internal(format!(
+                "Failed to check alias name collision: {e}"
+            )));
+        }
+    }
+
+    // If an aggregate alias with same name exists, require confirm to overwrite
+    let agg_exists: Option<i64> =
+        sqlx::query_scalar("SELECT id FROM aggregate_aliases WHERE alias = ?")
+            .bind(alias)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(|e| {
+                AliasWriteError::Internal(format!("Failed to check aggregate collision: {e}"))
+            })?;
+    if agg_exists.is_some() {
+        if !overwrite_aggregate {
+            return Err(AliasWriteError::AggregateConflict);
+        }
+        let _ = sqlx::query("DELETE FROM aggregate_aliases WHERE alias = ?")
+            .bind(alias)
+            .execute(&state.pool)
+            .await;
+        state.aggregate_router.lock().unwrap().remove(alias);
+        state.invalidate_aggregate_cache(alias);
+        if let Ok(mut cache) = state.models_cache.lock() {
+            *cache = None;
+        }
+        tracing::info!(
+            "🏷️ Overwrote aggregate alias '{}' with ordinary alias (confirmed)",
+            alias
+        );
+    }
+
+    // 原地 UPSERT，不是 `INSERT OR REPLACE`。REPLACE 是「删旧行 + 插新行」，
+    // 在 `alias` UNIQUE 上每次保存都会换一个 rowid（AUTOINCREMENT 不会复用）——
+    // 而上面的冲突判据靠「库里同名行的 id == 请求携带的 self_id」，id 每次保存都漂，
+    // 同一条别名连着保存两次就会把自己判成冲突。ON CONFLICT DO UPDATE 保留原行、id 稳定。
+    sqlx::query(
+        "INSERT INTO model_aliases (alias, target_model, provider_id, account_ids, preferred_account_id, upstream_api, first_byte_timeout_secs) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(alias) DO UPDATE SET target_model=excluded.target_model, provider_id=excluded.provider_id, account_ids=excluded.account_ids, preferred_account_id=excluded.preferred_account_id, upstream_api=excluded.upstream_api, first_byte_timeout_secs=excluded.first_byte_timeout_secs",
+    )
+    .bind(alias)
+    .bind(target_model)
+    .bind(provider_id.clone())
+    .bind(&account_ids)
+    .bind(preferred_account_id)
+    .bind(&upstream_api)
+    .bind(first_byte_timeout_secs)
+    .execute(&state.pool)
+    .await
+    .map_err(|e| AliasWriteError::Internal(format!("Failed to set alias: {e}")))?;
+
+    // Invalidate models cache so custom models appear immediately
+    if let Ok(mut cache) = state.models_cache.lock() {
+        *cache = None;
+    }
+    state.invalidate_model_cache(alias);
+    // 这条普通别名改了绑定 / 协议 / 超时 → 引用它的聚合别名候选跟着重新展开。
+    // 「加进聚合就跟着别名走」是这条机制的全部意义：留着旧快照，用户就会在
+    // 聚合里用到早就停用的账户。失败只记日志 —— 别名本身已经保存成功了，
+    // 不能因为刷新失败回 500 让用户以为别名没存上。
+    match llmux_core::aggregate::resync_alias_candidates(&state.pool, alias).await {
+        Ok(touched) => {
+            for agg in &touched {
+                state.invalidate_aggregate_cache(agg);
+            }
+            if !touched.is_empty() {
+                if let Ok(mut cache) = state.models_cache.lock() {
+                    *cache = None;
+                }
+                tracing::info!(
+                    "🔀 别名 {alias} 变更 → {} 个聚合别名候选已重新展开: {:?}",
+                    touched.len(),
+                    touched
+                );
+            }
+        }
+        Err(e) => tracing::warn!("🔀 刷新引用别名 {alias} 的聚合别名失败: {e}"),
+    }
+    tracing::info!(
+        "🏷️ Set alias {} -> {} (provider: {:?}), cache invalidated",
+        alias,
+        target_model,
+        provider_id
+    );
+    // 保存后自动验证：探到的协议只记录 + 提示，不改配置。
+    // 后台跑，别拖慢保存接口（多账户时逐个探可达数分钟）。
+    let ids: Vec<i64> = account_ids
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<Vec<i64>>(s).ok())
+        .unwrap_or_default();
+    let bg_state = state.clone();
+    let target_model_owned = target_model.to_string();
+    let provider_owned = provider_id.clone();
+    if !SKIP_VERIFY_FOR_TEST.load(std::sync::atomic::Ordering::Relaxed) {
+        tokio::spawn(async move {
+            super::verify::verify_targets(
+                &bg_state,
+                &target_model_owned,
+                provider_owned.as_deref(),
+                &ids,
+            )
+            .await;
+        });
+    }
+    Ok(())
+}
+
 pub async fn set_model_alias(
     Extension(state): Extension<AppState>,
     Json(body): Json<Value>,
@@ -84,68 +251,6 @@ pub async fn set_model_alias(
     // 编辑态携带的自身 id（可选）：用来区分「同名更新自己」和「名字被别的别名占着」。
     let self_id = body.get("id").and_then(Value::as_i64);
 
-    // 同名冲突：alias 上有 UNIQUE，而 `INSERT … ON CONFLICT(alias) DO UPDATE` 永远不会
-    // 报冲突 —— 目标名已被**另一条**别名占用时，它会静默改掉那一条的 target/绑定/协议。
-    // 典型触发：编辑别名 A 时把名字改成已存在的 B（UI 改名走「先删 A 再建」，
-    // 建的时候 B 还活着 → 原本 B 被覆盖，A 却还在，两条别名变成一条都不对）。
-    // 判据只有「同名且不是自己」这一条；同名且是自己 → 正常更新。
-    //
-    // 这里排在聚合别名冲突检查之前：名字被普通别名占用时**没有 confirm 逃生口**
-    // （静默删掉别人的别名不是用户想要的），而前端对 409 的分支是看 `conflict` 字段，
-    // 先返回才不会把这种冲突渲染成「要覆盖聚合别名吗？」的确认框。
-    match sqlx::query_scalar::<_, i64>("SELECT id FROM model_aliases WHERE alias = ?")
-        .bind(&alias)
-        .fetch_optional(&state.pool)
-        .await
-    {
-        Ok(Some(existing_id)) if Some(existing_id) != self_id => {
-            tracing::warn!(
-                "🏷️ 拒绝保存别名 {alias}：名字已被别名 #{existing_id} 占用（请求携带 self_id={self_id:?}）"
-            );
-            return (
-                StatusCode::CONFLICT,
-                Json(json!({
-                    "error": format!("Alias name already taken: {alias}"),
-                    "code": "alias_name_taken",
-                    "conflict": "ordinary",
-                    "alias": alias,
-                    "existing_id": existing_id,
-                })),
-            )
-                .into_response();
-        }
-        Ok(_) => {}
-        Err(e) => {
-            return crate::error::simple_error(
-                format!("Failed to check alias name collision: {e}"),
-                StatusCode::INTERNAL_SERVER_ERROR,
-            );
-        }
-    }
-    // If an aggregate alias with same name exists, require confirm to overwrite
-    let agg_exists: Option<i64> = match sqlx::query_scalar("SELECT id FROM aggregate_aliases WHERE alias = ?").bind(&alias).fetch_optional(&state.pool).await {
-        Ok(v) => v,
-        Err(e) => return crate::error::simple_error(format!("Failed to check aggregate collision: {e}"), StatusCode::INTERNAL_SERVER_ERROR),
-    };
-    if agg_exists.is_some() {
-        if !confirm {
-            return (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "error": format!("alias '{}' already exists as an aggregate alias", alias),
-                    "code": "alias_conflict",
-                    "conflict": "aggregate",
-                    "alias": alias,
-                })),
-            )
-                .into_response();
-        }
-        let _ = sqlx::query("DELETE FROM aggregate_aliases WHERE alias = ?").bind(&alias).execute(&state.pool).await;
-        state.aggregate_router.lock().unwrap().remove(&alias);
-        state.invalidate_aggregate_cache(&alias);
-        if let Ok(mut cache) = state.models_cache.lock() { *cache = None; }
-        tracing::info!("🏷️ Overwrote aggregate alias '{}' with ordinary alias (confirmed)", alias);
-    }
     let provider_id: Option<String> = body.get("provider_id").and_then(Value::as_str).map(|s| s.to_string());
 
     // Parse account_ids: JSON array like [1,5] or comma-separated "1,5"
@@ -189,69 +294,47 @@ pub async fn set_model_alias(
     // the UI warns and the runtime skips unsupported accounts (supports guard in
     // dispatch_with_conversion).
 
-    // 原地 UPSERT，不是 `INSERT OR REPLACE`。REPLACE 是「删旧行 + 插新行」，
-    // 在 `alias` UNIQUE 上每次保存都会换一个 rowid（AUTOINCREMENT 不会复用）——
-    // 而上面的冲突判据靠「库里同名行的 id == 请求携带的 self_id」，id 每次保存都漂，
-    // 同一条别名连着保存两次就会把自己判成冲突。ON CONFLICT DO UPDATE 保留原行、id 稳定。
-    match sqlx::query(
-        "INSERT INTO model_aliases (alias, target_model, provider_id, account_ids, preferred_account_id, upstream_api, first_byte_timeout_secs) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(alias) DO UPDATE SET target_model=excluded.target_model, provider_id=excluded.provider_id, account_ids=excluded.account_ids, preferred_account_id=excluded.preferred_account_id, upstream_api=excluded.upstream_api, first_byte_timeout_secs=excluded.first_byte_timeout_secs",
+    match upsert_model_alias(
+        &state,
+        &alias,
+        &target_model,
+        provider_id,
+        account_ids,
+        preferred_account_id,
+        upstream_api,
+        first_byte_timeout_secs,
+        self_id,
+        confirm,
     )
-    .bind(&alias)
-    .bind(&target_model)
-    .bind(provider_id.clone())
-    .bind(&account_ids)
-    .bind(preferred_account_id)
-    .bind(&upstream_api)
-    .bind(first_byte_timeout_secs)
-    .execute(&state.pool)
     .await
     {
-        Ok(_) => {
-            // Invalidate models cache so custom models appear immediately
-            if let Ok(mut cache) = state.models_cache.lock() {
-                *cache = None;
-            }
-            state.invalidate_model_cache(&alias);
-            // 这条普通别名改了绑定 / 协议 / 超时 → 引用它的聚合别名候选跟着重新展开。
-            // 「加进聚合就跟着别名走」是这条机制的全部意义：留着旧快照，用户就会在
-            // 聚合里用到早就停用的账户。失败只记日志 —— 别名本身已经保存成功了，
-            // 不能因为刷新失败回 500 让用户以为别名没存上。
-            match llmux_core::aggregate::resync_alias_candidates(&state.pool, &alias).await {
-                Ok(touched) => {
-                    for agg in &touched {
-                        state.invalidate_aggregate_cache(agg);
-                    }
-                    if !touched.is_empty() {
-                        if let Ok(mut cache) = state.models_cache.lock() {
-                            *cache = None;
-                        }
-                        tracing::info!(
-                            "🔀 别名 {alias} 变更 → {} 个聚合别名候选已重新展开: {:?}",
-                            touched.len(), touched
-                        );
-                    }
-                }
-                Err(e) => tracing::warn!("🔀 刷新引用别名 {alias} 的聚合别名失败: {e}"),
-            }
-            tracing::info!("🏷️ Set alias {} -> {} (provider: {:?}), cache invalidated", alias, target_model, provider_id);
-            // 保存后自动验证：探到的协议只记录 + 提示，不改配置。
-            // 后台跑，别拖慢保存接口（多账户时逐个探可达数分钟）。
-            let ids: Vec<i64> = account_ids
-                .as_deref()
-                .and_then(|s| serde_json::from_str::<Vec<i64>>(s).ok())
-                .unwrap_or_default();
-            let bg_state = state.clone();
-            let target_model = target_model.clone();
-            tokio::spawn(async move {
-                super::verify::verify_targets(&bg_state, &target_model, provider_id.as_deref(), &ids).await;
-            });
-            let resp = json!({ "success": true, "message": "Alias set successfully" });
-            Json(resp).into_response()
-        },
-        Err(e) => crate::error::simple_error(
-            format!("Failed to set alias: {e}"),
-            StatusCode::INTERNAL_SERVER_ERROR,
-        ),
+        Ok(()) => {
+            Json(json!({ "success": true, "message": "Alias set successfully" })).into_response()
+        }
+        Err(AliasWriteError::OrdinaryConflict { existing_id }) => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": format!("Alias name already taken: {alias}"),
+                "code": "alias_name_taken",
+                "conflict": "ordinary",
+                "alias": alias,
+                "existing_id": existing_id,
+            })),
+        )
+            .into_response(),
+        Err(AliasWriteError::AggregateConflict) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!("alias '{}' already exists as an aggregate alias", alias),
+                "code": "alias_conflict",
+                "conflict": "aggregate",
+                "alias": alias,
+            })),
+        )
+            .into_response(),
+        Err(AliasWriteError::Internal(e)) => {
+            crate::error::simple_error(e, StatusCode::INTERNAL_SERVER_ERROR)
+        }
     }
 }
 

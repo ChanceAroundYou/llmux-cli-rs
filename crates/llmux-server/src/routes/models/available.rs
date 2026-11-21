@@ -250,7 +250,7 @@ pub(super) fn cache_needs_refresh(updated_at: i64, error: Option<&str>, now: i64
 ///
 /// 创建处（SSE 的 `account` 事件、`do_fetch_models`）与识别处（`persist_snapshot`
 /// 把错误串写回 `error` 列）必须是同一个字符串，所以只留这一处。
-pub(super) fn placeholder_id(alias: &str) -> String {
+pub(crate) fn placeholder_id(alias: &str) -> String {
     format!("{alias}-models-unavailable")
 }
 
@@ -322,7 +322,7 @@ async fn load_persistent_snapshot(pool: &sqlx::SqlitePool) -> Option<(Vec<Value>
     Some((all, per_account, max_ts, stale))
 }
 
-async fn persist_snapshot(pool: &sqlx::SqlitePool, all_models: &[Value]) {
+pub(crate) async fn persist_snapshot(pool: &sqlx::SqlitePool, all_models: &[Value]) {
     // group by owned_by (alias)
     let mut by_alias: std::collections::HashMap<String, Vec<Value>> = std::collections::HashMap::new();
     for m in all_models { if let Some(alias) = m.get("owned_by").and_then(Value::as_str) { by_alias.entry(alias.to_string()).or_default().push(m.clone()); } }
@@ -464,10 +464,50 @@ async fn do_fetch_models(state: &AppState) -> Vec<Value> {
 /// 到期后必然 401 → 面板只剩 `*-models-unavailable` 占位卡 → 更没有流量 →
 /// 只有真实请求那条路径会自刷，而它已经没有流量了。刷新判据统一收在
 /// [`llmux_core::codex_auth::ensure_fresh`]（非 codex 账户直接原样返回）。
+/// codex 回 200 + 空清单不是成功：旧 `client_version` 会被后端过滤成空数组。
+/// 返回 `Some(error)` 表示「是 codex 且没有任何有效 slug」；其它 provider 或非空
+/// 清单返回 `None`。抽成纯函数便于契约测试，不依赖 HTTP。
+pub fn codex_empty_list_error(
+    provider_type: &str,
+    models: &[Value],
+    client_version: &str,
+) -> Option<String> {
+    if provider_type != "codex" {
+        return None;
+    }
+    let non_empty = models
+        .iter()
+        .filter(|m| {
+            m.get("id")
+                .and_then(Value::as_str)
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false)
+        })
+        .count();
+    (non_empty == 0).then(|| {
+        format!(
+            "codex backend returned 0 models for client_version={client_version}; version may be outdated"
+        )
+    })
+}
+
 pub async fn fetch_provider_models(
     pool: &sqlx::SqlitePool,
     account: &llmux_core::adapters::Account,
     provider_type: &str,
+) -> (Vec<Value>, Option<String>) {
+    // 版本从运行期状态里取（手动 pin > 探测通过的 last_good > 编译期兜底）。
+    // 保持旧签名是为了让 accounts/codex_device/testing/verify/SSE 这些调用点
+    // 不用改；需要显式指定版本时用下面的 `_with_version`。
+    let client_version = crate::codex_update::effective_client_version(pool).await;
+    fetch_provider_models_with_version(pool, account, provider_type, &client_version).await
+}
+
+pub async fn fetch_provider_models_with_version(
+    pool: &sqlx::SqlitePool,
+    account: &llmux_core::adapters::Account,
+    provider_type: &str,
+    client_version: &str,
 ) -> (Vec<Value>, Option<String>) {
     let account = llmux_core::codex_auth::ensure_fresh(pool, account).await;
 
@@ -501,10 +541,10 @@ pub async fn fetch_provider_models(
         //    `CODEX_MODELS_CLIENT_VERSION`）。凭据缺失时不断言 —— 让请求带空
         //    Bearer 去上游拿 401，错得清楚（与真实流量路径一致）。
         "codex" => {
-            let version = llmux_core::codex_compat::CODEX_MODELS_CLIENT_VERSION;
+            let version = client_version;
             let url = format!(
                 "{}/models?client_version={}",
-                llmux_core::codex_compat::CODEX_BACKEND_BASE.trim_end_matches('/'),
+                crate::codex_update::codex_backend_base().trim_end_matches('/'),
                 version
             );
             let mut headers = std::collections::BTreeMap::new();
@@ -664,6 +704,17 @@ pub async fn fetch_provider_models(
         normalize_model(m);
     }
 
+    // codex 的私有后端按 `client_version` 过滤模型：旧版本会回 200 + `models: []`。
+    // 以前空清单被当成成功写进 account_model_cache，再冻 24h —— 面板只剩空列表，
+    // 没有任何「版本过期」的信号。这里把它改成错误，让缓存走 5 分钟短退避，
+    // 状态页也能直接显示原因。非 codex provider 的合法空清单不受影响。
+    if let Some(msg) = codex_empty_list_error(provider_type, &models, client_version) {
+        tracing::warn!("🤖 [codex] {} (account {})", msg, account.alias);
+        // 回空表而不是带着一堆空 id 的 `models`：调用方用 `is_empty()` 判失败，
+        // 占位卡/短退避都靠这个信号。
+        return (Vec::new(), Some(msg));
+    }
+
     tracing::debug!(
         "🤖 [{}] Successfully listed {} models from {}",
         provider_type,
@@ -672,4 +723,74 @@ pub async fn fetch_provider_models(
     );
 
     (models, None)
+}
+
+/// 只刷新 codex 原生账户的模型清单，并把结果写回 `account_model_cache`。
+///
+/// 与全量 `do_fetch_models` 的区别：不碰非 codex 账户（升级 codex 客户端版本
+/// 不应让 Copilot/DeepSeek 的缓存时间戳跟着变），并且返回每个账户的原始清单
+/// 供 `codex_update` 做 diff / 自动建别名。
+pub(crate) async fn refresh_codex_models(
+    state: &crate::app::AppState,
+) -> Vec<(i64, String, Vec<Value>)> {
+    use llmux_core::dispatcher::{get_active_accounts, resolve_provider_type};
+
+    let accounts = match get_active_accounts(&state.pool, None, &state.master_key).await {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::warn!("codex-update: list accounts failed: {e}");
+            return Vec::new();
+        }
+    };
+    let codex_accounts: Vec<_> = accounts
+        .into_iter()
+        .filter(|a| {
+            a.category == "codex" && resolve_provider_type(None, &a.provider_id) == "codex"
+        })
+        .collect();
+    if codex_accounts.is_empty() {
+        return Vec::new();
+    }
+
+    let results = futures_util::future::join_all(codex_accounts.into_iter().map(|account| async move {
+        let (models, error) = fetch_provider_models(&state.pool, &account, "codex").await;
+        (account, models, error)
+    }))
+    .await;
+
+    let mut all_models: Vec<Value> = Vec::new();
+    let mut out: Vec<(i64, String, Vec<Value>)> = Vec::new();
+    for (account, mut models, error) in results {
+        if models.is_empty() {
+            let mut ph = serde_json::json!({
+                "id": placeholder_id(&account.alias),
+                "name": account.alias,
+                "object": "model",
+                "created": 0,
+                "owned_by": account.alias,
+            });
+            if let Some(ref e) = error {
+                ph["error"] = serde_json::json!(e);
+            }
+            all_models.push(ph);
+            out.push((account.id, account.alias, Vec::new()));
+            continue;
+        }
+        for m in &mut models {
+            if let Value::Object(obj) = m {
+                obj.insert("owned_by".to_string(), serde_json::json!(account.alias));
+            }
+        }
+        mark_disabled(&mut models, account.id, &state.pool).await;
+        all_models.extend(models.iter().cloned());
+        out.push((account.id, account.alias, models));
+    }
+
+    // 占位卡由 `persist_snapshot` 统一写回（它从占位卡 id 反推 error 列），
+    // 这样「空清单 → error 非空」与全量刷新是同一条路径。
+    persist_snapshot(&state.pool, &all_models).await;
+    if let Ok(mut c) = state.models_cache.lock() {
+        *c = None;
+    }
+    out
 }

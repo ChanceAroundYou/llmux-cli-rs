@@ -2,6 +2,7 @@ pub mod claude;
 pub mod codex;
 pub mod codex_device;
 pub mod codex_toml;
+pub mod codex_update;
 pub mod gemini;
 pub mod helpers;
 
@@ -20,6 +21,10 @@ pub use codex::{
 };
 pub use codex_device::{
     cancel_codex_device_login, get_codex_device_login, start_codex_device_login, DeviceLoginSession,
+};
+pub use codex_update::{
+    apply_codex_update, check_codex_update, create_codex_aliases, get_codex_update,
+    reset_codex_version,
 };
 pub use gemini::{
     apply_gemini_settings, delete_gemini_backup, get_gemini_settings, list_gemini_backups,
