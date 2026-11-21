@@ -12,9 +12,11 @@ import {
   CheckCircle2,
   Download,
   Upload,
-  KeyRound
+  KeyRound,
+  Bot
 } from 'lucide-react';
 import { ConfirmDialog } from '../components/Modal';
+import { CodexUpdateCard } from '../components/CodexUpdateCard';
 import { cn } from '../lib/utils';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -400,6 +402,10 @@ export default function Settings() {
               )}
             </div>
           </SettingItem>
+        </SettingGroup>
+
+        <SettingGroup title={t('codexUpdate.title')} icon={Bot}>
+          <CodexUpdateCard />
         </SettingGroup>
       </div>
 
