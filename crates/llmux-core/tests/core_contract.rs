@@ -61,6 +61,7 @@ async fn init_db_creates_fresh_schema_and_seed_providers() {
             "admin_credentials",
             "aggregate_aliases",
             "api_keys",
+            "codex_update_state",
             "disabled_models",
             "model_aliases",
             "model_prices",
