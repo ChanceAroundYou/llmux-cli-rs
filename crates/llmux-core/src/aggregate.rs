@@ -743,7 +743,9 @@ impl AggregateRouter {
     }
 
     /// Called when a request succeeds at `hit` (hit may equal active or downstream).
-    /// 连续 3 次命中同一非 active 候选才迁移；命中 active 则连续计数清零。
+    /// 连续 3 次命中同一非 active 候选才迁移；命中 active 只中断**降级**方向的
+    /// 计数（目标是 active 之后的候选），回升方向（目标在 active 之前）不清零，
+    /// 否则兜底的持续流量会把探活每轮攒的 1 次确认无限冲掉。
     /// `anchor_attempted` = 这一轮**真的尝试了锚点且它真的失败了**。被跳过不算
     /// （冷却 / 装不下 / max_tokens 不合规 / 账户不存在都是「没试过」，不是「坏了」）
     /// —— 否则一次 30 分钟的限流休息就能把主候选永久挤下线。见 dispatch 路径。
@@ -759,8 +761,17 @@ impl AggregateRouter {
             e.last_status[hit] = Some(true);
         }
         if hit == e.active {
-            // 命中当前活跃：视为中断，连续计数清零（例：失败2次后成功1次 -> 重新计数）
-            Self::break_pending(e);
+            // 命中当前活跃：只中断**降级**方向（pending_target 在 active 之后）。
+            //
+            // 回升方向（pending_target < active，想把位置挪回更优候选）不能被兜底
+            // 候选的成功清零：兜底成功只证明它能服务，不证明首选候选已经恢复或更差。
+            // 清零会让持续流量把探活每轮攒的 1 次确认无限冲掉 —— 首选明明活着，
+            // 别名也会永远停在兜底上（2026-11-21 生产 `os`：降级后兜底每小时几百次
+            // 成功反复打断，probe 连续 7 小时报 best=V0 也没能切回去）。
+            let pending_is_downgrade = matches!(e.pending_target, Some(t) if t > e.active);
+            if pending_is_downgrade {
+                Self::break_pending(e);
+            }
             e.probe_backoff_secs = PROBE_BACKOFF_BASE_SECS;
             return false;
         }
@@ -1188,6 +1199,56 @@ mod tests {
         assert!(!r.record_probe_candidate("a", 0, 3, t + Duration::from_secs(10)));
         assert!(r.record_probe_candidate("a", 0, 3, t + Duration::from_secs(20)));
         assert_eq!(r.get_active("a"), 0);
+    }
+
+    /// 兜底候选（active=1）的成功**不能**清掉「回升到 0」的确认。
+    /// 生产形状：降级后 os 的持续流量全命中兜底，每轮探活的 1 次确认都被下一次
+    /// 成功请求清零，probe 连续 7 小时报 best=V0 也回不去（2026-11-21）。
+    #[test]
+    fn a_fallback_success_does_not_clear_an_upgrade_confirmation() {
+        let mut r = AggregateRouter::default();
+        let t = Instant::now();
+        r.set_active("a", 1, 2);
+        assert!(!r.record_probe_candidate("a", 0, 2, t));
+        // 每次探活之间都有兜底的成功流量（锚点=兜底，被真试过且成功）
+        assert!(!r.record_request_outcome("a", 1, 2, t + Duration::from_secs(10), true));
+        assert_eq!(r.entries.get("a").unwrap().confirm_count, 1);
+        assert!(!r.record_probe_candidate("a", 0, 2, t + Duration::from_secs(300)));
+        assert!(!r.record_request_outcome("a", 1, 2, t + Duration::from_secs(310), true));
+        assert_eq!(r.entries.get("a").unwrap().confirm_count, 2);
+        assert!(r.record_probe_candidate("a", 0, 2, t + Duration::from_secs(600)));
+        assert_eq!(r.get_active("a"), 0);
+    }
+
+    /// 反方向保留：降级确认（目标在 active 之后）仍被锚点成功打断。
+    #[test]
+    fn an_anchor_success_still_breaks_a_downgrade_confirmation() {
+        let mut r = AggregateRouter::default();
+        let t = Instant::now();
+        r.set_active("a", 1, 3);
+        assert!(!r.record_request_outcome("a", 2, 3, t, true));
+        assert!(!r.record_request_outcome("a", 2, 3, t + Duration::from_secs(10), true));
+        assert_eq!(r.entries.get("a").unwrap().confirm_count, 2);
+        assert!(!r.record_request_outcome("a", 1, 3, t + Duration::from_secs(20), true));
+        assert_eq!(r.entries.get("a").unwrap().confirm_count, 0);
+        assert!(r.entries.get("a").unwrap().pending_target.is_none());
+        // 重新从 1 开始，不会凭前两次直接切
+        assert!(!r.record_request_outcome("a", 2, 3, t + Duration::from_secs(30), true));
+        assert_eq!(r.get_active("a"), 1);
+    }
+
+    /// 探活明确说 active 就是最好的，回升确认照样清零 —— 那是真证据。
+    #[test]
+    fn a_probe_verdict_for_the_anchor_clears_an_upgrade_confirmation() {
+        let mut r = AggregateRouter::default();
+        let t = Instant::now();
+        r.set_active("a", 1, 2);
+        assert!(!r.record_probe_candidate("a", 0, 2, t));
+        assert!(!r.record_probe_candidate("a", 1, 2, t + Duration::from_secs(300)));
+        assert_eq!(r.entries.get("a").unwrap().confirm_count, 0);
+        assert!(!r.record_probe_candidate("a", 0, 2, t + Duration::from_secs(600)));
+        assert_eq!(r.get_active("a"), 1);
+        assert_eq!(r.entries.get("a").unwrap().confirm_count, 1);
     }
 
     /// C-A3/A4：重启播种—— 库值在界内则恢复，越界归 0 并要求调用点回写。

@@ -190,6 +190,25 @@
 
 ### Fixed
 
+- **聚合别名的位置迁移立刻对请求侧可见**（`crates/llmux-server/src/app.rs`，2026-11-21）。
+  `resolve_aggregate_cached` 的 60s 热缓存此前整份缓存 `AggregateResolution`（含运行时
+  `active` / `locked`）。探活把位置抬回首选的**同一秒**，请求侧仍按缓存里迁移前的起点
+  分派——生产 `os` 的形态是三轮一致的证据：`🔍 probe V migrated -> 0` 之后紧跟 3 条
+  `🔀 [agg:os V=1]`，一次都没试过刚抬上去的候选；而那 3 次在旧候选上的成功又被
+  `record_request_outcome` 记成反方向迁移的确认，3-confirm 把刚抬上的位置原地打回
+  （18:27:04→18:27:11、18:42:15→18:42:20、18:58:09→18:58:30，每轮 5–21 秒）。
+  现在缓存命中时也用内存路由的实时值刷新 `active` / `locked`（配置部分仍走缓存）。
+  回归测试 `crates/llmux-server/tests/aggregate_cache_contract.rs`（2 条，已做变异验证：
+  去掉刷新即两条全红）。
+
+- **聚合别名降级后能及时回升**（`crates/llmux-core/src/aggregate.rs`，2026-11-21）。
+  `record_request_outcome` 此前对「命中 active 的成功」无条件 `break_pending`，不区分方向：
+  别名降级到兜底后，兜底的持续流量每几秒就把探活攒下的「回升」确认清零 —— 首选候选明明
+  活着，`probe` 连续多轮报 `best V=更靠前的 index` 也回不去（生产 `os`：2026-11-21 09:45
+  被 3-confirm 降级后 7 小时未回升，只有流量静默窗口能自行恢复）。现在只有**降级方向**
+  （`pending_target > active`）才被 active 成功打断，回升方向保留确认，探活 3 轮（默认约
+  15 分钟）即可抬回；探活明确判 active 最好时仍清零。回归测试 3 条（`aggregate.rs` 单元测试）。
+
 - **Messages 入口经 chat 上游的流式响应：思考字段、块索引与 `message_start` 形状**
   （`crates/llmux-core/src/proxy/anthropic_openai.rs`，2026-11-20）。
   现场是 `hy4-flash-free`（zen go，OpenRouter 形状）：推理文本只在 `reasoning` /

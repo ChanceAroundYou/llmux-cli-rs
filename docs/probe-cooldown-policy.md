@@ -33,6 +33,38 @@ Alive 为空且真探过 → record_request_all_failed(anchor_attempted = true)
 此前只评估 `active..len`，等于探活永远看不见更优的候选 —— 一次降级就回不来，
 只能靠「全链失败复位到 0」那条硬路径，而它要求连付费兜底也一起挂。
 
+### 1.1 回升确认不被兜底流量清零（2026-11-21 修）
+
+`record_request_outcome` 里「命中 active 就 `break_pending`」只对**降级方向**成立
+（`pending_target > active`）。回升方向（`pending_target < active`）不清零：
+兜底候选成功只证明它能服务，不证明首选候选没恢复或更差。
+
+不区分方向时，别名一旦降级，兜底的持续流量（生产 `os` 每小时几百次成功）会把探活
+每轮攒的 1 次确认无限冲掉 —— probe 连续多轮报 `best V=更低 index`，位置却永远回不去，
+只有流量静默 ≥15 分钟的窗口才可能自动回升。修完后探活 3 轮（默认约 15 分钟）即可抬回。
+
+判据日志仍是 `🔍 [agg:X] probe best V=k (active=m…)` 与派发行的 `🔀 [agg:X V=m]`：
+两者长期矛盾（best 更靠前、V 一直不降）就是这条又坏了。
+
+反方向保留：`record_probe_candidate(v_prime == active)` 依然清零任何 pending ——
+探活明确判定「兜底最好」是真证据。
+
+### 1.2 位置迁移必须立刻对请求侧可见（2026-11-21 修）
+
+`AppState::resolve_aggregate_cached` 有 60s 热缓存（`HOT_CACHE_TTL`），此前整份缓存
+`AggregateResolution`，把**运行时**的 `active` / `locked` 也一起钉住了。于是探活抬升之后，
+请求侧还在按迁移前的起点分派：生产 `os` 三次一致的形态是
+`🔍 probe V migrated -> 0` 之后紧跟 3 条 `🔀 [agg:os V=1]`（一次都没碰过新位置），
+而这 3 次在旧候选上的成功被 `record_request_outcome` 记成「迁回旧位置」的确认 ——
+3-confirm 在 5–21 秒内把刚抬上去的位置原地打回，看起来像「抬回去又立刻被打下来」。
+
+现在命中缓存时同样用内存路由的实时值覆盖 `active` / `locked`（配置、候选、协议仍走缓存）。
+判据：`🔍 probe V migrated -> k` 之后**第一条**派发行的 `V=` 必须等于 `k`；
+若仍等于旧值，就是这条又坏了（日志里 `V=` 与状态机长期错位）。
+
+⚠️ 别把缓存 TTL 调小当修法：错位与 TTL 长短无关，只是被钉住的时间变短；问题在
+「运行时状态跟着配置一起缓存」这件事本身。
+
 ## 2. 三态结论（这次改动的核心）
 
 原来只有「活 / 死」两态，于是**冷却中的候选被算成死**，`run_probe_round` 再把它

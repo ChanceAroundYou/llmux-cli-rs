@@ -560,6 +560,16 @@ context_length 字段：先查 models_cache（上游提供）→ 再查内置表
 攒满 3 次确认并挪走活跃位置）；探活侧冷却递增 `5/15/30/60 min`（连败 2 次起）但**流量侧保持平坦**
 （`Retry-After` 不能因本机探活不顺被拉长）；信任窗口 `clamp(4×别名周期, 15min, 2h)` 会被更新的
 真实流量**失败**推翻。完整判据与日志行见 `docs/probe-cooldown-policy.md`。
+**回升确认不被兜底流量清零（2026-11-21 修）**：`record_request_outcome` 命中 active 的
+`break_pending` 只对降级方向（`pending_target > active`）生效；回升方向（想挪回更靠前的
+候选）保留探活攒的确认，否则兜底候选的持续成功会把确认无限冲掉，首选活着也永远回不去。
+判据：`🔍 [agg:X] probe best V=k (active=m…)` 与派发行 `🔀 [agg:X V=m]` 长期矛盾即又坏了。
+**位置迁移必须立刻对请求侧可见（同日再修）**：`resolve_aggregate_cached` 的 60s 热缓存
+曾把运行时 `active`/`locked` 跟配置一起缓存 —— 探活抬升后请求侧仍按旧起点分派
+（`probe V migrated -> 0` 紧跟 3 条 `V=1` 的派发），那 3 次在旧候选上的成功又被记成
+反方向确认，5–21 秒就把刚抬上去的位置打回。现在命中缓存也按内存路由刷新这两项；
+判据：`probe V migrated -> k` 之后第一条派发行的 `V=` 必须等于 `k`。
+回归测试 `crates/llmux-server/tests/aggregate_cache_contract.rs`。
 单个手工拨测不受冷却约束；批量拨测队列算自动拨测，冷却中的会被跳过。
 
 ## 开发约定

@@ -574,11 +574,29 @@ impl AppState {
     }
     pub async fn resolve_aggregate_cached(&self, model_name: &str) -> anyhow::Result<Option<AggregateResolution>> {
         let key = llmux_core::dispatcher::sanitize_model_name(model_name);
-        // Aggregate lookup bypasses model_cache; use its own TTL cache
-        if let Some(cached) = self.aggregate_cache.lock().unwrap().get(&key).cloned() {
-            if cached.expires > Instant::now() {
-                return Ok(cached.resolution.clone());
+        // Aggregate lookup bypasses model_cache; use its own TTL cache.
+        // 命中后 active / locked 仍然要按**内存路由**的实时值刷新一次：这两项是运行时
+        // 状态（探活和流量迁移随时改），不是配置，整份缓存会把迁移前的起点钉住最多
+        // HOT_CACHE_TTL（60s）。那样请求侧会按旧起点分派，日志里 `V=` 落后于状态机，
+        // 而这些请求在旧候选上的成功又会被记成「迁回旧位置」的确认 —— 三次就把探活刚
+        // 抬上去的位置原地打回（2026-11-21 生产 `os` 每轮 ping-pong 的根因：探活
+        // `migrated -> 0` 之后紧接着 3 条 `V=1` 的派发，然后 `V migrated -> 1`）。
+        let cached_hit = {
+            let cache = self.aggregate_cache.lock().unwrap();
+            cache
+                .get(&key)
+                .filter(|c| c.expires > Instant::now())
+                .map(|c| c.resolution.clone())
+        };
+        if let Some(mut res) = cached_hit {
+            if let Some(r) = res.as_mut() {
+                let router = self.aggregate_router.lock().unwrap();
+                if let Some(e) = router.entries.get(&key) {
+                    r.active = e.active.min(r.candidates.len().saturating_sub(1));
+                    r.locked = e.locked;
+                }
             }
+            return Ok(res);
         }
         // read active without holding aggregate lock across await
         let active = self.aggregate_router.lock().unwrap().get_active(&key);
