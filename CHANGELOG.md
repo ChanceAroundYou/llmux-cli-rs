@@ -209,6 +209,39 @@
   （`pending_target > active`）才被 active 成功打断，回升方向保留确认，探活 3 轮（默认约
   15 分钟）即可抬回；探活明确判 active 最好时仍清零。回归测试 3 条（`aggregate.rs` 单元测试）。
 
+- **Responses 直通流不再被记成 `truncated`**（`crates/llmux-server/src/routes/v1/openai.rs`，
+  2026-11-21）。`openai_streaming_passthrough` 同时承载 `ingress == target == Responses`
+  的请求，但流记账只认 Chat Completions 的 `choices` / `finish_reason` / `[DONE]`。
+  Responses SSE 三者都没有：终态是 `response.completed`（codex 私有后端为
+  `response.done`，撞上限时是 `response.incomplete`），usage 在 `response.usage`
+  （`input_tokens` / `output_tokens`）。于是**每一条完整的 Responses 直通流**都被记成
+  `truncated: finish_reason=null … empty=false`、`success=0`、token 全 0 —— 生产上
+  2026-11-08 起 `gpt-6-sol` 2484 条、`gpt-6-luna` 223 条流式失败都是这个形状
+  （这些失败行里 `output_tokens>0` 的为 0 条），而客户端实际完整收到了回复。
+  现在按事件类型记账（`output_text` / `function_call_arguments` 的 delta 与 done、
+  `output_item`、`completed` / `incomplete` / `done`），usage 同时认
+  `input/output`；`empty` 改为无条件计算 —— 此前 `!truncated && …` 让它在截断流上恒为
+  `false`，排障时被误读成「有内容」。回归测试：`openai.rs` 内 4 条单元测试 +
+  `e2e_protocol_split.rs::a_completed_responses_stream_is_booked_as_success`
+  （断言 usage 行 `success=1` 且 input/output 均 >0）。
+
+- **Responses 直通流里的 `custom_tool_call` 不再被记成空回复**
+  （`crates/llmux-server/src/routes/v1/openai.rs`，2026-11-21）。上一条修好终态识别后，
+  剩下的失败换成了另一个形状：`saw_done=true empty=true`、`output_tokens>0`。生产取证
+  （id 512512，2026-11-21T12:26:04Z，`gpt-6-luna`，`chunks=85`，`usage=(5788,399)`）与
+  现场复现都显示流里**只有** `response.output_item.added/done` 的
+  `item.type=custom_tool_call` 加 `response.custom_tool_call_input.delta/done`，
+  而记账只认 `function_call` / `output_text` → `produced_nothing()` 判真 → `empty=true`。
+  客户端其实完整收到了这次工具调用：失败轮次的历史是 `custom_tool_call=2, reasoning=2`，
+  下一条请求变成 `custom_tool_call=3, reasoning=3`（Codex 执行后把调用与结果带回）。
+  现在 output item 的任意 `*_call` 类型、`custom_tool_call_input.*`、
+  `reasoning_text.*`、`refusal.*`，以及带 `encrypted_content` 的 reasoning item 都算产出；
+  空的 reasoning 头仍不算。回归测试：`openai.rs`
+  `a_custom_tool_call_stream_is_output_even_without_text`、
+  `encrypted_reasoning_counts_as_output_but_empty_items_do_not` +
+  `e2e_protocol_split.rs::a_custom_tool_call_responses_stream_is_booked_as_success`
+  （断言 usage 行 `success=1` 且 input/output 均 >0）。
+
 - **Messages 入口经 chat 上游的流式响应：思考字段、块索引与 `message_start` 形状**
   （`crates/llmux-core/src/proxy/anthropic_openai.rs`，2026-11-20）。
   现场是 `hy4-flash-free`（zen go，OpenRouter 形状）：推理文本只在 `reasoning` /

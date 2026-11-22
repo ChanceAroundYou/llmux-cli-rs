@@ -24,6 +24,7 @@ use axum::response::IntoResponse;
 use axum::{body::{to_bytes, Body}, http::{header, Method, Request, StatusCode}};
 use futures_util::StreamExt;
 use serde_json::{json, Value};
+use sqlx::Row;
 
 // --- mock upstreams -----------------------------------------------------------
 
@@ -96,6 +97,20 @@ fn anthropic_sse(marker: &str) -> String {
     ), marker = marker)
 }
 
+/// Responses SSE for a Codex freeform-tool turn: a `custom_tool_call` item and
+/// its input events, with no `output_text` and no `function_call`.
+fn custom_tool_responses_sse() -> String {
+    concat!(
+        "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"mock_resp_2\",\"object\":\"response\",\"status\":\"in_progress\",\"model\":\"gpt-4o\"}}\n\n",
+        "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"call_1\",\"type\":\"custom_tool_call\",\"call_id\":\"call_1\",\"name\":\"exec\",\"input\":\"\"}}\n\n",
+        "event: response.custom_tool_call_input.delta\ndata: {\"type\":\"response.custom_tool_call_input.delta\",\"output_index\":0,\"delta\":\"echo hi\"}\n\n",
+        "event: response.custom_tool_call_input.done\ndata: {\"type\":\"response.custom_tool_call_input.done\",\"output_index\":0,\"input\":\"echo hi\"}\n\n",
+        "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"call_1\",\"type\":\"custom_tool_call\",\"call_id\":\"call_1\",\"name\":\"exec\",\"input\":\"echo hi\",\"status\":\"completed\"}}\n\n",
+        "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"mock_resp_2\",\"object\":\"response\",\"status\":\"completed\",\"model\":\"gpt-4o\",\"usage\":{\"input_tokens\":21,\"output_tokens\":9,\"total_tokens\":30}}}\n\n",
+    )
+    .to_string()
+}
+
 fn sse_response(body: String) -> axum::response::Response {
     axum::response::Response::builder()
         .header(header::CONTENT_TYPE, "text/event-stream")
@@ -139,6 +154,9 @@ async fn spawn_mock_upstreams() -> (String, String) {
     let router_b = axum::Router::new()
         .route("/responses", axum::routing::post(|axum::Json(body): axum::Json<Value>| async move {
             if body["stream"].as_bool() == Some(true) {
+                if body["model"].as_str() == Some("custom-tool-model") {
+                    return sse_response(custom_tool_responses_sse());
+                }
                 return sse_response(responses_sse("B-resp-stream"));
             }
             axum::Json(responses_body("B-resp")).into_response()
@@ -1382,6 +1400,181 @@ async fn e2e_aggregate_streaming_matrix_keeps_streaming() {
             }
         }
     }
+}
+
+/// Regression (first seen 2026-11-08, reported 2026-11-20): a complete
+/// Responses passthrough stream was booked as `truncated:
+/// finish_reason=null` because stream accounting only knew the
+/// Chat-Completions shape (no `choices`, no `finish_reason`, no `[DONE]`).
+/// Assert the user-visible usage row, not the internal flag: success, real
+/// tokens, no error.
+#[tokio::test]
+async fn a_completed_responses_stream_is_booked_as_success() {
+    let (_upstream_a, upstream_b) = spawn_mock_upstreams().await;
+    let state = llmux_server::test_state().await;
+    let app = llmux_server::app(state.clone());
+
+    sqlx::query("INSERT INTO api_keys (name, key, allowed_models) VALUES (?, ?, ?)")
+        .bind("e2e-resp-usage")
+        .bind("sk-resp-usage")
+        .bind("*")
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+    let cookie = login(app.clone()).await;
+    let (st, body) = api_post(
+        app.clone(),
+        &cookie,
+        "/api/accounts",
+        json!({
+            "alias": "mockresp",
+            "provider_id": "openai",
+            "api_key": "sk-mock",
+            "base_url": upstream_b,
+            "responses_endpoint": upstream_b,
+            "default_protocol": "responses",
+            "skip_validation": true,
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body:?}");
+    let acct_id = body["id"].as_i64().expect("account id");
+    let (st, body) = api_post(
+        app.clone(),
+        &cookie,
+        "/api/models/aliases",
+        json!({
+            "alias": "mx-resp-usage",
+            "target_model": "gpt-4o",
+            "account_ids": [acct_id],
+            "upstream_api": "responses",
+            "provider_id": "openai",
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body:?}");
+
+    let (st, _resp, raw) = v1_post(
+        app,
+        "sk-resp-usage",
+        "/v1/responses",
+        json!({"model": "mx-resp-usage", "input": "hi", "stream": true}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{raw}");
+    assert!(raw.contains("response.completed"), "mock SSE lost: {raw}");
+
+    // `spawn_log_usage` writes from a detached task; poll instead of sleeping.
+    let mut row = None;
+    for _ in 0..100 {
+        if let Ok(Some(r)) = sqlx::query(
+            "SELECT success, input_tokens, output_tokens, error_message FROM usage_logs WHERE is_test = 0 ORDER BY id DESC LIMIT 1",
+        )
+        .fetch_optional(&state.pool)
+        .await
+        {
+            row = Some(r);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let row = row.expect("usage row written");
+    let success: i64 = row.get("success");
+    let input: i64 = row.get("input_tokens");
+    let output: i64 = row.get("output_tokens");
+    let error: Option<String> = row.get("error_message");
+    assert_eq!(success, 1, "error={error:?}");
+    assert!(
+        input > 0 && output > 0,
+        "Responses usage must be booked, got {input}/{output}"
+    );
+}
+
+/// Regression (2026-11-21): a Responses turn whose only output is a
+/// `custom_tool_call` (Codex's freeform tools) is a real reply. It used to be
+/// booked `empty=true` because the accounting only knew `function_call` and
+/// `output_text`; production clients received and executed the call anyway.
+#[tokio::test]
+async fn a_custom_tool_call_responses_stream_is_booked_as_success() {
+    let (_upstream_a, upstream_b) = spawn_mock_upstreams().await;
+    let state = llmux_server::test_state().await;
+    let app = llmux_server::app(state.clone());
+
+    sqlx::query("INSERT INTO api_keys (name, key, allowed_models) VALUES (?, ?, ?)")
+        .bind("e2e-custom-tool")
+        .bind("sk-custom-tool")
+        .bind("*")
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+    let cookie = login(app.clone()).await;
+    let (st, body) = api_post(
+        app.clone(),
+        &cookie,
+        "/api/accounts",
+        json!({
+            "alias": "mockcustom",
+            "provider_id": "openai",
+            "api_key": "sk-mock",
+            "base_url": upstream_b,
+            "responses_endpoint": upstream_b,
+            "default_protocol": "responses",
+            "skip_validation": true,
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body:?}");
+    let acct_id = body["id"].as_i64().expect("account id");
+    let (st, body) = api_post(
+        app.clone(),
+        &cookie,
+        "/api/models/aliases",
+        json!({
+            "alias": "mx-custom-tool",
+            "target_model": "custom-tool-model",
+            "account_ids": [acct_id],
+            "upstream_api": "responses",
+            "provider_id": "openai",
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body:?}");
+
+    let (st, _resp, raw) = v1_post(
+        app,
+        "sk-custom-tool",
+        "/v1/responses",
+        json!({"model": "mx-custom-tool", "input": "hi", "stream": true}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{raw}");
+    assert!(
+        raw.contains("response.custom_tool_call_input.done"),
+        "mock SSE lost: {raw}"
+    );
+
+    let mut row = None;
+    for _ in 0..100 {
+        if let Ok(Some(r)) = sqlx::query(
+            "SELECT success, input_tokens, output_tokens, error_message FROM usage_logs WHERE is_test = 0 ORDER BY id DESC LIMIT 1",
+        )
+        .fetch_optional(&state.pool)
+        .await
+        {
+            row = Some(r);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let row = row.expect("usage row written");
+    let success: i64 = row.get("success");
+    let input: i64 = row.get("input_tokens");
+    let output: i64 = row.get("output_tokens");
+    let error: Option<String> = row.get("error_message");
+    assert_eq!(success, 1, "error={error:?}");
+    assert!(input > 0 && output > 0, "got {input}/{output}");
 }
 
 /// Upstreams that emit one complete SSE frame per protocol and then keep the

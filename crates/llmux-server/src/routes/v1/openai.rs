@@ -2431,6 +2431,25 @@ impl StreamAccounting {
 /// turn from that upstream into a logged failure.
 const REASONING_FIELDS: [&str; 3] = ["reasoning", "reasoning_content", "reasoning_details"];
 
+/// Token counts from an upstream usage object.
+///
+/// Chat Completions spells them `prompt_tokens`/`completion_tokens`; the
+/// Responses API spells the same quantities `input_tokens`/`output_tokens`.
+fn stream_usage_tokens(usage: &Value) -> (i64, i64) {
+    (
+        usage
+            .get("prompt_tokens")
+            .or_else(|| usage.get("input_tokens"))
+            .and_then(Value::as_i64)
+            .unwrap_or(0),
+        usage
+            .get("completion_tokens")
+            .or_else(|| usage.get("output_tokens"))
+            .and_then(Value::as_i64)
+            .unwrap_or(0),
+    )
+}
+
 /// Non-empty string, non-empty array, or any other present value (objects,
 /// numbers) — i.e. the field actually carries something.
 fn is_non_empty_value(v: &Value) -> bool {
@@ -2457,13 +2476,28 @@ fn observe_event(event_text: &str, acc: &mut StreamAccounting) {
     let Ok(parsed) = serde_json::from_str::<Value>(payload) else {
         return;
     };
-    if let Some(u) = parsed.get("usage") {
+    // Chat Completions carries `usage` at the top level; Responses nests it in
+    // `response.usage` on the terminal event.
+    if let Some(u) = parsed
+        .get("usage")
+        .or_else(|| parsed.get("response").and_then(|r| r.get("usage")))
+    {
         if u.is_object() {
             acc.last_usage = Some(u.clone());
         }
     }
     if llmux_core::streaming::event_has_generated_content(&parsed) {
         acc.generated_content = true;
+    }
+    // Responses SSE shares this passthrough (ingress == target == Responses)
+    // but has a completely different shape: see `observe_responses_event`.
+    if parsed
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|t| t.starts_with("response."))
+    {
+        observe_responses_event(&parsed, acc);
+        return;
     }
     let Some(choice) = parsed
         .get("choices")
@@ -2519,6 +2553,137 @@ fn observe_event(event_text: &str, acc: &mut StreamAccounting) {
                 }
             }
         }
+    }
+}
+
+/// Fold one Responses-API SSE event into the accounting state.
+///
+/// `openai_streaming_passthrough` also carries `ingress == target == Responses`
+/// streams, and those have **no** `choices`, no `finish_reason` and no
+/// `[DONE]` — they terminate with `response.completed` (or `response.incomplete`,
+/// and `response.done` from the Codex private backend). Judging them with the
+/// Chat-Completions shape therefore marked **every** Responses passthrough as
+/// truncated: 2026-11-20 production had 452/452 `gpt-6-luna` rows carrying
+/// `truncated: finish_reason=null` while clients received complete answers.
+///
+/// The content side has its own blind spots. A turn whose only output is a
+/// `custom_tool_call` (Codex's freeform tools) emits
+/// `response.output_item.added/done` with `item.type=custom_tool_call` and
+/// `response.custom_tool_call_input.delta/done` — no `output_text`, no
+/// `function_call`. Before those were recognised, such turns were booked as
+/// `empty=true` although the client had received and executed the call:
+/// 2026-11-21 production had 361 `gpt-6-luna` rows with this signature while
+/// the next request's history carried the new `custom_tool_call`/
+/// `custom_tool_call_output` pair.
+fn observe_responses_event(parsed: &Value, acc: &mut StreamAccounting) {
+    match parsed.get("type").and_then(Value::as_str) {
+        Some("response.completed" | "response.incomplete" | "response.done") => {
+            acc.saw_done = true;
+        }
+        Some("response.output_text.delta") => {
+            if parsed.get("delta").is_some_and(is_non_empty_value) {
+                acc.saw_text = true;
+            }
+        }
+        // A batching upstream may skip deltas and only send the `.done` forms.
+        Some("response.output_text.done") => {
+            if parsed.get("text").is_some_and(is_non_empty_value) {
+                acc.saw_text = true;
+            }
+        }
+        Some("response.function_call_arguments.done") => {
+            if parsed.get("arguments").is_some_and(is_non_empty_value) {
+                acc.saw_tool_call = true;
+            }
+        }
+        // Codex declares freeform tools as `custom` (inside `additional_tools`)
+        // and the upstream answers with a `custom_tool_call` item plus these
+        // two events. Recognising only `function_call` booked every such turn
+        // as an empty reply even though the client received and executed the
+        // call: 2026-11-21 production had 361 `gpt-6-luna` rows like this
+        // (`saw_done=true empty=true`, output_tokens > 0).
+        Some("response.custom_tool_call_input.delta") => {
+            if parsed.get("delta").is_some_and(is_non_empty_value) {
+                acc.saw_tool_call = true;
+            }
+        }
+        Some("response.custom_tool_call_input.done") => {
+            if ["input", "delta"]
+                .iter()
+                .any(|k| parsed.get(*k).is_some_and(is_non_empty_value))
+            {
+                acc.saw_tool_call = true;
+            }
+        }
+        // Reasoning is output too, and the field carrying it is not stable.
+        Some("response.reasoning_summary_text.delta" | "response.reasoning_text.delta") => {
+            if ["delta", "text", "summary"]
+                .iter()
+                .any(|k| parsed.get(*k).is_some_and(is_non_empty_value))
+            {
+                acc.saw_text = true;
+            }
+        }
+        Some("response.reasoning_summary_text.done" | "response.reasoning_text.done") => {
+            if ["text", "summary"]
+                .iter()
+                .any(|k| parsed.get(*k).is_some_and(is_non_empty_value))
+            {
+                acc.saw_text = true;
+            }
+        }
+        // A refusal is still visible output; counting it keeps a refused turn
+        // from being booked as an empty stream.
+        Some("response.refusal.delta" | "response.refusal.done") => {
+            if ["delta", "refusal"]
+                .iter()
+                .any(|k| parsed.get(*k).is_some_and(is_non_empty_value))
+            {
+                acc.saw_text = true;
+            }
+        }
+        Some("response.function_call_arguments.delta") => {
+            if parsed.get("delta").is_some_and(is_non_empty_value) {
+                acc.saw_tool_call = true;
+            }
+        }
+        Some("response.output_item.added" | "response.output_item.done") => {
+            let item = parsed.get("item");
+            match item.and_then(|i| i.get("type")).and_then(Value::as_str) {
+                // A no-argument tool call has no non-empty argument delta, so
+                // the item itself is the only evidence it produced output.
+                // Every Responses call kind ends in `_call`: `function_call`,
+                // `custom_tool_call`, `local_shell_call`, `web_search_call`,
+                // `computer_call`, `mcp_call`, ...
+                Some(kind) if kind.ends_with("_call") => acc.saw_tool_call = true,
+                Some("message") => {
+                    if item
+                        .and_then(|i| i.get("content"))
+                        .and_then(Value::as_array)
+                        .is_some_and(|parts| {
+                            parts
+                                .iter()
+                                .any(|p| p.get("text").is_some_and(is_non_empty_value))
+                        })
+                    {
+                        acc.saw_text = true;
+                    }
+                }
+                // Encrypted reasoning (`include: reasoning.encrypted_content`)
+                // is real output whose summary may be empty on the wire.
+                Some("reasoning") => {
+                    let non_empty = |key: &str| {
+                        item.and_then(|i| i.get(key))
+                            .is_some_and(is_non_empty_value)
+                    };
+                    if non_empty("summary") || non_empty("content") || non_empty("encrypted_content") {
+                        acc.saw_text = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        _ => {}
     }
 }
 
@@ -2639,11 +2804,10 @@ async fn openai_streaming_passthrough(
             );
         }
 
+        // Chat Completions names tokens `prompt/completion`; Responses names the
+        // same values `input/output`.
         let (raw_prompt, completion_tokens) = match &acc.last_usage {
-            Some(u) => (
-                u.get("prompt_tokens").and_then(Value::as_i64).unwrap_or(0),
-                u.get("completion_tokens").and_then(Value::as_i64).unwrap_or(0),
-            ),
+            Some(u) => stream_usage_tokens(u),
             None => (0, 0),
         };
         let (cache_read, _) = acc
@@ -2656,9 +2820,13 @@ async fn openai_streaming_passthrough(
         // truncation = no [DONE]/finish_reason; a finished stream that produced
         // no text and no tool calls is an empty response. Both are read off the
         // payload directly — see `StreamAccounting::produced_nothing`.
+        //
+        // `empty` is computed unconditionally: `!truncated && …` forced it to
+        // `false` on exactly the streams where "did anything arrive?" matters
+        // most, which read as "content was produced" in incident triage.
         let done = acc.saw_done || acc.last_finish.as_deref().is_some_and(|s| !s.is_empty());
         let truncated = !done;
-        let empty_content = !truncated && acc.produced_nothing();
+        let empty_content = acc.produced_nothing();
         let final_truncated = truncated || empty_content;
         let overflow = llmux_core::context::lookup_context_length(&model)
             .is_some_and(|limit| (prompt_tokens as u64) > limit);
@@ -2750,7 +2918,7 @@ async fn openai_streaming_passthrough(
 
 #[cfg(test)]
 mod tests {
-    use super::{observe_and_should_forward, responses_body_shape, should_forward_event, StreamAccounting};
+    use super::{observe_and_should_forward, responses_body_shape, should_forward_event, stream_usage_tokens, StreamAccounting};
     use serde_json::{json, Value};
 
     #[test]
@@ -3054,6 +3222,137 @@ mod tests {
             observe_and_should_forward(&delta(empty), &mut acc);
             assert!(acc.produced_nothing(), "empty value is not output: {empty}");
         }
+    }
+
+    /// Regression (2026-11-20): a Responses passthrough stream has no
+    /// `choices`, no `finish_reason` and no `[DONE]`; it ends with
+    /// `response.completed`. Judged by the Chat-Completions shape it looked
+    /// truncated on every single stream (452/452 `gpt-6-luna` rows in prod).
+    #[test]
+    fn a_completed_responses_stream_is_not_truncated() {
+        let mut acc = StreamAccounting::default();
+        for frame in [
+            "event: response.created\n\
+             data: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\",\"status\":\"in_progress\"}}\n\n",
+            "event: response.output_text.delta\n\
+             data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n",
+            "event: response.completed\n\
+             data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"completed\",\"usage\":{\"input_tokens\":13,\"output_tokens\":5}}}\n\n",
+        ] {
+            assert!(observe_and_should_forward(frame, &mut acc));
+        }
+        assert!(acc.saw_done, "response.completed terminates the stream");
+        assert!(acc.saw_text, "output_text.delta is output");
+        assert!(!acc.produced_nothing());
+        let usage = acc.last_usage.expect("usage rides on response.completed");
+        assert_eq!(stream_usage_tokens(&usage), (13, 5));
+    }
+
+    /// The fix must not blanket-trust any `event:`-prefixed stream: without a
+    /// terminal event the response really is truncated.
+    #[test]
+    fn a_responses_stream_without_terminal_event_stays_truncated() {
+        let mut acc = StreamAccounting::default();
+        observe_and_should_forward(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
+            &mut acc,
+        );
+        assert!(!acc.saw_done);
+        assert!(acc.saw_text, "partial output is still visible");
+    }
+
+    /// Tool calls and `incomplete` (max_output_tokens) are legitimate ends; a
+    /// no-argument `function_call` item is output even without an args delta.
+    #[test]
+    fn responses_tool_calls_and_incomplete_are_accounted() {
+        let mut tool = StreamAccounting::default();
+        observe_and_should_forward(
+            "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"name\":\"f\"}}\n\n",
+            &mut tool,
+        );
+        assert!(tool.saw_tool_call);
+        assert!(!tool.produced_nothing());
+
+        let mut once = StreamAccounting::default();
+        observe_and_should_forward(
+            "data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\"}}\n\n",
+            &mut once,
+        );
+        assert!(once.saw_done, "response.incomplete is a terminal event");
+
+        let mut codex = StreamAccounting::default();
+        observe_and_should_forward(
+            "data: {\"type\":\"response.done\",\"response\":{\"status\":\"completed\"}}\n\n",
+            &mut codex,
+        );
+        assert!(codex.saw_done, "codex private backend uses response.done");
+    }
+
+    /// Regression (2026-11-21): the exact stream Copilot's Responses endpoint
+    /// returns for a Codex freeform-tool turn — a `custom_tool_call` item and
+    /// its input events, with no `output_text` and no `function_call`. It was
+    /// booked `empty=true` although the client received and executed the call
+    /// (the next request carried the new `custom_tool_call_output`).
+    #[test]
+    fn a_custom_tool_call_stream_is_output_even_without_text() {
+        let mut acc = StreamAccounting::default();
+        for frame in [
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\",\"status\":\"in_progress\"}}\n\n",
+            "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"custom_tool_call\",\"call_id\":\"c1\",\"name\":\"exec\",\"input\":\"\"}}\n\n",
+            "data: {\"type\":\"response.custom_tool_call_input.delta\",\"delta\":\"echo hi\"}\n\n",
+            "data: {\"type\":\"response.custom_tool_call_input.done\",\"input\":\"echo hi\"}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"custom_tool_call\",\"call_id\":\"c1\",\"name\":\"exec\",\"input\":\"echo hi\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":165,\"output_tokens\":15}}}\n\n",
+        ] {
+            assert!(observe_and_should_forward(frame, &mut acc));
+        }
+        assert!(acc.saw_done);
+        assert!(acc.saw_tool_call, "custom_tool_call is a tool call");
+        assert!(!acc.produced_nothing());
+        assert_eq!(
+            stream_usage_tokens(&acc.last_usage.expect("usage on completed")),
+            (165, 15)
+        );
+    }
+
+    /// Reasoning-only turns are output; an empty reasoning header is not.
+    #[test]
+    fn encrypted_reasoning_counts_as_output_but_empty_items_do_not() {
+        let mut acc = StreamAccounting::default();
+        observe_and_should_forward(
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\",\"summary\":[],\"encrypted_content\":\"gAAA\"}}\n\n",
+            &mut acc,
+        );
+        assert!(acc.saw_text);
+        assert!(!acc.produced_nothing());
+
+        let mut empty = StreamAccounting::default();
+        observe_and_should_forward(
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\",\"summary\":[],\"encrypted_content\":null}}\n\n",
+            &mut empty,
+        );
+        assert!(empty.produced_nothing(), "an empty reasoning header is not output");
+
+        // `response.reasoning_text.*` (non-summary form) is also output.
+        observe_and_should_forward(
+            "data: {\"type\":\"response.reasoning_text.delta\",\"delta\":\"thinking\"}\n\n",
+            &mut empty,
+        );
+        assert!(!empty.produced_nothing());
+    }
+
+    /// Chat Completions continues to read `prompt/completion`; Responses reads
+    /// `input/output`. Mixing the two up books every Responses stream as 0/0.
+    #[test]
+    fn usage_tokens_understand_both_protocols() {
+        assert_eq!(
+            stream_usage_tokens(&json!({"prompt_tokens": 7, "completion_tokens": 3})),
+            (7, 3)
+        );
+        assert_eq!(
+            stream_usage_tokens(&json!({"input_tokens": 13, "output_tokens": 5})),
+            (13, 5)
+        );
     }
 
     // -----------------------------------------------------------------------
