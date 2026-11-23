@@ -36,18 +36,35 @@ Alive 为空且真探过 → record_request_all_failed(anchor_attempted = true)
 ### 1.1 回升确认不被兜底流量清零（2026-11-21 修）
 
 `record_request_outcome` 里「命中 active 就 `break_pending`」只对**降级方向**成立
-（`pending_target > active`）。回升方向（`pending_target < active`）不清零：
+（`pending_target > active`）。更靠前方向（`pending_target < active`）不清零：
 兜底候选成功只证明它能服务，不证明首选候选没恢复或更差。
 
-不区分方向时，别名一旦降级，兜底的持续流量（生产 `os` 每小时几百次成功）会把探活
-每轮攒的 1 次确认无限冲掉 —— probe 连续多轮报 `best V=更低 index`，位置却永远回不去，
-只有流量静默 ≥15 分钟的窗口才可能自动回升。修完后探活 3 轮（默认约 15 分钟）即可抬回。
-
-判据日志仍是 `🔍 [agg:X] probe best V=k (active=m…)` 与派发行的 `🔀 [agg:X V=m]`：
-两者长期矛盾（best 更靠前、V 一直不降）就是这条又坏了。
+不区分方向时，别名一旦降级，兜底的持续流量（生产 `os` 每小时几百次成功）会把这条路上
+攒的确认无限冲掉 —— probe 连续多轮报 `best V=更低 index`，位置却永远回不去。
 
 反方向保留：`record_probe_candidate(v_prime == active)` 依然清零任何 pending ——
 探活明确判定「兜底最好」是真证据。
+
+### 1.1b 升降不对称：回升 1 次确认 / 降级 3 次（2026-11-23 改）
+
+确认次数按方向拆开（`CONFIRMATIONS_FOR_RECOVERY = 1` / `CONFIRMATIONS_REQUIRED = 3`）。
+此前两个方向都要 3 次，而探活每轮每个候选最多贡献 1 次确认，回升等于要 3 轮探活；
+更糟的是第 2、3 轮读到的常常是第 1 轮那条 `model_test_results` 的**信任窗口复用**
+（`probe_trust_secs` = clamp(4×300s, 15min, 2h) = 20 分钟 > 2×300s），两轮零请求，
+同一份证据被数了三遍。生产 `os` 实测降级→回升 p50 = 913s ≈ 3×300s。
+
+降级仍是 3 次：请求侧每命中一次下游候选就攒 1 次，一次抖动不该换掉主力。
+
+**回升只认本轮真探过的证据**（`Verdict::Alive` vs `AliveStale`）：判活还有两条不花
+请求的路（近 10 分钟成功流量、信任窗口内上次探活成功），它们对**非活跃**候选读到的
+是降级**之前**的旧结论。回升只要 1 次，如果旧证据也算，刚被流量判死的候选会在下一轮
+探活被原地抬回去，形成每 300s 一次的 ping-pong。旧证据仍算「活着」（不往下降、UI 角标
+照常），只是不能单独构成回升。
+
+判据日志：
+`🔍 [agg:X] probe best V=k (active=m…，发请求 N 次，采信 M 次（其中本轮真探 F 个）…)`，
+迁移行末尾带方向标签 `回升，1 次确认` / `降级，3 次确认`。
+两者长期矛盾（best 更靠前、`migrated` 却很少出现）就是这条又坏了。
 
 ### 1.2 位置迁移必须立刻对请求侧可见（2026-11-21 修）
 
@@ -128,9 +145,9 @@ Alive 为空且真探过 → record_request_all_failed(anchor_attempted = true)
 | 日志 | 含义 |
 |---|---|
 | `⏭️ [agg:x] 本轮 N 个候选都在冷却里，零请求 —— 不改状态机` | 全 Deferred，状态机没动（DEBUG） |
-| `🔍 [agg:x] probe best V=k (active=…, 发请求 n 次, 采信 m 次, 冷却跳过 d 次)` | 正常一轮；`n` 是真实配额开销 |
+| `🔍 [agg:x] probe best V=k (active=…, 发请求 n 次, 采信 m 次（其中本轮真探 f 个）, 冷却跳过 d 次)` | 正常一轮；`n` 是真实配额开销，`f` 是能构成回升的证据数 |
 | `🔍 [agg:x] 本轮真探了 n 个候选，全挂（另有 d 个在冷却里）` | 真有证据的降级轮 |
-| `🔍 [agg:x] probe V migrated -> k (best alive / all failed, reset, 本轮发了 n 次请求)` | 位置真的挪了 |
+| `🔍 [agg:x] probe V migrated -> k (best alive / all failed, reset, <回升，1 次确认\|降级，3 次确认>, 本轮发了 n 次请求)` | 位置真的挪了，末尾标签说明走的是哪条确认路 |
 
 `model_probe_suspensions` 里可以直接读某个 (账户, 模型) 当前处于哪一侧冷却、
 连败几次（`consecutive_failures` / `consecutive_quota_failures`）。
