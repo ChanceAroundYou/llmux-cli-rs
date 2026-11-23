@@ -15,10 +15,13 @@ const TCP_KEEPALIVE_IDLE_SECS: u64 = 30;
 const TCP_KEEPALIVE_INTERVAL_SECS: u64 = 120;
 
 /// 探针重试次数。死连接的总判定预算 =
-/// `idle + interval × retries` = 30 + 120×6 = **750s**，必须盖过
+/// `idle + interval × retries` = 30 + 120×5 = **630s**，必须盖过
 /// [`MAX_FIRST_BYTE_TIMEOUT_SECS`]（600s）——否则救活一个配了长超时的别名时，
 /// 内核会先于我们自己配的超时把连接掐掉（这正是 45s 墙的成因）。
-const TCP_KEEPALIVE_RETRIES: u32 = 6;
+///
+/// 2026-11-23：先取 750s（retries=6），用户要求收到 600s 量级 —— 12 分钟以上的
+/// 静默已经不该由我们来等，中继那边冷前缀实测是 109–139s。
+const TCP_KEEPALIVE_RETRIES: u32 = 5;
 
 /// 模型/聚合别名的 `first_byte_timeout_secs` 允许的最大值（保存路由用它校验）。
 pub const MAX_FIRST_BYTE_TIMEOUT_SECS: u64 = 600;
