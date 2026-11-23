@@ -59,7 +59,7 @@ llmux/                  ← git 仓库根（origin = fork）
 | 日志归档还在不在、覆盖到哪天 | `ls -1t ~/HD/openwrt/log-archive/llmux/ \| head -3`；跨度 `ls -1 ~/HD/openwrt/log-archive/llmux/llmux.log.* \| sed -n '1p;$p'` | ⚠️ 文件名是 `llmux.log.<日期>-<两位后缀>`（**不是按天**），且后缀**不等于内容所在小时**（2026-11-07 13:10 读到最新是 `-05`、mtime 13:00）。旧小时会被 gzip → `rg` 搜不到，用 `zgrep` / `zcat … \| rg`。窗口是快照：2026-11-07 读到 78 个文件、跨 `11-04-01 → 11-07-05`（约 3.5 天）—— **别按 `LOG_RETAIN_DAYS=30` 以为能翻 30 天** |
 | `target` 体积、「清一次能拿回多少」 | `du -sh target` + `./scripts/clean.sh`（默认 dry-run） | 「稳态」= 陈旧产物与增量缓存被清掉之后的读数；dry-run 报的「可释放」就是本轮上限 |
 | 当前账户 / 别名 / 聚合别名 id 与绑定 | 登录 Web 界面看；或带**会话 cookie**（不是 `/v1` 的 API key）打 `GET /api/models/aliases`、`GET /api/aggregate-aliases`、`GET /api/accounts` | **不要把 id 写进本文、脚本常量或提交** —— 按 id 操作前先查当前值 |
-| 别名 / 聚合实际生效的首字节超时 | `GET /api/aggregate-aliases` 的 `first_byte_timeout_secs`，以及候选上的同名字段 | 候选值优先于聚合值；两个都空 → `FIRST_BYTE_TIMEOUT_SECS`（`grep -n FIRST_BYTE_TIMEOUT_SECS crates/llmux-core/src/adapters/mod.rs`） |
+| 别名 / 聚合实际生效的首字节超时 | `GET /api/aggregate-aliases` 的 `first_byte_timeout_secs`，以及候选上的同名字段 | 候选值优先于聚合值；两个都空 → `FIRST_BYTE_TIMEOUT_SECS`（`grep -n FIRST_BYTE_TIMEOUT_SECS crates/llmux-core/src/adapters/mod.rs`）。⚠️ 这个超时只在**非流式**请求上生效，且**配了也不一定等到**：上游静默时内核的 keepalive 判死预算（`dead_peer_budget_secs()`，当前 750s）必须晚于它，见 §45s 静默墙 |
 | 测试是否**真的**全绿 | `cargo test > /tmp/t.log 2>&1`，然后 `grep '^test result' /tmp/t.log` | ⚠️ 别用 `cargo test \| tail`：管道的退出码是 `tail` 的，**编译失败也会被报成 exit 0**（2026-11-07 踩过）。判据是各套件的 passed/failed 计数 + `grep -c '^error'`。⚠️ **退出码 0 不代表跑完了**：同日一次后台 `cargo test` 只留下 5 个 `test result` 行却回 exit 0 —— 数一下套件数（`grep -c '^test result'`）对不对得上已知的量（2026-11-07 是 21 套 / 583 通过），对不上就是没跑完，别据此声称全绿 |
 | 上游某别名今天的形态（端点、模型清单、免费档门） | 直接打上游，如 `GET https://opencode.ai/zen/v1/models` | 上游随时会变；本文关于上游的记述都是「某日实测」，用前先打一次 |
 | 改了保存侧校验后，**现有配置**会不会被拒 | 本地重放：只读快照生产 `accounts/model_aliases/aggregate_aliases` 的**非密钥列** → 灌进本地新建库 → 用同一份 binary 跑保存路由，出站地址指 `127.0.0.1:9` | 零外呼、零密钥副本 —— 日志里 `failed to decrypt API key for account id=…` 是**预期**的（本地没有生产 master.key），保存路由校验阶段用不到明文 key。**别为了重跑去取生产 cookie / master.key** |
@@ -461,6 +461,40 @@ ChatGPT Plus 的 Codex 额度直连 `chatgpt.com/backend-api/codex`，llmux 原�
   根本没发出去，重试不重复计费；不重试就会被打成 502（锁定的别名没有退路）。
   超时和「已连上但中途出错」都不重试（后者可能已经计费）。回归测试
   `a_refused_connection_is_retried_once` 同时钉住分类与重试间隔。
+
+### 45s 静默墙：reqwest 的 `TCP_USER_TIMEOUT` 默认值（2026-11-23 修）
+
+**症状**：`error sending request for url (http://192.168.10.106:3000/v1/chat/completions)`，
+耗时**稳定落在 45.2–47.5s**，别名配的 120s / 60s 首字节超时完全不起作用。
+
+**根因**：reqwest 0.12 在 Linux 上**默认**给每个 socket 设 `TCP_USER_TIMEOUT = 30s`
+（`client.rs` 的 cfg(linux) 分支，不是 Rust 层超时，是内核的）。tcp(7)：它
+「will override keepalive」。配合 `.tcp_keepalive(30s)` + reqwest 默认 `interval=15s`，
+探针在 t=30s 发出、对端不回，内核在 t=45s 直接 `tcp_send_active_reset` + ETIMEDOUT。
+中继在大前缀 prefill 期间（冷前缀实测 109–139s）一个字都不回，于是整片命中。
+
+**判据（四条一起看）**：
+1. 失败耗时**成簇**在 45s 附近，`psql`/sqlite 里 `latency_ms BETWEEN 40000 AND 49999`；
+2. **流式也要算**：`latency_ms - ttft_ms` 同样成簇在 45.2–45.9s（2026-11-23 读数：
+   账户 63 有 30 例）—— 首字节到了之后中途静默同样会被掐，不只是「首字节」；
+3. 本地复现：netns 里起一个「收完请求就静默、且丢弃自己发出的纯 ACK」的对端
+   （**只丢 ACK 才复现**：loopback 或正常 ACK 的对端会把探针应答掉，`probes_out`
+   永远是 0，`/tmp/kaproto` 那轮就是这么假阴性的）；
+4. `grep -rn '45\\|:45' crates/` 找不到任何 45s 常量 —— 它不在代码里。
+
+**修复**：`get_client()` 显式 `.tcp_user_timeout(None)`，并把 keepalive 改成
+idle 30s / interval 120s / retries 6 → 判死预算 **750s**。
+⚠️ **只关 `user_timeout` 不够**：实测墙只是从 45.8s 挪到 **76.2s**（30+15×3）。
+⚠️ **预算必须盖过 `MAX_FIRST_BYTE_TIMEOUT_SECS`（600s）**，否则给别名配 120s 超时时，
+内核仍会先于我们的超时动手，错误退化成没有诊断价值的 `error sending request`。
+两个常量在同一个文件里，测试 `the_dead_peer_budget_outlives_the_largest_…` 钉住这个不等式。
+
+**验收判据**（同一冷体请求，netns 静默对端）：修复前 45.7s `error sending request`；
+修复后配 30s → **30.0s** `Upstream sent no response headers within 30s`，配 120s →
+**120.0s** 同一条消息。错误从「内核 RST」变回「配置的超时」才算修好。
+
+**别用 loopback 验证这件事**：loopback 对端会自动 ACK keepalive 探针，
+`ss -tieop` 里 `probes_out` 一直是 0，永远不掉。必须让对端**丢弃纯 ACK**。
 
 ## 路由模型机制
 
