@@ -7,6 +7,31 @@ use std::time::Duration;
 
 static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
+/// 客户端 keepalive 空闲时长：连接空闲这么久之后才开始发探针。
+const TCP_KEEPALIVE_IDLE_SECS: u64 = 30;
+
+/// 探针间隔。**必须显式设**：reqwest 默认 15s，配合它默认的
+/// `tcp_user_timeout = 30s` 会把「上游连着但不吭声」在 30+15=45s 掐死（见下）。
+const TCP_KEEPALIVE_INTERVAL_SECS: u64 = 120;
+
+/// 探针重试次数。死连接的总判定预算 =
+/// `idle + interval × retries` = 30 + 120×6 = **750s**，必须盖过
+/// [`MAX_FIRST_BYTE_TIMEOUT_SECS`]（600s）——否则救活一个配了长超时的别名时，
+/// 内核会先于我们自己配的超时把连接掐掉（这正是 45s 墙的成因）。
+const TCP_KEEPALIVE_RETRIES: u32 = 6;
+
+/// 模型/聚合别名的 `first_byte_timeout_secs` 允许的最大值（保存路由用它校验）。
+pub const MAX_FIRST_BYTE_TIMEOUT_SECS: u64 = 600;
+
+/// 每个上游 socket 的 `TCP_USER_TIMEOUT` 策略。
+///
+/// **必须是 `None`（关闭）**，理由见 [`get_client`] 里的长注释：reqwest 0.12 在
+/// Linux 上默认给 30s，而内核会用它 override keepalive —— 一旦探针没被应答就直接
+/// RST，把「上游还在 prefilling」误判成「连接已死」，错误也退化成没有诊断价值的
+/// `error sending request`。抽成常量是为了能被测试盯住（写在链式调用里就没有
+/// 任何运行时可断言的痕迹）。
+const TCP_USER_TIMEOUT: Option<std::time::Duration> = None;
+
 fn get_client() -> &'static reqwest::Client {
     CLIENT.get_or_init(|| {
         reqwest::Client::builder()
@@ -20,10 +45,32 @@ fn get_client() -> &'static reqwest::Client {
             // timeouts for non-streaming callers live at their call sites.
             .pool_idle_timeout(std::time::Duration::from_secs(90))
             .pool_max_idle_per_host(20)
-            .tcp_keepalive(std::time::Duration::from_secs(30))
+            .tcp_keepalive(std::time::Duration::from_secs(TCP_KEEPALIVE_IDLE_SECS))
+            .tcp_keepalive_interval(std::time::Duration::from_secs(TCP_KEEPALIVE_INTERVAL_SECS))
+            .tcp_keepalive_retries(TCP_KEEPALIVE_RETRIES)
+            // ponytail: 必须显式关掉。reqwest 0.12 在 Linux 上默认给每个 socket
+            // 设 `TCP_USER_TIMEOUT = 30s`（不是 Rust 层的超时，是内核的），而
+            // tcp(7) 规定它 **override keepalive**：一旦有探针没被应答，内核就在
+            // `user_timeout` 到点时直接 `tcp_send_active_reset` + ETIMEDOUT。
+            // 实测（netns + 不回应 ACK 的静默对端，三轮）：当前设置下连接在
+            // 45.6/45.7/45.8s 被自己 RST 掉，reqwest 报 `error sending request`。
+            // 生产里中继 192.168.10.106 在大前缀 prefill 期间一个字都不回，
+            // 于是 os/deepseek-yf 的请求在 45.2–47.5s 整片失败 —— 与别名配的
+            // 120s/60s 首字节超时毫无关系，那个超时根本没机会触发。
+            // 关掉之后死连接只由上面的 keepalive 预算判定（实测 766s）。
+            .tcp_user_timeout(TCP_USER_TIMEOUT)
             .build()
             .expect("failed to build reqwest client")
     })
+}
+
+/// 死连接的判定预算（秒）：`idle + interval × retries`。
+///
+/// 与 [`MAX_FIRST_BYTE_TIMEOUT_SECS`] 的先后关系是这条链的关键：内核必须在
+/// **我们自己的首字节超时之后**才判定连接死亡，否则错误会变成
+/// `error sending request`（无诊断价值）而不是配置的超时消息。
+pub fn dead_peer_budget_secs() -> u64 {
+    TCP_KEEPALIVE_IDLE_SECS + TCP_KEEPALIVE_INTERVAL_SECS * TCP_KEEPALIVE_RETRIES as u64
 }
 
 /// 首字节超时：**只等到响应头**（body 不在超时范围内），且**只对非流式请求**生效。
@@ -1152,6 +1199,76 @@ mod first_byte_timeout_tests {
         assert!(FIRST_BYTE_TIMEOUT_SECS >= 30);
         // 上限：必须显著小于实测的 340s 挂死，否则这特性没意义
         assert!(FIRST_BYTE_TIMEOUT_SECS <= 60);
+    }
+
+    /// 内核判死连接的预算必须**晚于**我们自己配的首字节超时。
+    ///
+    /// 这条钉的是一个只在真实网络里才看得见的坑：reqwest 0.12 在 Linux 上默认给
+    /// 每个 socket 设 `TCP_USER_TIMEOUT = 30s`，而 tcp(7) 规定它 override keepalive。
+    /// 探针没被应答时内核直接 RST，错误变成 `error sending request`，配置的首字节
+    /// 超时根本没机会触发 —— 生产上中继在大前缀 prefill 期间完全静默，于是整片
+    /// 请求在 45.2–47.5s 失败（2026-11-23 实测 199 次/天）。
+    ///
+    /// 死连接预算一旦短于可配的最大首字节超时，这条链就回来了：用户把别名超时
+    /// 设成 120s，实际却在 45s 被掐。所以两者必须由同一处常量约束。
+    #[test]
+    fn the_dead_peer_budget_outlives_the_largest_configurable_first_byte_timeout() {
+        assert!(
+            dead_peer_budget_secs() > MAX_FIRST_BYTE_TIMEOUT_SECS,
+            "keepalive 判死预算 {}s 必须盖过最大可配首字节超时 {}s",
+            dead_peer_budget_secs(),
+            MAX_FIRST_BYTE_TIMEOUT_SECS
+        );
+        // 探针不能太密：Linux 每丢一个探针要指数退避（tcp_probe_interval 上限 120s），
+        // 设成 1s 只会让探测本身成为流量。
+        assert!(TCP_KEEPALIVE_INTERVAL_SECS >= 60);
+        // 也不能无限等：对端真的死了，连接得在分钟级被回收，不能挂到进程结束。
+        assert!(dead_peer_budget_secs() <= 1800);
+    }
+
+    /// 客户端必须显式关掉 `TCP_USER_TIMEOUT`，而且这一行必须真的挂在共享 client 的
+    /// builder 链上。
+    ///
+    /// reqwest 的 builder 默认值（Linux = 30s）是**隐式**的，读代码看不出来，
+    /// 只能靠这条挡住两种回归：把常量改回 `Some(30s)`，以及**把调用点删掉**
+    /// （回落默认值同样是 30s，但没有任何可见痕迹）。
+    ///
+    /// 所以分两段断言：
+    /// 1. 常量值 —— 能执行到的值，不是源码文本；
+    /// 2. `get_client` 那段代码**去掉注释后**仍含 `.tcp_user_timeout(TCP_USER_TIMEOUT)`。
+    ///    不去注释的话，解释这个调用的注释本身就会让断言成立（2026-11-23 踩过）。
+    #[test]
+    fn the_shared_client_does_not_rely_on_reqwests_tcp_user_timeout_default() {
+        assert_eq!(
+            TCP_USER_TIMEOUT, None,
+            "provider 客户端必须显式关闭 TCP_USER_TIMEOUT：reqwest 的 Linux 默认值 \
+             30s 会在探针未应答时抢先 RST 连接（见 get_client 注释）"
+        );
+
+        let src = include_str!("mod.rs");
+        let fn_start = src.find("fn get_client()").expect("get_client 必须存在");
+        let fn_end = fn_start
+            + src[fn_start..]
+                .find("\n}\n")
+                .expect("get_client 必须有闭合");
+        let body: String = src[fn_start..fn_end]
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            body.contains(".tcp_user_timeout(TCP_USER_TIMEOUT)"),
+            "get_client 的 builder 链必须带上 .tcp_user_timeout(TCP_USER_TIMEOUT)；\
+             删掉它等于回落 reqwest 的 30s 默认值（去注释后的代码里没找到）"
+        );
+
+        let built = reqwest::Client::builder()
+            .tcp_keepalive(Duration::from_secs(TCP_KEEPALIVE_IDLE_SECS))
+            .tcp_keepalive_interval(Duration::from_secs(TCP_KEEPALIVE_INTERVAL_SECS))
+            .tcp_keepalive_retries(TCP_KEEPALIVE_RETRIES)
+            .tcp_user_timeout(None)
+            .build();
+        assert!(built.is_ok(), "连接池参数必须能 build：{:?}", built.err());
     }
 
     /// 主断言：**非流式**请求遇到挂死的上游会被超时打断（而不是挂到天荒地老）。

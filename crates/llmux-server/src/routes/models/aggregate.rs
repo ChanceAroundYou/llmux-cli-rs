@@ -367,7 +367,7 @@ pub async fn set_aggregate_alias(
                     )
                 }
             };
-            if !(1..=600).contains(&n) {
+            if !(1..=llmux_core::adapters::MAX_FIRST_BYTE_TIMEOUT_SECS as i64).contains(&n) {
                 return crate::error::simple_error(
                     "first_byte_timeout_secs must be an integer from 1 to 600, or null",
                     StatusCode::BAD_REQUEST,

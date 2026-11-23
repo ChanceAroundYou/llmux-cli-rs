@@ -285,7 +285,11 @@ pub async fn set_model_alias(
     let first_byte_timeout_secs = match body.get("first_byte_timeout_secs") {
         None | Some(Value::Null) => None,
         Some(value) => match value.as_i64() {
-            Some(seconds) if (1..=600).contains(&seconds) => Some(seconds),
+            Some(seconds)
+                if (1..=llmux_core::adapters::MAX_FIRST_BYTE_TIMEOUT_SECS as i64).contains(&seconds) =>
+            {
+                Some(seconds)
+            }
             _ => return crate::error::simple_error("first_byte_timeout_secs must be an integer from 1 to 600, or null", StatusCode::BAD_REQUEST),
         },
     };
