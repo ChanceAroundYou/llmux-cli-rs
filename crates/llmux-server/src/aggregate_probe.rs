@@ -151,13 +151,18 @@ enum Verdict {
     Deferred,
 }
 
-/// 一轮的结果。`probed` 是**真发过请求**的候选数 —— 它是「这一轮到底有没有证据」
-/// 的判据，零请求的一轮不许改动状态机。
+/// 一轮的结果。`probed` 是**真发过请求**的候选数（成功 + 失败都算）—— 它是
+/// 「这一轮到底有没有花请求拿证据」的判据，零请求的一轮不许改动状态机。
+///
+/// ⚠️ `probed` 以前只累计 `Dead`，于是成功的真探（`fresh`）没算进去，日志里会
+/// 出现「发请求 0 次」和「本轮真探 1 个」并存的自相矛盾，也让 `本轮发了 N 次请求`
+/// 系统性少报。现在 `probed == fresh.len() + 失败数`。
 struct RoundOutcome {
     /// 本轮判定活着的候选（升序）。含不发请求采信的旧证据。
     alive: Vec<usize>,
     /// 其中**本轮真发了探活请求**并成功的那些（升序）。回升只认这份。
     fresh: Vec<usize>,
+    /// 本轮**真发了探活请求**的候选数（成功 + 失败）。
     probed: usize,
 }
 
@@ -294,7 +299,9 @@ async fn probe_round(
     let mut alive: Vec<usize> = Vec::new();
     // `fresh` = 本轮**真发了探活请求**并成功的候选。回升只认这份证据（见 Verdict）。
     let mut fresh: Vec<usize> = Vec::new();
-    let mut probed = 0usize;
+    // 真探失败的候选数。「全挂」判断要用它；`probed`（真发请求总数）在循环后
+    // 由 `fresh.len() + failed` 合成 —— 成功与失败都花了一次配额。
+    let mut failed = 0usize;
     let mut deferred = 0usize;
 
     let mut futs = Vec::new();
@@ -318,12 +325,13 @@ async fn probe_round(
                 fresh.push(idx);
             }
             Verdict::AliveStale => alive.push(idx),
-            Verdict::Dead => probed += 1,
+            Verdict::Dead => failed += 1,
             Verdict::Deferred => deferred += 1,
         }
     }
     alive.sort_unstable();
     fresh.sort_unstable();
+    let probed = fresh.len() + failed;
 
     if !alive.is_empty() {
         tracing::info!(

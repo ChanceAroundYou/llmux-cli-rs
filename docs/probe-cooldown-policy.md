@@ -145,8 +145,8 @@ Alive 为空且真探过 → record_request_all_failed(anchor_attempted = true)
 | 日志 | 含义 |
 |---|---|
 | `⏭️ [agg:x] 本轮 N 个候选都在冷却里，零请求 —— 不改状态机` | 全 Deferred，状态机没动（DEBUG） |
-| `🔍 [agg:x] probe best V=k (active=…, 发请求 n 次, 采信 m 次（其中本轮真探 f 个）, 冷却跳过 d 次)` | 正常一轮；`n` 是真实配额开销，`f` 是能构成回升的证据数 |
-| `🔍 [agg:x] 本轮真探了 n 个候选，全挂（另有 d 个在冷却里）` | 真有证据的降级轮 |
+| `🔍 [agg:x] probe best V=k (active=…, 发请求 n 次, 采信 m 次（其中本轮真探 f 个）, 冷却跳过 d 次)` | 正常一轮；`n` 是真实配额开销（**成功与失败的真探都算**，`n ≥ f`），`f` 是能构成回升的证据数（真探成功那些） |
+| `🔍 [agg:x] 本轮真探了 n 个候选，全挂（另有 d 个在冷却里）` | 真有证据的降级轮（这里 `n` 即 `failed`，因为 alive 为空时没有成功的真探可算） |
 | `🔍 [agg:x] probe V migrated -> k (best alive / all failed, reset, <回升，1 次确认\|降级，3 次确认>, 本轮发了 n 次请求)` | 位置真的挪了，末尾标签说明走的是哪条确认路 |
 
 `model_probe_suspensions` 里可以直接读某个 (账户, 模型) 当前处于哪一侧冷却、
