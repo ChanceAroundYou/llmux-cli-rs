@@ -1303,7 +1303,7 @@ pub(crate) async fn dispatch_aggregate_with_conversion(
             .unwrap()
             .record_request_outcome(&alias, hit, len, Instant::now(), anchor_attempted);
         if switched {
-            tracing::info!("🔀 [agg:{}] V migrated -> {} (after 3-confirm)", alias, hit);
+            tracing::info!("🔀 [agg:{}] V migrated -> {} (after 3-confirm，降级)", alias, hit);
             llmux_core::aggregate::persist_active(&state.pool, &alias, hit).await;
         }
         if let Some(resp) = hit_stream_resp {

@@ -580,7 +580,7 @@ pub struct AggregateResolution {
 }
 
 // ---------------------------------------------------------------------------
-// Router state machine — V-anchored with 3-confirm stabilization
+// Router state machine — V-anchored, asymmetric confirmation (3 降级 / 1 回升)
 // ---------------------------------------------------------------------------
 
 /// 探活退避的**基准值**，也是退避翻倍与初始的下限。
@@ -589,10 +589,35 @@ pub struct AggregateResolution {
 pub const PROBE_BACKOFF_BASE_SECS: u64 = 300;
 /// 退避翻倍的上限。
 pub const PROBE_BACKOFF_MAX_SECS: u64 = 600;
-/// 3 次确认必须落在的这个窗口内（从第一次确认起算）。
+/// **硬证据**迁移需要的连续确认次数：请求侧命中下游候选（降级），以及
+/// 全链失败后复位到 0（`record_request_all_failed`）。
+///
+/// 请求侧每命中一次下游候选就攒 1 次，三次（窗口内）才换位置 —— 否则一次抖动
+/// 就能把主力换掉。全链失败复位同理：三条路一起挂才值得动位置。
+pub const CONFIRMATIONS_REQUIRED: u8 = 3;
+
+/// **回升**（探活判定更靠前的候选活着）需要的确认次数：只要 1 次。
+///
+/// 回升的唯一证据来源是探活 —— 请求侧从 `active..` 开始派发，永远打不到更靠前
+/// 的候选 —— 而探活每轮每个候选最多贡献 1 次确认。此前回升也走 3 次，等于要
+/// 3 轮探活；更糟的是第 2、3 轮读到的常常是第 1 轮那条 `model_test_results` 的
+/// **信任窗口复用**（`probe_trust_secs` = clamp(4×300s, 15min, 2h) = 20 分钟 >
+/// 2×300s），两轮零请求，同一份证据被数了三遍。生产 `os` 实测降级→回升
+/// p50 = 913s ≈ 3×300s。2026-11-23 用户要求：自部署 DeepSeek 繁忙/偶尔故障
+/// 是正常的，恢复后要积极抬回去。
+///
+/// 1 次不等于「一次抖动就抬」：能构成回升的只有 `fresh_evidence`（本轮真发了
+/// 探活请求且成功），而不花请求的旧证据（成功流量 / 信任窗口内的上次探活成功）
+/// 一概不算 —— 见 [`AggregateRouter::record_probe_candidate`]。比 active 更靠前的
+/// 候选还会被后台探活强制每轮真探（`aggregate_probe` 的 `must_probe`），所以
+/// 恢复后的第一轮探活就能把它抬回去，而不会被信任窗口拖着等 20 分钟。
+pub const CONFIRMATIONS_FOR_RECOVERY: u8 = 1;
+
+/// 降级确认必须落在的这个窗口内（从第一次确认起算）。
 ///
 /// 取 30 分钟不是随手拍的：最长退避 600s，探活侧跑满 3 轮正好 20 分钟。窗口
 /// 再小就会和退避互相卡死（永远攒不满 3 次），再大就允许跨小时的漂移。
+/// 回升只要 1 次确认，不受这个窗口约束。
 pub const PENDING_WINDOW_SECS: u64 = 1800;
 
 #[derive(Debug, Clone)]
@@ -744,8 +769,9 @@ impl AggregateRouter {
 
     /// Called when a request succeeds at `hit` (hit may equal active or downstream).
     /// 连续 3 次命中同一非 active 候选才迁移；命中 active 只中断**降级**方向的
-    /// 计数（目标是 active 之后的候选），回升方向（目标在 active 之前）不清零，
-    /// 否则兜底的持续流量会把探活每轮攒的 1 次确认无限冲掉。
+    /// 计数（目标是 active 之后的候选），倾「更靠前」方向（目标在 active 之前，
+    /// 唯一来源是 `record_request_all_failed` 的复位）不清零，否则兜底的持续流量
+    /// 会把那条路攒的确认无限冲掉。
     /// `anchor_attempted` = 这一轮**真的尝试了锚点且它真的失败了**。被跳过不算
     /// （冷却 / 装不下 / max_tokens 不合规 / 账户不存在都是「没试过」，不是「坏了」）
     /// —— 否则一次 30 分钟的限流休息就能把主候选永久挤下线。见 dispatch 路径。
@@ -763,11 +789,14 @@ impl AggregateRouter {
         if hit == e.active {
             // 命中当前活跃：只中断**降级**方向（pending_target 在 active 之后）。
             //
-            // 回升方向（pending_target < active，想把位置挪回更优候选）不能被兜底
+            // 「更靠前」方向（pending_target < active，想把位置挪回更优候选）不能被兜底
             // 候选的成功清零：兜底成功只证明它能服务，不证明首选候选已经恢复或更差。
-            // 清零会让持续流量把探活每轮攒的 1 次确认无限冲掉 —— 首选明明活着，
+            // 清零会让持续流量把这条路上攒的确认无限冲掉 —— 首选明明活着，
             // 别名也会永远停在兜底上（2026-11-21 生产 `os`：降级后兜底每小时几百次
             // 成功反复打断，probe 连续 7 小时报 best=V0 也没能切回去）。
+            // 探活侧的回升现在是 1 次确认（`CONFIRMATIONS_FOR_RECOVERY`），不会在这里
+            // 攒等待；真正会走到这里的「更靠前」pending 只剩 `record_request_all_failed`
+            // 那条 3 次确认的复位。
             let pending_is_downgrade = matches!(e.pending_target, Some(t) if t > e.active);
             if pending_is_downgrade {
                 Self::break_pending(e);
@@ -779,8 +808,9 @@ impl AggregateRouter {
             // 锚点这一轮没被试过：记成功、不推进。
             return false;
         }
-        // 命中下游候选：按同一 target 连续 3 次（且在窗口内）才切
-        Self::advance_pending(e, alias, hit, now)
+        // 命中下游候选：按同一 target 连续 3 次（且在窗口内）才切。
+        // 请求侧只会从 `active..` 开始派发，命中的必然是**降级**方向。
+        Self::advance_pending(e, alias, hit, now, CONFIRMATIONS_REQUIRED)
     }
 
     /// Called when a request exhausts all candidates (502). Treat as pending V=0.
@@ -804,7 +834,7 @@ impl AggregateRouter {
         if e.active == 0 {
             // 已在 0：无迁移，但「连续全失败」仍要 3 次（窗口内）才触发退避翻倍。
             // 中断（锚点成功过一次）由 record_request_outcome 的 break_pending 负责。
-            if !Self::bump_pending(e, alias, 0, now) {
+            if !Self::bump_pending(e, alias, 0, now, CONFIRMATIONS_REQUIRED) {
                 return false;
             }
             Self::break_pending(e);
@@ -812,7 +842,7 @@ impl AggregateRouter {
             return false;
         }
         // active != 0 且全失败：视为连续 3 次要求切回 0，中断则清零
-        let switched = Self::advance_pending(e, alias, 0, now);
+        let switched = Self::advance_pending(e, alias, 0, now, CONFIRMATIONS_REQUIRED);
         if switched {
             e.probe_backoff_secs = (e.probe_backoff_secs * 2).min(PROBE_BACKOFF_MAX_SECS);
         }
@@ -827,8 +857,22 @@ impl AggregateRouter {
     /// 不是靠拒绝回升。
     /// C-B2：锁定后 no-op（后台探活也会跳过，这是请求侧探活都绕过内存直调
     /// 状态机时的兜底）。
+    ///
+    /// `fresh_evidence` = 这一轮的判活结论来自**本轮真的发出去的探活请求**。
+    /// 判活还有两条不花请求的路（近期成功流量、信任窗口内的上次探活成功），
+    /// 它们对**非活跃**候选读到的都是降级**之前**的旧证据 —— 拿它去抬回刚被
+    /// 流量判死的候选，就是每轮探活一次的 ping-pong（回升只要 1 次确认，所以
+    /// 这道门必须在这里守住）。非新鲜证据仍可作**降级**方向（3 次确认，
+    /// 而且旧成功本来也不该把位置往下推），只是不能单独构成回升。
     /// Returns true if switched.
-    pub fn record_probe_candidate(&mut self, alias: &str, v_prime: usize, len: usize, now: Instant) -> bool {
+    pub fn record_probe_candidate(
+        &mut self,
+        alias: &str,
+        v_prime: usize,
+        len: usize,
+        now: Instant,
+        fresh_evidence: bool,
+    ) -> bool {
         let e = self.ensure_entry(alias, len);
         if e.locked {
             return false;
@@ -846,15 +890,48 @@ impl AggregateRouter {
             }
             return false;
         }
-        let switched = Self::advance_pending(e, alias, v_prime, now);
+        // 探活的两个方向确认次数不同：更靠前 = 回升，只要 1 次；更靠后 = 降级，
+        // 要 3 次硬证据。回升的证据只有探活能给（请求侧从 active.. 派发，打不到
+        // 更靠前的候选），而探活每轮最多 1 次确认 —— 3 次 = 3 轮 ≈ 15 分钟，
+        // 生产 `os` 实测 p50 913s。
+        //
+        // 回升还要求 `fresh_evidence`：不花请求的判活对这一侧是旧证据（见上）。
+        // 没新鲜证据就不动状态机 —— 连 pending 都不碰，免得把一次真确认冲掉。
+        let recovering = v_prime < e.active;
+        let required = if recovering {
+            CONFIRMATIONS_FOR_RECOVERY
+        } else {
+            CONFIRMATIONS_REQUIRED
+        };
+        if recovering && !fresh_evidence {
+            // 旧证据仍算「活着」：不往下降、状态角标照常 —— 但绝不据此抬位置，
+            // 也不动退避（退避描述的是「探过且全挂」，旧证据没提供这类新信息）。
+            e.last_probe = Instant::now();
+            if v_prime < e.last_status.len() {
+                e.last_status[v_prime] = Some(true);
+            }
+            return false;
+        }
+        let switched = Self::advance_pending(e, alias, v_prime, now, required);
         e.last_probe = Instant::now();
         switched
     }
 
     /// 推进一次确认：窗口内才继续攒，超窗口从头计数（是从 1 重新开始，不是清零）。
-    /// 返回是否达到 3 次。窗口判据只在这一处 —— 请求侧和探活侧共用同一个 pending，
-    /// 所以「3 次」是 3 次观察，证据来源可以混合。
-    fn bump_pending(e: &mut AggregateEntry, alias: &str, target: usize, now: Instant) -> bool {
+    /// 返回是否达到 `required` 次。窗口判据只在这一处 —— 请求侧和探活侧共用同一个
+    /// pending，所以「N 次」是 N 次观察，证据来源可以混合。
+    ///
+    /// `required` 由调用点按方向决定（见 [`CONFIRMATIONS_REQUIRED`] /
+    /// [`CONFIRMATIONS_FOR_RECOVERY`]）：降级要 3 次硬证据，回升只要 1 次。
+    /// `required <= 1` 时不套窗口 —— 单次确认没有「连续性」可言，套上只会让
+    /// 一次本该生效的确认在窗口过期后反而被丢掉。
+    fn bump_pending(e: &mut AggregateEntry, alias: &str, target: usize, now: Instant, required: u8) -> bool {
+        if required <= 1 {
+            e.pending_target = Some(target);
+            e.pending_started = Some(now);
+            e.confirm_count = 1;
+            return true;
+        }
         if e.pending_target == Some(target) {
             let started = e.pending_started.unwrap_or(now);
             if now.saturating_duration_since(started).as_secs() > PENDING_WINDOW_SECS {
@@ -876,11 +953,11 @@ impl AggregateRouter {
             e.pending_started = Some(now);
             e.confirm_count = 1;
         }
-        e.confirm_count >= 3
+        e.confirm_count >= required
     }
 
-    fn advance_pending(e: &mut AggregateEntry, alias: &str, target: usize, now: Instant) -> bool {
-        if !Self::bump_pending(e, alias, target, now) {
+    fn advance_pending(e: &mut AggregateEntry, alias: &str, target: usize, now: Instant, required: u8) -> bool {
+        if !Self::bump_pending(e, alias, target, now, required) {
             return false;
         }
         e.active = target;
@@ -913,7 +990,7 @@ impl AggregateRouter {
 // ---------------------------------------------------------------------------
 
 /// 状态机真正迁移后落库（此前只有手动 `set_active` 落库，所以重启会把运行时位置
-/// 丢掉、回到手动起点）。只在 3 次确认成立时调用，频率很低。
+/// 丢掉、回到手动起点）。只在确认次数成立时调用，频率很低（回升 1 次 / 降级 3 次）。
 /// 写失败只打日志：内存已经切过去了，落库失败不能把一次成功的迁移变成错误。
 pub async fn persist_active(pool: &SqlitePool, alias: &str, idx: usize) {
     if let Err(e) = sqlx::query("UPDATE aggregate_aliases SET active_idx = ? WHERE alias = ?")
@@ -1124,21 +1201,62 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    /// 手动 set_active 只是起点，不是地板也不是上限：探活连续 3 次确认更优的
-    /// 候选就该把位置挪回去。（此前 C-A1 拒绝 `v_prime < active`，等于把一次性
+    /// 手动 set_active 只是起点，不是地板也不是上限：探活判定更优的候选活着就该
+    /// 把位置挪回去。（此前 C-A1 拒绝 `v_prime < active`，等于把一次性
     /// 的降级结果当成永久位置 —— 别名会永久停在付费兜底上。）
+    /// 回升只要 1 次确认（2026-11-23）：再等 3 轮探活就是 15 分钟。
     #[test]
     fn the_anchor_can_move_back_above_a_manually_set_start() {
         let mut r = AggregateRouter::default();
         let t = Instant::now();
         assert!(r.set_active("a", 2, 3));
-        assert!(!r.record_probe_candidate("a", 0, 3, t));
-        assert!(!r.record_probe_candidate("a", 0, 3, t + Duration::from_secs(300)));
-        assert!(r.record_probe_candidate("a", 0, 3, t + Duration::from_secs(600)));
+        assert!(r.record_probe_candidate("a", 0, 3, t, true));
+        assert_eq!(r.get_active("a"), 0);
+    }
+
+    /// 回升 1 次就够，降级仍要 3 次 —— 两个方向必须不对称，否则「积极抬回去」
+    /// 会把「一次抖动就换掉主力」一起放开。
+    #[test]
+    fn promotion_and_demotion_require_different_confirmation_counts() {
+        assert_eq!(CONFIRMATIONS_FOR_RECOVERY, 1);
+        assert_eq!(CONFIRMATIONS_REQUIRED, 3);
+
+        // 回升：一轮探活就抬回
+        let mut r = AggregateRouter::default();
+        let t = Instant::now();
+        r.set_active("a", 2, 4);
+        assert!(r.record_probe_candidate("a", 0, 4, t, true));
+
+        // 降级：探活说更靠后的候选活着，3 轮才切
+        let mut r = AggregateRouter::default();
+        r.set_active("a", 0, 4);
+        assert!(!r.record_probe_candidate("a", 2, 4, t, true));
+        assert!(!r.record_probe_candidate("a", 2, 4, t + Duration::from_secs(300), true));
+        assert!(r.record_probe_candidate("a", 2, 4, t + Duration::from_secs(600), true));
+        assert_eq!(r.get_active("a"), 2);
+    }
+
+    /// 回升只认**本轮真探过**的证据：不花请求的判活（成功流量 / 信任窗口内的
+    /// 旧探活成功）读到的是降级之前的旧结论，拿它抬回刚被流量判死的候选，就是
+    /// 每轮探活一次的 ping-pong（回升只要 1 次确认）。旧证据仍允许「不打扰」。
+    #[test]
+    fn stale_evidence_cannot_promote_but_still_counts_as_alive() {
+        let mut r = AggregateRouter::default();
+        let t = Instant::now();
+        r.set_active("a", 2, 4);
+        // 旧证据说 0 活着：不迁移，也不进入 pending
+        assert!(!r.record_probe_candidate("a", 0, 4, t, false));
+        assert_eq!(r.get_active("a"), 2);
+        assert!(r.entries.get("a").unwrap().pending_target.is_none());
+        // 但还是被记成「活着」（UI 角标 / 不往下降）
+        assert_eq!(r.entries.get("a").unwrap().last_status[0], Some(true));
+        // 换成新鲜证据：一轮就抬回
+        assert!(r.record_probe_candidate("a", 0, 4, t + Duration::from_secs(300), true));
         assert_eq!(r.get_active("a"), 0);
     }
 
     /// 3 次确认必须落在窗口内（从第一次确认起算）。超窗口从头计数。
+    /// 这条只覆盖降级方向 —— 回升只要 1 次，没有「连续性」可言。
     #[test]
     fn pending_confirmations_expire_after_the_window() {
         let mut r = AggregateRouter::default();
@@ -1195,28 +1313,35 @@ mod tests {
         let mut r = AggregateRouter::default();
         let t = Instant::now();
         r.set_active("a", 2, 3);
-        assert!(!r.record_probe_candidate("a", 0, 3, t));
-        assert!(!r.record_probe_candidate("a", 0, 3, t + Duration::from_secs(10)));
-        assert!(r.record_probe_candidate("a", 0, 3, t + Duration::from_secs(20)));
+        assert!(r.record_probe_candidate("a", 0, 3, t, true));
         assert_eq!(r.get_active("a"), 0);
+        // 抬上去之后 pending 已经清空（不留残余确认给下一轮）
+        assert!(r.entries.get("a").unwrap().pending_target.is_none());
     }
 
     /// 兜底候选（active=1）的成功**不能**清掉「回升到 0」的确认。
-    /// 生产形状：降级后 os 的持续流量全命中兜底，每轮探活的 1 次确认都被下一次
+    /// 生产形状：降级后 os 的持续流量全命中兜底，每轮探活攒的确认都被下一次
     /// 成功请求清零，probe 连续 7 小时报 best=V0 也回不去（2026-11-21）。
+    ///
+    /// 探活回升现在 1 次就生效、没有等待窗口可言，所以这条守卫的实际适用场景
+    /// 是**请求侧的全链失败复位**（`record_request_all_failed` 攒的是
+    /// 「升到 0」方向，同样要 3 次）。
     #[test]
     fn a_fallback_success_does_not_clear_an_upgrade_confirmation() {
         let mut r = AggregateRouter::default();
         let t = Instant::now();
         r.set_active("a", 1, 2);
-        assert!(!r.record_probe_candidate("a", 0, 2, t));
-        // 每次探活之间都有兜底的成功流量（锚点=兜底，被真试过且成功）
+        // 全链失败开始攒「复位到 0」的确认（回升方向）
+        assert!(!r.record_request_all_failed("a", 2, t, true));
+        assert_eq!(r.entries.get("a").unwrap().confirm_count, 1);
+        assert_eq!(r.entries.get("a").unwrap().pending_target, Some(0));
+        // 兜底候选自己的成功流量（锚点=兜底，被真试过且成功）不清零它
         assert!(!r.record_request_outcome("a", 1, 2, t + Duration::from_secs(10), true));
         assert_eq!(r.entries.get("a").unwrap().confirm_count, 1);
-        assert!(!r.record_probe_candidate("a", 0, 2, t + Duration::from_secs(300)));
+        assert!(!r.record_request_all_failed("a", 2, t + Duration::from_secs(300), true));
         assert!(!r.record_request_outcome("a", 1, 2, t + Duration::from_secs(310), true));
         assert_eq!(r.entries.get("a").unwrap().confirm_count, 2);
-        assert!(r.record_probe_candidate("a", 0, 2, t + Duration::from_secs(600)));
+        assert!(r.record_request_all_failed("a", 2, t + Duration::from_secs(600), true));
         assert_eq!(r.get_active("a"), 0);
     }
 
@@ -1237,18 +1362,22 @@ mod tests {
         assert_eq!(r.get_active("a"), 1);
     }
 
-    /// 探活明确说 active 就是最好的，回升确认照样清零 —— 那是真证据。
+    /// 探活明确说 active 就是最好的，**降级**确认照样清零 —— 那是真证据。
     #[test]
-    fn a_probe_verdict_for_the_anchor_clears_an_upgrade_confirmation() {
+    fn a_probe_verdict_for_the_anchor_clears_a_switch_confirmation() {
         let mut r = AggregateRouter::default();
         let t = Instant::now();
-        r.set_active("a", 1, 2);
-        assert!(!r.record_probe_candidate("a", 0, 2, t));
-        assert!(!r.record_probe_candidate("a", 1, 2, t + Duration::from_secs(300)));
+        r.set_active("a", 1, 3);
+        // 请求侧攒了两条「降级到 2」的确认
+        assert!(!r.record_request_outcome("a", 2, 3, t, true));
+        assert!(!r.record_request_outcome("a", 2, 3, t + Duration::from_secs(10), true));
+        assert_eq!(r.entries.get("a").unwrap().confirm_count, 2);
+        // 探活说 active(1) 活着 → 清零
+        assert!(!r.record_probe_candidate("a", 1, 3, t + Duration::from_secs(300), true));
         assert_eq!(r.entries.get("a").unwrap().confirm_count, 0);
-        assert!(!r.record_probe_candidate("a", 0, 2, t + Duration::from_secs(600)));
+        // 之后重新攒，不会凭前两条直接切
+        assert!(!r.record_request_outcome("a", 2, 3, t + Duration::from_secs(310), true));
         assert_eq!(r.get_active("a"), 1);
-        assert_eq!(r.entries.get("a").unwrap().confirm_count, 1);
     }
 
     /// C-A3/A4：重启播种—— 库值在界内则恢复，越界归 0 并要求调用点回写。
@@ -1306,7 +1435,7 @@ mod tests {
         assert!(!r.record_request_all_failed("a", 3, t, true));
         assert_eq!(r.get_active("a"), 0);
         // 探活 V'：不启动 pending
-        assert!(!r.record_probe_candidate("a", 1, 3, t));
+        assert!(!r.record_probe_candidate("a", 1, 3, t, true));
         assert!(r.entries.get("a").unwrap().pending_target.is_none());
 
         // 解锁后恢复：下游 3 次切过去

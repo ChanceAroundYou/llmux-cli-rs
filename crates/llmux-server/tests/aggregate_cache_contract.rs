@@ -4,13 +4,14 @@
 //! （日志 `🔍 [agg:os] probe V migrated -> 0`），请求侧却继续按缓存里迁移前的
 //! `active=1` 分派 —— 紧接着的 3 条派发全是 `🔀 [agg:os V=1]`，一次都没试过刚抬上
 //! 去的候选。更糟的是这 3 次在候选 1 上的成功会被 `record_request_outcome` 记成
-//! 「迁回 1」的确认，3-confirm 立刻把刚抬上去的位置打回，形成每 15 分钟一轮的
-//! ping-pong（配合 `HOT_CACHE_TTL = 60s`，一次抬升最多被钉住一整分钟）。
+//! 「迁回 1」的降级确认，把刚抬上去的位置打回，形成每 15 分钟一轮的 ping-pong
+//! （配合 `HOT_CACHE_TTL = 60s`，一次抬升最多被钉住一整分钟）。
 //!
-//! 判据：缓存命中路径必须像 miss 路径那样，用**内存路由**的实时值覆盖
+//! 2026-11-23 起回升只要 1 次确认（降级仍是 3 次），所以本测试的迁移发生在**第一轮**。
+//! 判据不变：缓存命中路径必须像 miss 路径那样，用**内存路由**的实时值覆盖
 //! `active` / `locked` —— 这两项是运行时状态，不是配置。
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 async fn seed_aggregate(state: &llmux_server::app::AppState, alias: &str, active_idx: i64) {
     let candidates = serde_json::json!([
@@ -40,16 +41,15 @@ async fn a_probe_migration_is_visible_to_the_request_path_before_the_ttl_expires
     assert_eq!(first.active, 1, "起点来自库里的 active_idx");
     assert!(!first.locked);
 
-    // 探活连续三轮判定候选 0 活着 → 第 3 轮迁移（生产上的 `probe V migrated` 同一条路）。
-    let now = Instant::now();
-    for round in 0..3u64 {
-        let switched = state
-            .aggregate_router
-            .lock()
-            .unwrap()
-            .record_probe_candidate("agc", 0, 2, now + Duration::from_secs(round));
-        assert_eq!(switched, round == 2, "3 次确认才迁移");
-    }
+    // 探活判定候选 0 活着 → 回升只要 1 次确认就迁移（生产上的 `probe V migrated`
+    // 同一条路）。以前要 3 轮，等于 3×300s。这里传 `fresh_evidence = true`：
+    // 回升只认本轮真探过的证据。
+    let switched = state
+        .aggregate_router
+        .lock()
+        .unwrap()
+        .record_probe_candidate("agc", 0, 2, Instant::now(), true);
+    assert!(switched, "回升 1 次确认就迁移");
     assert_eq!(
         state.aggregate_router.lock().unwrap().get_active("agc"),
         0,

@@ -136,8 +136,15 @@ fn evaluation_range(len: usize) -> std::ops::Range<usize> {
 ///   一轮零请求却可以攒满 3 次确认、把位置挪走、还把退避翻倍。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Verdict {
-    /// 不花一个请求的判活：近期成功流量，或近期成功探活仍在信任窗口内。
+    /// 本轮**真发了探活请求**且成功。这是唯一能构成「回升」的判活证据。
     Alive,
+    /// 不花一个请求的判活：近期成功流量，或近期成功探活仍在信任窗口内。
+    ///
+    /// 单列出来是因为它对**非活跃**候选读到的是降级之前的旧证据 —— 只能用来
+    /// 「不打扰」（仍算活、不往下降），不能拿来把候选抬回更靠前的位置。
+    /// 降级/复位方向仍采信它（旧的成功本来也不该把位置往下推，`record_probe_candidate`
+    /// 会让它照常进入 3 次确认）。
+    AliveStale,
     /// 本轮真发过请求（含重试）且仍失败。
     Dead,
     /// 本轮不发请求：冷却没走完（越失败间隔越长那一档），既不算活也不算死。
@@ -147,7 +154,10 @@ enum Verdict {
 /// 一轮的结果。`probed` 是**真发过请求**的候选数 —— 它是「这一轮到底有没有证据」
 /// 的判据，零请求的一轮不许改动状态机。
 struct RoundOutcome {
+    /// 本轮判定活着的候选（升序）。含不发请求采信的旧证据。
     alive: Vec<usize>,
+    /// 其中**本轮真发了探活请求**并成功的那些（升序）。回升只认这份。
+    fresh: Vec<usize>,
     probed: usize,
 }
 
@@ -236,9 +246,14 @@ async fn run_probe_round(
         }
 
         let v_prime = outcome.alive.first().copied();
+        // 最优存活候选是不是**本轮真探过**的。旧证据只能「不打扰」，不能抬位置。
+        let fresh_evidence = v_prime.map(|vp| outcome.fresh.contains(&vp)).unwrap_or(false);
         let switched = if let Some(vp) = v_prime {
             // 评估完后取到的就是「活着的最优候选」，可以比 active 更优（往上走）。
-            aggregate_router.lock().unwrap().record_probe_candidate(&alias, vp, len, now)
+            aggregate_router
+                .lock()
+                .unwrap()
+                .record_probe_candidate(&alias, vp, len, now, fresh_evidence)
         } else {
             // 真发过请求且全挂：以 0（复位到默认）为目标走同一个确认器，3 次（窗口内）才切。
             // 退避翻倍也在 record_request_all_failed 里同处完成 —— 此前这里另有一个
@@ -249,11 +264,15 @@ async fn run_probe_round(
         let target = v_prime.unwrap_or(0);
 
         if switched {
+            // 方向标签必须与真正走的那条确认路径一致：只有「探活判活且更靠前」才是
+            // 1 次确认的回升；`v_prime = None` 走的是 `record_request_all_failed`
+            // 那条 3 次确认的复位路，不是回升。
             tracing::info!(
-                "🔍 [agg:{}] probe V migrated -> {} ({}，本轮发了 {} 次请求)",
+                "🔍 [agg:{}] probe V migrated -> {} ({}，{}，本轮发了 {} 次请求)",
                 alias,
                 target,
                 if v_prime.is_some() { "best alive" } else { "all failed, reset" },
+                if v_prime.is_some() && target < active { "回升，1 次确认" } else { "降级，3 次确认" },
                 outcome.probed
             );
             llmux_core::aggregate::persist_active(pool, &alias, target).await;
@@ -273,6 +292,8 @@ async fn probe_round(
 ) -> RoundOutcome {
     // 全表并发评估（见 evaluation_range）：取活着的最小 index（优先级最高）。
     let mut alive: Vec<usize> = Vec::new();
+    // `fresh` = 本轮**真发了探活请求**并成功的候选。回升只认这份证据（见 Verdict）。
+    let mut fresh: Vec<usize> = Vec::new();
     let mut probed = 0usize;
     let mut deferred = 0usize;
 
@@ -281,32 +302,41 @@ async fn probe_round(
         let cand = candidates[idx].clone();
         let pool = pool.clone();
         let master_key = master_key.to_string();
+        // 比 active 更靠前的候选不接流量，只能靠探活判断 —— 它们必须每轮真探，
+        // 否则回升会干等信任窗口（20 分钟）过期，比原来 3 轮还慢。
+        let must_probe = idx < active;
         futs.push(async move {
-            let verdict = probe_candidate(&cand, mode, &pool, &master_key, trust_ms).await;
+            let verdict = probe_candidate(&cand, mode, &pool, &master_key, trust_ms, must_probe).await;
             (idx, verdict)
         });
     }
     let results = futures_util::future::join_all(futs).await;
     for (idx, verdict) in results {
         match verdict {
-            Verdict::Alive => alive.push(idx),
+            Verdict::Alive => {
+                alive.push(idx);
+                fresh.push(idx);
+            }
+            Verdict::AliveStale => alive.push(idx),
             Verdict::Dead => probed += 1,
             Verdict::Deferred => deferred += 1,
         }
     }
     alive.sort_unstable();
+    fresh.sort_unstable();
 
     if !alive.is_empty() {
         tracing::info!(
-            "🔍 [agg:{}] probe best V={} (active={}，发请求 {} 次，采信 {} 次，冷却跳过 {} 次)",
+            "🔍 [agg:{}] probe best V={} (active={}，发请求 {} 次，采信 {} 次（其中本轮真探 {} 个），冷却跳过 {} 次)",
             alias,
             alive[0],
             active,
             probed,
             alive.len(),
+            fresh.len(),
             deferred
         );
-        return RoundOutcome { alive, probed };
+        return RoundOutcome { alive, fresh, probed };
     }
 
     if probed > 0 {
@@ -317,7 +347,7 @@ async fn probe_round(
             deferred
         );
     }
-    RoundOutcome { alive, probed }
+    RoundOutcome { alive, fresh, probed }
 }
 
 async fn probe_candidate(
@@ -326,6 +356,7 @@ async fn probe_candidate(
     pool: &sqlx::SqlitePool,
     master_key: &str,
     trust_ms: i64,
+    must_probe: bool,
 ) -> Verdict {
     // 冷却中的候选本轮直接跳过 —— 冷却时长随连败递增（5/15/30/60 分钟，
     // 见 `probe::probe_cooldown_secs`），这正是「只对失败/降级的探活」里
@@ -351,29 +382,45 @@ async fn probe_candidate(
     // 流量刚**失败**不采信 —— 可能是瞬时 429/抖动，直接判死会让 3-confirm 误迁移，
     // 也**不能**再拿更旧的探活结论兜底（最近一次证据是失败，它比旧的成功更该被采信）：
     // 直接落到下面的主动探测做二次确认。
+    //
+    // `must_probe`（比 active 更靠前的候选）跳过这里所有「不花请求」的短路：
+    // 请求侧从 active.. 开始派发，永远打不到这一侧，所以它们读到的成功流量和
+    // 信任窗口里的探活成功**全是降级之前的老证据**。回升只要 1 次确认，旧证据
+    // 不能构成它，而干等信任窗口（20 分钟）过期反而比原来的 3 轮更慢 ——
+    // 想让回升积极，就得每轮真探一下（这一侧通常只有 1–2 个候选，代价有限）。
     let traffic = llmux_core::probe::recent_traffic(pool, cand.account_id, &cand.model, TRAFFIC_FRESHNESS_MS).await;
     let traffic_failed = matches!(&traffic, Some(t) if !t.usable_as_alive());
     if let Some(t) = &traffic {
         if t.usable_as_alive() {
+            if !must_probe {
+                tracing::debug!(
+                    "🌿 [agg] {} | 账户 {}：采信 {}ms 前的成功流量，不发请求",
+                    cand.model,
+                    cand.account_id,
+                    now_ms().saturating_sub(t.at_ms) / 1000
+                );
+                return Verdict::AliveStale;
+            }
             tracing::debug!(
-                "🌿 [agg] {} | 账户 {}：采信 {}ms 前的成功流量，不发请求",
+                "🎯 [agg] {} | 账户 {}：比 active 靠前（回升候选），即使有 {}ms 前的成功流量也必须真探",
                 cand.model,
                 cand.account_id,
                 now_ms().saturating_sub(t.at_ms) / 1000
             );
-            return Verdict::Alive;
+        } else {
+            tracing::debug!(
+                "🩺 [agg] {} | 账户 {}：{}ms 前流量失败，补一次主动探测确认",
+                cand.model,
+                cand.account_id,
+                now_ms().saturating_sub(t.at_ms) / 1000
+            );
         }
-        tracing::debug!(
-            "🩺 [agg] {} | 账户 {}：{}ms 前流量失败，补一次主动探测确认",
-            cand.model,
-            cand.account_id,
-            now_ms().saturating_sub(t.at_ms) / 1000
-        );
     }
 
     // 兜底候选没有流量，只靠上一次探活结论活着：信任窗口内不再重探。
     // 窗口 = 4× 别名周期，夹在 [15 分钟, 2 小时]（`probe::probe_trust_secs`）。
-    if !traffic_failed
+    if !must_probe
+        && !traffic_failed
         && llmux_core::probe::recent_probe_success_within(pool, cand.account_id, &cand.model, trust_ms).await
     {
         tracing::debug!(
@@ -381,7 +428,7 @@ async fn probe_candidate(
             cand.model,
             cand.account_id
         );
-        return Verdict::Alive;
+        return Verdict::AliveStale;
     }
 
     let account = match get_account_by_id(pool, cand.account_id, master_key).await {
@@ -558,8 +605,9 @@ mod tests {
         // 探针测试只关心 (账户, 模型)：其余字段取默认（无来源别名、无协议/超时覆盖）。
         let cand = AggregateCandidate { account_id: 99, model: "m".into(), ..Default::default() };
         // 账户 99 在库里不存在：若走到主动探测分支，get_account_by_id 会返回
-        // None → 函数返回 Dead。返回 Alive 证明确实在发请求之前就短路了。
-        assert_eq!(probe_candidate(&cand, chat_mode(), &pool, "key", trust_ms()).await, Verdict::Alive);
+        // None → 函数返回 Dead。返回 AliveStale 证明确实在发请求之前就短路了，
+        // 而且这种「没发请求」的结论被单独标出来 —— 它不能拿来把候选往上抬。
+        assert_eq!(probe_candidate(&cand, chat_mode(), &pool, "key", trust_ms(), false).await, Verdict::AliveStale);
     }
 
     /// 反向对照：只有**失败**的近期流量不足以判活，仍要发一次主动探测。
@@ -580,7 +628,7 @@ mod tests {
         // 探针测试只关心 (账户, 模型)：其余字段取默认（无来源别名、无协议/超时覆盖）。
         let cand = AggregateCandidate { account_id: 99, model: "m".into(), ..Default::default() };
         // 落到主动探测 → 账户 99 不存在 → Dead。
-        assert_eq!(probe_candidate(&cand, chat_mode(), &pool, "key", trust_ms()).await, Verdict::Dead);
+        assert_eq!(probe_candidate(&cand, chat_mode(), &pool, "key", trust_ms(), false).await, Verdict::Dead);
     }
 
     /// 冷却优先于被动采信：冷却中的候选连流量都不查，本轮直接跳过。
@@ -620,7 +668,7 @@ mod tests {
 
         // 探针测试只关心 (账户, 模型)：其余字段取默认（无来源别名、无协议/超时覆盖）。
         let cand = AggregateCandidate { account_id: 99, model: "m".into(), ..Default::default() };
-        assert_eq!(probe_candidate(&cand, chat_mode(), &pool, "key", trust_ms()).await, Verdict::Deferred);
+        assert_eq!(probe_candidate(&cand, chat_mode(), &pool, "key", trust_ms(), false).await, Verdict::Deferred);
     }
 
     /// 默认别名周期下的信任窗口，测试里统一取它，免得各写一个数。
@@ -631,8 +679,8 @@ mod tests {
     /// 「只对失败/降级的探活」的另一半：兜底候选没有真实流量，只靠上一次探活
     /// 成功的结论活着 —— 信任窗口内不再为它付请求。
     ///
-    /// 同样用「账户 99 不存在」当探针：真去探测必然返回 Dead（拿不到账户），
-    /// 返回 Alive 只可能是走了不发请求的那条路。
+    /// 同样用「账户 99 不存在」当探针：这仍必须是**不发请求**的那条路，
+    /// 但它给的是旧证据，所以返回 `AliveStale` 而不是 `Alive`。
     #[tokio::test]
     async fn a_fallback_candidate_inside_the_trust_window_costs_no_request() {
         let pool = llmux_core::db::connect_sqlite("sqlite::memory:").await.unwrap();
@@ -648,7 +696,7 @@ mod tests {
         .unwrap();
 
         let cand = AggregateCandidate { account_id: 99, model: "m".into(), ..Default::default() };
-        assert_eq!(probe_candidate(&cand, chat_mode(), &pool, "key", trust_ms()).await, Verdict::Alive);
+        assert_eq!(probe_candidate(&cand, chat_mode(), &pool, "key", trust_ms(), false).await, Verdict::AliveStale);
     }
 
     /// 信任窗口过期后必须回到「探」，否则一次成功就把候选永久免探 ——
@@ -670,7 +718,43 @@ mod tests {
 
         let cand = AggregateCandidate { account_id: 99, model: "m".into(), ..Default::default() };
         // 过期 → 去探 → 账户 99 不存在 → Dead。
-        assert_eq!(probe_candidate(&cand, chat_mode(), &pool, "key", trust_ms()).await, Verdict::Dead);
+        assert_eq!(probe_candidate(&cand, chat_mode(), &pool, "key", trust_ms(), false).await, Verdict::Dead);
+    }
+
+    /// 比 active 更靠前的候选（回升候选）必须**每轮真探**，即使它刚好有一条新鲜的
+    /// 成功流量或仍在探活信任窗口内 —— 那两种证据对这一侧都是降级之前的老结论。
+    /// 回升只要 1 次确认，若这里也短路，刚被流量判死的候选会在下一轮探活原地抬回去
+    /// （ping-pong）；而干等信任窗口（20 分钟）过期又比原来的 3 轮更慢。
+    #[tokio::test]
+    async fn a_candidate_above_active_is_probed_even_with_fresh_success_evidence() {
+        let pool = llmux_core::db::connect_sqlite("sqlite::memory:").await.unwrap();
+        llmux_core::db::init_db(&pool).await.unwrap();
+
+        // 同时给一条新鲜成功流量和一条信任窗口内的探活成功 —— 普通路径都会短路。
+        sqlx::query(
+            "INSERT INTO usage_logs (timestamp, account_id, provider_id, model, latency_ms, success, is_test) \
+             VALUES (?, 99, 'p', 'm', 100, 1, 0)",
+        )
+        .bind(now_ms())
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO model_test_results (account_id, model, success, latency_ms, checked_at, source) \
+             VALUES (99, 'm', 1, 100, ?, 'aggregate')",
+        )
+        .bind(now_ms() - 60_000)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let cand = AggregateCandidate { account_id: 99, model: "m".into(), ..Default::default() };
+        // must_probe = true 跳过全部免探短路 → 真去探测 → 账户 99 不存在 → Dead。
+        assert_eq!(
+            probe_candidate(&cand, chat_mode(), &pool, "key", trust_ms(), true).await,
+            Verdict::Dead,
+            "回升候选必须真探，不能被旧证据短路"
+        );
     }
 
     /// 最近一次证据是**真实流量失败**时，不能拿更旧的探活成功兜底 —— 降级
@@ -698,7 +782,7 @@ mod tests {
         .unwrap();
 
         let cand = AggregateCandidate { account_id: 99, model: "m".into(), ..Default::default() };
-        assert_eq!(probe_candidate(&cand, chat_mode(), &pool, "key", trust_ms()).await, Verdict::Dead);
+        assert_eq!(probe_candidate(&cand, chat_mode(), &pool, "key", trust_ms(), false).await, Verdict::Dead);
     }
 
     /// 整轮都在冷却里 → 一个请求都没发 → **不许**改动状态机。
