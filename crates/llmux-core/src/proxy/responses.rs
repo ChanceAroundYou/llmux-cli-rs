@@ -407,6 +407,51 @@ pub fn extract_responses_function_calls(resp: &Value) -> Vec<Value> {
         .collect()
 }
 
+/// Extract a human-readable message from an upstream error value.
+fn error_message_of(err: &Value) -> Option<String> {
+    match err {
+        Value::Null => None,
+        Value::String(s) if !s.trim().is_empty() => Some(s.clone()),
+        _ => err
+            .get("message")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_string)
+            .or_else(|| err.as_str().map(str::to_string)),
+    }
+}
+
+/// Detect an upstream Responses body that represents a **failed** turn.
+///
+/// The codex backend reports capacity/rate errors (e.g. `server_is_overloaded`)
+/// as HTTP 200 with `{"status":"failed","error":{...}}` instead of a 4xx/5xx.
+/// Treating that as success is silently destructive: `responses_to_anthropic`
+/// and `responses_to_chat` turn it into an **empty** assistant message
+/// (`content: []` / no choices), the turn is booked as a healthy 0/0, and the
+/// aggregate router boosts a candidate that just failed. 2026-11-27 production
+/// (`gpt-6.2-astra` via codex) hit this on ~40% of requests.
+///
+/// Returns `Some("<code>: <message>")` for a failed body, `None` otherwise.
+/// `status: "incomplete"` (e.g. `max_output_tokens`) is **not** a failure.
+pub fn responses_failure(resp: &Value) -> Option<String> {
+    let err = resp.get("error").filter(|v| !v.is_null());
+    let failed = resp.get("status").and_then(Value::as_str) == Some("failed");
+    if !failed && err.is_none() {
+        return None;
+    }
+    let message = err
+        .and_then(error_message_of)
+        .unwrap_or_else(|| "upstream response failed".to_string());
+    let code = err
+        .and_then(|e| e.get("code"))
+        .and_then(Value::as_str)
+        .filter(|c| !c.trim().is_empty());
+    Some(match code {
+        Some(code) => format!("{code}: {message}"),
+        None => message,
+    })
+}
+
 pub fn responses_to_anthropic(resp: &Value, model: &str) -> Value {
     let text = extract_responses_text(resp);
     let calls = extract_responses_function_calls(resp);
@@ -1027,7 +1072,9 @@ fn response_function_call(item: &Value) -> Option<(&str, &str, &str, &str)> {
     Some((item_id, call_id, name, arguments))
 }
 
-fn response_event_error(data: &Value) -> String {
+/// Message from a Responses failure event, accepting both the nested
+/// `response.error` shape and the flat `{type:"error",message}` one.
+pub fn response_event_error(data: &Value) -> String {
     data.get("error")
         .and_then(|error| error.get("message").or_else(|| error.get("code")))
         .and_then(Value::as_str)
@@ -2741,6 +2788,45 @@ fn uuid_simple() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn responses_failure_detects_codex_overload_body() {
+        // 2026-11-27 实测：codex 对 gpt-6.2-astra 的容量错误走 HTTP 200 + failed。
+        let body = json!({
+            "object": "response",
+            "status": "failed",
+            "output": [],
+            "error": {
+                "code": "server_is_overloaded",
+                "message": "Our servers are currently overloaded. Please try again later.",
+                "type": "service_unavailable_error"
+            }
+        });
+        let msg = responses_failure(&body).expect("failed status must be detected");
+        assert!(msg.contains("server_is_overloaded"), "{msg}");
+        assert!(msg.contains("currently overloaded"), "{msg}");
+    }
+
+    #[test]
+    fn responses_failure_accepts_null_error_on_completed_turns() {
+        // 正常完成的 Responses 体恒带 `"error": null` —— 不能当失败。
+        for body in [
+            json!({"status": "completed", "error": null, "output": []}),
+            json!({"status": "incomplete", "error": null,
+                   "incomplete_details": {"reason": "max_output_tokens"}}),
+            json!({"object": "response", "output": []}),
+        ] {
+            assert_eq!(responses_failure(&body), None, "{body}");
+        }
+    }
+
+    #[test]
+    fn responses_failure_treats_non_null_error_as_failure() {
+        let body = json!({"status": "completed", "error": {"message": "boom"}});
+        assert_eq!(responses_failure(&body).as_deref(), Some("boom"));
+        let stringy = json!({"error": "rate limit"});
+        assert_eq!(responses_failure(&stringy).as_deref(), Some("rate limit"));
+    }
 
     /// spec §6：3 片 content + 2 片 tool_call arguments → 单 JSON；usage 尾片保留。
     #[test]
