@@ -371,6 +371,44 @@ ChatGPT Plus 的 Codex 额度直连 `chatgpt.com/backend-api/codex`，llmux 原�
 - 归档：sidecar 方案见 `docs/codex-absorption-plan.md`；旧 compose 备份在路由器
   `docker-compose.yml.bak-before-codex-remove-20261013`。
 
+### Codex 容量错误是 HTTP 200 + 失败 body（2026-11-27 修）
+
+codex 私有后端在容量/过载时**不改状态行**：
+
+```
+HTTP 200
+{"id":"resp_…","status":"failed","error":{"code":"server_is_overloaded",
+ "message":"Our servers are currently overloaded. Please try again later."}}
+```
+
+2026-11-27 实测 `gpt-6.2-astra` 约 40–50% 的请求是这个形状（非流式/流式都有，
+effort low 与 medium 无差别，耗时 7–12s）。5h/周配额都没到上限，`model_usage`
+里也只有它 —— 是模型容量问题，不是账户额度。
+
+修复前 llmux 只看状态行，于是：
+
+- `/v1/messages`（`Back::MessagesFromResponses`）把失败 body 转成
+  `content: []` + `stop_reason: end_turn` + `usage 0/0` 的 **HTTP 200 空成功**；
+- `/v1/chat/completions`（`ChatFromResponses`）同理（无 choices）；
+- `usage_logs` 记 `success=1`，聚合路由给刚落败的候选记一次成功；
+- 拨测把 200 当「协议可用」，失败时再报
+  `🧭 … 实际可用 [none] … 配置可能写错了`（配置其实没错）。
+
+修复点（判据看日志/测试）：
+
+| 位置 | 行为 | 可 grep 的信号 |
+|---|---|---|
+| `llmux_core::proxy::responses::responses_failure` | 识别 `status:"failed"` 或非空 `error`，格式 `code: message`；`incomplete` 不算 | 单元测试 `responses_failure_*` |
+| 单账户 dispatcher 三个非流式 Responses 分支 + 聚合 dispatcher | 当候选失败、试下一个；耗尽回 **502** 并带上游原话 | `🔀 … 回了 HTTP 200 但响应体是失败：[server_is_overloaded: …]` |
+| 流式记账 `StreamAccounting` | `response.failed` / `response.error` / 裸 `error` 记 `failed`；终态 `upstream failed: …`，不再是 `truncated … empty=true` | `[openai:…] stream failed upstream` / `usage_logs.error_message` |
+| 探活 `send_probe` / `native_probe` | 200-but-failed 判 `ok=false`；「配置写错」只认**被配置协议自己**的确定性失败（404/401/400…），瞬时失败（0/408/429/5xx/2xx-failed）不下结论 | `send_probe` 的 `body_reports_failure` 与 `mismatch_with_evidence` 单测 |
+| 聚合探活超时 | 10s/15s → **30s/35s**（与手动拨测、保存校验同口径）；astra 正常/失败回合 7–12s，10s 正好切在边界 | `aggregate_probe.rs` |
+
+契约测试：`crates/llmux-server/tests/responses_failed_body_contract.rs`
+（普通别名 × 三种入口、聚合别名 × 两种入口，都必须 502 且含上游原话）。
+⚠️ 流式入口状态行已经发出去，无法改 502；Anthropic/Chat 的流式 converter 会把
+`response.failed` 转成 `event: error` / `{"error":…}`，客户端能看到真实原因。
+
 ## OpenCode Zen 上游（原生，2026-10-14 起；sidecar 已退役）
 
 把 OpenCode Zen（`opencode.ai/zen/v1` 的 `*-free` 免费档 + 付费模型）当 OpenAI

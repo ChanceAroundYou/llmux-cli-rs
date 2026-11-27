@@ -52,6 +52,21 @@ enum Back {
     ResponsesFromMessages,
 }
 
+/// Upstream-failure detection, limited to upstreams that speak the Responses API.
+///
+/// The codex backend reports capacity/rate errors as HTTP 200 with
+/// `{"status":"failed","error":{...}}`. Converters then turn that into an empty
+/// assistant message, the turn is booked as a healthy 0/0, and the aggregate
+/// router boosts a candidate that just failed (2026-11-27 `gpt-6.2-astra`).
+fn upstream_responses_failure(back: Back, target: Protocol, data: &Value) -> Option<String> {
+    let responses_upstream = matches!(back, Back::ChatFromResponses | Back::MessagesFromResponses)
+        || (matches!(back, Back::Passthrough) && target == Protocol::Responses);
+    if !responses_upstream {
+        return None;
+    }
+    llmux_core::proxy::responses::responses_failure(data)
+}
+
 /// Build the forward body and the matching back-conversion for one
 /// (ingress, target) pair. Both dispatchers use this so the matrix cannot drift.
 fn forward_and_back(
@@ -486,6 +501,17 @@ pub(crate) async fn dispatch_with_conversion(
                         }
                     }
                 };
+                // 上游是 Responses 时，HTTP 200 也可能是失败回合
+                // （codex: `{"status":"failed","error":{"code":"server_is_overloaded"}}`）。
+                // 直接透传会让下游拿到一个「正常」的空响应，账本还会记成功。
+                if let Some(failure) = upstream_responses_failure(back, target, &data) {
+                    tracing::warn!("🔀 {} (id={}) 回了 HTTP 200 但响应体是失败：[{}] — 试下一个账户", account.alias, account.id, failure);
+                    last_error = Some(format!("Upstream reported a failed response: {failure}"));
+                    last_status = Some(200);
+                    if account.id == preferred_id { let mut r = state.dispatch_router.lock().unwrap(); r.record_result(&dispatch_key, &dispatch_meta, None, false); }
+                    failed_candidates += 1;
+                    continue;
+                }
                 let latency_ms = start.elapsed().as_millis() as i64;
                 let (prompt_tokens, completion_tokens, cache_read, cache_create) = passthrough_usage(&data);
                 // 日志/账本记上游原值，客户端拿到的是估算值 —— 两件事。
@@ -515,6 +541,14 @@ pub(crate) async fn dispatch_with_conversion(
                         }
                     }
                 };
+                if let Some(failure) = upstream_responses_failure(back, target, &data) {
+                    tracing::warn!("🔀 {} (id={}) 回了 HTTP 200 但响应体是失败：[{}] — 试下一个账户", account.alias, account.id, failure);
+                    last_error = Some(format!("Upstream reported a failed response: {failure}"));
+                    last_status = Some(200);
+                    if account.id == preferred_id { let mut r = state.dispatch_router.lock().unwrap(); r.record_result(&dispatch_key, &dispatch_meta, None, false); }
+                    failed_candidates += 1;
+                    continue;
+                }
                 let chat_resp = responses_to_chat(&data, &model_name);
                 let (raw_prompt, completion_tokens) = adapters::usage_from_openai_response_body(&chat_resp);
                 let (cache_read, _) = cache_usage_from_openai(&data["usage"]);
@@ -625,6 +659,14 @@ pub(crate) async fn dispatch_with_conversion(
                         }
                     }
                 };
+                if let Some(failure) = upstream_responses_failure(back, target, &data) {
+                    tracing::warn!("🔀 {} (id={}) 回了 HTTP 200 但响应体是失败：[{}] — 试下一个账户", account.alias, account.id, failure);
+                    last_error = Some(format!("Upstream reported a failed response: {failure}"));
+                    last_status = Some(200);
+                    if account.id == preferred_id { let mut r = state.dispatch_router.lock().unwrap(); r.record_result(&dispatch_key, &dispatch_meta, None, false); }
+                    failed_candidates += 1;
+                    continue;
+                }
                 let mut anth_resp = responses_to_anthropic(&data, &model_name);
                 let (input_tokens, output_tokens, cache_read, cache_create) = anthropic_usage(&data);
                 let latency_ms = start.elapsed().as_millis() as i64;
@@ -1321,6 +1363,20 @@ pub(crate) async fn dispatch_aggregate_with_conversion(
                 }
             }
         };
+        // 上游把失败报成 HTTP 200（codex 的 `server_is_overloaded` 就是这样）。
+        // 不拦住的话：转换器会吐出**空回复**、usage 记成 0/0 成功，聚合路由还会
+        // 给刚失败的候选记一次成功（2026-11-27 `gpt-6.2-astra` 实测 ~40%）。
+        if let Some(failure) = upstream_responses_failure(back, target, &data) {
+            tracing::warn!(
+                "🔀 [agg:{}] {} (id={}) 回了 HTTP {} 但响应体是失败：[{}] — 试下一个候选",
+                alias, account.alias, account.id, status.as_u16(), failure
+            );
+            state.aggregate_router.lock().unwrap().note_candidate_failure(&alias, i, len);
+            last_error = Some(format!("Upstream reported a failed response: {failure}"));
+            last_status = Some(status.as_u16());
+            failed_candidates += 1;
+            continue;
+        }
         let (converted, pt, ct, cr, cc) = back_convert_non_streaming(back, &data, &cand.model, &custom_tools);
         let latency_ms = start.elapsed().as_millis() as i64;
         spawn_log_usage(state.pool.clone(), account.clone(), cand.model.clone(), account.provider_id.clone(), pt, ct, cr, cc, latency_ms, true, None, Some(body.to_string()), Some(converted.to_string()), Some(latency_ms), false);
@@ -2431,6 +2487,13 @@ struct StreamAccounting {
     saw_text: bool,
     /// Did any event carry a tool_calls fragment?
     saw_tool_call: bool,
+    /// Did the upstream explicitly report a failed turn? HTTP 200 streams can
+    /// still fail: the Codex private backend sends `response.failed` (or a bare
+    /// `error` event) with `server_is_overloaded` while the status line is 200.
+    /// Without this the turn was booked as a generic `truncated … empty=true`
+    /// and the real cause never reached the log.
+    failed: bool,
+    failure_message: Option<String>,
 }
 
 impl StreamAccounting {
@@ -2531,6 +2594,19 @@ fn observe_event(event_text: &str, acc: &mut StreamAccounting) {
         observe_responses_event(&parsed, acc);
         return;
     }
+    // A failed turn can arrive as a bare `error` event (no `choices`); it is
+    // terminal, and the message is the only diagnostic the upstream gives.
+    if parsed.get("type").and_then(Value::as_str) == Some("error")
+        || parsed.get("error").is_some_and(|e| !e.is_null())
+    {
+        acc.saw_done = true;
+        acc.failed = true;
+        acc.failure_message.get_or_insert_with(|| {
+            llmux_core::proxy::responses::responses_failure(&parsed)
+                .unwrap_or_else(|| llmux_core::proxy::responses::response_event_error(&parsed))
+        });
+        return;
+    }
     let Some(choice) = parsed
         .get("choices")
         .and_then(Value::as_array)
@@ -2611,6 +2687,19 @@ fn observe_responses_event(parsed: &Value, acc: &mut StreamAccounting) {
     match parsed.get("type").and_then(Value::as_str) {
         Some("response.completed" | "response.incomplete" | "response.done") => {
             acc.saw_done = true;
+        }
+        // HTTP 200 + `response.failed` is how the Codex private backend reports
+        // capacity errors (`server_is_overloaded`). It *is* terminal, so mark
+        // `saw_done` too — but the turn failed, and only this branch can carry
+        // the real reason.
+        Some("response.failed" | "response.error") => {
+            acc.saw_done = true;
+            acc.failed = true;
+            acc.failure_message.get_or_insert_with(|| {
+                let leaf = parsed.get("response").unwrap_or(parsed);
+                llmux_core::proxy::responses::responses_failure(leaf)
+                    .unwrap_or_else(|| llmux_core::proxy::responses::response_event_error(leaf))
+            });
         }
         Some("response.output_text.delta") => {
             if parsed.get("delta").is_some_and(is_non_empty_value) {
@@ -2859,7 +2948,10 @@ async fn openai_streaming_passthrough(
         let done = acc.saw_done || acc.last_finish.as_deref().is_some_and(|s| !s.is_empty());
         let truncated = !done;
         let empty_content = acc.produced_nothing();
-        let final_truncated = truncated || empty_content;
+        // An explicit upstream failure is neither a truncation nor an empty
+        // success. It must be booked (and logged) as itself, otherwise
+        // `server_is_overloaded` looks exactly like a dead connection.
+        let final_truncated = truncated || empty_content || acc.failed;
         let overflow = llmux_core::context::lookup_context_length(&model)
             .is_some_and(|limit| (prompt_tokens as u64) > limit);
         let latency_ms = start.elapsed().as_millis() as i64;
@@ -2870,12 +2962,13 @@ async fn openai_streaming_passthrough(
         // `text`/`tool` record the direct output evidence behind the verdict.
         // Body-free so this can stay at INFO: the full dumps cost ~130MB/day.
         tracing::info!(
-            "[openai:{model}] stream complete: done={done} saw_done={} finish={:?} chunks={} text={} tool={} truncated={final_truncated} overflow={overflow} usage=({prompt_tokens},{completion_tokens})",
+            "[openai:{model}] stream complete: done={done} saw_done={} finish={:?} chunks={} text={} tool={} failed={} truncated={final_truncated} overflow={overflow} usage=({prompt_tokens},{completion_tokens})",
             acc.saw_done,
             acc.last_finish,
             acc.chunks,
             acc.saw_text,
-            acc.saw_tool_call
+            acc.saw_tool_call,
+            acc.failed
         );
         // This path forwards upstream bytes to the client **verbatim** — it
         // parses only for usage accounting, and never repairs a tool_call. So
@@ -2903,7 +2996,28 @@ async fn openai_streaming_passthrough(
                 &received.to_body_string().unwrap_or_default()
             );
         }
-        if final_truncated {
+        let account_error = if acc.failed {
+            Some(format!(
+                "upstream failed: {}",
+                acc.failure_message.as_deref().unwrap_or("unknown failure")
+            ))
+        } else if final_truncated {
+            Some(format!(
+                "truncated: finish_reason=null chunks={} saw_done={} empty={empty_content} overflow={overflow}",
+                acc.chunks, acc.saw_done
+            ))
+        } else {
+            None
+        };
+        if acc.failed {
+            tracing::warn!(
+                "[openai:{model}] stream failed upstream: account={} chunks={} empty={} [{}]",
+                account.alias,
+                acc.chunks,
+                empty_content,
+                acc.failure_message.as_deref().unwrap_or("unknown failure")
+            );
+        } else if final_truncated {
             tracing::warn!(
                 "[openai:{model}] stream truncated: account={} finish_reason=null chunks={} saw_done={} empty={empty_content} overflow={overflow}",
                 account.alias,
@@ -2923,14 +3037,7 @@ async fn openai_streaming_passthrough(
             cache_create,
             latency_ms,
             !final_truncated,
-            if final_truncated {
-                Some(format!(
-                    "truncated: finish_reason=null chunks={} saw_done={} empty={empty_content} overflow={overflow}",
-                    acc.chunks, acc.saw_done
-                ))
-            } else {
-                None
-            },
+            account_error,
             request_body,
             received.to_body_string(),
             acc.ttft_ms, true, client_ip, api_key_id,
@@ -3291,6 +3398,40 @@ mod tests {
         );
         assert!(!acc.saw_done);
         assert!(acc.saw_text, "partial output is still visible");
+    }
+
+    /// HTTP 200 + `response.failed` is the Codex private backend's overload
+    /// shape. It is terminal, so it must not be reported as a truncation, and
+    /// the actual reason must survive into the log/usage row.
+    #[test]
+    fn responses_failed_event_records_the_upstream_reason() {
+        let mut acc = StreamAccounting::default();
+        observe_and_should_forward(
+            "event: response.failed\n\
+             data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"Our servers are currently overloaded.\"}}}\n\n",
+            &mut acc,
+        );
+        assert!(acc.saw_done, "response.failed is a terminal event");
+        assert!(acc.failed);
+        let msg = acc.failure_message.as_deref().unwrap_or_default();
+        assert!(msg.contains("server_is_overloaded"), "got {msg}");
+        assert!(msg.contains("overloaded"), "got {msg}");
+    }
+
+    /// The flat `{type:"error",code,message}` shape has no `response` wrapper
+    /// and no `choices`; it used to fall through and be booked as
+    /// `truncated … empty=true`, losing the only diagnostic.
+    #[test]
+    fn bare_error_event_is_recorded_as_failure() {
+        let mut acc = StreamAccounting::default();
+        observe_and_should_forward(
+            "data: {\"type\":\"error\",\"code\":\"server_is_overloaded\",\"message\":\"try later\"}\n\n",
+            &mut acc,
+        );
+        assert!(acc.saw_done, "a bare error event is terminal");
+        assert!(acc.failed);
+        let msg = acc.failure_message.as_deref().unwrap_or_default();
+        assert!(msg.contains("try later"), "got {msg}");
     }
 
     /// Tool calls and `incomplete` (max_output_tokens) are legitimate ends; a
