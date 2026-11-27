@@ -461,12 +461,17 @@ async fn probe_candidate(
     // 与拨测/别名校验走**同一套**探测（协议缓存起点 + 真实路由同款回退阶梯）。
     // 此前这里只会拼 /chat/completions，对只服务 /v1/responses 的模型
     // （Console Go muse-spark-1.x-contributor）永远判死，聚合候选会被错误降级。
-    // 10s 是**每个协议各自**的上限（三个并行，所以整轮 ≈ 10s 而非 30s）；
-    // 外面再包一层 15s 兜底，防止将来某协议不遵守 client 超时而卡住整轮。
-    // 10s 覆盖的是「建连 + 收 header + 读完 body」全程 —— 读 body 失败会被
+    // 30s 是**每个协议各自**的上限（三个并行，所以整轮 ≈ 30s 而非 90s）；
+    // 外面再包一层 35s 兜底，防止将来某协议不遵守 client 超时而卡住整轮。
+    // 30s 覆盖的是「建连 + 收 header + 读完 body」全程 —— 读 body 失败会被
     // `send_probe` 判成失败（见 probe.rs），不会因为「header 到了」就误判可用。
+    //
+    // 为什么不是 10s：codex `gpt-6.2-astra` 正常/失败回合实测 7–12s 才回
+    // （200 + `server_is_overloaded` 也是这个量级），10s 正好把一批真实结论
+    // 切成「超时」，让探活把好候选判死、把失败误报成网络问题。
+    // 手动拨测与保存校验用的也是 30s（testing.rs / verify.rs），三者同口径。
     let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
         .build()
     {
         Ok(c) => c,
@@ -474,7 +479,7 @@ async fn probe_candidate(
     };
 
     let mut outcome = match tokio::time::timeout(
-        Duration::from_secs(15),
+        Duration::from_secs(35),
         llmux_core::probe::run_probe(&client, &account, &cand.model, &provider_type, mode),
     )
     .await
@@ -500,7 +505,7 @@ async fn probe_candidate(
         );
         tokio::time::sleep(Duration::from_secs(llmux_core::probe::PROBE_RETRY_SECS)).await;
         outcome = match tokio::time::timeout(
-            Duration::from_secs(15),
+            Duration::from_secs(35),
             llmux_core::probe::run_probe(&client, &account, &cand.model, &provider_type, mode),
         )
         .await

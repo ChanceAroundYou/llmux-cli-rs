@@ -200,6 +200,29 @@ pub fn build_probe_request(account: &Account, model: &str, protocol: Protocol) -
     build_passthrough_with_beta(account, protocol, &body, None)
 }
 
+/// A 2xx body that still reports an upstream failure.
+///
+/// Codex/Responses backends signal capacity errors as HTTP 200 with
+/// `{"status":"failed","error":{...}}`. A normal Responses body carries
+/// `"error": null`, and Chat/Messages bodies carry no `error` field at all —
+/// so a non-null `error` or `status:"failed"` is an unambiguous failure.
+fn body_reports_failure(body: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let has_error = v.get("error").is_some_and(|e| !e.is_null());
+    let failed = v.get("status").and_then(|s| s.as_str()) == Some("failed");
+    if !has_error && !failed {
+        return None;
+    }
+    let msg = v
+        .pointer("/error/message")
+        .or_else(|| v.pointer("/error/error/message"))
+        .and_then(|m| m.as_str())
+        .map(String::from)
+        .or_else(|| v.get("error").and_then(|e| e.as_str()).map(String::from))
+        .unwrap_or_else(|| "upstream reported a failed response".to_string());
+    Some(msg)
+}
+
 async fn send_probe(
     client: &reqwest::Client,
     account: &Account,
@@ -241,9 +264,16 @@ async fn send_probe(
                 }
             };
             let latency_ms = start.elapsed().as_millis() as i64;
-            let ok = status.is_success();
+            // 2xx 也可能是失败：codex 后端把容量/配额错误报成 HTTP 200 +
+            // `{"status":"failed","error":{...}}`（2026-11-27 `gpt-6.2-astra`
+            // 实测 ~40%）。只看 `status.is_success()` 会把它记成「协议可用」，
+            // 拨测结论于是与真实流量相反。
+            let body_failure = body_reports_failure(&body);
+            let ok = status.is_success() && body_failure.is_none();
             let error = if ok {
                 String::new()
+            } else if let Some(msg) = body_failure {
+                msg
             } else {
                 serde_json::from_str::<serde_json::Value>(&body)
                     .ok()
@@ -321,10 +351,44 @@ pub async fn run_probe(
 
     ProbeOutcome {
         native: false,
+        mismatched_config: mismatch_with_evidence(&probes, &supported, mode, account),
         protocols: probes,
-        mismatched_config: mismatch(&supported, mode, account),
         supported,
     }
+}
+
+/// `mismatch` 只在有**确定性**证据时才能说「配置写错了」。
+///
+/// 判据落在**被配置的那个协议自己**的探测上：它没结论（连不上 / 超时 /
+/// 429 / 5xx / 200-but-failed-body）时，别的协议失败不构成「配置写错了」
+/// 的证据 —— 此时 `supported` 为空，裸 `mismatch` 会返回 `Some(configured)`，
+/// 日志就变成「实际可用 [none] … 配置可能写错了」。生产上 codex
+/// `gpt-6.2-astra` 返回 200 + `server_is_overloaded`（修好 body 判定后算失败）
+/// 正是这种形状：配置没错，是上游容量不够。
+fn mismatch_with_evidence(
+    probes: &[ProtocolProbe],
+    supported: &[Protocol],
+    mode: DownstreamMode,
+    account: &Account,
+) -> Option<Protocol> {
+    if mode != DownstreamMode::Default {
+        let configured = target_protocol(Protocol::Chat, mode, account);
+        let Some(configured_probe) = probes.iter().find(|p| p.protocol == configured) else {
+            // 连配置的协议都没探到 → 零证据。
+            return None;
+        };
+        if !configured_probe.ok && probe_status_is_inconclusive(configured_probe.status) {
+            return None;
+        }
+    }
+    mismatch(supported, mode, account)
+}
+
+/// 0 = 请求没发出去 / 没拿到响应；408 / 429 / 5xx = 上游暂时不可用。
+/// 2xx 但 body 报失败（codex 的 `server_is_overloaded`）同样是上游容量，
+/// 不是「协议或端点写错了」的证据。
+fn probe_status_is_inconclusive(status: u16) -> bool {
+    status == 0 || status == 408 || status == 429 || status >= 500 || (200..300).contains(&status)
 }
 
 /// anthropic / gemini 的原生端点探测（`ProbeOutcome.protocols` 里 `protocol`
@@ -419,14 +483,17 @@ async fn native_probe(
                 }
             };
             let latency_ms = start.elapsed().as_millis() as i64;
+            // 与 `send_probe` 同口径：HTTP 200 也可能是失败 body。
+            let body_failure = body_reports_failure(&body);
+            let ok = status.is_success() && body_failure.is_none();
             ProtocolProbe {
                 protocol,
-                ok: status.is_success(),
+                ok,
                 status: status.as_u16(),
-                error: if status.is_success() {
+                error: if ok {
                     String::new()
                 } else {
-                    body.clone()
+                    body_failure.unwrap_or_else(|| body.clone())
                 },
                 body,
                 latency_ms,
@@ -1360,6 +1427,54 @@ mod tests {
         assert_eq!(mismatch(&supported, DownstreamMode::Responses, &a), None);
         // 配 responses 但只有 chat 通 → 这才是真的配错
         assert_eq!(mismatch(&[Protocol::Chat], DownstreamMode::Responses, &a), Some(Protocol::Responses));
+    }
+
+    fn failed_probe(protocol: Protocol, status: u16) -> ProtocolProbe {
+        ProtocolProbe {
+            protocol,
+            ok: false,
+            status,
+            error: String::new(),
+            body: String::new(),
+            latency_ms: 0,
+        }
+    }
+
+    /// 上游容量不足（5xx）或连不上，不能说明「配置写错了」。
+    /// 生产：codex `gpt-6.2-astra` 返回 200 + `server_is_overloaded`（现判失败），
+    /// 若三条探测全挂，旧逻辑会报「实际可用 [none] … 配置可能写错了」。
+    #[test]
+    fn all_transient_failures_do_not_claim_a_config_mismatch() {
+        let a = account("codex", "http://gw/v1", Some("http://gw/v1"), Some("http://gw/v1"));
+        let probes = [
+            failed_probe(Protocol::Chat, 502),
+            failed_probe(Protocol::Messages, 0),
+            // codex：HTTP 200 + `status:"failed"`（send_probe 判 ok=false）
+            failed_probe(Protocol::Responses, 200),
+        ];
+        assert_eq!(
+            mismatch_with_evidence(&probes, &[], DownstreamMode::Responses, &a),
+            None
+        );
+        assert_eq!(mismatch_with_evidence(&[], &[], DownstreamMode::Responses, &a), None);
+        // 配置的协议（Responses）自己没结论：别的协议 404 也不构成证据
+        let probes = [
+            failed_probe(Protocol::Chat, 404),
+            failed_probe(Protocol::Responses, 200),
+        ];
+        assert_eq!(
+            mismatch_with_evidence(&probes, &[], DownstreamMode::Responses, &a),
+            None
+        );
+        // 配置的协议给出确定性失败（404）→ 这才是「配置写错了」
+        let probes = [
+            failed_probe(Protocol::Chat, 502),
+            failed_probe(Protocol::Responses, 404),
+        ];
+        assert_eq!(
+            mismatch_with_evidence(&probes, &[], DownstreamMode::Responses, &a),
+            Some(Protocol::Responses)
+        );
     }
 
     #[test]
