@@ -59,6 +59,10 @@ pub struct AggregateAliasRow {
     pub updated_at: Option<String>,
     pub active_idx: Option<i64>,
     pub locked: Option<i64>,
+    /// 性能自适应分流开关（0/1，默认 0）。见 `PerfRegistry` / `split_roll`。
+    pub adaptive_split: Option<i64>,
+    /// 最大分流比例（百分比，0–90，默认 50）。
+    pub adaptive_max_spill_pct: Option<i64>,
 }
 
 pub fn parse_candidates(raw: &str) -> anyhow::Result<Vec<AggregateCandidate>> {
@@ -309,7 +313,7 @@ pub async fn expand_aggregate_candidate(
         anyhow::bail!("aggregate candidate name must not be empty");
     }
     let row = sqlx::query_as::<_, AggregateAliasRow>(
-        "SELECT id, alias, candidates, interval_secs, upstream_api, first_byte_timeout_secs, active_idx, locked, created_at, updated_at FROM aggregate_aliases WHERE alias = ?",
+        "SELECT id, alias, candidates, interval_secs, upstream_api, first_byte_timeout_secs, active_idx, locked, adaptive_split, adaptive_max_spill_pct, created_at, updated_at FROM aggregate_aliases WHERE alias = ?",
     )
     .bind(name)
     .fetch_optional(pool)
@@ -577,6 +581,10 @@ pub struct AggregateResolution {
     /// 「调 lock 接口」和「探活跑到这一轮」两条路径会写内存，所以重启后、探活
     /// 第一轮之前，已锁定的别名在请求侧是不锁定的，会被照常迁移。
     pub locked: bool,
+    /// 性能自适应分流开关。开启后主候选相对自身基线恶化时按比例向下一级分流。
+    pub adaptive_split: bool,
+    /// 最大分流比例（百分比，0–90）。
+    pub adaptive_max_spill_pct: u8,
 }
 
 // ---------------------------------------------------------------------------
@@ -633,6 +641,11 @@ pub struct AggregateEntry {
     /// C-B2：锁定后该别名的探测与升降级全部冻结，直至解锁。
     /// 只在内存 + `aggregate_aliases.locked` 列（重启恢复），pending 状态不落库。
     pub locked: bool,
+    /// 自适应分流的迟滞锁存：severity ≥ `T_START` 置真，≤ `T_STOP` 归假。
+    /// 纯运行时状态，不落库（重启/保存后重新积累）。
+    pub degraded: bool,
+    /// 确定性分流累加器：每请求加 `p`，≥1 时分流一次并减去 1。
+    pub split_acc: f64,
 }
 
 impl Default for AggregateEntry {
@@ -646,6 +659,8 @@ impl Default for AggregateEntry {
             last_probe: Instant::now(),
             last_status: Vec::new(),
             locked: false,
+            degraded: false,
+            split_acc: 0.0,
         }
     }
 }
@@ -694,6 +709,79 @@ impl AggregateRouter {
 
     pub fn is_locked(&self, alias: &str) -> bool {
         self.entries.get(alias).map(|e| e.locked).unwrap_or(false)
+    }
+
+    /// 性能自适应分流：返回本请求应**先走**的下游候选下标。
+    ///
+    /// 只在 `adaptive_split` 开启且未锁定时由调用方调用。语义：
+    /// - severity 越过 `T_START` 进入分流，跌到 `T_STOP` 以下停止（迟滞，防抖）；
+    /// - 分流比例随 severity 线性升到 `max_spill`，用累加器实现确定性比例；
+    /// - 目标只在 `active+1..len` 里选，跳过来源失效 / 最近失败的候选；
+    /// - **不改变 `active`**，也不参与 3-confirm 迁移 —— 慢不是坏。
+    pub fn split_roll(
+        &mut self,
+        alias: &str,
+        active: usize,
+        len: usize,
+        severity: f64,
+        max_spill: f64,
+        candidates: &[AggregateCandidate],
+    ) -> Option<usize> {
+        use crate::perf::{T_FULL, T_START, T_STOP};
+        let e = self.ensure_entry(alias, len);
+        if !severity.is_finite() {
+            e.degraded = false;
+            e.split_acc = 0.0;
+            return None;
+        }
+        let was = e.degraded;
+        if severity >= T_START {
+            e.degraded = true;
+        }
+        if severity <= T_STOP {
+            e.degraded = false;
+        }
+        if e.degraded != was {
+            if e.degraded {
+                tracing::info!(
+                    "⚠️ [agg:{}] 检测到主候选性能恶化 sev={:.2} → 开始性能分流（上限 {:.0}%）",
+                    alias,
+                    severity,
+                    max_spill.clamp(0.0, 0.9) * 100.0
+                );
+            } else {
+                tracing::info!(
+                    "✅ [agg:{}] 主候选性能恢复 sev={:.2} → 停止性能分流",
+                    alias,
+                    severity
+                );
+            }
+        }
+        if !e.degraded {
+            e.split_acc = 0.0;
+            return None;
+        }
+        // 只在 active 之后找目标：绝不把流量分给已被降级掉的更靠前候选。
+        let target = (active + 1..len).find(|&i| {
+            candidates.get(i).map(|c| !c.stale_source).unwrap_or(false)
+                && e.last_status.get(i).copied().flatten() != Some(false)
+        });
+        let Some(target) = target else {
+            e.split_acc = 0.0;
+            return None;
+        };
+        let p = max_spill.clamp(0.0, 0.9)
+            * ((severity - T_STOP) / (T_FULL - T_STOP)).clamp(0.0, 1.0);
+        if p <= 0.0 {
+            return None;
+        }
+        e.split_acc += p;
+        if e.split_acc >= 1.0 {
+            e.split_acc -= 1.0;
+            Some(target)
+        } else {
+            None
+        }
     }
 
     /// C-A3：内存没有 entry 时用库里的 `active_idx` 播种（clamp：越界归 0，
@@ -1008,7 +1096,7 @@ async fn find_aggregate_row(
     alias: &str,
 ) -> anyhow::Result<Option<AggregateAliasRow>> {
     Ok(sqlx::query_as::<_, AggregateAliasRow>(
-        "SELECT id, alias, candidates, interval_secs, upstream_api, first_byte_timeout_secs, active_idx, locked, created_at, updated_at FROM aggregate_aliases WHERE alias = ?",
+        "SELECT id, alias, candidates, interval_secs, upstream_api, first_byte_timeout_secs, active_idx, locked, adaptive_split, adaptive_max_spill_pct, created_at, updated_at FROM aggregate_aliases WHERE alias = ?",
     )
     .bind(alias)
     .fetch_optional(pool)
@@ -1149,6 +1237,11 @@ pub async fn resolve_aggregate(
         upstream_api,
         first_byte_timeout_secs: row.first_byte_timeout_secs.and_then(|v| u64::try_from(v).ok()),
         locked: row.locked.unwrap_or(0) == 1,
+        adaptive_split: row.adaptive_split.unwrap_or(0) != 0,
+        adaptive_max_spill_pct: row
+            .adaptive_max_spill_pct
+            .unwrap_or(50)
+            .clamp(0, 90) as u8,
     }))
 }
 
@@ -1445,5 +1538,133 @@ mod tests {
         assert!(!r.record_request_outcome("a", 2, 3, t, true));
         assert!(r.record_request_outcome("a", 2, 3, t, true));
         assert_eq!(r.get_active("a"), 2);
+    }
+
+    // ----- 性能自适应分流 -----
+
+    fn cands(n: usize) -> Vec<AggregateCandidate> {
+        (0..n)
+            .map(|i| AggregateCandidate {
+                account_id: i as i64,
+                model: format!("m{i}"),
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn split_roll_targets_only_downstream() {
+        let mut r = AggregateRouter::default();
+        let c = cands(3);
+        // active=1 → 只可能分到 2，绝不分给 0。
+        for _ in 0..20 {
+            if let Some(t) = r.split_roll("a", 1, 3, 3.0, 0.9, &c) {
+                assert_eq!(t, 2);
+            }
+        }
+        // active 在末位时没有下游 → 不分流。
+        for _ in 0..20 {
+            assert!(r.split_roll("b", 2, 3, 3.0, 0.9, &c).is_none());
+        }
+    }
+
+    #[test]
+    fn split_roll_accumulator_matches_ratio() {
+        let mut r = AggregateRouter::default();
+        let c = cands(2);
+        // severity=3.0、max_spill=0.5 → 每题 0.5，100 次应正好 50 次。
+        let spilled = (0..100)
+            .filter(|_| r.split_roll("a", 0, 2, 3.0, 0.5, &c).is_some())
+            .count();
+        assert_eq!(spilled, 50);
+    }
+
+    #[test]
+    fn split_roll_hysteresis_between_thresholds() {
+        let mut r = AggregateRouter::default();
+        let c = cands(2);
+        // 1.9 进入分流
+        assert!(r.split_roll("a", 0, 2, 1.9, 0.9, &c).is_some() || r.entries["a"].degraded);
+        assert!(r.entries["a"].degraded);
+        // 1.5 在 [T_STOP, T_START) 区间：保持分流（迟滞内不退出）
+        let spilled = (0..100)
+            .filter(|_| r.split_roll("a", 0, 2, 1.5, 0.9, &c).is_some())
+            .count();
+        assert!(spilled > 0, "迟滞区间内应继续分流");
+        assert!(r.entries["a"].degraded);
+        // 1.2 < T_STOP：立即停止，且绝不再分流
+        assert!(r.split_roll("a", 0, 2, 1.2, 0.9, &c).is_none());
+        assert!(!r.entries["a"].degraded);
+        for _ in 0..50 {
+            assert!(r.split_roll("a", 0, 2, 1.2, 0.9, &c).is_none());
+        }
+    }
+
+    #[test]
+    fn split_roll_skips_failed_and_stale_targets() {
+        let mut r = AggregateRouter::default();
+        let mut c = cands(2);
+        // 下游最近失败 → 不分流（慢至少还在服务，别把请求扔给已知坏节点）。
+        r.note_candidate_failure("a", 1, 2);
+        for _ in 0..20 {
+            assert!(r.split_roll("a", 0, 2, 3.0, 0.9, &c).is_none());
+        }
+        // 下游来源失效 → 同样不分流。
+        let mut r2 = AggregateRouter::default();
+        c[1].stale_source = true;
+        for _ in 0..20 {
+            assert!(r2.split_roll("a", 0, 2, 3.0, 0.9, &c).is_none());
+        }
+    }
+
+    #[test]
+    fn split_roll_clamps_max_spill() {
+        let mut r = AggregateRouter::default();
+        let c = cands(2);
+        // max_spill 超过 0.9 → 按 0.9 计，不是每题都分。
+        let spilled = (0..100)
+            .filter(|_| r.split_roll("a", 0, 2, 3.0, 5.0, &c).is_some())
+            .count();
+        // 累加器是 f64，100 次 0.9 相加可能因表示误差只触发 89 次。
+        assert!((89..=90).contains(&spilled), "实际 {spilled}/100");
+    }
+
+    #[test]
+    fn split_roll_non_finite_severity_is_safe() {
+        let mut r = AggregateRouter::default();
+        let c = cands(2);
+        assert!(r.split_roll("a", 0, 2, f64::NAN, 0.5, &c).is_none());
+        assert!(!r.entries["a"].degraded);
+        for _ in 0..10 {
+            // 再次进入恶化仍能正常工作（累加器没被 NaN 污染）。
+            let _ = r.split_roll("a", 0, 2, 3.0, 0.5, &c);
+        }
+        assert!(r.entries["a"].split_acc.is_finite());
+    }
+
+    #[test]
+    fn a_failed_spill_target_resumes_after_success_is_recorded() {
+        let mut r = AggregateRouter::default();
+        let c = cands(2);
+        // 失败标记只影响"这一刻不往坏节点扔"，不是永久黑名单：派发成功路径和
+        // 探活成功路径都会把它写回 Some(true)，分流随即恢复。
+        r.note_candidate_failure("a", 1, 2);
+        assert!(r.split_roll("a", 0, 2, 3.0, 0.9, &c).is_none());
+        r.note_candidate_success("a", 1, 2);
+        assert!(r.split_roll("a", 0, 2, 3.0, 0.9, &c).is_none());
+        assert_eq!(r.split_roll("a", 0, 2, 3.0, 0.9, &c), Some(1));
+    }
+
+    #[test]
+    fn recovery_clears_the_spill_accumulator() {
+        let mut r = AggregateRouter::default();
+        let c = cands(2);
+        assert!(r.split_roll("a", 0, 2, 3.0, 0.9, &c).is_none());
+        assert!(r.split_roll("a", 0, 2, 1.0, 0.9, &c).is_none());
+        assert!(!r.entries["a"].degraded);
+        assert_eq!(r.entries["a"].split_acc, 0.0);
+        // 再次恶化不能因为上次残留的小数立刻连分两次。
+        assert!(r.split_roll("a", 0, 2, 3.0, 0.9, &c).is_none());
+        assert_eq!(r.split_roll("a", 0, 2, 3.0, 0.9, &c), Some(1));
     }
 }

@@ -12,6 +12,7 @@ pub mod dispatcher;
 pub mod export_import;
 pub mod max_tokens;
 pub mod models;
+pub mod perf;
 pub mod probe;
 pub mod proxy;
 pub mod reasoning_effort;

@@ -1535,6 +1535,43 @@ async fn migration_0036_adds_active_idx_and_locked() {
     assert_eq!(active2, 2);
 }
 
+/// 0038（性能自适应分流）：`aggregate_aliases` 加开关（默认关）与最大分流比例
+/// （默认 50）。存量行拿到默认值；重启重跑迁移不能覆盖用户配置。
+#[tokio::test]
+async fn migration_0038_adds_adaptive_split_columns() {
+    let pool = memory_db().await;
+    let cols: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM pragma_table_info('aggregate_aliases') WHERE name IN ('adaptive_split', 'adaptive_max_spill_pct') ORDER BY name",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("columns");
+    assert_eq!(cols, vec!["adaptive_max_spill_pct", "adaptive_split"]);
+
+    sqlx::query("INSERT INTO aggregate_aliases (alias, candidates) VALUES ('agg38', '[{\"account_id\":1,\"model\":\"m\"}]')")
+        .execute(&pool)
+        .await
+        .expect("insert");
+    let (on, pct): (i64, i64) =
+        sqlx::query_as("SELECT adaptive_split, adaptive_max_spill_pct FROM aggregate_aliases WHERE alias = 'agg38'")
+            .fetch_one(&pool)
+            .await
+            .expect("defaults");
+    assert_eq!((on, pct), (0, 50));
+
+    sqlx::query("UPDATE aggregate_aliases SET adaptive_split = 1, adaptive_max_spill_pct = 80 WHERE alias = 'agg38'")
+        .execute(&pool)
+        .await
+        .expect("update");
+    init_db(&pool).await.expect("restart reruns migrations");
+    let (on, pct): (i64, i64) =
+        sqlx::query_as("SELECT adaptive_split, adaptive_max_spill_pct FROM aggregate_aliases WHERE alias = 'agg38'")
+            .fetch_one(&pool)
+            .await
+            .expect("preserved");
+    assert_eq!((on, pct), (1, 80));
+}
+
 /// 重启后第一次请求也要把库里的 `locked` 认下来。此前 `resolve_aggregate` 只恢复
 /// `active_idx`，`locked` 只在「调 lock 接口」或「探活跑到这一轮」时才进内存 ——
 /// 于是重启后、探活第一轮之前，一个已锁定的别名在请求侧是不锁定的，照样会被迁移。
