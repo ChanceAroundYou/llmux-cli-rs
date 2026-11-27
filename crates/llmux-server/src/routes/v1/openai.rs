@@ -1065,7 +1065,39 @@ pub(crate) async fn dispatch_aggregate_with_conversion(
     // 单次请求失败仍会顺着列表往下故障转移 —— 下游看到的模型照样换来换去，
     // 锁形同虚设（2026-10-31 用户明确要求「失败也不切换」）。
     let last = if agg.locked { (active + 1).min(len) } else { len };
-    for i in active..last {
+    // 性能自适应分流：仅在开关打开且未锁定时，把本请求的**起点**换成下游候选。
+    // 其余候选顺序不变，失败转移 / 冷却 / stale / anchor 语义全部沿用；绝不改 active。
+    // 见 `AggregateRouter::split_roll` 与 `llmux_core::perf`。
+    let mut order: Vec<usize> = (active..last).collect();
+    if agg.adaptive_split && !agg.locked && active + 1 < last {
+        let severity = {
+            let cand = &agg.candidates[active];
+            match llmux_core::perf::global().lock() {
+                Ok(reg) => reg.severity(cand.account_id, &cand.model, Instant::now()),
+                Err(_) => 1.0,
+            }
+        };
+        let target = state.aggregate_router.lock().unwrap().split_roll(
+            &alias,
+            active,
+            len,
+            severity,
+            agg.adaptive_max_spill_pct as f64 / 100.0,
+            &agg.candidates,
+        );
+        if let Some(t) = target {
+            order.retain(|&x| x != t);
+            order.insert(0, t);
+            tracing::debug!(
+                "🔀 [agg:{}] 性能分流 → 候选 {} ({}) | sev={:.2}",
+                alias,
+                t,
+                agg.candidates[t].model,
+                severity
+            );
+        }
+    }
+    for i in order {
         let cand = &agg.candidates[i];
         // 来源普通别名已被删除 → 配置失效，跳过且不计失败（见 helpers::stale_candidate_reason）。
         if let Some(reason) = crate::routes::v1::helpers::stale_candidate_reason(cand) {

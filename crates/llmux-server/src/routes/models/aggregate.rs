@@ -20,7 +20,7 @@ use crate::app::AppState;
 /// 而漏掉另两处就是「别名锁定修了两次都没修好」的实际成因。
 pub async fn aggregate_alias_payloads(state: &AppState) -> anyhow::Result<Value> {
     let rows = sqlx::query_as::<_, AggregateAliasRow>(
-        "SELECT id, alias, candidates, interval_secs, upstream_api, first_byte_timeout_secs, active_idx, locked, created_at, updated_at FROM aggregate_aliases ORDER BY id",
+        "SELECT id, alias, candidates, interval_secs, upstream_api, first_byte_timeout_secs, active_idx, locked, adaptive_split, adaptive_max_spill_pct, created_at, updated_at FROM aggregate_aliases ORDER BY id",
     )
     .fetch_all(&state.pool)
     .await?;
@@ -96,6 +96,8 @@ pub async fn aggregate_alias_payloads(state: &AppState) -> anyhow::Result<Value>
             "interval_secs": row.interval_secs.unwrap_or(300),
             "upstream_api": row.upstream_api.clone().unwrap_or_else(|| "chat".to_string()),
             "first_byte_timeout_secs": row.first_byte_timeout_secs,
+            "adaptive_split": row.adaptive_split.unwrap_or(0) != 0,
+            "adaptive_max_spill_pct": row.adaptive_max_spill_pct.unwrap_or(50).clamp(0, 90),
             "active": active,
             "locked": row.locked.unwrap_or(0),
             "last_status": last_status,
@@ -377,6 +379,17 @@ pub async fn set_aggregate_alias(
         }
     };
 
+    // 性能自适应分流：默认关闭；最大分流比例 0–90（至少给慢节点留 10%）。
+    let adaptive_split = body
+        .get("adaptive_split")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let adaptive_max_spill_pct = body
+        .get("adaptive_max_spill_pct")
+        .and_then(Value::as_i64)
+        .unwrap_or(50)
+        .clamp(0, 90);
+
     // Validate account_ids exist and are active (dedup: same account may appear with different models)
     {
         let mut unique_ids = account_ids.clone();
@@ -553,7 +566,7 @@ pub async fn set_aggregate_alias(
     };
 
     match sqlx::query(
-        "INSERT INTO aggregate_aliases (alias, candidates, interval_secs, upstream_api, first_byte_timeout_secs, active_idx, locked, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP) ON CONFLICT(alias) DO UPDATE SET candidates=excluded.candidates, interval_secs=excluded.interval_secs, upstream_api=excluded.upstream_api, first_byte_timeout_secs=excluded.first_byte_timeout_secs, active_idx=excluded.active_idx, locked=excluded.locked, updated_at=CURRENT_TIMESTAMP",
+        "INSERT INTO aggregate_aliases (alias, candidates, interval_secs, upstream_api, first_byte_timeout_secs, active_idx, locked, adaptive_split, adaptive_max_spill_pct, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP) ON CONFLICT(alias) DO UPDATE SET candidates=excluded.candidates, interval_secs=excluded.interval_secs, upstream_api=excluded.upstream_api, first_byte_timeout_secs=excluded.first_byte_timeout_secs, active_idx=excluded.active_idx, locked=excluded.locked, adaptive_split=excluded.adaptive_split, adaptive_max_spill_pct=excluded.adaptive_max_spill_pct, updated_at=CURRENT_TIMESTAMP",
     )
     .bind(&alias)
     .bind(&candidates_json)
@@ -562,6 +575,8 @@ pub async fn set_aggregate_alias(
     .bind(first_byte_timeout_secs)
     .bind(keep_active)
     .bind(keep_locked)
+    .bind(adaptive_split as i64)
+    .bind(adaptive_max_spill_pct)
     .execute(&state.pool)
     .await
     {
@@ -630,7 +645,7 @@ pub async fn delete_aggregate_alias(
     Path(id): Path<String>,
 ) -> Response {
     let row = match sqlx::query_as::<_, AggregateAliasRow>(
-        "SELECT id, alias, candidates, interval_secs, upstream_api, first_byte_timeout_secs, active_idx, locked, created_at, updated_at FROM aggregate_aliases WHERE id = ?",
+        "SELECT id, alias, candidates, interval_secs, upstream_api, first_byte_timeout_secs, active_idx, locked, adaptive_split, adaptive_max_spill_pct, created_at, updated_at FROM aggregate_aliases WHERE id = ?",
     )
     .bind(&id)
     .fetch_optional(&state.pool)
@@ -727,7 +742,7 @@ pub async fn set_aggregate_active(
     Json(body): Json<Value>,
 ) -> Response {
     let row = match sqlx::query_as::<_, AggregateAliasRow>(
-        "SELECT id, alias, candidates, interval_secs, upstream_api, first_byte_timeout_secs, active_idx, locked, created_at, updated_at FROM aggregate_aliases WHERE id = ?",
+        "SELECT id, alias, candidates, interval_secs, upstream_api, first_byte_timeout_secs, active_idx, locked, adaptive_split, adaptive_max_spill_pct, created_at, updated_at FROM aggregate_aliases WHERE id = ?",
     )
     .bind(&id)
     .fetch_optional(&state.pool)
@@ -775,7 +790,7 @@ pub async fn set_aggregate_lock(
     Json(body): Json<Value>,
 ) -> Response {
     let row = match sqlx::query_as::<_, AggregateAliasRow>(
-        "SELECT id, alias, candidates, interval_secs, upstream_api, first_byte_timeout_secs, active_idx, locked, created_at, updated_at FROM aggregate_aliases WHERE id = ?",
+        "SELECT id, alias, candidates, interval_secs, upstream_api, first_byte_timeout_secs, active_idx, locked, adaptive_split, adaptive_max_spill_pct, created_at, updated_at FROM aggregate_aliases WHERE id = ?",
     )
     .bind(&id)
     .fetch_optional(&state.pool)

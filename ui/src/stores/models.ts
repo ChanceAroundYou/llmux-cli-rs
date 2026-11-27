@@ -73,6 +73,10 @@ export interface AggregateAlias {
   upstream_api?: string | null;
   /// 首字节超时（秒）。null = 走后端默认 30s（aggregate.rs 的 payload 用同一个字段名）。
   first_byte_timeout_secs?: number | null;
+  /// 性能自适应分流开关（默认关闭）。开启后主候选相对自身基线恶化时按比例向下一级分流。
+  adaptive_split?: boolean;
+  /// 最大分流比例（百分比，0–90，默认 50）。
+  adaptive_max_spill_pct?: number;
   active: number;
   locked?: number | boolean | null;
   last_status: (boolean | null)[];
@@ -100,7 +104,7 @@ interface ModelsState {
   fetchSummary: (signal?: AbortSignal) => Promise<void>;
   addAlias: (alias: string, targetModel: string, providerId?: string, accountIds?: number[], preferredAccountId?: number, confirm?: boolean, upstreamApi?: string, firstByteTimeoutSecs?: number | null, id?: number) => Promise<void>;
   deleteAlias: (id: number) => Promise<void>;
-  saveAggregateAlias: (alias: string, candidates: AggregateCandidateInput[], intervalSecs?: number, confirm?: boolean, upstreamApi?: string, firstByteTimeoutSecs?: number | null) => Promise<string[]>;
+  saveAggregateAlias: (alias: string, candidates: AggregateCandidateInput[], intervalSecs?: number, confirm?: boolean, upstreamApi?: string, firstByteTimeoutSecs?: number | null, adaptive?: { split: boolean; maxSpillPct: number }) => Promise<string[]>;
   deleteAggregateAlias: (id: number) => Promise<void>;
   setAggregateActive: (id: number, active: number) => Promise<void>;
   setAggregateLock: (id: number, locked: boolean) => Promise<void>;
@@ -327,9 +331,9 @@ export const useModelsStore = create<ModelsState>((set, get) => ({
     }
   },
 
-  saveAggregateAlias: async (alias, candidates, intervalSecs, confirm, upstreamApi, firstByteTimeoutSecs) => {
+  saveAggregateAlias: async (alias, candidates, intervalSecs, confirm, upstreamApi, firstByteTimeoutSecs, adaptive) => {
     try {
-      const body: any = { alias, candidates, interval_secs: intervalSecs ?? 300, ...(confirm ? { confirm: true } : {}), upstream_api: upstreamApi ?? 'default', ...(firstByteTimeoutSecs != null ? { first_byte_timeout_secs: firstByteTimeoutSecs } : {}) };
+      const body: any = { alias, candidates, interval_secs: intervalSecs ?? 300, ...(confirm ? { confirm: true } : {}), upstream_api: upstreamApi ?? 'default', ...(firstByteTimeoutSecs != null ? { first_byte_timeout_secs: firstByteTimeoutSecs } : {}), ...(adaptive ? { adaptive_split: adaptive.split, adaptive_max_spill_pct: adaptive.maxSpillPct } : {}) };
       const res = await apiFetch('/api/aggregate-aliases', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
       if (!res.ok) { const data = await res.json(); const err: any = new Error(data.error || 'Failed to save aggregate alias'); err.code = data.code; err.conflict = data.conflict; err.status = res.status; throw err; }
       // 别名候选展开成了什么、丢了哪些停用账户、协议不一致 —— 只有后端知道，

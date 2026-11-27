@@ -185,7 +185,7 @@ export default function Models() {
   const [editingAliasId, setEditingAliasId] = useState<number | null>(null);
   const [isAggregateModalOpen, setIsAggregateModalOpen] = useState(false);
   const [editingAggregateId, setEditingAggregateId] = useState<number | null>(null);
-  const [aggregateForm, setAggregateForm] = useState<{ alias: string; downstreamMode: string; candidates: AggregateCandidateRow[]; firstByteTimeoutSecs: number | '' }>({ alias: '', downstreamMode: 'chat', candidates: [{ account_id: '', model: '' }], firstByteTimeoutSecs: '' });
+  const [aggregateForm, setAggregateForm] = useState<{ alias: string; downstreamMode: string; candidates: AggregateCandidateRow[]; firstByteTimeoutSecs: number | ''; adaptiveSplit: boolean; adaptiveMaxSpillPct: number }>({ alias: '', downstreamMode: 'chat', candidates: [{ account_id: '', model: '' }], firstByteTimeoutSecs: '', adaptiveSplit: false, adaptiveMaxSpillPct: 50 });
   const [aggregateFormNotice, setAggregateFormNotice] = useState<string | null>(null);
   /// 保存后后端回的话：别名候选展开成了什么、丢了哪些停用账户、协议不一致。
   /// 只有后端知道，不显示出来用户只会问「为什么没走到那个候选」。
@@ -505,10 +505,10 @@ export default function Models() {
         ...(c.upstream_api ? { upstream_api: c.upstream_api } : {}),
         ...(c.first_byte_timeout_secs != null ? { first_byte_timeout_secs: c.first_byte_timeout_secs } : {}),
       }));
-      setAggregateForm({ alias: agg.alias, downstreamMode: normalizeMode((agg as any).upstream_api), candidates: candidates.length ? candidates : [{ account_id: '', model: '' }], firstByteTimeoutSecs: (agg as any).first_byte_timeout_secs ?? '' });
+      setAggregateForm({ alias: agg.alias, downstreamMode: normalizeMode((agg as any).upstream_api), candidates: candidates.length ? candidates : [{ account_id: '', model: '' }], firstByteTimeoutSecs: (agg as any).first_byte_timeout_secs ?? '', adaptiveSplit: !!(agg as any).adaptive_split, adaptiveMaxSpillPct: (agg as any).adaptive_max_spill_pct ?? 50 });
     } else {
       setEditingAggregateId(null);
-      setAggregateForm({ alias: '', downstreamMode: 'default', candidates: [{ account_id: '', model: '' }], firstByteTimeoutSecs: '' });
+      setAggregateForm({ alias: '', downstreamMode: 'default', candidates: [{ account_id: '', model: '' }], firstByteTimeoutSecs: '', adaptiveSplit: false, adaptiveMaxSpillPct: 50 });
     }
     setIsAggregateModalOpen(true);
   };
@@ -517,7 +517,7 @@ export default function Models() {
     setIsAggregateModalOpen(false);
     setEditingAggregateId(null);
     setAggregateFormNotice(null);
-    setAggregateForm({ alias: '', downstreamMode: 'default', candidates: [{ account_id: '', model: '' }], firstByteTimeoutSecs: '' });
+    setAggregateForm({ alias: '', downstreamMode: 'default', candidates: [{ account_id: '', model: '' }], firstByteTimeoutSecs: '', adaptiveSplit: false, adaptiveMaxSpillPct: 50 });
   };
 
   /// 候选自带的协议与聚合强制的协议不一致 —— **保存会被后端 400**（2026-11-07 改，
@@ -582,7 +582,7 @@ export default function Models() {
     }
     try {
       const timeout = aggregateForm.firstByteTimeoutSecs === '' ? null : Number(aggregateForm.firstByteTimeoutSecs);
-      const notes = await saveAggregateAlias(aggregateForm.alias.trim(), candidates, undefined, undefined, aggregateForm.downstreamMode || 'default', timeout);
+      const notes = await saveAggregateAlias(aggregateForm.alias.trim(), candidates, undefined, undefined, aggregateForm.downstreamMode || 'default', timeout, { split: aggregateForm.adaptiveSplit, maxSpillPct: aggregateForm.adaptiveMaxSpillPct });
       setAggregateSaveNotes(notes);
       showBgVerifyHint();
       closeAggregateModal();
@@ -1603,6 +1603,35 @@ export default function Models() {
               placeholder={t('models.firstByteTimeoutPlaceholder')}
               className="w-full h-10 px-3 py-2 rounded-md border border-input bg-background text-sm"
             />
+          </div>
+          <div className="space-y-1.5 border-t border-border pt-3">
+            <label className="flex items-center gap-2 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={aggregateForm.adaptiveSplit}
+                onChange={e => setAggregateForm({ ...aggregateForm, adaptiveSplit: e.target.checked })}
+                className="w-4 h-4 rounded accent-primary shrink-0"
+              />
+              <span className="text-xs font-bold text-muted-foreground uppercase">性能自适应分流</span>
+            </label>
+            <p className="text-xs text-muted-foreground">
+              主候选比自身历史基线明显变慢（TTFT 升高 / tokens/s 下降）时，按比例把部分请求分流到后面的候选；健康时仍全走主候选。默认关闭，只影响本聚合。
+            </p>
+            {aggregateForm.adaptiveSplit && (
+              <div className="flex items-center gap-2 pt-1">
+                <span className="text-xs text-muted-foreground shrink-0">最大分流比例</span>
+                <input
+                  type="range"
+                  min={10}
+                  max={90}
+                  step={5}
+                  value={aggregateForm.adaptiveMaxSpillPct}
+                  onChange={e => setAggregateForm({ ...aggregateForm, adaptiveMaxSpillPct: Number(e.target.value) })}
+                  className="flex-1 accent-primary"
+                />
+                <span className="text-xs font-mono w-10 text-right">{aggregateForm.adaptiveMaxSpillPct}%</span>
+              </div>
+            )}
           </div>
           <div className="pt-4 flex gap-3">
             <Button type="button" variant="outline" onClick={closeAggregateModal} className="flex-1">{t('common.cancel')}</Button>

@@ -1178,6 +1178,24 @@ pub fn spawn_log_usage_ip(
     // 详情页按需从本地日志读取。
     let request_body: Option<String> = None;
     let response_body: Option<String> = None;
+    // 性能自适应分流的样本：只收**流式成功**请求（真实 TTFT + 解码吞吐）。
+    // 非流式下 ttft 等于总耗时，与流式不可比，不纳入基线。
+    if success && is_stream {
+        if let Some(ttft) = ttft_ms {
+            let decode_ms = latency_ms.saturating_sub(ttft);
+            let tps = (decode_ms >= 500 && output_tokens >= 8)
+                .then(|| output_tokens as f64 / (decode_ms as f64 / 1000.0));
+            if let Ok(mut reg) = llmux_core::perf::global().lock() {
+                reg.record(
+                    account.id,
+                    &model,
+                    ttft as f64,
+                    tps,
+                    std::time::Instant::now(),
+                );
+            }
+        }
+    }
     tokio::spawn(async move {
         let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
         // 真实调用成功 → 解除「连续失败暂停自动拨测」。模型恢复后不必等冷却

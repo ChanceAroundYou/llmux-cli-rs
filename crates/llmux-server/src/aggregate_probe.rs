@@ -899,6 +899,8 @@ mod tests {
                 last_probe: Instant::now(),
                 last_status: vec![Some(true)],
                 locked: false,
+                degraded: false,
+                split_acc: 0.0,
             },
         );
         r.entries.insert(
@@ -912,6 +914,8 @@ mod tests {
                 last_probe: Instant::now(),
                 last_status: vec![Some(false)],
                 locked: false,
+                degraded: false,
+                split_acc: 0.0,
             },
         );
 
