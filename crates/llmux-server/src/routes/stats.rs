@@ -2,6 +2,7 @@ use axum::extract::Query;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
+use llmux_core::perf;
 use llmux_core::usage::{UsageFilter, UsageService};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -245,4 +246,66 @@ pub async fn get_stats_logs(
         .collect();
 
     Json(json!({ "logs": entries, "total": total })).into_response()
+}
+
+/// 实时性能快照（进程内存，重启清零）。筛选口径与 /api/stats 一致：
+/// 别名过滤先从 usage_logs 近 24h 的归属行取 (account_id, model) 集合，
+/// 再拿它裁剪 registry 快照 —— 不把无关节点的 severity 混进别名卡片。
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+pub struct PerfQuery {
+    pub account_id: Option<i64>,
+    pub alias: Option<String>,
+    pub alias_kind: Option<String>,
+    pub model: Option<String>,
+}
+
+pub async fn get_live_perf(
+    Extension(state): Extension<crate::AppState>,
+    Query(params): Query<PerfQuery>,
+) -> Response {
+    let mut live = perf::global()
+        .lock()
+        .unwrap()
+        .snapshot_all(std::time::Instant::now());
+
+    if let Some(account_id) = params.account_id {
+        live.retain(|n| n.account_id == account_id);
+    }
+    if let Some(model) = &params.model {
+        live.retain(|n| &n.model == model);
+    }
+    if let Some(alias) = &params.alias {
+        let col = if params.alias_kind.as_deref() == Some("aggregate") {
+            "aggregate_alias"
+        } else {
+            "requested_model"
+        };
+        let cutoff = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64
+            - 24 * 60 * 60 * 1000;
+        let sql = format!(
+            "SELECT DISTINCT account_id, model FROM usage_logs WHERE {col} = ? AND timestamp >= ?"
+        );
+        let rows: Result<Vec<(Option<i64>, Option<String>)>, _> =
+            sqlx::query_as(&sql).bind(alias).bind(cutoff).fetch_all(&state.pool).await;
+        match rows {
+            Ok(rows) => {
+                let allowed: Vec<(i64, String)> = rows
+                    .into_iter()
+                    .filter_map(|(a, m)| a.zip(m))
+                    .collect();
+                live.retain(|n| allowed.iter().any(|(a, m)| *a == n.account_id && m == &n.model));
+            }
+            Err(e) => {
+                return crate::error::simple_error(
+                    format!("Failed to resolve alias for live perf: {e}"),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                )
+            }
+        }
+    }
+    Json(json!({ "live": live })).into_response()
 }

@@ -103,6 +103,9 @@ pub async fn aggregate_alias_payloads(state: &AppState) -> anyhow::Result<Value>
             "last_status": last_status,
             "pending_target": pending_target,
             "confirm_count": confirm_count,
+            // 自适应分流的运行时状态：重启后重新积累，读不到时回填未分流。
+            "degraded": entry.map(|e| e.degraded).unwrap_or(false),
+            "split_acc": entry.map(|e| e.split_acc).unwrap_or(0.0),
         }));
     }
     Ok(Value::Array(out))

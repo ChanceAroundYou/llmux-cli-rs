@@ -13,9 +13,16 @@ use axum::{
     http::{header, Method, Request, StatusCode},
     response::IntoResponse,
 };
-use llmux_core::perf::{global, PerfRegistry};
+use llmux_core::perf::{global, PerfRegistry, STALE_AFTER};
 use serde_json::{json, Value};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+// 三个测试共用进程级 PerfRegistry，必须串行，否则一个 clear_perf 会把另一个的样本抹掉。
+static PERF_TEST_LOCK: Mutex<()> = Mutex::new(());
+fn perf_lock() -> std::sync::MutexGuard<'static, ()> {
+    PERF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 fn chat_body(marker: &str) -> Value {
     json!({
@@ -186,6 +193,7 @@ fn clear_perf() {
 /// 全局性能注册表是进程级单例，四段场景串在同一个测试里跑（各自先清干净）。
 #[tokio::test]
 async fn adaptive_split_contract() {
+    let _perf_guard = perf_lock();
     config_roundtrip().await;
     disabled_and_healthy_stay_on_primary().await;
     degraded_spills_then_recovers().await;
@@ -311,6 +319,11 @@ async fn degraded_spills_then_recovers() {
     assert!(spilled >= 10, "基线恶化后应分流，实际 {spilled}/40");
     assert!(primary_hits >= 10, "上限 50% 应给主候选留流量，实际 {primary_hits}/40");
 
+    // 聚合列表要把运行时迟滞状态与分流累加器带给前端，卡片才能显示「分流中」。
+    let aggregate = aggregate_row(&app, &cookie, "split-on").await;
+    assert_eq!(aggregate["degraded"], json!(true), "{aggregate:?}");
+    assert!(aggregate["split_acc"].as_f64().is_some());
+
     // 真实聚合请求要把客户端别名与命中的候选下标一起落库，统计页才能按别名看流量走向。
     let mut rows: Vec<(Option<String>, Option<i64>)> = Vec::new();
     for _ in 0..100 {
@@ -406,4 +419,77 @@ async fn only_streaming_success_feeds_baseline() {
     assert!((snap.ttft_fast_ms.unwrap() - 500.0).abs() < 1e-9);
     // 100 tokens / 1.0s 解码 = 100 tps。
     assert!((snap.tps_fast.unwrap() - 100.0).abs() < 1e-9);
+}
+
+// --- 6. 实时性能快照（统计页高频刷新用） ---------------------------------------
+
+#[test]
+fn live_snapshot_is_none_without_fresh_samples() {
+    let _perf_guard = perf_lock();
+    clear_perf();
+    let now = Instant::now();
+    assert!(global().lock().unwrap().snapshot_all(now).is_empty());
+
+    {
+        let mut reg = global().lock().unwrap();
+        for i in 0..5 {
+            reg.record(777, "live-model", 100.0, Some(50.0), now - Duration::from_secs(5 - i));
+        }
+    }
+    let snap = global().lock().unwrap().snapshot_all(now);
+    let node = snap.iter().find(|n| n.account_id == 777 && n.model == "live-model").unwrap();
+    assert_eq!(node.samples, 5);
+    assert!(node.severity.is_some() && node.severity.unwrap().is_finite());
+    assert!(node.ttft_fast_ms.unwrap() > 0.0);
+    assert!(node.tps_fast.unwrap() > 0.0);
+    assert!(node.ttft_slow_ms.is_some() && node.tps_slow.is_some());
+    assert!(node.last_sample_age_secs <= 6);
+
+    // 不足 3 个样本：保留节点，但不给 severity。
+    clear_perf();
+    global().lock().unwrap().record(778, "thin-model", 100.0, Some(50.0), now);
+    let snap = global().lock().unwrap().snapshot_all(now);
+    let thin = snap.iter().find(|n| n.account_id == 778).unwrap();
+    assert_eq!(thin.samples, 1);
+    assert_eq!(thin.severity, None);
+
+    // 过旧：同样显示「无样本」，不能拿旧基线给实时卡片一个健康绿灯。
+    clear_perf();
+    global().lock().unwrap().record(779, "stale-model", 100.0, Some(50.0), now - STALE_AFTER - Duration::from_secs(1));
+    let snap = global().lock().unwrap().snapshot_all(now);
+    let stale = snap.iter().find(|n| n.account_id == 779).unwrap();
+    assert_eq!(stale.severity, None);
+}
+
+#[tokio::test]
+async fn perf_endpoint_exposes_live_snapshot_with_filters() {
+    let _perf_guard = perf_lock();
+    clear_perf();
+    let now = Instant::now();
+    {
+        let mut reg = global().lock().unwrap();
+        for i in 0..5 {
+            reg.record(777, "live-model", 100.0, Some(50.0), now - Duration::from_secs(5 - i));
+            reg.record(778, "other-model", 400.0, Some(10.0), now - Duration::from_secs(5 - i));
+        }
+    }
+    let state = llmux_server::test_state().await;
+    let app = llmux_server::app(state);
+    let cookie = login(&app).await;
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/api/stats/perf?account_id=777")
+        .header(header::COOKIE, cookie)
+        .body(Body::empty())
+        .unwrap();
+    let resp = llmux_server::test_request(app, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    let live = body["live"].as_array().unwrap();
+    assert_eq!(live.len(), 1, "body: {body}");
+    assert_eq!(live[0]["accountId"], json!(777));
+    assert_eq!(live[0]["model"], json!("live-model"));
+    assert!(live[0]["severity"].is_number());
 }

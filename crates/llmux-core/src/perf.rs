@@ -9,6 +9,7 @@
 //! `severity = max(fast_ttft/slow_ttft, slow_tps/fast_tps)`，再配一组绝对差下限，
 //! 防止小基数下的比例噪声误触发。纯内存、进程内，重启清零。
 
+use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
@@ -145,6 +146,22 @@ pub struct PerfSnapshot {
     pub samples: u64,
 }
 
+/// 统计页的只读实时视图。severity=None 表示样本不足或过期，UI 显示「无样本」，
+/// 不把默认的 1.0（分流阈值里的「没恶化」）误当成实测健康。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PerfNodeView {
+    pub account_id: i64,
+    pub model: String,
+    pub severity: Option<f64>,
+    pub ttft_fast_ms: Option<f64>,
+    pub ttft_slow_ms: Option<f64>,
+    pub tps_fast: Option<f64>,
+    pub tps_slow: Option<f64>,
+    pub samples: u64,
+    pub last_sample_age_secs: u64,
+}
+
 const MAX_NODES: usize = 4096;
 const PRUNE_EVERY_OPS: u64 = 512;
 const MAX_AGE: Duration = Duration::from_secs(60 * 60);
@@ -184,6 +201,43 @@ impl PerfRegistry {
         self.nodes
             .get(&(account_id, model.to_string()))
             .map(NodePerf::snapshot)
+    }
+
+    /// 全量只读快照，供统计页展示实时性能。无样本 / 样本不足 3 / 过期节点
+    /// 仍会出现在列表里（前端据此显示「无样本」），但 severity 为 None。
+    pub fn snapshot_all(&self, now: Instant) -> Vec<PerfNodeView> {
+        let mut out: Vec<PerfNodeView> = self
+            .nodes
+            .iter()
+            .map(|((account_id, model), node)| {
+                let snap = node.snapshot();
+                let fresh = node
+                    .last_sample_at
+                    .map(|t| now.saturating_duration_since(t) <= STALE_AFTER)
+                    .unwrap_or(false);
+                let enough = snap.samples >= MIN_SAMPLES;
+                PerfNodeView {
+                    account_id: *account_id,
+                    model: model.clone(),
+                    severity: if fresh && enough {
+                        Some(node.severity(now))
+                    } else {
+                        None
+                    },
+                    ttft_fast_ms: snap.ttft_fast_ms,
+                    ttft_slow_ms: snap.ttft_slow_ms,
+                    tps_fast: snap.tps_fast,
+                    tps_slow: snap.tps_slow,
+                    samples: snap.samples,
+                    last_sample_age_secs: node
+                        .last_sample_at
+                        .map(|t| now.saturating_duration_since(t).as_secs())
+                        .unwrap_or(u64::MAX),
+                }
+            })
+            .collect();
+        out.sort_by(|a, b| a.account_id.cmp(&b.account_id).then(a.model.cmp(&b.model)));
+        out
     }
 
     /// 丢掉一小时没更新的节点；超过硬上限时从最旧的开始删，保证内存有界。
