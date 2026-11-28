@@ -1,7 +1,7 @@
 import React from 'react';
 import { useTranslation } from 'react-i18next';
 import { apiFetch } from '@/lib/api';
-import { Button } from '@/components/ui/button';
+import FilterSelect from './FilterSelect';
 
 /** 与后端 usage_logs.api_key_id 对应（迁移 0026）。 */
 export interface ApiKeyOption {
@@ -17,11 +17,10 @@ interface KeyFilterProps {
 }
 
 /**
- * 按网关密钥筛选的下拉组。
+ * 按网关密钥筛选的单向下拉。
  *
- * 用仓库既有的「描边按钮组」样式（见 logs.tsx 的成功/失败筛选），而不是
- * `components/ui/select.tsx` —— 那个 Radix 封装全仓无人使用，密钥名长短不定时
- * 也不如按钮组直观。密钥多于 5 把时横向会挤，届时换成 Select 是自然的升级路径。
+ * 密钥名长短不一、数量会涨，按钮组部署到统计 / 日志 / 仪表盘三页后会横向挤爆；
+ * 统一走共享的 FilterSelect（Radix Select），「全部密钥」即不筛选。
  *
  * 密钥列表自己拉一次并缓存到模块级：三个页面（统计 / 日志 / 仪表盘）都会用到，
  * 而密钥几乎不变，没必要每个组件各拉一次。
@@ -70,26 +69,12 @@ export default function KeyFilter({ value, onChange, className }: KeyFilterProps
   if (!keys.length) return null;
 
   return (
-    <div className={`flex border border-border rounded-lg overflow-hidden ${className ?? ''}`}>
-      <Button
-        variant={value === null ? 'default' : 'ghost'}
-        size="sm"
-        onClick={() => onChange(null)}
-        className="rounded-none h-auto py-1.5 text-xs font-semibold"
-      >
-        {t('common.allKeys', { defaultValue: '全部密钥' })}
-      </Button>
-      {keys.map(k => (
-        <Button
-          key={k.id}
-          variant={value === k.id ? 'default' : 'ghost'}
-          size="sm"
-          onClick={() => onChange(k.id)}
-          className="rounded-none h-auto py-1.5 text-xs font-semibold max-w-[160px] truncate"
-        >
-          {k.name}
-        </Button>
-      ))}
-    </div>
+    <FilterSelect
+      className={className}
+      value={value === null ? null : String(value)}
+      options={keys.map(k => ({ value: String(k.id), label: k.name }))}
+      allLabel={t('common.allKeys', { defaultValue: '全部密钥' })}
+      onChange={next => onChange(next === null ? null : Number(next))}
+    />
   );
 }
