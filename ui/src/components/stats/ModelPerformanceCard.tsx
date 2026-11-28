@@ -31,6 +31,8 @@ export interface PerfRow {
   avgTtft: number;
   p95Ttft: number;
   avgTps: number;
+  ttftSamples: number;
+  tpsSamples: number;
   prevStreamRequests: number;
   prevSuccessRate: number;
   prevAvgTtft: number;
@@ -49,6 +51,8 @@ export interface PerfPoint {
   avgTtft: number;
   p95Ttft: number;
   avgTps: number;
+  ttftSamples: number;
+  tpsSamples: number;
 }
 
 export interface LivePerf {
@@ -295,7 +299,7 @@ export default function ModelPerformanceCard({
           onChange={setSelected}
         />
         <span className="text-[11px] text-muted-foreground">
-          {t('usage.perf.scope', { defaultValue: '仅流式成功请求 · TPS 按解码段计算' })}
+          {t('usage.perf.scope', { defaultValue: '曲线只用合格成功样本 · 表格列出样本数' })}
         </span>
       </div>
 
@@ -339,8 +343,12 @@ export default function ModelPerformanceCard({
                       </td>
                       <td className="text-right px-3 py-2">{r.streamRequests}</td>
                       <td className="text-right px-3 py-2">{(r.successRate * 100).toFixed(1)}%</td>
-                      <td className="text-right px-3 py-2">{r.avgTtft.toFixed(2)}s <span className="text-muted-foreground">p95 {r.p95Ttft.toFixed(2)}</span></td>
-                      <td className="text-right px-3 py-2">{r.avgTps.toFixed(1)}</td>
+                      <td className="text-right px-3 py-2" title={t('usage.perf.ttftSamplesTip', { defaultValue: 'TTFT 只统计成功且非空样本' })}>
+                        {r.avgTtft.toFixed(2)}s <span className="text-muted-foreground">p95 {r.p95Ttft.toFixed(2)} · n={r.ttftSamples}</span>
+                      </td>
+                      <td className="text-right px-3 py-2" title={t('usage.perf.tpsSamplesTip', { defaultValue: 'TPS 只统计解码段 ≥500ms 且输出 ≥8 token 的成功请求' })}>
+                        {r.avgTps.toFixed(1)} <span className="text-muted-foreground">n={r.tpsSamples}</span>
+                      </td>
                       <td className="px-3 py-2"><div className="flex flex-wrap gap-1">
                         <DeltaChip label="TTFT" value={r.deltaTtftPct} goodWhenPositive={false} />
                         <DeltaChip label="TPS" value={r.deltaTpsPct} goodWhenPositive />

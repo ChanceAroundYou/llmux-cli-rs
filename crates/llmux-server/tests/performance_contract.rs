@@ -124,6 +124,65 @@ async fn performance_endpoint_assembles_live_and_honors_filters() {
     let body: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(body["groupBy"], "account_model");
     assert_eq!(body["rows"][0]["accountId"], 12);
+    assert_eq!(body["rows"][0]["ttftSamples"], 1, "图上点的样本数必须和请求数分开暴露");
     assert_eq!(body["live"][0]["accountId"], 12);
     assert!(body["live"][0]["severity"].is_number());
+}
+
+#[tokio::test]
+async fn performance_windows_are_half_open_at_boundaries() {
+    let pool = llmux_server::test_state().await.pool;
+    insert(&pool, FROM - 3_600_000 + 100, true, true, false, 1100, Some(100), 100).await;
+    // start 属于当前窗口，不属于前一窗口；end 属于下一窗口。
+    insert(&pool, FROM, true, true, false, 1100, Some(100), 100).await;
+    insert(&pool, FROM + 100, true, true, false, 1100, Some(100), 100).await;
+    insert(&pool, TO, true, true, false, 1100, Some(100), 100).await;
+
+    let data = UsageService::new(pool)
+        .get_performance(
+            Some(FROM),
+            Some(TO),
+            None,
+            &UsageFilter::default(),
+            None,
+            "model",
+            3_600_000,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(data.rows.len(), 1);
+    assert_eq!(data.rows[0].stream_requests, 2, "end 边界不能混进当前窗口");
+    assert_eq!(data.rows[0].prev_stream_requests, 1, "start 边界不能同时进前后窗口");
+    assert_eq!(data.series[0].stream_requests, 2);
+}
+
+#[tokio::test]
+async fn performance_exposes_sample_counts_beside_request_counts() {
+    let pool = llmux_server::test_state().await.pool;
+    insert(&pool, FROM + 100, true, true, false, 1100, Some(100), 100).await;
+    insert(&pool, FROM + 200, true, true, false, 1000, Some(900), 10).await;
+    insert(&pool, FROM + 300, true, true, false, 1000, None, 100).await;
+    insert(&pool, FROM + 400, true, false, false, 1000, None, 0).await;
+
+    let data = UsageService::new(pool)
+        .get_performance(
+            Some(FROM),
+            Some(TO),
+            None,
+            &UsageFilter::default(),
+            None,
+            "model",
+            3_600_000,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(data.rows.len(), 1);
+    assert_eq!(data.rows[0].stream_requests, 4);
+    assert_eq!(data.rows[0].ttft_samples, 2, "无 TTFT 的成功行不能算进 TTFT 样本");
+    assert_eq!(data.rows[0].tps_samples, 1, "解码段太短的行不算 TPS 样本");
+    assert_eq!(data.series.len(), 1);
+    assert_eq!(data.series[0].ttft_samples, 2);
+    assert_eq!(data.series[0].tps_samples, 1);
 }

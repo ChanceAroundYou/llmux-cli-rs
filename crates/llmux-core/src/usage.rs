@@ -180,6 +180,10 @@ pub struct PerformanceRow {
     pub avg_ttft: f64,
     pub p95_ttft: f64,
     pub avg_tps: f64,
+    /// 图上点的样本数：TTFT 要成功且非空，TPS 还要解码段 ≥500ms / 输出 ≥8 token。
+    /// 与 stream_requests（全部流式行，含失败）分开暴露，避免把点当作请求数。
+    pub ttft_samples: usize,
+    pub tps_samples: usize,
     pub prev_stream_requests: i64,
     pub prev_success_rate: f64,
     pub prev_avg_ttft: f64,
@@ -201,6 +205,8 @@ pub struct PerformancePoint {
     pub avg_ttft: f64,
     pub p95_ttft: f64,
     pub avg_tps: f64,
+    pub ttft_samples: usize,
+    pub tps_samples: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -900,7 +906,8 @@ impl UsageService {
 
     /// 流式请求的历史性能。只取真实流量，口径与自动分流的 PerfRegistry 对齐：
     /// TTFT 取成功行的非空样本，TPS 取解码段 ≥500ms 且输出 ≥8 token 的成功行。
-    /// 前一等长窗口用于 `prev*` 与变化量。
+    /// 前一等长窗口用于 `prev*` 与变化量。两个窗口都用半开区间 [start, end)，
+    /// ms 时间戳上以 `end - 1` 作闭区间上界，避免边界行同时进前后窗口。
     pub async fn get_performance(
         &self,
         start_time: Option<i64>,
@@ -922,10 +929,10 @@ impl UsageService {
         };
 
         let current = self
-            .fetch_perf_rows(Some(start), Some(end), api_key_id, filter, model, gran)
+            .fetch_perf_rows(Some(start), Some(end.saturating_sub(1)), api_key_id, filter, model, gran)
             .await?;
         let previous = self
-            .fetch_perf_rows(Some(start - span), Some(start), api_key_id, filter, model, gran)
+            .fetch_perf_rows(Some(start.saturating_sub(span)), Some(start.saturating_sub(1)), api_key_id, filter, model, gran)
             .await?;
 
         let cur_groups = group_perf_rows(&current, group_by);
@@ -948,6 +955,8 @@ impl UsageService {
                 avg_ttft,
                 p95_ttft,
                 avg_tps,
+                ttft_samples: acc.ttfts.len(),
+                tps_samples: acc.tps.len(),
                 prev_stream_requests: prev.map(|(_, a)| a.requests).unwrap_or(0),
                 prev_success_rate,
                 prev_avg_ttft,
@@ -976,6 +985,8 @@ impl UsageService {
                     avg_ttft,
                     p95_ttft,
                     avg_tps,
+                    ttft_samples: acc.ttfts.len(),
+                    tps_samples: acc.tps.len(),
                 }
             })
             .collect();
