@@ -67,6 +67,10 @@ pub struct UsageLogRecord {
     pub account_id: Option<i64>,
     pub provider_id: Option<String>,
     pub model: Option<String>,
+    /// 客户端请求名（别名或裸模型）与路由归属；0039 之前为 NULL。
+    pub requested_model: Option<String>,
+    pub aggregate_alias: Option<String>,
+    pub candidate_idx: Option<i64>,
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub cache_read_input_tokens: i64,
@@ -176,6 +180,9 @@ pub struct DetailedLogQuery {
     pub success: Option<bool>,
     pub is_stream: Option<bool>,
     pub api_key_id: Option<i64>,
+    pub account_id: Option<i64>,
+    pub alias: Option<String>,
+    pub alias_kind: Option<String>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
 }
@@ -869,6 +876,12 @@ impl UsageService {
         if options.api_key_id.is_some() {
             sql.push_str(" AND l.api_key_id = ?");
         }
+        let filter = UsageFilter {
+            account_id: options.account_id,
+            alias: options.alias.clone(),
+            alias_kind: options.alias_kind.clone(),
+        };
+        append_attribution_filter(&mut sql, "l", &filter);
         sql.push_str(" ORDER BY l.timestamp DESC");
         if options.limit.is_some() {
             sql.push_str(" LIMIT ?");
@@ -899,6 +912,7 @@ impl UsageService {
         if let Some(api_key_id) = options.api_key_id {
             query = query.bind(api_key_id);
         }
+        query = bind_attribution_filter(query, &filter);
         if let Some(limit) = options.limit {
             query = query.bind(limit);
         }
@@ -933,6 +947,12 @@ impl UsageService {
         if options.api_key_id.is_some() {
             sql.push_str(" AND l.api_key_id = ?");
         }
+        let filter = UsageFilter {
+            account_id: options.account_id,
+            alias: options.alias.clone(),
+            alias_kind: options.alias_kind.clone(),
+        };
+        append_attribution_filter(&mut sql, "l", &filter);
 
         let mut query = sqlx::query(&sql);
         if let Some(start_time) = options.start_time {
@@ -956,6 +976,7 @@ impl UsageService {
         if let Some(api_key_id) = options.api_key_id {
             query = query.bind(api_key_id);
         }
+        query = bind_attribution_filter(query, &filter);
         Ok(query.fetch_one(&self.pool).await?.try_get("COUNT(*)")?)
     }
 }
@@ -1096,6 +1117,7 @@ fn price_expr(log_alias: &str) -> String {
 fn base_log_select(where_clause: &str) -> String {
     format!(
         "SELECT l.id, l.timestamp, l.account_id, l.provider_id, l.model,
+                l.requested_model, l.aggregate_alias, l.candidate_idx,
                 l.input_tokens, l.output_tokens, l.cache_read_input_tokens,
                 l.cache_creation_input_tokens, l.latency_ms, l.success,
                 l.error_message, l.is_test, l.ttft_ms, l.is_stream,
@@ -1211,6 +1233,9 @@ fn rows_to_logs(rows: Vec<sqlx::sqlite::SqliteRow>) -> Result<Vec<UsageLogRecord
                 account_id: row.try_get("account_id")?,
                 provider_id: row.try_get("provider_id")?,
                 model: row.try_get("model")?,
+                requested_model: row.try_get("requested_model")?,
+                aggregate_alias: row.try_get("aggregate_alias")?,
+                candidate_idx: row.try_get("candidate_idx")?,
                 input_tokens: row.try_get("input_tokens")?,
                 output_tokens: row.try_get("output_tokens")?,
                 cache_read_input_tokens: row.try_get("cache_read_input_tokens")?,

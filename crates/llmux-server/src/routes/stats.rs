@@ -51,6 +51,10 @@ pub struct LogsQuery {
     pub is_stream: Option<String>,
     /// 按网关密钥筛选，见 StatsQuery::key_id。
     pub key_id: Option<i64>,
+    /// 账户 / 别名归属筛选，与 /api/stats 同口径。
+    pub account_id: Option<i64>,
+    pub alias: Option<String>,
+    pub alias_kind: Option<String>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
 }
@@ -172,6 +176,9 @@ pub async fn get_stats_logs(
             success: success_flag,
             is_stream: stream_flag,
             api_key_id: params.key_id,
+            account_id: params.account_id,
+            alias: params.alias.clone(),
+            alias_kind: params.alias_kind.clone(),
             limit: None,
             offset: None,
         })
@@ -190,6 +197,9 @@ pub async fn get_stats_logs(
             success: success_flag,
             is_stream: stream_flag,
             api_key_id: params.key_id,
+            account_id: params.account_id,
+            alias: params.alias,
+            alias_kind: params.alias_kind,
             limit: Some(limit),
             offset: Some(offset),
         })
@@ -214,6 +224,9 @@ pub async fn get_stats_logs(
                 "accountId": r.account_id,
                 "providerId": r.provider_id,
                 "model": r.model,
+                "requestedModel": r.requested_model,
+                "aggregateAlias": r.aggregate_alias,
+                "candidateIdx": r.candidate_idx,
                 "inputTokens": r.input_tokens,
                 "outputTokens": r.output_tokens,
                 "cacheReadInputTokens": r.cache_read_input_tokens,
