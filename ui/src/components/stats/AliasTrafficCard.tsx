@@ -1,9 +1,10 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { apiFetch } from '@/lib/api';
 import { useTranslation } from 'react-i18next';
-import { AlertTriangle, Check, Inbox } from 'lucide-react';
+import { Inbox } from 'lucide-react';
 import { EmptyState } from '@/components/shared/EmptyState';
 import { seriesColor } from '@/utils/thresholds';
+import { LivePerfBadge } from './ModelPerformanceCard';
 import type { LivePerf } from './ModelPerformanceCard';
 
 export interface CandidateRow {
@@ -42,24 +43,6 @@ function pct(part: number, total: number): string {
 
 const entityKey = (accountId: number | null | undefined, model: string | null | undefined) =>
   `${accountId ?? ''}|${model ?? ''}`;
-
-function LiveCell({ live, detail }: { live?: LivePerf; detail?: string }) {
-  const { t } = useTranslation();
-  if (!live || live.severity === null) {
-    return <span className="text-[11px] text-muted-foreground inline-flex items-center gap-1" title={detail}>
-      <Inbox size={11} />{t('usage.perf.noSample', { defaultValue: '无样本' })}
-    </span>;
-  }
-  const slow = live.severity > 1.3;
-  const Icon = slow ? AlertTriangle : Check;
-  return (
-    <span className={`text-[11px] inline-flex items-center gap-1 ${slow ? 'text-warning' : 'text-success'}`} title={detail}>
-      <Icon size={11} />
-      {slow ? t('usage.perf.slow', { defaultValue: '偏慢' }) : t('usage.perf.normal', { defaultValue: '正常' })}
-      {' '}{live.severity.toFixed(1)}×
-    </span>
-  );
-}
 
 /** 别名流量走向：按成功数分摊到 (账户, 模型, 候选下标)。 */
 export default function AliasTrafficCard({
@@ -229,7 +212,7 @@ export default function AliasTrafficCard({
                       <td className="text-right px-3 py-2">{pct(r.successCount || 0, totalSuccess)}</td>
                       <td className="text-right px-3 py-2">{r.avgTtft?.toFixed(2) ?? '0.00'}s</td>
                       <td className="text-right px-3 py-2">{r.avgTps?.toFixed(1) ?? '0.0'}</td>
-                      <td className="px-3 py-2"><LiveCell live={liveNode} detail={detail} /></td>
+                      <td className="px-3 py-2 align-middle whitespace-nowrap"><LivePerfBadge live={liveNode} detail={detail} /></td>
                     </tr>
                   );
                 })}

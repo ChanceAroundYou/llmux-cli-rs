@@ -103,15 +103,29 @@ function DeltaChip({ label, value, goodWhenPositive }: { label: string; value: n
   );
 }
 
-function SeverityBadge({ live, detail }: { live: LivePerf | undefined; detail?: string }) {
+/**
+ * 实时状态徽标。图标、标签、数值各占一个 flex item，数值两侧用相同的 gap，
+ * 避免普通空格在不同语言/字体下宽度漂移；统一在一行内居中对齐。
+ */
+export function LivePerfBadge({ live, detail }: { live: LivePerf | undefined; detail?: string }) {
   const { t } = useTranslation();
   if (!live || live.severity === null) {
-    return <span className="text-[11px] text-muted-foreground inline-flex items-center gap-1" title={detail}><Inbox size={11} />{t('usage.perf.noSample', { defaultValue: '无样本' })}</span>;
+    return (
+      <span className="inline-flex items-center gap-1 whitespace-nowrap align-middle text-[11px] leading-none text-muted-foreground" title={detail}>
+        <Inbox size={11} className="shrink-0" />
+        <span>{t('usage.perf.noSample', { defaultValue: '无样本' })}</span>
+      </span>
+    );
   }
-  if (live.severity > 1.3) {
-    return <span className="text-[11px] text-warning inline-flex items-center gap-1" title={detail}><AlertTriangle size={11} />{t('usage.perf.slow', { defaultValue: '变慢' })} {live.severity.toFixed(1)}×</span>;
-  }
-  return <span className="text-[11px] text-success inline-flex items-center gap-1" title={detail}><Check size={11} />{t('usage.perf.normal', { defaultValue: '正常' })} {live.severity.toFixed(1)}×</span>;
+  const slow = live.severity > 1.3;
+  const Icon = slow ? AlertTriangle : Check;
+  return (
+    <span className={`inline-flex items-center gap-1 whitespace-nowrap align-middle text-[11px] leading-none ${slow ? 'text-warning' : 'text-success'}`} title={detail}>
+      <Icon size={11} className="shrink-0" />
+      <span>{slow ? t('usage.perf.slow', { defaultValue: '变慢' }) : t('usage.perf.normal', { defaultValue: '正常' })}</span>
+      <span className="tabular-nums">{live.severity.toFixed(1)}×</span>
+    </span>
+  );
 }
 
 /** 流式性能：多条时间序列 + 当前/前一窗口变化 + 实时 severity。 */
@@ -354,10 +368,9 @@ export default function ModelPerformanceCard({
                         <DeltaChip label="TPS" value={r.deltaTpsPct} goodWhenPositive />
                         <DeltaChip label={t('usage.perf.success', { defaultValue: '成功率' })} value={r.deltaSuccessRate * 100} goodWhenPositive />
                       </div></td>
-                      <td className="px-3 py-2"><div className="flex flex-col">
-                        <SeverityBadge live={liveNode} detail={liveDetail(r, liveNode)} />
-                        {liveNode && <span className="text-[10px] text-muted-foreground">{liveNode.samples} {t('usage.perf.samples', { defaultValue: '样本' })} · {liveNode.lastSampleAgeSecs}s</span>}
-                      </div></td>
+                      <td className="px-3 py-2 align-middle whitespace-nowrap">
+                        <LivePerfBadge live={liveNode} detail={liveDetail(r, liveNode)} />
+                      </td>
                     </tr>
                   );
                 })}
