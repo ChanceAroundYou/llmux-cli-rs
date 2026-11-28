@@ -49,6 +49,10 @@ const splitAliasSelection = (v: string | null): [AliasKind | null, string | null
   return [i > 0 && v.slice(0, i) === 'aggregate' ? 'aggregate' : 'ordinary', name || null];
 };
 
+/** 日志里只显示一个别名：客户端实际打进来的那个；聚合路由信息由候选序号承载。 */
+const inboundAlias = (log: Pick<LogEntry, 'requestedModel' | 'aggregateAlias'>): string =>
+  log.requestedModel || log.aggregateAlias || '—';
+
 interface LogEntry {
   id: number;
   timestamp: number;
@@ -163,7 +167,7 @@ export default function Logs() {
         label: a.alias || a.name || `#${a.id}`,
       })));
       setAliasOptions([
-        ...(aliases as Array<{ name: string }>).map(a => ({ value: `ordinary:${a.name}`, label: a.name })),
+        ...(aliases as Array<{ alias: string }>).map(a => ({ value: `ordinary:${a.alias}`, label: a.alias })),
         ...(aggregates as Array<{ alias: string }>).map(a => ({ value: `aggregate:${a.alias}`, label: `〔聚合〕${a.alias}` })),
       ]);
     }).catch(() => { /* 筛选项加载失败时仍可手动输入模型过滤 */ });
@@ -414,8 +418,7 @@ export default function Logs() {
                 <th className="text-left px-3 py-2 font-medium cursor-pointer select-none" onClick={() => toggleSort('model')}>{t('logs.model')}{sortInd('model')}</th>
                 <th className="text-left px-3 py-2 font-medium cursor-pointer select-none" onClick={() => toggleSort('account')}>{t('logs.account')}{sortInd('account')}</th>
                 <th className="text-left px-3 py-2 font-medium whitespace-nowrap xl:hidden">{t('logs.route', { defaultValue: '路由' })}</th>
-                <th className="hidden xl:table-cell text-left px-3 py-2 font-medium whitespace-nowrap">{t('logs.requestedAlias', { defaultValue: '请求别名' })}</th>
-                <th className="hidden xl:table-cell text-left px-3 py-2 font-medium whitespace-nowrap">{t('logs.aggregateAlias', { defaultValue: '聚合别名' })}</th>
+                <th className="hidden xl:table-cell text-left px-3 py-2 font-medium whitespace-nowrap">{t('logs.alias', { defaultValue: '别名' })}</th>
                 <th className="hidden xl:table-cell text-right px-3 py-2 font-medium whitespace-nowrap">#</th>
                 <th className="text-right px-3 py-2 font-medium cursor-pointer select-none" onClick={() => toggleSort('input')}>{t('logs.input')}{sortInd('input')}</th>
                 <th className="text-right px-3 py-2 font-medium cursor-pointer select-none" onClick={() => toggleSort('output')}>{t('logs.output')}{sortInd('output')}</th>
@@ -430,13 +433,13 @@ export default function Logs() {
               {isLoading && (
                 <>
                   <tr className="xl:hidden"><td colSpan={11} className="px-4 py-10 text-center text-muted-foreground"><Loader2 className="inline animate-spin mr-2" size={14} />{t('logs.loading')}</td></tr>
-                  <tr className="hidden xl:table-row"><td colSpan={13} className="px-4 py-10 text-center text-muted-foreground"><Loader2 className="inline animate-spin mr-2" size={14} />{t('logs.loading')}</td></tr>
+                  <tr className="hidden xl:table-row"><td colSpan={12} className="px-4 py-10 text-center text-muted-foreground"><Loader2 className="inline animate-spin mr-2" size={14} />{t('logs.loading')}</td></tr>
                 </>
               )}
               {!isLoading && logs.length === 0 && (
                 <>
                   <tr className="xl:hidden"><td colSpan={11} className="px-4 py-10 text-center text-muted-foreground">{t('logs.empty')}</td></tr>
-                  <tr className="hidden xl:table-row"><td colSpan={13} className="px-4 py-10 text-center text-muted-foreground">{t('logs.empty')}</td></tr>
+                  <tr className="hidden xl:table-row"><td colSpan={12} className="px-4 py-10 text-center text-muted-foreground">{t('logs.empty')}</td></tr>
                 </>
               )}
               {!isLoading && displayLogs.map(log => {
@@ -465,12 +468,11 @@ export default function Logs() {
                     {abbrModel(log.model)}
                   </td>
                   <td className="px-3 py-2 text-muted-foreground max-w-[140px] truncate" title={log.accountName || ''}>{log.accountName || `#${log.accountId}`}</td>
-                  <td className="px-3 py-2 text-muted-foreground whitespace-nowrap xl:hidden" title={`${log.requestedModel || '—'} / ${log.aggregateAlias || '—'} / #${log.candidateIdx ?? '—'}`}>
-                    {log.aggregateAlias ? `〔聚〕${log.aggregateAlias}` : (log.requestedModel || '—')}
+                  <td className="px-3 py-2 text-muted-foreground whitespace-nowrap xl:hidden" title={`${inboundAlias(log)}${log.candidateIdx != null ? ` #${log.candidateIdx}` : ''}`}>
+                    {inboundAlias(log)}
                     {log.candidateIdx != null && <span className="text-muted-foreground/60"> #{log.candidateIdx}</span>}
                   </td>
-                  <td className="hidden xl:table-cell px-3 py-2 font-mono max-w-[140px] truncate text-muted-foreground" title={log.requestedModel || ''}>{log.requestedModel || '—'}</td>
-                  <td className="hidden xl:table-cell px-3 py-2 font-mono max-w-[140px] truncate text-muted-foreground" title={log.aggregateAlias || ''}>{log.aggregateAlias || '—'}</td>
+                  <td className="hidden xl:table-cell px-3 py-2 font-mono max-w-[140px] truncate text-muted-foreground" title={inboundAlias(log)}>{inboundAlias(log)}</td>
                   <td className="hidden xl:table-cell px-3 py-2 text-right font-mono text-muted-foreground">{log.candidateIdx ?? '—'}</td>
                   <td className="px-3 py-2 text-right font-mono whitespace-nowrap">{formatK(log.inputTokens)}</td>
                   <td className="px-3 py-2 text-right font-mono whitespace-nowrap">{formatK(log.outputTokens)}</td>
@@ -530,8 +532,7 @@ export default function Logs() {
                   [t('logs.time'), detailLog ? parseServerDate(detailLog.timestamp).toLocaleString() : '—'],
                   [t('logs.model'), detailLog.model],
                   [t('logs.account'), detailLog.accountName || `#${detailLog.accountId}`],
-                  [t('logs.requestedAlias', { defaultValue: '请求别名' }), detailLog.requestedModel || '—'],
-                  [t('logs.aggregateAlias', { defaultValue: '聚合别名' }), detailLog.aggregateAlias || '—'],
+                  [t('logs.alias', { defaultValue: '别名' }), inboundAlias(detailLog)],
                   [t('logs.candidateIndex', { defaultValue: '候选序号' }), detailLog.candidateIdx ?? '—'],
                   [t('logs.elapsed', { defaultValue: '耗时' }), detailLog.latencyMs ? fmtSec(netMs(detailLog.latencyMs, detailLog.ttftMs, detailLog.isStream)) : '—'],
                   [t('logs.ttft'), typeof detailLog.ttftMs === 'number' ? fmtSec(detailLog.ttftMs) : '—'],

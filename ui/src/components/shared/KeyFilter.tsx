@@ -1,6 +1,7 @@
 import React from 'react';
 import { useTranslation } from 'react-i18next';
 import { apiFetch } from '@/lib/api';
+import { cn } from '@/lib/utils';
 import FilterSelect from './FilterSelect';
 
 /** 与后端 usage_logs.api_key_id 对应（迁移 0026）。 */
@@ -69,12 +70,16 @@ export default function KeyFilter({ value, onChange, className }: KeyFilterProps
   if (!keys.length) return null;
 
   return (
-    <FilterSelect
-      className={className}
-      value={value === null ? null : String(value)}
-      options={keys.map(k => ({ value: String(k.id), label: k.name }))}
-      allLabel={t('common.allKeys', { defaultValue: '全部密钥' })}
-      onChange={next => onChange(next === null ? null : Number(next))}
-    />
+    <div className={cn('flex items-center gap-1.5', className)}>
+      <span className="text-xs text-muted-foreground">
+        {t('common.key', { defaultValue: '密钥' })}
+      </span>
+      <FilterSelect
+        value={value === null ? null : String(value)}
+        options={keys.map(k => ({ value: String(k.id), label: k.name }))}
+        allLabel={t('common.allKeys', { defaultValue: '全部密钥' })}
+        onChange={next => onChange(next === null ? null : Number(next))}
+      />
+    </div>
   );
 }

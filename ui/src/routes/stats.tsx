@@ -88,7 +88,7 @@ interface AccountOption {
   alias: string;
 }
 interface AliasOption {
-  name: string;
+  alias: string;
 }
 interface AggregateOption {
   alias: string;
@@ -191,7 +191,7 @@ export default function StatsPage() {
       setAggregates(Array.isArray(agg) ? agg : []);
       const list: Array<{ value: string; label: string }> = [];
       for (const a of aliases as AliasOption[]) {
-        if (a?.name) list.push({ value: `ordinary:${a.name}`, label: a.name });
+        if (a?.alias) list.push({ value: `ordinary:${a.alias}`, label: a.alias });
       }
       for (const g of agg as AggregateOption[]) {
         if (g?.alias) list.push({ value: `aggregate:${g.alias}`, label: `〔聚合〕${g.alias}` });
