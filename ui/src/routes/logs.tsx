@@ -5,6 +5,7 @@ import { useSearchParams } from 'react-router-dom';
 import { Loader2, ScrollText, ChevronLeft, ChevronRight, Copy, Check } from 'lucide-react';
 import { StatusDot } from '@/components/shared/StatusDot';
 import KeyFilter from '@/components/shared/KeyFilter';
+import FilterSelect, { type FilterOption } from '@/components/shared/FilterSelect';
 import { Dialog } from '../components/Modal';
 import { JsonView } from '@/components/shared/JsonTree';
 import { Button } from '@/components/ui/button';
@@ -38,9 +39,22 @@ const tpsOf = (l: LogEntry): number | null => {
   return null;
 };
 
+type AliasKind = 'ordinary' | 'aggregate';
+
+/** 和统计页一致：一个下拉值同时编码别名类型与名字，名字本身可以含冒号。 */
+const splitAliasSelection = (v: string | null): [AliasKind | null, string | null] => {
+  if (!v) return [null, null];
+  const i = v.indexOf(':');
+  const name = v.slice(i + 1);
+  return [i > 0 && v.slice(0, i) === 'aggregate' ? 'aggregate' : 'ordinary', name || null];
+};
+
 interface LogEntry {
   id: number;
   timestamp: number;
+  requestedModel?: string | null;
+  aggregateAlias?: string | null;
+  candidateIdx?: number | null;
   accountId: number;
   providerId: string;
   model: string;
@@ -88,6 +102,8 @@ const fetchBody = async (id: number, part: 'request' | 'response'): Promise<stri
 
 export default function Logs() {
   const { t } = useTranslation();
+  // 筛选写进 URL，和统计页共用 accountId / aliasKind / alias 参数名。
+  const [searchParams, setSearchParams] = useSearchParams();
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -96,6 +112,18 @@ export default function Logs() {
   const [modelFilter, setModelFilter] = useState('');
   // null = 全部密钥（服务端筛选，区别于 modelFilter 的本地过滤）
   const [keyId, setKeyId] = useState<number | null>(null);
+  const [selectedAccountId, setSelectedAccountId] = useState<number | null>(() => {
+    const raw = searchParams.get('accountId');
+    const n = raw === null ? NaN : Number(raw);
+    return Number.isFinite(n) ? n : null;
+  });
+  const [aliasSelection, setAliasSelection] = useState<string | null>(() => {
+    const name = searchParams.get('alias');
+    if (!name) return null;
+    return `${searchParams.get('aliasKind') === 'aggregate' ? 'aggregate' : 'ordinary'}:${name}`;
+  });
+  const [accountOptions, setAccountOptions] = useState<FilterOption[]>([]);
+  const [aliasOptions, setAliasOptions] = useState<FilterOption[]>([]);
   const [streamMode, setStreamMode] = useState<'all' | 'stream' | 'nonStream'>('all');
   const [page, setPage] = useState(0);
   const [total, setTotal] = useState(0);
@@ -110,13 +138,56 @@ export default function Logs() {
   // 当前打开的日志 id。异步回调据此判断「我还在这个弹窗里吗」——不检查的话，
   // 快速切到下一条时，上一条还在途的响应会覆盖新条目的分段。
   const detailIdRef = useRef<number | null>(null);
-  const [searchParams, setSearchParams] = useSearchParams();
   const [blockOpen, setBlockOpen] = useState({ request: true, response: true });
   const [allExpanded, setAllExpanded] = useState<boolean | undefined>(undefined);
   const [treeKey, setTreeKey] = useState(0);
   const [copiedError, setCopiedError] = useState(false);
   const [sortKey, setSortKey] = useState<SortKey>('time');
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc');
+  const [aliasKind, aliasName] = splitAliasSelection(aliasSelection);
+
+  useEffect(() => {
+    const ac = new AbortController();
+    const readJson = async (r: Response) => {
+      if (!r.ok) throw new Error(await r.text());
+      return r.json();
+    };
+    Promise.all([
+      apiFetch('/api/accounts', { signal: ac.signal }),
+      apiFetch('/api/models/aliases', { signal: ac.signal }),
+      apiFetch('/api/aggregate-aliases', { signal: ac.signal }),
+    ]).then(async ([ra, rl, rg]) => {
+      const [accounts, aliases, aggregates] = await Promise.all([readJson(ra), readJson(rl), readJson(rg)]);
+      setAccountOptions((accounts as Array<{ id: number; alias?: string; name?: string }>).map(a => ({
+        value: String(a.id),
+        label: a.alias || a.name || `#${a.id}`,
+      })));
+      setAliasOptions([
+        ...(aliases as Array<{ name: string }>).map(a => ({ value: `ordinary:${a.name}`, label: a.name })),
+        ...(aggregates as Array<{ alias: string }>).map(a => ({ value: `aggregate:${a.alias}`, label: `〔聚合〕${a.alias}` })),
+      ]);
+    }).catch(() => { /* 筛选项加载失败时仍可手动输入模型过滤 */ });
+    return () => ac.abort();
+  }, []);
+
+  useEffect(() => {
+    setSearchParams(prev => {
+      const next = new URLSearchParams(prev);
+      let changed = false;
+      const put = (key: string, value: string | null) => {
+        if (value === null) {
+          if (next.has(key)) { next.delete(key); changed = true; }
+        } else if (next.get(key) !== value) {
+          next.set(key, value);
+          changed = true;
+        }
+      };
+      put('accountId', selectedAccountId === null ? null : String(selectedAccountId));
+      put('aliasKind', aliasName ? aliasKind : null);
+      put('alias', aliasName);
+      return changed ? next : prev;
+    }, { replace: true });
+  }, [selectedAccountId, aliasKind, aliasName, setSearchParams]);
 
   const expandAllBlocks = () => {
     setAllExpanded(true);
@@ -157,7 +228,11 @@ export default function Logs() {
   const closeLogDetail = () => {
     setDetailLog(null);
     detailIdRef.current = null;
-    setSearchParams({}, { replace: true });
+    setSearchParams(prev => {
+      const next = new URLSearchParams(prev);
+      next.delete('log');
+      return next;
+    }, { replace: true });
   };
 
   useEffect(() => {
@@ -187,6 +262,11 @@ export default function Logs() {
       if (statusFilter !== 'all') params.set('success', statusFilter === 'success' ? '1' : '0');
       if (modelFilter.trim()) params.set('model', modelFilter.trim());
       if (keyId !== null) params.set('key_id', String(keyId));
+      if (selectedAccountId !== null) params.set('account_id', String(selectedAccountId));
+      if (aliasName) {
+        params.set('alias', aliasName);
+        params.set('alias_kind', aliasKind ?? 'ordinary');
+      }
       const res = await apiFetch(`/api/stats/logs?${params.toString()}`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
@@ -198,7 +278,7 @@ export default function Logs() {
     } finally {
       setIsLoading(false);
     }
-  }, [range, statusFilter, modelFilter, keyId, page]);
+  }, [range, statusFilter, modelFilter, keyId, page, selectedAccountId, aliasName, aliasKind]);
 
   useEffect(() => {
     fetchLogs();
@@ -301,6 +381,18 @@ export default function Logs() {
           ))}
         </div>
         <KeyFilter value={keyId} onChange={id => { setKeyId(id); resetPage(); }} />
+        <FilterSelect
+          value={selectedAccountId === null ? null : String(selectedAccountId)}
+          options={accountOptions}
+          allLabel={t('usage.filter.allAccounts', { defaultValue: '全部账户' })}
+          onChange={v => { setSelectedAccountId(v === null ? null : Number(v)); resetPage(); }}
+        />
+        <FilterSelect
+          value={aliasSelection}
+          options={aliasOptions}
+          allLabel={t('usage.filter.allAliases', { defaultValue: '全部别名' })}
+          onChange={v => { setAliasSelection(v); resetPage(); }}
+        />
         <Input
           value={modelFilter}
           onChange={e => { setModelFilter(e.target.value); resetPage(); }}
@@ -321,6 +413,10 @@ export default function Logs() {
                 <th className="text-left px-4 py-2 font-medium cursor-pointer select-none whitespace-nowrap" onClick={() => toggleSort('time')}>{t('logs.time')}{sortInd('time')}</th>
                 <th className="text-left px-3 py-2 font-medium cursor-pointer select-none" onClick={() => toggleSort('model')}>{t('logs.model')}{sortInd('model')}</th>
                 <th className="text-left px-3 py-2 font-medium cursor-pointer select-none" onClick={() => toggleSort('account')}>{t('logs.account')}{sortInd('account')}</th>
+                <th className="text-left px-3 py-2 font-medium whitespace-nowrap xl:hidden">{t('logs.route', { defaultValue: '路由' })}</th>
+                <th className="hidden xl:table-cell text-left px-3 py-2 font-medium whitespace-nowrap">{t('logs.requestedAlias', { defaultValue: '请求别名' })}</th>
+                <th className="hidden xl:table-cell text-left px-3 py-2 font-medium whitespace-nowrap">{t('logs.aggregateAlias', { defaultValue: '聚合别名' })}</th>
+                <th className="hidden xl:table-cell text-right px-3 py-2 font-medium whitespace-nowrap">#</th>
                 <th className="text-right px-3 py-2 font-medium cursor-pointer select-none" onClick={() => toggleSort('input')}>{t('logs.input')}{sortInd('input')}</th>
                 <th className="text-right px-3 py-2 font-medium cursor-pointer select-none" onClick={() => toggleSort('output')}>{t('logs.output')}{sortInd('output')}</th>
                 <th className="text-right px-3 py-2 font-medium cursor-pointer select-none" onClick={() => toggleSort('cache')}>{t('logs.cacheTokens', { defaultValue: '缓存' })}{sortInd('cache')}</th>
@@ -332,10 +428,16 @@ export default function Logs() {
             </thead>
             <tbody className="divide-y divide-border/50">
               {isLoading && (
-                <tr><td colSpan={10} className="px-4 py-10 text-center text-muted-foreground"><Loader2 className="inline animate-spin mr-2" size={14} />{t('logs.loading')}</td></tr>
+                <>
+                  <tr className="xl:hidden"><td colSpan={11} className="px-4 py-10 text-center text-muted-foreground"><Loader2 className="inline animate-spin mr-2" size={14} />{t('logs.loading')}</td></tr>
+                  <tr className="hidden xl:table-row"><td colSpan={13} className="px-4 py-10 text-center text-muted-foreground"><Loader2 className="inline animate-spin mr-2" size={14} />{t('logs.loading')}</td></tr>
+                </>
               )}
               {!isLoading && logs.length === 0 && (
-                <tr><td colSpan={10} className="px-4 py-10 text-center text-muted-foreground">{t('logs.empty')}</td></tr>
+                <>
+                  <tr className="xl:hidden"><td colSpan={11} className="px-4 py-10 text-center text-muted-foreground">{t('logs.empty')}</td></tr>
+                  <tr className="hidden xl:table-row"><td colSpan={13} className="px-4 py-10 text-center text-muted-foreground">{t('logs.empty')}</td></tr>
+                </>
               )}
               {!isLoading && displayLogs.map(log => {
                 const elapsed = netMs(log.latencyMs, log.ttftMs, log.isStream);
@@ -363,6 +465,13 @@ export default function Logs() {
                     {abbrModel(log.model)}
                   </td>
                   <td className="px-3 py-2 text-muted-foreground max-w-[140px] truncate" title={log.accountName || ''}>{log.accountName || `#${log.accountId}`}</td>
+                  <td className="px-3 py-2 text-muted-foreground whitespace-nowrap xl:hidden" title={`${log.requestedModel || '—'} / ${log.aggregateAlias || '—'} / #${log.candidateIdx ?? '—'}`}>
+                    {log.aggregateAlias ? `〔聚〕${log.aggregateAlias}` : (log.requestedModel || '—')}
+                    {log.candidateIdx != null && <span className="text-muted-foreground/60"> #{log.candidateIdx}</span>}
+                  </td>
+                  <td className="hidden xl:table-cell px-3 py-2 font-mono max-w-[140px] truncate text-muted-foreground" title={log.requestedModel || ''}>{log.requestedModel || '—'}</td>
+                  <td className="hidden xl:table-cell px-3 py-2 font-mono max-w-[140px] truncate text-muted-foreground" title={log.aggregateAlias || ''}>{log.aggregateAlias || '—'}</td>
+                  <td className="hidden xl:table-cell px-3 py-2 text-right font-mono text-muted-foreground">{log.candidateIdx ?? '—'}</td>
                   <td className="px-3 py-2 text-right font-mono whitespace-nowrap">{formatK(log.inputTokens)}</td>
                   <td className="px-3 py-2 text-right font-mono whitespace-nowrap">{formatK(log.outputTokens)}</td>
                   <td className="px-3 py-2 text-right font-mono whitespace-nowrap text-muted-foreground">{formatK(cacheOf(log))}</td>
@@ -421,6 +530,9 @@ export default function Logs() {
                   [t('logs.time'), detailLog ? parseServerDate(detailLog.timestamp).toLocaleString() : '—'],
                   [t('logs.model'), detailLog.model],
                   [t('logs.account'), detailLog.accountName || `#${detailLog.accountId}`],
+                  [t('logs.requestedAlias', { defaultValue: '请求别名' }), detailLog.requestedModel || '—'],
+                  [t('logs.aggregateAlias', { defaultValue: '聚合别名' }), detailLog.aggregateAlias || '—'],
+                  [t('logs.candidateIndex', { defaultValue: '候选序号' }), detailLog.candidateIdx ?? '—'],
                   [t('logs.elapsed', { defaultValue: '耗时' }), detailLog.latencyMs ? fmtSec(netMs(detailLog.latencyMs, detailLog.ttftMs, detailLog.isStream)) : '—'],
                   [t('logs.ttft'), typeof detailLog.ttftMs === 'number' ? fmtSec(detailLog.ttftMs) : '—'],
                   [t('logs.input'), formatK(detailLog.inputTokens)],
