@@ -179,8 +179,8 @@ async fn a_real_request_records_the_gateway_key_id_on_its_usage_row() {
         "一次请求只该落一行真实用量 —— 多行说明日志路径被调了两次"
     );
 
-    let (key_on_row, model): (Option<i64>, Option<String>) = sqlx::query_as(
-        "SELECT api_key_id, model FROM usage_logs WHERE is_test = 0 ORDER BY id DESC LIMIT 1",
+    let (key_on_row, model, requested_model): (Option<i64>, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT api_key_id, model, requested_model FROM usage_logs WHERE is_test = 0 ORDER BY id DESC LIMIT 1",
     )
     .fetch_one(&state.pool)
     .await
@@ -192,4 +192,9 @@ async fn a_real_request_records_the_gateway_key_id_on_its_usage_row() {
         "落库的 usage_logs 行必须带着发起请求那把密钥的 id —— 这正是整个特性的地基"
     );
     assert_eq!(model.as_deref(), Some("gpt-4o"));
+    assert_eq!(
+        requested_model.as_deref(),
+        Some("keyid-model"),
+        "客户端请求里的别名必须落到 requested_model —— 统计按别名筛选靠这一列"
+    );
 }

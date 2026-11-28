@@ -27,7 +27,7 @@ use llmux_core::proxy::{build_anthropic_passthrough_request, extract_anthropic_u
 use crate::app::{AppState, TuiEvent};
 use crate::middleware::{self, AuthContext};
 
-use super::helpers::{spawn_log_usage, spawn_log_usage_ip, send_tui_request};
+use super::helpers::{UsageAttribution, spawn_log_usage, spawn_log_usage_ip, send_tui_request};
 
 // ---------------------------------------------------------------------------
 // /v1/messages  (Anthropic Messages API)
@@ -41,6 +41,23 @@ use super::helpers::{spawn_log_usage, spawn_log_usage_ip, send_tui_request};
 // ---------------------------------------------------------------------------
 
 pub async fn messages(
+    Extension(state): Extension<AppState>,
+    Extension(auth): Extension<AuthContext>,
+    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
+    headers: HeaderMap,
+    raw_body: Bytes,
+) -> Response {
+    let requested_model = serde_json::from_slice::<Value>(&raw_body)
+        .ok()
+        .and_then(|v| v.get("model").and_then(Value::as_str).map(str::to_string));
+    super::helpers::with_usage_attribution(
+        requested_model.as_deref(),
+        messages_inner(Extension(state), Extension(auth), axum::extract::OriginalUri(uri), headers, raw_body),
+    )
+    .await
+}
+
+async fn messages_inner(
     Extension(state): Extension<AppState>,
     Extension(auth): Extension<AuthContext>,
     axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
@@ -518,7 +535,7 @@ pub async fn messages(
                 true,
                 None,
                 Some(body.to_string()),
-                Some(anthropic_resp.to_string()), Some(latency_ms), false);
+                Some(anthropic_resp.to_string()), Some(latency_ms), false, UsageAttribution::current());
             {
                 let mut router = state.dispatch_router.lock().unwrap();
                 router.record_result(&dispatch_key, &dispatch_meta, Some(account.id), true);
@@ -558,7 +575,7 @@ pub async fn messages(
             true,
             None,
             Some(body.to_string()),
-            Some(data.to_string()), Some(latency_ms), false);
+            Some(data.to_string()), Some(latency_ms), false, UsageAttribution::current());
         {
             let mut router = state.dispatch_router.lock().unwrap();
             router.record_result(&dispatch_key, &dispatch_meta, Some(account.id), true);
@@ -594,7 +611,7 @@ pub async fn messages(
             false,
             Some(error_msg.clone()),
             Some(body.to_string()),
-            None, Some(latency_ms), false);
+            None, Some(latency_ms), false, UsageAttribution::current());
     }
     let exhausted_status = super::helpers::exhausted_status(
         cooled_skips,
@@ -882,6 +899,7 @@ pub(crate) async fn anthropic_streaming_passthrough(
     let client_ip = crate::routes::v1::helpers::current_client_ip();
     // 同 client_ip：流式跑在 tokio::spawn 里，task-local 传不进来，必须在此捕获。
     let api_key_id = super::helpers::current_api_key_id();
+    let attribution = UsageAttribution::current();
 
     tokio::spawn(async move {
         // 有界头尾缓冲：见 helpers::StreamCapture（p99 上游流 615KB，全量缓冲
@@ -967,7 +985,7 @@ pub(crate) async fn anthropic_streaming_passthrough(
             },
             request_body,
             Some(resp_body),
-            ttft_ms, true, client_ip, api_key_id,
+            ttft_ms, true, client_ip, api_key_id, attribution.clone()
         )
     });
 
@@ -1005,6 +1023,7 @@ pub(crate) async fn anthropic_to_openai_streaming(
     let client_ip = crate::routes::v1::helpers::current_client_ip();
     // 同 client_ip：流式跑在 tokio::spawn 里，task-local 传不进来，必须在此捕获。
     let api_key_id = crate::routes::v1::helpers::current_api_key_id();
+    let attribution = UsageAttribution::current();
 
     tokio::spawn(async move {
         let mut buffer: Vec<u8> = Vec::with_capacity(4096);
@@ -1182,7 +1201,7 @@ pub(crate) async fn anthropic_to_openai_streaming(
             },
             request_body,
             received.to_body_string(),
-            ttft_ms, true, client_ip, api_key_id,
+            ttft_ms, true, client_ip, api_key_id, attribution.clone()
         )
     });
 
@@ -1214,6 +1233,7 @@ pub(crate) async fn responses_to_anthropic_streaming(
     let client_ip = crate::routes::v1::helpers::current_client_ip();
     // 同 client_ip：流式跑在 tokio::spawn 里，task-local 传不进来，必须在此捕获。
     let api_key_id = crate::routes::v1::helpers::current_api_key_id();
+    let attribution = UsageAttribution::current();
     tokio::spawn(async move {
         let mut buffer: Vec<u8> = Vec::with_capacity(4096);
         // 有界头尾缓冲：见 helpers::StreamCapture（p99 上游流 615KB，全量缓冲
@@ -1273,7 +1293,7 @@ pub(crate) async fn responses_to_anthropic_streaming(
             );
         }
         let complete = conv.is_done() && !conv.is_failed();
-        crate::routes::v1::helpers::spawn_log_usage_ip(pool.clone(), account.clone(), model.clone(), provider_id.clone(), input_tokens, output_tokens, cache_read, cache_create, latency_ms, complete, if complete { None } else if conv.is_failed() { Some("Upstream SSE reported a failure event".to_string()) } else { Some("Responses upstream ended without terminal event".to_string()) }, request_body, received.to_body_string(), ttft_ms, true, client_ip, api_key_id)
+        crate::routes::v1::helpers::spawn_log_usage_ip(pool.clone(), account.clone(), model.clone(), provider_id.clone(), input_tokens, output_tokens, cache_read, cache_create, latency_ms, complete, if complete { None } else if conv.is_failed() { Some("Upstream SSE reported a failure event".to_string()) } else { Some("Responses upstream ended without terminal event".to_string()) }, request_body, received.to_body_string(), ttft_ms, true, client_ip, api_key_id, attribution.clone())
     });
     let body = Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx));
     Response::builder().status(StatusCode::OK).header("content-type", "text/event-stream").header("cache-control", "no-cache").header("connection", "keep-alive").body(body).unwrap().into_response()

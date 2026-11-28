@@ -1,8 +1,10 @@
 use axum::response::IntoResponse;
 use llmux_core::adapters;
 use serde_json::Value;
+use std::cell::RefCell;
 use std::sync::LazyLock;
 use std::time::Instant;
+use tokio::task_local;
 
 use crate::app::TuiEvent;
 
@@ -1111,6 +1113,59 @@ pub fn current_api_key_id() -> Option<i64> {
     crate::app::API_KEY_ID.try_with(|v| *v).ok().flatten()
 }
 
+// 一条 usage 行对应的路由归属。requested_model 是客户端 body 里的 model（别名或裸模型），
+// aggregate_alias 只有经聚合别名路由时才有值，candidate_idx 是当时的候选下标。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UsageAttribution {
+    pub requested_model: Option<String>,
+    pub aggregate_alias: Option<String>,
+    pub candidate_idx: Option<i64>,
+}
+
+impl UsageAttribution {
+    /// 当前请求的归属快照。与 API_KEY_ID 同样受 task-local 限制：流式路径在
+    /// `tokio::spawn` 之后读到的是默认值，必须在 spawn 前捕获再传进去。
+    pub fn current() -> Self {
+        USAGE_ATTRIBUTION
+            .try_with(|cell| cell.borrow().clone())
+            .unwrap_or_default()
+    }
+
+    /// 聚合 dispatch 在选中候选时写入；同一请求后续的所有 usage 行都归属该候选。
+    pub fn note_aggregate_candidate(alias: &str, idx: usize) {
+        USAGE_ATTRIBUTION
+            .try_with(|cell| {
+                let mut attr = cell.borrow_mut();
+                attr.aggregate_alias = Some(alias.to_string());
+                attr.candidate_idx = Some(idx as i64);
+            })
+            .ok();
+    }
+}
+
+task_local! {
+    /// 由四个协议入口 scope：客户端 body/path 里的 model/别名。用 RefCell 是因为
+    /// 聚合 dispatch 要在同一次请求里逐轮更新候选下标，而 scope 本身不可变。
+    pub static USAGE_ATTRIBUTION: RefCell<UsageAttribution>;
+}
+
+/// 协议入口的统一 scope 包装。requested_model 取客户端 body/path 里原始值，
+/// 下游 dispatch 再通过 note_aggregate_candidate 补上聚合别名与候选下标。
+pub async fn with_usage_attribution<F: std::future::Future>(
+    requested_model: Option<&str>,
+    fut: F,
+) -> F::Output {
+    USAGE_ATTRIBUTION
+        .scope(
+            RefCell::new(UsageAttribution {
+                requested_model: requested_model.map(str::to_string),
+                ..Default::default()
+            }),
+            fut,
+        )
+        .await
+}
+
 // Fire-and-forget variant — does not block the response path.
 // Reads the request-scoped client IP from the task-local automatically.
 #[allow(clippy::too_many_arguments)]
@@ -1130,12 +1185,13 @@ pub fn spawn_log_usage(
     response_body: Option<String>,
     ttft_ms: Option<i64>,
     is_stream: bool,
+    attribution: UsageAttribution,
 ) {
     spawn_log_usage_ip(
         pool, account, model, provider_id, input_tokens, output_tokens,
         cache_read_input_tokens, cache_creation_input_tokens, latency_ms,
         success, error_message, request_body, response_body, ttft_ms, is_stream, current_client_ip(),
-        current_api_key_id(),
+        current_api_key_id(), attribution,
     );
 }
 
@@ -1160,6 +1216,7 @@ pub fn spawn_log_usage_ip(
     is_stream: bool,
     client_ip: Option<String>,
     api_key_id: Option<i64>,
+    attribution: UsageAttribution,
 ) {
     let account = account.clone();
     if !success {
@@ -1203,13 +1260,16 @@ pub fn spawn_log_usage_ip(
         if success {
             llmux_core::probe::clear_suspension(&pool, account.id, &model).await;
         }
-        let res = sqlx::query("INSERT INTO usage_logs (timestamp, account_id, provider_id, model, input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens, latency_ms, success, error_message, request_body, response_body, ttft_ms, is_stream, client_ip, is_test, api_key_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+        let res = sqlx::query("INSERT INTO usage_logs (timestamp, account_id, provider_id, model, input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens, latency_ms, success, error_message, request_body, response_body, ttft_ms, is_stream, client_ip, is_test, api_key_id, requested_model, aggregate_alias, candidate_idx) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
             .bind(timestamp).bind(account.id).bind(&provider_id).bind(&model)
             .bind(input_tokens).bind(output_tokens).bind(cache_read_input_tokens).bind(cache_creation_input_tokens)
             .bind(latency_ms).bind(if success {1} else {0}).bind(error_message.as_deref())
             .bind(request_body.as_deref()).bind(response_body.as_deref())
             .bind(ttft_ms).bind(if is_stream {1} else {0}).bind(client_ip.as_deref()).bind(0)
             .bind(api_key_id)
+            .bind(attribution.requested_model.as_deref())
+            .bind(attribution.aggregate_alias.as_deref())
+            .bind(attribution.candidate_idx)
             .execute(&pool).await;
         if let Err(e) = res { tracing::error!("📊 Failed to insert usage log: {e}"); }
         prune_old_bodies(&pool).await;

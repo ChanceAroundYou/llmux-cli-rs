@@ -311,6 +311,30 @@ async fn degraded_spills_then_recovers() {
     assert!(spilled >= 10, "基线恶化后应分流，实际 {spilled}/40");
     assert!(primary_hits >= 10, "上限 50% 应给主候选留流量，实际 {primary_hits}/40");
 
+    // 真实聚合请求要把客户端别名与命中的候选下标一起落库，统计页才能按别名看流量走向。
+    let mut rows: Vec<(Option<String>, Option<i64>)> = Vec::new();
+    for _ in 0..100 {
+        rows = sqlx::query_as(
+            "SELECT requested_model, candidate_idx FROM usage_logs WHERE aggregate_alias = 'split-on'",
+        )
+        .fetch_all(&state.pool)
+        .await
+        .unwrap();
+        if rows.len() >= 40 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(rows.len(), 40, "40 次聚合请求各落一行归属");
+    assert!(
+        rows.iter().all(|(model, _)| model.as_deref() == Some("split-on")),
+        "requested_model 应是客户端请求的聚合别名：{rows:?}"
+    );
+    let mut indices: Vec<i64> = rows.iter().filter_map(|(_, idx)| *idx).collect();
+    indices.sort_unstable();
+    indices.dedup();
+    assert_eq!(indices, vec![0, 1], "分流期间两个候选都应被记到：{rows:?}");
+
     // 分流不推进 active：库里的 active_idx 仍是 0。
     let active: i64 = sqlx::query_scalar("SELECT active_idx FROM aggregate_aliases WHERE alias = 'split-on'")
         .fetch_one(&state.pool)
@@ -368,6 +392,7 @@ async fn only_streaming_success_feeds_baseline() {
             is_stream,
             None,
             None,
+            llmux_server::routes::v1::helpers::UsageAttribution::default(),
         );
     };
 

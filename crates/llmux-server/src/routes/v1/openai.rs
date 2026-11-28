@@ -36,7 +36,7 @@ use llmux_core::proxy::{build_anthropic_target_url, anthropic_openai::{parse_sse
 use crate::app::{AppState, TuiEvent};
 use crate::middleware::{self, AuthContext};
 
-use super::helpers::{spawn_log_usage, spawn_log_usage_ip, normalize_base_url, send_tui_request};
+use super::helpers::{UsageAttribution, spawn_log_usage, spawn_log_usage_ip, normalize_base_url, send_tui_request};
 
 /// How the upstream response must be translated back to the client protocol.
 /// Shared by the ordinary and aggregate dispatchers so both use the same
@@ -101,6 +101,21 @@ pub async fn chat_completions(
     Extension(auth): Extension<AuthContext>,
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let requested_model = body.get("model").and_then(Value::as_str).map(str::to_string);
+    super::helpers::with_usage_attribution(
+        requested_model.as_deref(),
+        chat_completions_inner(Extension(state), Extension(auth), OriginalUri(uri), headers, Json(body)),
+    )
+    .await
+}
+
+async fn chat_completions_inner(
+    Extension(state): Extension<AppState>,
+    Extension(auth): Extension<AuthContext>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
     Json(mut body): Json<Value>,
 ) -> Response {
     // 客户端历史消息可能带 `tool_calls: []` 或双重编码成字符串的
@@ -133,6 +148,21 @@ pub async fn chat_completions(
 /// decision table (`target_protocol(Responses ingress, mode, account)`):
 /// supported → passthrough, else convert to the account's default protocol.
 pub async fn responses(
+    Extension(state): Extension<AppState>,
+    Extension(auth): Extension<AuthContext>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let requested_model = body.get("model").and_then(Value::as_str).map(str::to_string);
+    super::helpers::with_usage_attribution(
+        requested_model.as_deref(),
+        responses_inner(Extension(state), Extension(auth), OriginalUri(uri), headers, Json(body)),
+    )
+    .await
+}
+
+async fn responses_inner(
     Extension(state): Extension<AppState>,
     Extension(auth): Extension<AuthContext>,
     OriginalUri(uri): OriginalUri,
@@ -473,7 +503,7 @@ pub(crate) async fn dispatch_with_conversion(
                 continue;
             }
             let latency_ms = start.elapsed().as_millis() as i64;
-            spawn_log_usage(state.pool.clone(), (*account).clone(), model_name.clone(), res.provider_id.clone(), 0, 0, 0, 0, latency_ms, false, last_error.clone(), Some(forward_body.to_string()), None, Some(latency_ms), false);
+            spawn_log_usage(state.pool.clone(), (*account).clone(), model_name.clone(), res.provider_id.clone(), 0, 0, 0, 0, latency_ms, false, last_error.clone(), Some(forward_body.to_string()), None, Some(latency_ms), false, UsageAttribution::current());
             send_tui_request(&state.tui_tx, normalized_uri.path(), status.as_u16(), start, &model_name);
             if let Ok(v) = serde_json::from_str::<Value>(&error_body) { return (status, Json(v)).into_response(); }
             return (status, error_body).into_response();
@@ -515,7 +545,7 @@ pub(crate) async fn dispatch_with_conversion(
                 let latency_ms = start.elapsed().as_millis() as i64;
                 let (prompt_tokens, completion_tokens, cache_read, cache_create) = passthrough_usage(&data);
                 // 日志/账本记上游原值，客户端拿到的是估算值 —— 两件事。
-                spawn_log_usage(state.pool.clone(), (*account).clone(), model_name.clone(), res.provider_id.clone(), prompt_tokens, completion_tokens, cache_read, cache_create, latency_ms, true, None, Some(forward_body.to_string()), Some(data.to_string()), Some(latency_ms), false);
+                spawn_log_usage(state.pool.clone(), (*account).clone(), model_name.clone(), res.provider_id.clone(), prompt_tokens, completion_tokens, cache_read, cache_create, latency_ms, true, None, Some(forward_body.to_string()), Some(data.to_string()), Some(latency_ms), false, UsageAttribution::current());
                 { let mut r = state.dispatch_router.lock().unwrap(); r.record_result(&dispatch_key, &dispatch_meta, Some(account.id), true); }
                 send_tui_request(&state.tui_tx, normalized_uri.path(), 200, start, &model_name);
                 if let (Some(tokens), true) = (usage_override, is_anthropic) {
@@ -555,7 +585,7 @@ pub(crate) async fn dispatch_with_conversion(
                 let prompt_tokens = (raw_prompt - cache_read).max(0);
                 let cache_create = 0;
                 let latency_ms = start.elapsed().as_millis() as i64;
-                spawn_log_usage(state.pool.clone(), (*account).clone(), model_name.clone(), res.provider_id.clone(), prompt_tokens, completion_tokens, cache_read, cache_create, latency_ms, true, None, Some(forward_body.to_string()), Some(chat_resp.to_string()), Some(latency_ms), false);
+                spawn_log_usage(state.pool.clone(), (*account).clone(), model_name.clone(), res.provider_id.clone(), prompt_tokens, completion_tokens, cache_read, cache_create, latency_ms, true, None, Some(forward_body.to_string()), Some(chat_resp.to_string()), Some(latency_ms), false, UsageAttribution::current());
                 { let mut r = state.dispatch_router.lock().unwrap(); r.record_result(&dispatch_key, &dispatch_meta, Some(account.id), true); }
                 send_tui_request(&state.tui_tx, normalized_uri.path(), 200, start, &model_name);
                 return Json(chat_resp).into_response();
@@ -582,7 +612,7 @@ pub(crate) async fn dispatch_with_conversion(
                 let prompt_tokens = (raw_prompt - cache_read).max(0);
                 let cache_create = 0;
                 let latency_ms = start.elapsed().as_millis() as i64;
-                spawn_log_usage(state.pool.clone(), (*account).clone(), model_name.clone(), res.provider_id.clone(), prompt_tokens, completion_tokens, cache_read, cache_create, latency_ms, true, None, Some(forward_body.to_string()), Some(resp_body.to_string()), Some(latency_ms), false);
+                spawn_log_usage(state.pool.clone(), (*account).clone(), model_name.clone(), res.provider_id.clone(), prompt_tokens, completion_tokens, cache_read, cache_create, latency_ms, true, None, Some(forward_body.to_string()), Some(resp_body.to_string()), Some(latency_ms), false, UsageAttribution::current());
                 { let mut r = state.dispatch_router.lock().unwrap(); r.record_result(&dispatch_key, &dispatch_meta, Some(account.id), true); }
                 send_tui_request(&state.tui_tx, normalized_uri.path(), 200, start, &model_name);
                 return Json(resp_body).into_response();
@@ -608,7 +638,7 @@ pub(crate) async fn dispatch_with_conversion(
                 let cache_read = data["usage"]["cache_read_input_tokens"].as_i64().unwrap_or(0);
                 let cache_create = data["usage"]["cache_creation_input_tokens"].as_i64().unwrap_or(0);
                 let latency_ms = start.elapsed().as_millis() as i64;
-                spawn_log_usage(state.pool.clone(), (*account).clone(), model_name.clone(), res.provider_id.clone(), prompt_tokens, completion_tokens, cache_read, cache_create, latency_ms, true, None, Some(forward_body.to_string()), Some(resp_body.to_string()), Some(latency_ms), false);
+                spawn_log_usage(state.pool.clone(), (*account).clone(), model_name.clone(), res.provider_id.clone(), prompt_tokens, completion_tokens, cache_read, cache_create, latency_ms, true, None, Some(forward_body.to_string()), Some(resp_body.to_string()), Some(latency_ms), false, UsageAttribution::current());
                 { let mut r = state.dispatch_router.lock().unwrap(); r.record_result(&dispatch_key, &dispatch_meta, Some(account.id), true); }
                 send_tui_request(&state.tui_tx, normalized_uri.path(), 200, start, &model_name);
                 return Json(resp_body).into_response();
@@ -638,7 +668,7 @@ pub(crate) async fn dispatch_with_conversion(
                 let prompt_tokens = (raw_prompt - cache_read).max(0);
                 let cache_create = 0;
                 let latency_ms = start.elapsed().as_millis() as i64;
-                spawn_log_usage(state.pool.clone(), (*account).clone(), model_name.clone(), res.provider_id.clone(), prompt_tokens, completion_tokens, cache_read, cache_create, latency_ms, true, None, Some(forward_body.to_string()), Some(chat_resp.to_string()), Some(latency_ms), false);
+                spawn_log_usage(state.pool.clone(), (*account).clone(), model_name.clone(), res.provider_id.clone(), prompt_tokens, completion_tokens, cache_read, cache_create, latency_ms, true, None, Some(forward_body.to_string()), Some(chat_resp.to_string()), Some(latency_ms), false, UsageAttribution::current());
                 { let mut r = state.dispatch_router.lock().unwrap(); r.record_result(&dispatch_key, &dispatch_meta, Some(account.id), true); }
                 send_tui_request(&state.tui_tx, normalized_uri.path(), 200, start, &model_name);
                 return Json(chat_resp).into_response();
@@ -670,7 +700,7 @@ pub(crate) async fn dispatch_with_conversion(
                 let mut anth_resp = responses_to_anthropic(&data, &model_name);
                 let (input_tokens, output_tokens, cache_read, cache_create) = anthropic_usage(&data);
                 let latency_ms = start.elapsed().as_millis() as i64;
-                spawn_log_usage(state.pool.clone(), (*account).clone(), model_name.clone(), res.provider_id.clone(), input_tokens, output_tokens, cache_read, cache_create, latency_ms, true, None, Some(forward_body.to_string()), Some(anth_resp.to_string()), Some(latency_ms), false);
+                spawn_log_usage(state.pool.clone(), (*account).clone(), model_name.clone(), res.provider_id.clone(), input_tokens, output_tokens, cache_read, cache_create, latency_ms, true, None, Some(forward_body.to_string()), Some(anth_resp.to_string()), Some(latency_ms), false, UsageAttribution::current());
                 { let mut r = state.dispatch_router.lock().unwrap(); r.record_result(&dispatch_key, &dispatch_meta, Some(account.id), true); }
                 send_tui_request(&state.tui_tx, normalized_uri.path(), 200, start, &model_name);
                 // 日志已按上游原值落库，客户端拿到的是估算值。
@@ -701,7 +731,7 @@ pub(crate) async fn dispatch_with_conversion(
                 let prompt_tokens = (raw_prompt - cache_read).max(0);
                 let cache_create = 0;
                 let latency_ms = start.elapsed().as_millis() as i64;
-                spawn_log_usage(state.pool.clone(), (*account).clone(), model_name.clone(), res.provider_id.clone(), prompt_tokens, completion_tokens, cache_read, cache_create, latency_ms, true, None, Some(forward_body.to_string()), Some(anth_resp.to_string()), Some(latency_ms), false);
+                spawn_log_usage(state.pool.clone(), (*account).clone(), model_name.clone(), res.provider_id.clone(), prompt_tokens, completion_tokens, cache_read, cache_create, latency_ms, true, None, Some(forward_body.to_string()), Some(anth_resp.to_string()), Some(latency_ms), false, UsageAttribution::current());
                 { let mut r = state.dispatch_router.lock().unwrap(); r.record_result(&dispatch_key, &dispatch_meta, Some(account.id), true); }
                 send_tui_request(&state.tui_tx, normalized_uri.path(), 200, start, &model_name);
                 // 日志已按上游原值落库，客户端拿到的是估算值。
@@ -717,7 +747,7 @@ pub(crate) async fn dispatch_with_conversion(
     // 耗尽也要落库 —— 之前这条路径不记，前端失败率面板完全看不到这些 502。
     if let Some(account) = ordered_accounts.first() {
         let latency_ms = start.elapsed().as_millis() as i64;
-        spawn_log_usage(state.pool.clone(), (*account).clone(), model_name.clone(), res.provider_id.clone(), 0, 0, 0, 0, latency_ms, false, Some(error_msg.clone()), Some(patched.to_string()), None, Some(latency_ms), false);
+        spawn_log_usage(state.pool.clone(), (*account).clone(), model_name.clone(), res.provider_id.clone(), 0, 0, 0, 0, latency_ms, false, Some(error_msg.clone()), Some(patched.to_string()), None, Some(latency_ms), false, UsageAttribution::current());
     }
     let exhausted_status = super::helpers::exhausted_status(
         cooled_skips,
@@ -1098,6 +1128,9 @@ pub(crate) async fn dispatch_aggregate_with_conversion(
         }
     }
     for i in order {
+        // 归属跟着“本次真正尝试的候选”走：usage 行的 aggregate_alias/candidate_idx
+        // 由此填写；失败的候选不落 usage 行，下一次尝试会覆盖这里。
+        UsageAttribution::note_aggregate_candidate(&alias, i);
         let cand = &agg.candidates[i];
         // 来源普通别名已被删除 → 配置失效，跳过且不计失败（见 helpers::stale_candidate_reason）。
         if let Some(reason) = crate::routes::v1::helpers::stale_candidate_reason(cand) {
@@ -1379,7 +1412,7 @@ pub(crate) async fn dispatch_aggregate_with_conversion(
         }
         let (converted, pt, ct, cr, cc) = back_convert_non_streaming(back, &data, &cand.model, &custom_tools);
         let latency_ms = start.elapsed().as_millis() as i64;
-        spawn_log_usage(state.pool.clone(), account.clone(), cand.model.clone(), account.provider_id.clone(), pt, ct, cr, cc, latency_ms, true, None, Some(body.to_string()), Some(converted.to_string()), Some(latency_ms), false);
+        spawn_log_usage(state.pool.clone(), account.clone(), cand.model.clone(), account.provider_id.clone(), pt, ct, cr, cc, latency_ms, true, None, Some(body.to_string()), Some(converted.to_string()), Some(latency_ms), false, UsageAttribution::current());
         provider_request.effort.record_success();
         state.aggregate_router.lock().unwrap().note_candidate_success(&alias, i, len);
         let override_tokens = prompt_estimate.filter(|_| state.usage_estimate_enabled(account.id));
@@ -1438,7 +1471,9 @@ pub(crate) async fn dispatch_aggregate_with_conversion(
     let latency_ms = start.elapsed().as_millis() as i64;
     if let Some(cand) = agg.candidates.first() {
         if let Ok(Some(acc)) = get_account_by_id(&state.pool, cand.account_id, &state.master_key).await {
-            spawn_log_usage(state.pool.clone(), acc, cand.model.clone(), String::new(), 0, 0, 0, 0, latency_ms, false, Some(error_msg.clone()), Some(body.to_string()), None, Some(latency_ms), false);
+            // 全候选耗尽时记的是第一个候选（它没有“命中”），下标明确写 0。
+            UsageAttribution::note_aggregate_candidate(&alias, 0);
+            spawn_log_usage(state.pool.clone(), acc, cand.model.clone(), String::new(), 0, 0, 0, 0, latency_ms, false, Some(error_msg.clone()), Some(body.to_string()), None, Some(latency_ms), false, UsageAttribution::current());
         }
     }
     let exhausted_status = crate::routes::v1::helpers::exhausted_status(
@@ -1637,6 +1672,7 @@ async fn responses_to_chat_streaming(
     let client_ip = super::helpers::current_client_ip();
     // 同 client_ip：流式跑在 tokio::spawn 里，task-local 传不进来，必须在此捕获。
     let api_key_id = super::helpers::current_api_key_id();
+    let attribution = UsageAttribution::current();
     tokio::spawn(async move {
         let mut buffer: Vec<u8> = Vec::with_capacity(4096);
         // 有界头尾缓冲：见 helpers::StreamCapture（p99 上游流 615KB，全量缓冲
@@ -1695,7 +1731,7 @@ async fn responses_to_chat_streaming(
         let (cache_read, cache_create) = converter.usage_cache();
         let complete = converter.is_done() && !converter.is_failed();
         let latency_ms = start.elapsed().as_millis() as i64;
-        spawn_log_usage_ip(pool.clone(), account.clone(), model.clone(), account.provider_id.clone(), prompt_tokens, completion_tokens, cache_read, cache_create, latency_ms, complete, if complete { None } else if converter.is_failed() { Some("Upstream SSE reported a failure event".to_string()) } else { Some(format!("Responses upstream ended without terminal event after {chunks} chunks")) }, request_body, received.to_body_string(), ttft_ms, true, client_ip, api_key_id)
+        spawn_log_usage_ip(pool.clone(), account.clone(), model.clone(), account.provider_id.clone(), prompt_tokens, completion_tokens, cache_read, cache_create, latency_ms, complete, if complete { None } else if converter.is_failed() { Some("Upstream SSE reported a failure event".to_string()) } else { Some(format!("Responses upstream ended without terminal event after {chunks} chunks")) }, request_body, received.to_body_string(), ttft_ms, true, client_ip, api_key_id, attribution.clone())
     });
     let body = Body::from_stream(ReceiverStream::new(rx));
     Response::builder().status(StatusCode::OK).header("content-type", "text/event-stream").header("cache-control", "no-cache").header("connection", "keep-alive").body(body).unwrap().into_response()
@@ -1719,6 +1755,7 @@ async fn chat_to_responses_streaming(
     let client_ip = super::helpers::current_client_ip();
     // 同 client_ip：流式跑在 tokio::spawn 里，task-local 传不进来，必须在此捕获。
     let api_key_id = super::helpers::current_api_key_id();
+    let attribution = UsageAttribution::current();
     tokio::spawn(async move {
         let mut buffer: Vec<u8> = Vec::with_capacity(4096);
         // 有界头尾缓冲：见 helpers::StreamCapture。
@@ -1821,7 +1858,7 @@ async fn chat_to_responses_streaming(
             ttft_ms,
             true,
             client_ip,
-            api_key_id,
+            api_key_id, attribution.clone()
         )
     });
     let body = Body::from_stream(ReceiverStream::new(rx));
@@ -1850,6 +1887,7 @@ async fn anthropic_to_responses_streaming(
     let client_ip = super::helpers::current_client_ip();
     // 同 client_ip：流式跑在 tokio::spawn 里，task-local 传不进来，必须在此捕获。
     let api_key_id = super::helpers::current_api_key_id();
+    let attribution = UsageAttribution::current();
     tokio::spawn(async move {
         let mut buffer: Vec<u8> = Vec::with_capacity(4096);
         // 有界头尾缓冲：见 helpers::StreamCapture。
@@ -1945,7 +1983,7 @@ async fn anthropic_to_responses_streaming(
             ttft_ms,
             true,
             client_ip,
-            api_key_id,
+            api_key_id, attribution.clone()
         )
     });
     let body = Body::from_stream(ReceiverStream::new(rx));
@@ -2300,7 +2338,7 @@ async fn openai_dispatch(
                 false,
                 last_error.clone(),
                 Some(log_req_body.clone()),
-                None, Some(latency_ms), false);
+                None, Some(latency_ms), false, UsageAttribution::current());
             send_tui_request(&state.tui_tx, normalized_uri.path(), status.as_u16(), start, &model_resolution.target_model);
             if let Ok(json_val) = serde_json::from_str::<Value>(&error_body) {
                 return (status, Json(json_val)).into_response();
@@ -2364,7 +2402,7 @@ async fn openai_dispatch(
             true,
             None,
             Some(log_req_body.clone()),
-            Some(data.to_string()), Some(latency_ms), false);
+            Some(data.to_string()), Some(latency_ms), false, UsageAttribution::current());
         {
             let mut router = state.dispatch_router.lock().unwrap();
             router.record_result(&dispatch_key, &dispatch_meta, Some(account.id), true);
@@ -2394,7 +2432,7 @@ async fn openai_dispatch(
             false,
             Some(error_msg.clone()),
             Some(log_req_body.clone()),
-            None, Some(latency_ms), false);
+            None, Some(latency_ms), false, UsageAttribution::current());
     }
     let exhausted_status = super::helpers::exhausted_status(
         cooled_skips,
@@ -2842,6 +2880,7 @@ async fn openai_streaming_passthrough(
     let client_ip = super::helpers::current_client_ip();
     // 同 client_ip：流式跑在 tokio::spawn 里，task-local 传不进来，必须在此捕获。
     let api_key_id = super::helpers::current_api_key_id();
+    let attribution = UsageAttribution::current();
     tokio::spawn(async move {
         let mut buffer: Vec<u8> = Vec::with_capacity(4096);
         // 有界头尾缓冲：见 helpers::StreamCapture（p99 上游流 615KB，全量缓冲
@@ -3040,7 +3079,7 @@ async fn openai_streaming_passthrough(
             account_error,
             request_body,
             received.to_body_string(),
-            acc.ttft_ms, true, client_ip, api_key_id,
+            acc.ttft_ms, true, client_ip, api_key_id, attribution.clone()
         )
     });
 
@@ -3819,7 +3858,7 @@ async fn anthropic_fallback_response(
             true,
             None,
             Some(openai_body.to_string()),
-            Some(openai_resp.to_string()), None, false);
+            Some(openai_resp.to_string()), None, false, UsageAttribution::current());
         Some(Json(openai_resp).into_response())
     }
 }
@@ -3841,6 +3880,7 @@ async fn anthropic_fallback_streaming(
     let client_ip = super::helpers::current_client_ip();
     // 同 client_ip：流式跑在 tokio::spawn 里，task-local 传不进来，必须在此捕获。
     let api_key_id = super::helpers::current_api_key_id();
+    let attribution = UsageAttribution::current();
     tokio::spawn(async move {
         let mut buffer: Vec<u8> = Vec::with_capacity(4096);
         // 有界头尾缓冲：见 helpers::StreamCapture（p99 上游流 615KB，全量缓冲
@@ -3916,7 +3956,7 @@ async fn anthropic_fallback_streaming(
                             None,
                             request_body,
                             received.to_body_string(),
-                            ttft_ms, true, client_ip, api_key_id,
+                            ttft_ms, true, client_ip, api_key_id, attribution.clone()
                         );
                         return;
                     }

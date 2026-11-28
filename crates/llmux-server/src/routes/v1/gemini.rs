@@ -23,13 +23,31 @@ use llmux_core::dispatcher::{self, get_accounts_by_ids, get_active_accounts, is_
 use crate::app::{AppState, TuiEvent};
 use crate::middleware::{self, AuthContext};
 
-use super::helpers::{spawn_log_usage, normalize_base_url, send_tui_request};
+use super::helpers::{UsageAttribution, spawn_log_usage, normalize_base_url, send_tui_request};
 
 // ---------------------------------------------------------------------------
 // /v1beta/models/{model}:{action}  — Gemini native protocol passthrough
 // ---------------------------------------------------------------------------
 
 pub async fn gemini(
+    Extension(state): Extension<AppState>,
+    Extension(auth): Extension<AuthContext>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    axum::extract::Path(path): axum::extract::Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    let trimmed = path.trim_start_matches('/');
+    let rest = trimmed.strip_prefix("models/").unwrap_or(trimmed);
+    let requested_model = rest.split_once(':').map(|(m, _)| m).unwrap_or(rest).to_string();
+    super::helpers::with_usage_attribution(
+        Some(&requested_model),
+        gemini_inner(Extension(state), Extension(auth), OriginalUri(uri), headers, axum::extract::Path(path), Json(body)),
+    )
+    .await
+}
+
+async fn gemini_inner(
     Extension(state): Extension<AppState>,
     Extension(auth): Extension<AuthContext>,
     OriginalUri(uri): OriginalUri,
@@ -294,7 +312,7 @@ pub async fn gemini(
                 false,
                 last_error.clone(),
                 Some(body.to_string()),
-                None, Some(latency_ms), false);
+                None, Some(latency_ms), false, UsageAttribution::current());
             send_tui_request(&state.tui_tx, uri.path(), status.as_u16(), start, &model_resolution.target_model);
             return (status, Json(serde_json::from_str::<Value>(&error_body)
                 .unwrap_or(Value::String(error_body))))
@@ -363,7 +381,7 @@ pub async fn gemini(
             true,
             None,
             Some(body.to_string()),
-            Some(data.to_string()), Some(latency_ms), false);
+            Some(data.to_string()), Some(latency_ms), false, UsageAttribution::current());
         {
             let mut router = state.dispatch_router.lock().unwrap();
             router.record_result(&dispatch_key, &dispatch_meta, Some(account.id), true);
@@ -393,7 +411,7 @@ pub async fn gemini(
             false,
             Some(error_msg.clone()),
             Some(body.to_string()),
-            None, Some(latency_ms), false);
+            None, Some(latency_ms), false, UsageAttribution::current());
     }
     // 与其余 5 个 dispatcher 同一套判定：全因配额冷却 → 429 + Retry-After，
     // 掺了别的原因 → 按那个状态。此前 Gemini 无条件回 502，全冷却时客户端
@@ -455,6 +473,7 @@ async fn gemini_streaming_passthrough(
     let client_ip = super::helpers::current_client_ip();
     // 同 client_ip：流式跑在 tokio::spawn 里，task-local 传不进来，必须在此捕获。
     let api_key_id = super::helpers::current_api_key_id();
+    let attribution = UsageAttribution::current();
     tokio::spawn(async move {
         // 有界头尾缓冲：见 helpers::StreamCapture（p99 上游流 615KB，全量缓冲
         // 是 RSS 386MiB 的主因）。头部给详情页，尾部保住结束符与最终 usage。
@@ -500,7 +519,7 @@ async fn gemini_streaming_passthrough(
             stream_failed,
             request_body,
             Some(resp_body),
-            ttft_ms, true, client_ip, api_key_id,
+            ttft_ms, true, client_ip, api_key_id, attribution.clone()
         )
     });
 

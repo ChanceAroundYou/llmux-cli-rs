@@ -1386,6 +1386,8 @@ async fn migration_0024_prunes_dead_indexes_and_adds_is_test_timestamp() {
         "idx_usage_logs_account_timestamp",
         "idx_usage_logs_provider_id",
         "idx_usage_logs_is_test_timestamp",
+        // 0039：别名筛选按 (aggregate_alias, timestamp) 走索引。
+        "idx_usage_logs_aggregate_alias_ts",
     ] {
         assert!(
             indexes.iter().any(|i| i == alive),
@@ -1396,8 +1398,8 @@ async fn migration_0024_prunes_dead_indexes_and_adds_is_test_timestamp() {
     // 剩下的索引总数：少了就是有人又加了没测过的索引，多了就是又复活了死索引。
     assert_eq!(
         indexes.len(),
-        5,
-        "usage_logs 应当只剩 5 个索引，实际：{indexes:?}"
+        6,
+        "usage_logs 应当只剩 6 个索引，实际：{indexes:?}"
     );
 }
 
