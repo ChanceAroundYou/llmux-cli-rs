@@ -31,6 +31,35 @@ pub struct UsageSummary {
     pub unpriced_models: i64,
 }
 
+/// 统计筛选维度。`alias_kind` 由调用方显式给出：ordinary 按 requested_model，
+/// aggregate 按 aggregate_alias；同一行 X→G 会同时出现在两个视角里。
+#[derive(Debug, Clone, Default)]
+pub struct UsageFilter {
+    pub account_id: Option<i64>,
+    pub alias: Option<String>,
+    pub alias_kind: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CandidateBreakdown {
+    pub account_id: i64,
+    pub account_name: Option<String>,
+    pub model: Option<String>,
+    pub candidate_idx: Option<i64>,
+    pub input: i64,
+    pub output: i64,
+    pub cache_read: i64,
+    pub cache_create: i64,
+    pub requests: i64,
+    pub success_count: i64,
+    pub avg_latency: f64,
+    pub avg_ttft: f64,
+    pub p95_ttft: f64,
+    pub avg_tps: f64,
+    pub est_cost: f64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct UsageLogRecord {
     pub id: i64,
@@ -219,6 +248,7 @@ impl UsageService {
         start_time: Option<i64>,
         end_time: Option<i64>,
         api_key_id: Option<i64>,
+        filter: &UsageFilter,
     ) -> Result<UsageSummary> {
         let mut sql = format!(
             "SELECT
@@ -246,9 +276,11 @@ impl UsageService {
         );
         append_time_filter(&mut sql, "", start_time, end_time);
         append_key_filter(&mut sql, "", api_key_id);
+        append_attribution_filter(&mut sql, "", filter);
         let mut query = sqlx::query(&sql);
         query = bind_time_filter(query, start_time, end_time);
         query = bind_key_filter(query, api_key_id);
+        query = bind_attribution_filter(query, filter);
         let row = query.fetch_one(&self.pool).await?;
         let total_input: i64 = row.try_get("total_input")?;
         let total_cache_read: i64 = row.try_get("total_cache_read")?;
@@ -274,9 +306,11 @@ impl UsageService {
         );
         append_time_filter(&mut raw_sql, "", start_time, end_time);
         append_key_filter(&mut raw_sql, "", api_key_id);
+        append_attribution_filter(&mut raw_sql, "", filter);
         let mut raw_query = sqlx::query(&raw_sql);
         raw_query = bind_time_filter(raw_query, start_time, end_time);
         raw_query = bind_key_filter(raw_query, api_key_id);
+        raw_query = bind_attribution_filter(raw_query, filter);
         let raw_rows = raw_query.fetch_all(&self.pool).await?;
         let mut latencies: Vec<i64> = Vec::with_capacity(raw_rows.len());
         let mut ttfts: Vec<i64> = Vec::new();
@@ -333,6 +367,7 @@ impl UsageService {
         start_time: Option<i64>,
         end_time: Option<i64>,
         api_key_id: Option<i64>,
+        filter: &UsageFilter,
     ) -> Result<FailoverStats> {
         let mut failure_sql = String::from(
             "SELECT COUNT(*) AS failed_requests,
@@ -342,14 +377,16 @@ impl UsageService {
         );
         append_time_filter(&mut failure_sql, "", start_time, end_time);
         append_key_filter(&mut failure_sql, "", api_key_id);
+        append_attribution_filter(&mut failure_sql, "", filter);
         let mut failure_query = sqlx::query(&failure_sql);
         failure_query = bind_time_filter(failure_query, start_time, end_time);
         failure_query = bind_key_filter(failure_query, api_key_id);
+        failure_query = bind_attribution_filter(failure_query, filter);
         let failure_row = failure_query.fetch_one(&self.pool).await?;
         let failed_requests: i64 = failure_row.try_get("failed_requests")?;
         let failover_triggers: i64 = failure_row.try_get("failover_triggers")?;
 
-        let summary = self.get_summary(start_time, end_time, api_key_id).await?;
+        let summary = self.get_summary(start_time, end_time, api_key_id, filter).await?;
         let expected_success = summary.total_requests - failed_requests;
         let recovered_requests = (summary.success_requests - expected_success).max(0);
         let failover_success_rate = if failover_triggers > 0 {
@@ -370,6 +407,7 @@ impl UsageService {
         start_time: Option<i64>,
         end_time: Option<i64>,
         api_key_id: Option<i64>,
+        filter: &UsageFilter,
     ) -> Result<Vec<ProviderBreakdown>> {
         let mut sql = format!(
             "SELECT provider_id AS id,
@@ -389,9 +427,11 @@ impl UsageService {
         );
         append_time_filter(&mut sql, "", start_time, end_time);
         append_key_filter(&mut sql, "", api_key_id);
+        append_attribution_filter(&mut sql, "", filter);
         let mut query = sqlx::query(&sql);
         query = bind_time_filter(query, start_time, end_time);
         query = bind_key_filter(query, api_key_id);
+        query = bind_attribution_filter(query, filter);
         let rows = query.fetch_all(&self.pool).await?;
 
         use std::collections::HashMap;
@@ -448,6 +488,7 @@ impl UsageService {
         start_time: Option<i64>,
         end_time: Option<i64>,
         api_key_id: Option<i64>,
+        filter: &UsageFilter,
     ) -> Result<Vec<ModelBreakdown>> {
         let mut sql = format!(
             "SELECT model,
@@ -467,9 +508,11 @@ impl UsageService {
         );
         append_time_filter(&mut sql, "", start_time, end_time);
         append_key_filter(&mut sql, "", api_key_id);
+        append_attribution_filter(&mut sql, "", filter);
         let mut query = sqlx::query(&sql);
         query = bind_time_filter(query, start_time, end_time);
         query = bind_key_filter(query, api_key_id);
+        query = bind_attribution_filter(query, filter);
         let rows = query.fetch_all(&self.pool).await?;
 
         use std::collections::HashMap;
@@ -525,6 +568,7 @@ impl UsageService {
         start_time: Option<i64>,
         end_time: Option<i64>,
         api_key_id: Option<i64>,
+        filter: &UsageFilter,
     ) -> Result<Vec<AccountBreakdown>> {
         let mut sql = format!(
             "SELECT l.account_id AS id,
@@ -547,9 +591,11 @@ impl UsageService {
         );
         append_time_filter(&mut sql, "l", start_time, end_time);
         append_key_filter(&mut sql, "l", api_key_id);
+        append_attribution_filter(&mut sql, "l", filter);
         let mut query = sqlx::query(&sql);
         query = bind_time_filter(query, start_time, end_time);
         query = bind_key_filter(query, api_key_id);
+        query = bind_attribution_filter(query, filter);
         let rows = query.fetch_all(&self.pool).await?;
 
         use std::collections::HashMap;
@@ -613,6 +659,110 @@ impl UsageService {
         Ok(out)
     }
 
+    /// 别名内流量走向：按「当时的账户 × 模型 × 候选下标」分组。
+    /// alias_kind=aggregate 按归属列聚合别名筛，其余按客户端请求的别名筛。
+    pub async fn get_breakdown_by_candidate(
+        &self,
+        start_time: Option<i64>,
+        end_time: Option<i64>,
+        api_key_id: Option<i64>,
+        account_id: Option<i64>,
+        alias: &str,
+        alias_kind: &str,
+    ) -> Result<Vec<CandidateBreakdown>> {
+        let col = if alias_kind == "aggregate" {
+            "l.aggregate_alias"
+        } else {
+            "l.requested_model"
+        };
+        let mut sql = format!(
+            "SELECT l.account_id AS id,
+                    a.alias AS name,
+                    l.model AS model,
+                    l.candidate_idx AS candidate_idx,
+                    IFNULL(l.input_tokens, 0) AS input_tokens,
+                    IFNULL(l.output_tokens, 0) AS output_tokens,
+                    IFNULL(l.cache_read_input_tokens, 0) AS cache_read,
+                    IFNULL(l.cache_creation_input_tokens, 0) AS cache_create,
+                    l.latency_ms, l.ttft_ms,
+                    CASE WHEN l.success = 1 THEN 1 ELSE 0 END AS success,
+                    {} AS est_cost
+             FROM usage_logs l
+             LEFT JOIN accounts a ON a.id = l.account_id
+             LEFT JOIN upstream_prices up
+                    ON up.account_id = l.account_id AND up.model_id = l.model
+             LEFT JOIN model_prices mp ON mp.model_id = l.model
+             WHERE l.is_test = 0 AND {col} = ?",
+            price_expr("l.")
+        );
+        if account_id.is_some() {
+            sql.push_str(" AND l.account_id = ?");
+        }
+        append_time_filter(&mut sql, "l", start_time, end_time);
+        append_key_filter(&mut sql, "l", api_key_id);
+        let mut query = sqlx::query(&sql);
+        query = query.bind(alias.to_string());
+        if let Some(account_id) = account_id {
+            query = query.bind(account_id);
+        }
+        query = bind_time_filter(query, start_time, end_time);
+        query = bind_key_filter(query, api_key_id);
+        let rows = query.fetch_all(&self.pool).await?;
+
+        use std::collections::HashMap;
+        let mut groups: HashMap<
+            (i64, Option<String>, Option<i64>),
+            (Option<String>, GroupAcc),
+        > = HashMap::new();
+        for row in rows {
+            let key = (
+                row.try_get::<i64, _>("id")?,
+                row.try_get::<Option<String>, _>("model")?,
+                row.try_get::<Option<i64>, _>("candidate_idx")?,
+            );
+            let entry = groups
+                .entry(key)
+                .or_insert_with(|| (row.try_get("name").ok().flatten(), GroupAcc::default()));
+            let acc = &mut entry.1;
+            acc.input += row.try_get::<i64, _>("input_tokens")?;
+            acc.output += row.try_get::<i64, _>("output_tokens")?;
+            acc.cache_read += row.try_get::<i64, _>("cache_read")?;
+            acc.cache_create += row.try_get::<i64, _>("cache_create")?;
+            acc.est_cost += row.try_get::<f64, _>("est_cost")?;
+            acc.requests += 1;
+            acc.success_count += row.try_get::<i64, _>("success")?;
+            acc.latencies.push(row.try_get::<i64, _>("latency_ms")?);
+            if let Some(t) = row.try_get::<Option<i64>, _>("ttft_ms")? {
+                acc.ttfts.push(t);
+            }
+        }
+
+        let mut out: Vec<CandidateBreakdown> = Vec::new();
+        for ((id, model, candidate_idx), (name, acc)) in groups {
+            let (avg_latency, _p50l, _p95l, avg_ttft, _p50t, p95_ttft, avg_tps, _cache_hit_rate) =
+                finalize_group(&acc);
+            out.push(CandidateBreakdown {
+                account_id: id,
+                account_name: name,
+                model,
+                candidate_idx,
+                input: acc.input,
+                output: acc.output,
+                cache_read: acc.cache_read,
+                cache_create: acc.cache_create,
+                requests: acc.requests,
+                success_count: acc.success_count,
+                avg_latency,
+                avg_ttft,
+                p95_ttft,
+                avg_tps,
+                est_cost: acc.est_cost,
+            });
+        }
+        out.sort_by(|a, b| a.account_id.cmp(&b.account_id).then(a.candidate_idx.cmp(&b.candidate_idx)));
+        Ok(out)
+    }
+
     /// Time-bucketed token timeseries (stacked-line ready).
     /// Buckets are [start, end) sliced by `granularity_ms` — caller chooses granularity based on window.
     pub async fn get_timeseries(
@@ -621,6 +771,7 @@ impl UsageService {
         end_time: Option<i64>,
         granularity_ms: i64,
         api_key_id: Option<i64>,
+        filter: &UsageFilter,
     ) -> Result<Vec<TimeseriesPoint>> {
         let gran = granularity_ms.max(60_000);
         let mut sql = format!(
@@ -640,12 +791,14 @@ impl UsageService {
         );
         append_time_filter(&mut sql, "", start_time, end_time);
         append_key_filter(&mut sql, "", api_key_id);
+        append_attribution_filter(&mut sql, "", filter);
         let mut query = sqlx::query(&sql);
         // 顺序即位置：gran 的两个 ? 在 SELECT 里，时间的在其后，key 的最后。
         // 调整这个顺序不会报错，只会让 gran 与 timestamp 错位、静默返回错分桶。
         query = query.bind(gran).bind(gran);
         query = bind_time_filter(query, start_time, end_time);
         query = bind_key_filter(query, api_key_id);
+        query = bind_attribution_filter(query, filter);
         let rows = query.fetch_all(&self.pool).await?;
 
         use std::collections::HashMap;
@@ -1007,6 +1160,44 @@ fn bind_key_filter<'q>(
 ) -> sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>> {
     if let Some(api_key_id) = api_key_id {
         query = query.bind(api_key_id);
+    }
+    query
+}
+
+/// 账户 / 别名筛选。必须在 time/key 之后拼接，绑定顺序同样在后；
+/// `alias_kind=aggregate` 走归属列，其余（含未指定）走请求名。
+/// 空表别名时用 `usage_logs.` 前缀：这些查询都 JOIN 了价格表，
+/// 裸 `account_id` 会报 ambiguous column。
+fn append_attribution_filter(sql: &mut String, table_alias: &str, filter: &UsageFilter) {
+    let prefix = |col: &str| {
+        if table_alias.is_empty() {
+            format!("usage_logs.{col}")
+        } else {
+            format!("{table_alias}.{col}")
+        }
+    };
+    if filter.account_id.is_some() {
+        sql.push_str(&format!(" AND {} = ?", prefix("account_id")));
+    }
+    if let Some(alias) = &filter.alias {
+        let col = if filter.alias_kind.as_deref() == Some("aggregate") {
+            "aggregate_alias"
+        } else {
+            "requested_model"
+        };
+        sql.push_str(&format!(" AND {} = ?", prefix(col)));
+    }
+}
+
+fn bind_attribution_filter<'q>(
+    mut query: sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>,
+    filter: &UsageFilter,
+) -> sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>> {
+    if let Some(account_id) = filter.account_id {
+        query = query.bind(account_id);
+    }
+    if let Some(alias) = &filter.alias {
+        query = query.bind(alias.clone());
     }
     query
 }

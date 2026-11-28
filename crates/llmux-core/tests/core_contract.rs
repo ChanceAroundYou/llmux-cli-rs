@@ -6,7 +6,7 @@ use llmux_core::db::{
 use llmux_core::export_import::{export_config, import_config, ConfigExport};
 use llmux_core::models::{Account, ApiKey, ModelAlias, Provider, UsageLogParams};
 use llmux_core::settings::SettingsService;
-use llmux_core::usage::{DetailedLogQuery, UsageService};
+use llmux_core::usage::{DetailedLogQuery, UsageFilter, UsageService};
 use serde_json::json;
 
 async fn memory_db() -> sqlx::SqlitePool {
@@ -224,7 +224,7 @@ async fn usage_service_logs_usage_updates_limit_cache_and_queries_non_test_data(
         .await
         .expect("log test usage");
 
-    let summary = usage.get_summary(None, None, None).await.expect("summary");
+    let summary = usage.get_summary(None, None, None, &UsageFilter::default()).await.expect("summary");
     assert_eq!(summary.total_input, 10);
     assert_eq!(summary.total_output, 20);
     assert_eq!(summary.total_cache_read, 3);
@@ -295,7 +295,7 @@ async fn usage_cost_is_summed_from_model_prices() {
     .expect("insert usage");
 
     // 没有任何价目行：估算是 REAL 0.0，且「未定价模型」要显式报出来。
-    let summary = usage.get_summary(None, None, None).await.expect("summary");
+    let summary = usage.get_summary(None, None, None, &UsageFilter::default()).await.expect("summary");
     assert_eq!(summary.est_cost, 0.0, "无价目行时应是 REAL 0.0");
     assert_eq!(summary.unpriced_models, 1, "未定价模型必须可见");
 
@@ -309,7 +309,7 @@ async fn usage_cost_is_summed_from_model_prices() {
     .await
     .expect("insert price");
 
-    let summary = usage.get_summary(None, None, None).await.expect("summary");
+    let summary = usage.get_summary(None, None, None, &UsageFilter::default()).await.expect("summary");
     let expected = 10.0 * 1e-6 + 20.0 * 2e-6 + 3.0 * 1e-7 + 4.0 * 2e-7;
     assert!(
         (summary.est_cost - expected).abs() < 1e-15,
@@ -320,7 +320,7 @@ async fn usage_cost_is_summed_from_model_prices() {
     assert_eq!(summary.unpriced_models, 0, "已定价模型不再计入未定价");
 
     let by_model = usage
-        .get_breakdown_by_model(None, None, None)
+        .get_breakdown_by_model(None, None, None, &UsageFilter::default())
         .await
         .expect("model breakdown");
     let row = by_model
@@ -330,7 +330,7 @@ async fn usage_cost_is_summed_from_model_prices() {
     assert!((row.est_cost - expected).abs() < 1e-15);
 
     let ts = usage
-        .get_timeseries(None, None, 60_000, None)
+        .get_timeseries(None, None, 60_000, None, &UsageFilter::default())
         .await
         .expect("timeseries");
     assert!((ts.iter().map(|p| p.est_cost).sum::<f64>() - expected).abs() < 1e-15);
@@ -392,7 +392,7 @@ async fn usage_prefers_account_price_over_global_fallback() {
     }
 
     let rows = usage
-        .get_breakdown_by_account(None, None, None)
+        .get_breakdown_by_account(None, None, None, &UsageFilter::default())
         .await
         .expect("account breakdown");
     let cost = |id: i64| rows.iter().find(|r| r.id == id).unwrap().est_cost;
@@ -446,7 +446,7 @@ async fn usage_applies_long_context_tier() {
     .await
     .unwrap();
 
-    let s = usage.get_summary(None, None, None).await.expect("summary");
+    let s = usage.get_summary(None, None, None, &UsageFilter::default()).await.expect("summary");
     assert!(
         (s.est_cost - 200.0 * 5e-6).abs() < 1e-15,
         "长上下文应命中 long_input_price，est_cost={}",

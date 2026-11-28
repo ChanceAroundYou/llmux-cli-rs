@@ -2,7 +2,7 @@ use axum::extract::Query;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
-use llmux_core::usage::UsageService;
+use llmux_core::usage::{UsageFilter, UsageService};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -30,6 +30,12 @@ pub struct StatsQuery {
     /// 只能筛到本列有值的行：usage_logs.api_key_id 是 0026 才加的，
     /// 更早的请求根本没记是哪把密钥，筛老时间窗必然是空。
     pub key_id: Option<i64>,
+    /// 绑定账户 id。空 = 全部。
+    pub account_id: Option<i64>,
+    /// 客户端请求的别名（ordinary 按 requested_model，aggregate 按 aggregate_alias）。
+    pub alias: Option<String>,
+    /// ordinary | aggregate，由前端显式传；不按名字猜。
+    pub alias_kind: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -73,13 +79,37 @@ pub async fn get_stats(
         .unwrap_or_else(|| auto_granularity(start, end));
 
     let svc = UsageService::new(state.pool.clone());
+    let filter = UsageFilter {
+        account_id: params.account_id,
+        alias: params.alias.clone(),
+        alias_kind: params.alias_kind.clone(),
+    };
     let (summary, by_model, by_account, by_provider, timeseries) = tokio::join!(
-        svc.get_summary(Some(start), Some(end), params.key_id),
-        svc.get_breakdown_by_model(Some(start), Some(end), params.key_id),
-        svc.get_breakdown_by_account(Some(start), Some(end), params.key_id),
-        svc.get_breakdown_by_provider(Some(start), Some(end), params.key_id),
-        svc.get_timeseries(Some(start), Some(end), granularity, params.key_id),
+        svc.get_summary(Some(start), Some(end), params.key_id, &filter),
+        svc.get_breakdown_by_model(Some(start), Some(end), params.key_id, &filter),
+        svc.get_breakdown_by_account(Some(start), Some(end), params.key_id, &filter),
+        svc.get_breakdown_by_provider(Some(start), Some(end), params.key_id, &filter),
+        svc.get_timeseries(Some(start), Some(end), granularity, params.key_id, &filter),
     );
+
+    // 只在选中别名时扫候选维度，避免无筛选页面白做一次 account×model 聚合。
+    let by_candidate = match &params.alias {
+        Some(alias) => match svc
+            .get_breakdown_by_candidate(
+                Some(start),
+                Some(end),
+                params.key_id,
+                params.account_id,
+                alias,
+                params.alias_kind.as_deref().unwrap_or("ordinary"),
+            )
+            .await
+        {
+            Ok(rows) => rows,
+            Err(e) => return simple_error(format!("Failed to get candidate breakdown: {e}"), StatusCode::INTERNAL_SERVER_ERROR),
+        },
+        None => Vec::new(),
+    };
 
     let summary = match summary {
         Ok(s) => s,
@@ -107,6 +137,7 @@ pub async fn get_stats(
         "byModel": by_model,
         "byAccount": by_account,
         "byProvider": by_provider,
+        "byCandidate": by_candidate,
         "timeseries": timeseries,
         "granularityMs": granularity,
     }))
