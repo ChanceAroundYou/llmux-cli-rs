@@ -77,3 +77,10 @@ export const healthBadgeClass = (latency: number | null, success: boolean): stri
   if (t === 'warn') return 'bg-warning/10 text-warning border-warning/20';
   return 'bg-success/10 text-success border-success/20';
 };
+
+// 六个固定类目色（从 stats 页既有 HUE_FAMILIES 的中间档取）。
+// dataviz/scripts/validate_palette.js 在 light 和 dark 两种 surface 上均全部通过：
+// 相邻 CVD ΔE 8.9（tritan）、常色 ΔE 27.2、对比度 ≥3:1。
+// 超过 6 个类目不循环色相，统一落到中性灰（配合表格标签区分）。
+export const SERIES_COLORS = ['#2563eb', '#16a34a', '#7c3aed', '#d97706', '#0891b2', '#e11d48'];
+export const seriesColor = (index: number): string => SERIES_COLORS[index] ?? '#64748b';

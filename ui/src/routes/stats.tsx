@@ -1,12 +1,16 @@
 import React, { useEffect, useState, useMemo, useCallback } from 'react';
 import { apiFetch } from "@/lib/api";
 import { useTranslation } from 'react-i18next';
+import { useSearchParams } from 'react-router-dom';
 import { BarChart3, RefreshCw, Search, Inbox } from 'lucide-react';
 import { fmtSec, fmtTokens, fmtCost } from '../utils/format';
 import { PageHeader } from '../components/shared/PageHeader';
 import { StatCard } from '../components/shared/StatCard';
 import { EmptyState } from '../components/shared/EmptyState';
 import KeyFilter from '../components/shared/KeyFilter';
+import FilterSelect from '../components/shared/FilterSelect';
+import AliasTrafficCard, { type CandidateRow, type AggregateRuntime } from '../components/stats/AliasTrafficCard';
+import ModelPerformanceCard from '../components/stats/ModelPerformanceCard';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
@@ -79,6 +83,23 @@ interface AccountBreakdown {
   estCost: number;
 }
 
+interface AccountOption {
+  id: number;
+  alias: string;
+}
+interface AliasOption {
+  name: string;
+}
+interface AggregateOption {
+  alias: string;
+  active?: number;
+  degraded?: boolean;
+  split_acc?: number;
+  adaptive_split?: boolean;
+  adaptive_max_spill_pct?: number;
+  candidates?: Array<{ account_id?: number; model?: string }>;
+}
+
 const PRESET_MS: Record<Exclude<Preset, 'custom'>, number> = {
   '1h': 60 * 60 * 1000,
   '24h': 24 * 60 * 60 * 1000,
@@ -93,6 +114,16 @@ function toLocalInput(ms: number): string {
 }
 function fromLocalInput(v: string): number {
   return new Date(v).getTime();
+}
+// 别名名本身可能带冒号，只在第一个冒号处切开。
+function splitAliasSelection(v: string | null): ['ordinary' | 'aggregate' | null, string | null] {
+  if (!v) return [null, null];
+  const i = v.indexOf(':');
+  if (i < 0) return [null, null];
+  const kind = v.slice(0, i);
+  return kind === 'ordinary' || kind === 'aggregate'
+    ? [kind, v.slice(i + 1)]
+    : [null, null];
 }
 
 export default function StatsPage() {
@@ -115,6 +146,82 @@ export default function StatsPage() {
   const [accountFilter, setAccountFilter] = useState('');
   // null = 全部密钥。服务端筛选（不是本地文本过滤），所以要进 fetchStats 的依赖。
   const [keyId, setKeyId] = useState<number | null>(null);
+
+  // 这三个筛选同步到 URL，便于把一份统计视图直接发给别人。编码里的 kind
+  // 区分同名普通/聚合别名，后端必须显式收到 alias_kind。
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [selectedAccountId, setSelectedAccountId] = useState<number | null>(() => {
+    const raw = searchParams.get('accountId');
+    const n = raw === null ? NaN : Number(raw);
+    return Number.isFinite(n) ? n : null;
+  });
+  const [aliasSelection, setAliasSelection] = useState<string | null>(() => {
+    const name = searchParams.get('alias');
+    const kind = searchParams.get('aliasKind');
+    return name && (kind === 'ordinary' || kind === 'aggregate') ? `${kind}:${name}` : null;
+  });
+  const [accountOptions, setAccountOptions] = useState<AccountOption[]>([]);
+  const [aliasOptions, setAliasOptions] = useState<Array<{ value: string; label: string }>>([]);
+  const [aggregates, setAggregates] = useState<AggregateOption[]>([]);
+  const [byCandidate, setByCandidate] = useState<CandidateRow[]>([]);
+
+  const [aliasKind, aliasName] = splitAliasSelection(aliasSelection);
+
+  // keyId 在 useSearchParams 之前声明，这里补一次 URL 初始化；URL 同步 effect 紧随其后。
+  useEffect(() => {
+    const raw = new URLSearchParams(window.location.search).get('keyId');
+    if (raw === null) return;
+    const n = Number(raw);
+    if (Number.isFinite(n)) setKeyId(n);
+  }, []);
+
+  useEffect(() => {
+    const ac = new AbortController();
+    Promise.all([
+      apiFetch('/api/accounts', { signal: ac.signal }),
+      apiFetch('/api/models/aliases', { signal: ac.signal }),
+      apiFetch('/api/aggregate-aliases', { signal: ac.signal }),
+    ]).then(async ([ra, rl, rg]) => {
+      const readJson = async (r: Response) => {
+        if (!r.ok) throw new Error(await r.text());
+        return r.json();
+      };
+      const [accounts, aliases, agg] = await Promise.all([readJson(ra), readJson(rl), readJson(rg)]);
+      setAccountOptions(Array.isArray(accounts) ? accounts : []);
+      setAggregates(Array.isArray(agg) ? agg : []);
+      const list: Array<{ value: string; label: string }> = [];
+      for (const a of aliases as AliasOption[]) {
+        if (a?.name) list.push({ value: `ordinary:${a.name}`, label: a.name });
+      }
+      for (const g of agg as AggregateOption[]) {
+        if (g?.alias) list.push({ value: `aggregate:${g.alias}`, label: `〔聚合〕${g.alias}` });
+      }
+      setAliasOptions(list);
+    }).catch(() => { /* 筛选选项拿不到时仍可看全量统计 */ });
+    return () => ac.abort();
+  }, []);
+
+  useEffect(() => {
+    setSearchParams(prev => {
+      const next = new URLSearchParams(prev);
+      if (selectedAccountId === null) next.delete('accountId');
+      else next.set('accountId', String(selectedAccountId));
+      if (!aliasSelection) {
+        next.delete('alias');
+        next.delete('aliasKind');
+      } else {
+        const [kind, name] = splitAliasSelection(aliasSelection)!;
+        if (kind && name) {
+          next.set('aliasKind', kind);
+          next.set('alias', name);
+        }
+      }
+      if (keyId === null) next.delete('keyId');
+      else next.set('keyId', String(keyId));
+      return next;
+    }, { replace: true });
+  }, [selectedAccountId, aliasSelection, keyId, setSearchParams]);
+
   const [modelSort, setModelSort] = useState<{ key: string; dir: 'asc' | 'desc' }>({ key: 'requests', dir: 'desc' });
   const [accountSort, setAccountSort] = useState<{ key: string; dir: 'asc' | 'desc' }>({ key: 'requests', dir: 'desc' });
 
@@ -137,6 +244,11 @@ export default function StatsPage() {
     try {
       const q = new URLSearchParams({ start: String(range.start), end: String(range.end) });
       if (keyId !== null) q.set('key_id', String(keyId));
+      if (selectedAccountId !== null) q.set('account_id', String(selectedAccountId));
+      if (aliasName && aliasKind) {
+        q.set('alias', aliasName);
+        q.set('alias_kind', aliasKind);
+      }
       const res = await apiFetch(`/api/stats?${q.toString()}`);
       if (!res.ok) throw new Error(await res.text());
       const data = await res.json();
@@ -145,12 +257,13 @@ export default function StatsPage() {
       setByAccount(data.byAccount ?? []);
       setTimeseries(Array.isArray(data.timeseries) ? data.timeseries : []);
       setGranularityMs(typeof data.granularityMs === 'number' ? data.granularityMs : null);
+      setByCandidate(Array.isArray(data.byCandidate) ? data.byCandidate : []);
     } catch (e) {
       console.error('stats fetch failed', e);
     } finally {
       setLoading(false);
     }
-  }, [range.start, range.end, keyId]);
+  }, [range.start, range.end, keyId, selectedAccountId, aliasName, aliasKind]);
 
   useEffect(() => { fetchStats(); }, [fetchStats]);
 
@@ -378,6 +491,26 @@ export default function StatsPage() {
   const successRate = summary?.total_requests ? Math.round((summary.success_requests / summary.total_requests) * 100) : 0;
   const avgNetLatency = Math.max(0, (summary?.avg_latency ?? 0) - (summary?.avg_ttft ?? 0));
   const p95NetLatency = Math.max(0, (summary?.p95_latency ?? 0) - (summary?.p95_ttft ?? 0));
+  const selectedAggregate = aliasKind === 'aggregate'
+    ? aggregates.find(g => g.alias === aliasName)
+    : undefined;
+  const aggregateRuntime: AggregateRuntime | undefined = selectedAggregate ? {
+    active: Number(selectedAggregate.active ?? 0),
+    degraded: !!selectedAggregate.degraded,
+    splitAcc: Number(selectedAggregate.split_acc ?? 0),
+    adaptiveSplit: !!selectedAggregate.adaptive_split,
+    adaptiveMaxSpillPct: Number(selectedAggregate.adaptive_max_spill_pct ?? 50),
+    candidates: selectedAggregate.candidates ?? [],
+  } : undefined;
+  const perfCandidates = useMemo(() => (selectedAggregate?.candidates ?? []).flatMap(c => {
+    const id = c.account_id;
+    if (id === undefined || id === null || !c.model) return [];
+    return [{
+      accountId: Number(id),
+      model: c.model,
+      accountName: accountOptions.find(a => a.id === Number(id))?.alias ?? null,
+    }];
+  }), [selectedAggregate, accountOptions]);
 
   return (
     <div className="flex flex-col gap-6 animate-fadeIn pb-8">
@@ -403,7 +536,21 @@ export default function StatsPage() {
           ))}
           {/* 服务端筛选：与下面表格里的「筛选模型/账号」不同 —— 那两个是对已取回的
               聚合结果做本地文本过滤，这个是真的改变查询。 */}
-          <KeyFilter value={keyId} onChange={setKeyId} className="ml-auto" />
+          <span className="text-xs text-muted-foreground ml-auto">{t('usage.filter.accountServer', { defaultValue: '账户' })}</span>
+          <FilterSelect
+            value={selectedAccountId === null ? null : String(selectedAccountId)}
+            options={accountOptions.map(a => ({ value: String(a.id), label: a.alias || `#${a.id}` }))}
+            allLabel={t('common.allAccounts', { defaultValue: '全部账户' })}
+            onChange={v => setSelectedAccountId(v === null ? null : Number(v))}
+          />
+          <span className="text-xs text-muted-foreground">{t('usage.filter.alias', { defaultValue: '别名' })}</span>
+          <FilterSelect
+            value={aliasSelection}
+            options={aliasOptions}
+            allLabel={t('common.allAliases', { defaultValue: '全部别名' })}
+            onChange={setAliasSelection}
+          />
+          <KeyFilter value={keyId} onChange={setKeyId} />
         </div>
         <div className="flex flex-wrap items-end gap-2">
           <div className="flex flex-col gap-1">
@@ -431,6 +578,29 @@ export default function StatsPage() {
         <StatCard label={t('usage.statsCards.avgTps', { defaultValue: '平均 Token/s' })} value={`${(summary?.avg_tps ?? 0).toFixed(1)} Token/s`} icon={BarChart3} />
         <StatCard label={t('usage.statsCards.estCost', { defaultValue: '折算成本' })} value={`$${fmtCost(summary?.est_cost ?? 0)}`} subtitle={(summary?.unpriced_models ?? 0) > 0 ? t('usage.unpricedModels', { defaultValue: '{{count}} 个模型未定价，估算偏低', count: summary?.unpriced_models }) : t('usage.statsCards.estCostNote', { defaultValue: '按 OpenRouter 单价折算' })} icon={BarChart3} />
       </section>
+
+      {aliasName && aliasKind && (
+        <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
+          <AliasTrafficCard
+            alias={aliasName}
+            aliasKind={aliasKind}
+            rows={byCandidate}
+            aggregate={aggregateRuntime}
+            accountId={selectedAccountId}
+            summaryRequests={summary?.total_requests ?? 0}
+          />
+          <ModelPerformanceCard
+            start={range.start}
+            end={range.end}
+            keyId={keyId}
+            accountId={selectedAccountId}
+            alias={aliasName}
+            aliasKind={aliasKind}
+            candidates={perfCandidates}
+            activeIndex={aggregateRuntime?.active}
+          />
+        </div>
+      )}
 
       {/* Charts */}
       <div className="bg-card border border-border rounded-xl p-4">
@@ -490,6 +660,7 @@ export default function StatsPage() {
                 <th className="text-right px-3 py-2 cursor-pointer select-none" onClick={() => toggleModelSort('cacheHit')}>{t('usage.cacheHit', { defaultValue: '缓存' })}{sortIndicator(modelSort,'cacheHit')}</th>
                 <th className="text-right px-3 py-2 cursor-pointer select-none" onClick={() => toggleModelSort('hitRate')}>{t('usage.tables.headers.hitRate', { defaultValue: '命中率' })}{sortIndicator(modelSort,'hitRate')}</th>
                 <th className="text-right px-3 py-2 cursor-pointer select-none" onClick={() => toggleModelSort('requests')}>{t('usage.tables.headers.requests', { defaultValue: '请求' })}{sortIndicator(modelSort,'requests')}</th>
+                <th className="text-right px-3 py-2">{t('usage.tables.headers.requestShare', { defaultValue: '请求占比' })}</th>
                 <th className="text-right px-3 py-2 cursor-pointer select-none" onClick={() => toggleModelSort('successRate')}>{t('usage.tables.headers.successRate', { defaultValue: '成功率' })}{sortIndicator(modelSort,'successRate')}</th>
                 <th className="text-right px-3 py-2 cursor-pointer select-none" onClick={() => toggleModelSort('avgLatency')}>{t('usage.tables.headers.avgLatency', { defaultValue: '平均耗时' })}{sortIndicator(modelSort,'avgLatency')}</th>
                 <th className="text-right px-3 py-2 cursor-pointer select-none" onClick={() => toggleModelSort('avgTtft')}>{t('usage.tables.headers.avgTtft', { defaultValue: '平均 TTFT' })}{sortIndicator(modelSort,'avgTtft')}</th>
@@ -499,7 +670,7 @@ export default function StatsPage() {
             </thead>
             <tbody className="divide-y divide-border/50">
               {sortedModels.length === 0 ? (
-                <tr><td colSpan={11} className="py-8"><EmptyState icon={Inbox} title={t('usage.noData', { defaultValue: '暂无数据' })} /></td></tr>
+                <tr><td colSpan={12} className="py-8"><EmptyState icon={Inbox} title={t('usage.noData', { defaultValue: '暂无数据' })} /></td></tr>
               ) : sortedModels.map((m, i) => (
                 <tr key={i} className="hover:bg-muted/30">
                   <td className="px-4 py-2 font-mono truncate max-w-[260px]">{m.model ?? '—'}</td>
@@ -508,6 +679,7 @@ export default function StatsPage() {
                   <td className="text-right px-3 py-2">{fmtTokens(m.cacheRead ?? 0)}</td>
                   <td className="text-right px-3 py-2">{m.cacheHitRate.toFixed(1)}%</td>
                   <td className="text-right px-3 py-2">{m.requests}</td>
+                  <td className="text-right px-3 py-2">{(summary?.total_requests ? m.requests / summary.total_requests * 100 : 0).toFixed(1)}%</td>
                   <td className="text-right px-3 py-2">{m.requests ? Math.round(m.successCount / m.requests * 100) : 0}%</td>
                   <td className="text-right px-3 py-2">{fmtSec(Math.max(0, m.avgLatency - m.avgTtft))}</td>
                   <td className="text-right px-3 py-2">{fmtSec(m.avgTtft)}</td>
@@ -539,6 +711,7 @@ export default function StatsPage() {
                 <th className="text-right px-3 py-2 cursor-pointer select-none" onClick={() => toggleAccountSort('cacheHit')}>{t('usage.cacheHit', { defaultValue: '缓存' })}{sortIndicator(accountSort,'cacheHit')}</th>
                 <th className="text-right px-3 py-2 cursor-pointer select-none" onClick={() => toggleAccountSort('hitRate')}>{t('usage.tables.headers.hitRate', { defaultValue: '命中率' })}{sortIndicator(accountSort,'hitRate')}</th>
                 <th className="text-right px-3 py-2 cursor-pointer select-none" onClick={() => toggleAccountSort('requests')}>{t('usage.tables.headers.requests', { defaultValue: '请求' })}{sortIndicator(accountSort,'requests')}</th>
+                <th className="text-right px-3 py-2">{t('usage.tables.headers.requestShare', { defaultValue: '请求占比' })}</th>
                 <th className="text-right px-3 py-2 cursor-pointer select-none" onClick={() => toggleAccountSort('successRate')}>{t('usage.tables.headers.successRate', { defaultValue: '成功率' })}{sortIndicator(accountSort,'successRate')}</th>
                 <th className="text-right px-3 py-2 cursor-pointer select-none" onClick={() => toggleAccountSort('avgLatency')}>{t('usage.tables.headers.avgLatency', { defaultValue: '平均耗时' })}{sortIndicator(accountSort,'avgLatency')}</th>
                 <th className="text-right px-3 py-2 cursor-pointer select-none" onClick={() => toggleAccountSort('avgTtft')}>{t('usage.tables.headers.avgTtft', { defaultValue: '平均 TTFT' })}{sortIndicator(accountSort,'avgTtft')}</th>
@@ -548,7 +721,7 @@ export default function StatsPage() {
             </thead>
             <tbody className="divide-y divide-border/50">
               {sortedAccounts.length === 0 ? (
-                <tr><td colSpan={11} className="py-8"><EmptyState icon={Inbox} title={t('usage.noData', { defaultValue: '暂无数据' })} /></td></tr>
+                <tr><td colSpan={12} className="py-8"><EmptyState icon={Inbox} title={t('usage.noData', { defaultValue: '暂无数据' })} /></td></tr>
               ) : sortedAccounts.map(a => (
                 <tr key={a.id} className="hover:bg-muted/30">
                   <td className="px-4 py-2 font-medium">{a.name}</td>
@@ -557,6 +730,7 @@ export default function StatsPage() {
                   <td className="text-right px-3 py-2">{fmtTokens(a.cacheRead ?? 0)}</td>
                   <td className="text-right px-3 py-2">{a.cacheHitRate.toFixed(1)}%</td>
                   <td className="text-right px-3 py-2">{a.requests}</td>
+                  <td className="text-right px-3 py-2">{(summary?.total_requests ? a.requests / summary.total_requests * 100 : 0).toFixed(1)}%</td>
                   <td className="text-right px-3 py-2">{a.requests ? Math.round(a.successCount / a.requests * 100) : 0}%</td>
                   <td className="text-right px-3 py-2">{fmtSec(Math.max(0, a.avgLatency - a.avgTtft))}</td>
                   <td className="text-right px-3 py-2">{fmtSec(a.avgTtft)}</td>
