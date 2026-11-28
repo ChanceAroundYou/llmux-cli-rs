@@ -248,6 +248,83 @@ pub async fn get_stats_logs(
     Json(json!({ "logs": entries, "total": total })).into_response()
 }
 
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+pub struct PerformanceQuery {
+    pub start: Option<i64>,
+    pub end: Option<i64>,
+    pub granularity: Option<i64>,
+    pub key_id: Option<i64>,
+    pub account_id: Option<i64>,
+    pub alias: Option<String>,
+    pub alias_kind: Option<String>,
+    pub model: Option<String>,
+    /// model | account_model；缺省时按筛选条件推断。
+    pub group_by: Option<String>,
+}
+
+/// 流式性能历史：当前/前一窗口的行级指标 + PerfRegistry 实时快照。
+pub async fn get_performance(
+    Extension(state): Extension<AppState>,
+    Query(params): Query<PerformanceQuery>,
+) -> Response {
+    let end = params.end.unwrap_or_else(now_ms);
+    let start = params.start.unwrap_or_else(|| end.saturating_sub(DAY_MS));
+    if start > end {
+        return simple_error("start must be <= end", StatusCode::BAD_REQUEST);
+    }
+    let group_by = params.group_by.unwrap_or_else(|| {
+        if params.account_id.is_some() || params.alias_kind.as_deref() == Some("aggregate") {
+            "account_model".to_string()
+        } else {
+            "model".to_string()
+        }
+    });
+    let granularity = params.granularity.unwrap_or_else(|| auto_granularity(start, end));
+    let filter = UsageFilter {
+        account_id: params.account_id,
+        alias: params.alias.clone(),
+        alias_kind: params.alias_kind.clone(),
+    };
+    let data = match UsageService::new(state.pool.clone())
+        .get_performance(
+            Some(start),
+            Some(end),
+            params.key_id,
+            &filter,
+            params.model.as_deref(),
+            &group_by,
+            granularity,
+        )
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => return simple_error(format!("Failed to get performance: {e}"), StatusCode::INTERNAL_SERVER_ERROR),
+    };
+    let live = match filtered_live(
+        &state,
+        PerfQuery {
+            account_id: params.account_id,
+            alias: params.alias,
+            alias_kind: params.alias_kind,
+            model: params.model,
+        },
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => return simple_error(e, StatusCode::INTERNAL_SERVER_ERROR),
+    };
+    Json(json!({
+        "granularityMs": data.granularity_ms,
+        "groupBy": data.group_by,
+        "rows": data.rows,
+        "series": data.series,
+        "live": live,
+    }))
+    .into_response()
+}
+
 /// 实时性能快照（进程内存，重启清零）。筛选口径与 /api/stats 一致：
 /// 别名过滤先从 usage_logs 近 24h 的归属行取 (account_id, model) 集合，
 /// 再拿它裁剪 registry 快照 —— 不把无关节点的 severity 混进别名卡片。
@@ -261,9 +338,19 @@ pub struct PerfQuery {
 }
 
 pub async fn get_live_perf(
-    Extension(state): Extension<crate::AppState>,
+    Extension(state): Extension<AppState>,
     Query(params): Query<PerfQuery>,
 ) -> Response {
+    match filtered_live(&state, params).await {
+        Ok(live) => Json(json!({ "live": live })).into_response(),
+        Err(e) => simple_error(e, StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+async fn filtered_live(
+    state: &AppState,
+    params: PerfQuery,
+) -> std::result::Result<Vec<perf::PerfNodeView>, String> {
     let mut live = perf::global()
         .lock()
         .unwrap()
@@ -289,23 +376,17 @@ pub async fn get_live_perf(
         let sql = format!(
             "SELECT DISTINCT account_id, model FROM usage_logs WHERE {col} = ? AND timestamp >= ?"
         );
-        let rows: Result<Vec<(Option<i64>, Option<String>)>, _> =
-            sqlx::query_as(&sql).bind(alias).bind(cutoff).fetch_all(&state.pool).await;
-        match rows {
-            Ok(rows) => {
-                let allowed: Vec<(i64, String)> = rows
-                    .into_iter()
-                    .filter_map(|(a, m)| a.zip(m))
-                    .collect();
-                live.retain(|n| allowed.iter().any(|(a, m)| *a == n.account_id && m == &n.model));
-            }
-            Err(e) => {
-                return crate::error::simple_error(
-                    format!("Failed to resolve alias for live perf: {e}"),
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                )
-            }
-        }
+        let rows: Vec<(Option<i64>, Option<String>)> = sqlx::query_as(&sql)
+            .bind(alias)
+            .bind(cutoff)
+            .fetch_all(&state.pool)
+            .await
+            .map_err(|e| format!("Failed to resolve alias for live perf: {e}"))?;
+        let allowed: Vec<(i64, String)> = rows
+            .into_iter()
+            .filter_map(|(a, m)| a.zip(m))
+            .collect();
+        live.retain(|n| allowed.iter().any(|(a, m)| *a == n.account_id && m == &n.model));
     }
-    Json(json!({ "live": live })).into_response()
+    Ok(live)
 }

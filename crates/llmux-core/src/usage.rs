@@ -2,7 +2,10 @@ use crate::models::UsageLogParams;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqlitePool};
+use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+const DAY_MS: i64 = 24 * 60 * 60 * 1000;
 
 #[derive(Debug, Clone)]
 pub struct UsageService {
@@ -162,6 +165,51 @@ pub struct TimeseriesPoint {
     pub avg_tps: f64,
     /// 折算成本（美元），见 UsageSummary::est_cost。
     pub est_cost: f64,
+}
+
+/// 流式成功历史的性能行。`avgTtft` / `p95Ttft` 用秒，`avgTps` 用 token/s。
+/// TTFT/TPS 只取成功且口径合格的行；成功率的分母是全部流式请求（含失败）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PerformanceRow {
+    pub model: Option<String>,
+    pub account_id: Option<i64>,
+    pub account_name: Option<String>,
+    pub stream_requests: i64,
+    pub success_rate: f64,
+    pub avg_ttft: f64,
+    pub p95_ttft: f64,
+    pub avg_tps: f64,
+    pub prev_stream_requests: i64,
+    pub prev_success_rate: f64,
+    pub prev_avg_ttft: f64,
+    pub prev_p95_ttft: f64,
+    pub prev_avg_tps: f64,
+    pub delta_ttft_pct: f64,
+    pub delta_tps_pct: f64,
+    /// 成功率变化用百分点差，不是相对百分比。
+    pub delta_success_rate: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PerformancePoint {
+    pub model: Option<String>,
+    pub account_id: Option<i64>,
+    pub bucket: i64,
+    pub stream_requests: i64,
+    pub avg_ttft: f64,
+    pub p95_ttft: f64,
+    pub avg_tps: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PerformanceData {
+    pub granularity_ms: i64,
+    pub group_by: String,
+    pub rows: Vec<PerformanceRow>,
+    pub series: Vec<PerformancePoint>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -850,6 +898,146 @@ impl UsageService {
         Ok(out)
     }
 
+    /// 流式请求的历史性能。只取真实流量，口径与自动分流的 PerfRegistry 对齐：
+    /// TTFT 取成功行的非空样本，TPS 取解码段 ≥500ms 且输出 ≥8 token 的成功行。
+    /// 前一等长窗口用于 `prev*` 与变化量。
+    pub async fn get_performance(
+        &self,
+        start_time: Option<i64>,
+        end_time: Option<i64>,
+        api_key_id: Option<i64>,
+        filter: &UsageFilter,
+        model: Option<&str>,
+        group_by: &str,
+        granularity_ms: i64,
+    ) -> Result<PerformanceData> {
+        let end = end_time.unwrap_or_else(now_millis);
+        let start = start_time.unwrap_or_else(|| end - DAY_MS);
+        let span = (end - start).max(0);
+        let gran = granularity_ms.max(60_000);
+        let group_by = if group_by == "account_model" {
+            "account_model"
+        } else {
+            "model"
+        };
+
+        let current = self
+            .fetch_perf_rows(Some(start), Some(end), api_key_id, filter, model, gran)
+            .await?;
+        let previous = self
+            .fetch_perf_rows(Some(start - span), Some(start), api_key_id, filter, model, gran)
+            .await?;
+
+        let cur_groups = group_perf_rows(&current, group_by);
+        let prev_groups = group_perf_rows(&previous, group_by);
+        let mut rows = Vec::new();
+        for (key, (account_name, acc)) in cur_groups {
+            let (avg_ttft, p95_ttft, avg_tps) = acc.metrics();
+            let success_rate = acc.success_rate();
+            let prev = prev_groups.get(&key);
+            let (prev_avg_ttft, prev_p95_ttft, prev_avg_tps) = prev
+                .map(|(_, a)| a.metrics())
+                .unwrap_or((0.0, 0.0, 0.0));
+            let prev_success_rate = prev.map(|(_, a)| a.success_rate()).unwrap_or(0.0);
+            rows.push(PerformanceRow {
+                model: key.1.clone(),
+                account_id: key.0,
+                account_name,
+                stream_requests: acc.requests,
+                success_rate,
+                avg_ttft,
+                p95_ttft,
+                avg_tps,
+                prev_stream_requests: prev.map(|(_, a)| a.requests).unwrap_or(0),
+                prev_success_rate,
+                prev_avg_ttft,
+                prev_p95_ttft,
+                prev_avg_tps,
+                delta_ttft_pct: delta_pct(avg_ttft, prev_avg_ttft),
+                delta_tps_pct: delta_pct(avg_tps, prev_avg_tps),
+                delta_success_rate: success_rate - prev_success_rate,
+            });
+        }
+
+        let mut buckets: BTreeMap<(Option<i64>, Option<String>, i64), PerfAcc> = BTreeMap::new();
+        for r in &current {
+            let key = perf_key(r, group_by);
+            buckets.entry((key.0, key.1, r.bucket)).or_default().fold(r);
+        }
+        let series = buckets
+            .into_iter()
+            .map(|((account_id, model, bucket), acc)| {
+                let (avg_ttft, p95_ttft, avg_tps) = acc.metrics();
+                PerformancePoint {
+                    model,
+                    account_id,
+                    bucket,
+                    stream_requests: acc.requests,
+                    avg_ttft,
+                    p95_ttft,
+                    avg_tps,
+                }
+            })
+            .collect();
+
+        Ok(PerformanceData {
+            granularity_ms: gran,
+            group_by: group_by.to_string(),
+            rows,
+            series,
+        })
+    }
+
+    async fn fetch_perf_rows(
+        &self,
+        start_time: Option<i64>,
+        end_time: Option<i64>,
+        api_key_id: Option<i64>,
+        filter: &UsageFilter,
+        model: Option<&str>,
+        gran: i64,
+    ) -> Result<Vec<PerfRaw>> {
+        let mut sql = format!(
+            "SELECT CAST(usage_logs.timestamp / ? AS INTEGER) * ? AS bucket,
+                    usage_logs.account_id, usage_logs.model, a.alias AS account_name,
+                    usage_logs.success, usage_logs.latency_ms, usage_logs.ttft_ms,
+                    usage_logs.output_tokens
+             FROM usage_logs
+             LEFT JOIN accounts a ON usage_logs.account_id = a.id
+             WHERE usage_logs.is_test = 0 AND usage_logs.is_stream = 1"
+        );
+        append_time_filter(&mut sql, "", start_time, end_time);
+        append_key_filter(&mut sql, "", api_key_id);
+        if model.is_some() {
+            sql.push_str(" AND usage_logs.model = ?");
+        }
+        append_attribution_filter(&mut sql, "", filter);
+        let mut query = sqlx::query(&sql)
+            .bind(gran)
+            .bind(gran);
+        query = bind_time_filter(query, start_time, end_time);
+        query = bind_key_filter(query, api_key_id);
+        if let Some(model) = model {
+            query = query.bind(model.to_string());
+        }
+        query = bind_attribution_filter(query, filter);
+        let rows = query.fetch_all(&self.pool).await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(PerfRaw {
+                    bucket: row.try_get("bucket")?,
+                    account_id: row.try_get("account_id")?,
+                    model: row.try_get("model")?,
+                    account_name: row.try_get("account_name")?,
+                    success: row.try_get::<i64, _>("success")? != 0,
+                    latency_ms: row.try_get("latency_ms")?,
+                    ttft_ms: row.try_get("ttft_ms")?,
+                    output_tokens: row.try_get("output_tokens")?,
+                })
+            })
+            .collect()
+    }
+
     pub async fn get_detailed_logs(
         &self,
         options: DetailedLogQuery,
@@ -1017,6 +1205,99 @@ fn percentile(values: &mut Vec<i64>, p: f64) -> f64 {
         let a = values[lo] as f64;
         let b = values[hi] as f64;
         a + (b - a) * frac
+    }
+}
+
+struct PerfRaw {
+    bucket: i64,
+    account_id: Option<i64>,
+    model: Option<String>,
+    account_name: Option<String>,
+    success: bool,
+    latency_ms: i64,
+    ttft_ms: Option<i64>,
+    output_tokens: i64,
+}
+
+#[derive(Default)]
+struct PerfAcc {
+    requests: i64,
+    successes: i64,
+    ttfts: Vec<i64>,
+    tps: Vec<f64>,
+}
+
+impl PerfAcc {
+    fn fold(&mut self, r: &PerfRaw) {
+        self.requests += 1;
+        if !r.success {
+            return;
+        }
+        self.successes += 1;
+        let Some(ttft) = r.ttft_ms else { return };
+        self.ttfts.push(ttft);
+        // 与 PerfRegistry 同口径：解码段太短/输出太少的行不足以估算 TPS。
+        let decode_ms = r.latency_ms - ttft;
+        if decode_ms >= 500 && r.output_tokens >= 8 {
+            self.tps.push(r.output_tokens as f64 / (decode_ms as f64 / 1000.0));
+        }
+    }
+
+    fn success_rate(&self) -> f64 {
+        if self.requests > 0 {
+            self.successes as f64 / self.requests as f64
+        } else {
+            0.0
+        }
+    }
+
+    /// (avg_ttft 秒, p95_ttft 秒, avg_tps)。
+    fn metrics(&self) -> (f64, f64, f64) {
+        let mut ttfts = self.ttfts.clone();
+        let avg_ttft = if ttfts.is_empty() {
+            0.0
+        } else {
+            ttfts.iter().sum::<i64>() as f64 / ttfts.len() as f64 / 1000.0
+        };
+        let p95_ttft = percentile(&mut ttfts, 95.0) / 1000.0;
+        let avg_tps = if self.tps.is_empty() {
+            0.0
+        } else {
+            self.tps.iter().sum::<f64>() / self.tps.len() as f64
+        };
+        (avg_ttft, p95_ttft, avg_tps)
+    }
+}
+
+fn perf_key(r: &PerfRaw, group_by: &str) -> (Option<i64>, Option<String>) {
+    if group_by == "account_model" {
+        (r.account_id, r.model.clone())
+    } else {
+        (None, r.model.clone())
+    }
+}
+
+fn group_perf_rows(
+    rows: &[PerfRaw],
+    group_by: &str,
+) -> BTreeMap<(Option<i64>, Option<String>), (Option<String>, PerfAcc)> {
+    let mut out: BTreeMap<_, _> = BTreeMap::new();
+    for r in rows {
+        let key = perf_key(r, group_by);
+        let entry = out.entry(key).or_insert_with(|| {
+            let name = if group_by == "account_model" { r.account_name.clone() } else { None };
+            (name, PerfAcc::default())
+        });
+        entry.1.fold(r);
+    }
+    out
+}
+
+fn delta_pct(current: f64, previous: f64) -> f64 {
+    if previous.abs() < 1e-9 {
+        0.0
+    } else {
+        (current - previous) / previous * 100.0
     }
 }
 

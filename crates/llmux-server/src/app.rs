@@ -381,6 +381,7 @@ fn core_router() -> AppRouter {
         .route("/api/stats", get(stats::get_stats))
         .route("/api/stats/logs", get(stats::get_stats_logs))
         .route("/api/stats/perf", get(stats::get_live_perf))
+        .route("/api/stats/performance", get(stats::get_performance))
         .route(
             "/api/model-prices",
             get(model_prices::list_model_prices).put(model_prices::set_model_price),
